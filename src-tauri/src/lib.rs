@@ -34,6 +34,25 @@ pub struct DialogueEntryDto {
     pub original_text: String,
     pub translated_text: Option<String>,
     pub status: String,
+    pub scene_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SceneDto {
+    pub id: String,
+    pub name: String,
+    pub total_lines: usize,
+    pub translated_lines: usize,
+    pub entries: Vec<DialogueEntryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedFileDto {
+    pub file_path: String,
+    pub file_name: String,
+    pub total_lines: usize,
+    pub translated_lines: usize,
+    pub scenes: Vec<SceneDto>,
 }
 
 #[tauri::command]
@@ -114,7 +133,7 @@ fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
 }
 
 #[tauri::command]
-fn parse_file_entries(file_path: String) -> Result<Vec<DialogueEntryDto>, String> {
+fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> {
     let path = Path::new(&file_path);
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
@@ -123,21 +142,75 @@ fn parse_file_entries(file_path: String) -> Result<Vec<DialogueEntryDto>, String
     let graph = parser.parse_file(path, &content)
         .map_err(|e| format!("Ошибка парсинга: {}", e))?;
 
-    let mut entries = Vec::new();
+    let mut scenes: Vec<SceneDto> = Vec::new();
+    let mut current_scene = SceneDto {
+        id: "default_scene".to_string(),
+        name: "Общие реплики".to_string(),
+        total_lines: 0,
+        translated_lines: 0,
+        entries: Vec::new(),
+    };
+
+    let mut file_total = 0;
+    let mut file_translated = 0;
+
     for idx in graph.node_indices() {
-        if let Some(ScenarioNode::Dialogue(d)) = graph.get_node(idx) {
-            entries.push(DialogueEntryDto {
-                id: d.id.clone(),
-                line_number: d.line_number,
-                speaker: d.speaker.clone(),
-                original_text: d.original_text.clone(),
-                translated_text: d.translated_text.clone(),
-                status: format!("{:?}", d.status),
-            });
+        if let Some(node) = graph.get_node(idx) {
+            match node {
+                ScenarioNode::Label(label_name) => {
+                    // Если в текущей сцене уже были реплики, сохраняем её
+                    if !current_scene.entries.is_empty() {
+                        scenes.push(current_scene);
+                    }
+                    current_scene = SceneDto {
+                        id: format!("scene_{}", label_name),
+                        name: label_name.clone(),
+                        total_lines: 0,
+                        translated_lines: 0,
+                        entries: Vec::new(),
+                    };
+                }
+                ScenarioNode::Dialogue(d) => {
+                    let is_trans = d.translated_text.is_some() && !d.translated_text.as_ref().unwrap().trim().is_empty();
+                    
+                    file_total += 1;
+                    current_scene.total_lines += 1;
+                    if is_trans {
+                        file_translated += 1;
+                        current_scene.translated_lines += 1;
+                    }
+
+                    // Если встретили реплики интерфейса, сгруппируем их красиво
+                    if d.speaker.as_deref() == Some("UI / Choice") && current_scene.id == "default_scene" {
+                        current_scene.name = "Интерфейс и выборы (strings)".to_string();
+                    }
+
+                    current_scene.entries.push(DialogueEntryDto {
+                        id: d.id.clone(),
+                        line_number: d.line_number,
+                        speaker: d.speaker.clone(),
+                        original_text: d.original_text.clone(),
+                        translated_text: d.translated_text.clone(),
+                        status: format!("{:?}", d.status),
+                        scene_name: current_scene.name.clone(),
+                    });
+                }
+                _ => {}
+            }
         }
     }
 
-    Ok(entries)
+    if !current_scene.entries.is_empty() {
+        scenes.push(current_scene);
+    }
+
+    Ok(ParsedFileDto {
+        file_path: file_path.clone(),
+        file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+        total_lines: file_total,
+        translated_lines: file_translated,
+        scenes,
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

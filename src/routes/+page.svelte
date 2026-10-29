@@ -10,7 +10,9 @@
     Search, 
     Users, 
     Languages, 
-    Cpu,
+    Clapperboard,
+    GitBranch,
+    Table,
     ArrowRight,
     Loader2
   } from "lucide-svelte";
@@ -44,18 +46,51 @@
     original_text: string;
     translated_text: string | null;
     status: string;
+    scene_name: string;
+  }
+
+  interface Scene {
+    id: string;
+    name: string;
+    total_lines: number;
+    translated_lines: number;
+    entries: DialogueEntry[];
+  }
+
+  interface ParsedFile {
+    file_path: string;
+    file_name: string;
+    total_lines: number;
+    translated_lines: number;
+    scenes: Scene[];
   }
 
   let project = $state<ProjectSummary | null>(null);
   let selectedFile = $state<TranslationFile | null>(null);
-  let entries = $state<DialogueEntry[]>([]);
+  let currentFile = $state<ParsedFile | null>(null);
+
+  // Навигация и фильтрация
+  let selectedSceneId = $state<string>("all");
   let searchQuery = $state("");
   let filterStatus = $state<"all" | "untranslated" | "translated">("all");
   let selectedEntry = $state<DialogueEntry | null>(null);
+  let viewMode = $state<"table" | "scenes">("table");
 
-  // Вычисляемые свойства (Runes)
-  let filteredEntries = $derived(
-    entries.filter(e => {
+  // Все реплики текущего файла плоским списком (для глобального поиска)
+  let allEntries = $derived(
+    currentFile ? currentFile.scenes.flatMap(s => s.entries) : []
+  );
+
+  // Реплики выбранной сцены (или всех сцен)
+  let visibleScenes = $derived(
+    currentFile 
+      ? (selectedSceneId === "all" ? currentFile.scenes : currentFile.scenes.filter(s => s.id === selectedSceneId))
+      : []
+  );
+
+  // Отфильтрованные реплики с учетом поиска и статуса
+  function filterSceneEntries(entries: DialogueEntry[]) {
+    return entries.filter(e => {
       const matchSearch = searchQuery === "" || 
         e.original_text.toLowerCase().includes(searchQuery.toLowerCase()) ||
         (e.translated_text && e.translated_text.toLowerCase().includes(searchQuery.toLowerCase())) ||
@@ -68,8 +103,8 @@
         (filterStatus === "translated" && isTranslated);
 
       return matchSearch && matchFilter;
-    })
-  );
+    });
+  }
 
   let totalPercent = $derived(
     project && project.total_lines > 0
@@ -99,9 +134,12 @@
     selectedFile = file;
     loadingFile = true;
     errorMsg = "";
+    selectedSceneId = "all";
     try {
-      entries = await invoke<DialogueEntry[]>("parse_file_entries", { filePath: file.path });
-      selectedEntry = entries.length > 0 ? entries[0] : null;
+      currentFile = await invoke<ParsedFile>("parse_file_entries", { filePath: file.path });
+      if (currentFile.scenes.length > 0 && currentFile.scenes[0].entries.length > 0) {
+        selectedEntry = currentFile.scenes[0].entries[0];
+      }
     } catch (e) {
       errorMsg = String(e);
     } finally {
@@ -116,7 +154,7 @@
     <div class="brand">
       <Languages class="icon-brand" size={24} />
       <span class="brand-title">Translator</span>
-      <span class="badge-tag">Ren'Py / Graph Edition</span>
+      <span class="badge-tag">Graph / Scene Edition</span>
     </div>
 
     <!-- Поле ввода папки игры -->
@@ -215,15 +253,36 @@
       {/if}
     </aside>
 
-    <!-- ОСНОВНАЯ ОБЛАСТЬ (Таблица реплик и инспектор) -->
+    <!-- ОСНОВНАЯ ОБЛАСТЬ (Сцены, Таблица реплик и Инспектор) -->
     <main class="content-area">
-      {#if selectedFile}
-        <!-- Тулбар фильтров файла -->
-        <div class="table-toolbar">
+      {#if currentFile}
+        <!-- ТУЛБАР ФАЙЛА И ПЕРЕКЛЮЧАТЕЛЬ РЕЖИМОВ -->
+        <div class="file-toolbar">
           <div class="file-info-badge">
             <FileText size={16} />
-            <strong>{selectedFile.name}</strong>
-            <span class="badge-lines">{filteredEntries.length} строк</span>
+            <strong>{currentFile.file_name}</strong>
+            <span class="badge-lines">{currentFile.scenes.length} сцен(ы)</span>
+            <span class="badge-lines">{currentFile.total_lines} строк</span>
+          </div>
+
+          <!-- Переключатель: Таблица / Сцены -->
+          <div class="view-switcher">
+            <button 
+              class:active={viewMode === 'table'} 
+              onclick={() => viewMode = 'table'}
+              title="Режим таблицы диалогов"
+            >
+              <Table size={14} />
+              <span>Таблица</span>
+            </button>
+            <button 
+              class:active={viewMode === 'scenes'} 
+              onclick={() => viewMode = 'scenes'}
+              title="Режим графа и структуры сцен"
+            >
+              <GitBranch size={14} />
+              <span>Сцены & Граф</span>
+            </button>
           </div>
 
           <!-- Поиск -->
@@ -232,11 +291,11 @@
             <input 
               type="search" 
               bind:value={searchQuery} 
-              placeholder="Поиск по оригиналу, переводу или персонажу..." 
+              placeholder="Поиск по тексту, переводу или спикеру..." 
             />
           </div>
 
-          <!-- Фильтры -->
+          <!-- Фильтры статуса -->
           <div class="filter-pills">
             <button 
               class:active={filterStatus === 'all'} 
@@ -253,68 +312,162 @@
           </div>
         </div>
 
-        <!-- Таблица строк -->
-        <div class="table-container">
-          {#if loadingFile}
-            <div class="loading-state">
-              <Loader2 size={32} class="spin" />
-              <p>Парсинг файла сценария через Rust...</p>
-            </div>
-          {:else}
-            <table class="grid-table">
-              <thead>
-                <tr>
-                  <th style="width: 60px;">#</th>
-                  <th style="width: 140px;">Персонаж</th>
-                  <th>Оригинал (EN)</th>
-                  <th>Перевод (RU)</th>
-                  <th style="width: 90px;">Статус</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each filteredEntries as entry}
-                  <tr 
-                    class:selected={selectedEntry?.id === entry.id}
-                    onclick={() => selectedEntry = entry}
-                  >
-                    <td class="col-line">{entry.line_number}</td>
-                    <td class="col-speaker">
-                      {#if entry.speaker}
-                        <span class="speaker-badge">{entry.speaker}</span>
-                      {:else}
-                        <span class="narrator-badge">Автор</span>
-                      {/if}
-                    </td>
-                    <td class="col-text en-text">{entry.original_text}</td>
-                    <td class="col-text ru-text">
-                      {#if entry.translated_text}
-                        <span>{entry.translated_text}</span>
-                      {:else}
-                        <span class="placeholder-text">Не переведено</span>
-                      {/if}
-                    </td>
-                    <td class="col-status">
-                      {#if entry.translated_text}
-                        <span class="status-pill status-ok">Готово</span>
-                      {:else}
-                        <span class="status-pill status-empty">Пусто</span>
-                      {/if}
-                    </td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-          {/if}
+        <!-- ЛЕНТА ПЕРЕКЛЮЧЕНИЯ СЦЕН (Сверху над таблицей) -->
+        <div class="scenes-nav-bar">
+          <button 
+            class="scene-nav-chip" 
+            class:active={selectedSceneId === 'all'}
+            onclick={() => selectedSceneId = 'all'}
+          >
+            <span>Все сцены ({currentFile.scenes.length})</span>
+          </button>
+
+          {#each currentFile.scenes as scene}
+            {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
+            <button 
+              class="scene-nav-chip" 
+              class:active={selectedSceneId === scene.id}
+              onclick={() => selectedSceneId = scene.id}
+            >
+              <Clapperboard size={12} class="scene-chip-icon" />
+              <span class="scene-chip-title">{scene.name}</span>
+              <span class="scene-chip-badge" class:badge-complete={pct === 100}>
+                {scene.translated_lines}/{scene.total_lines} ({pct}%)
+              </span>
+            </button>
+          {/each}
         </div>
+
+        <!-- ОСНОВНОЙ ВИД -->
+        {#if viewMode === 'scenes'}
+          <!-- РЕЖИМ ГРАФА И КАРТОЧЕК СЦЕН (Story Flow) -->
+          <div class="scenes-flow-container">
+            <div class="scenes-flow-grid">
+              {#each currentFile.scenes as scene, index}
+                {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
+                <div 
+                  class="scene-card" 
+                  class:card-selected={selectedSceneId === scene.id}
+                  onclick={() => { selectedSceneId = scene.id; viewMode = 'table'; }}
+                >
+                  <div class="scene-card-header">
+                    <div class="scene-card-title-row">
+                      <Clapperboard size={16} class="text-sky-400" />
+                      <span class="scene-card-name">{scene.name}</span>
+                    </div>
+                    <span class="scene-card-seq">#{index + 1}</span>
+                  </div>
+
+                  <p class="scene-card-preview">
+                    {scene.entries.length > 0 ? scene.entries[0].original_text : "Пустая сцена"}
+                  </p>
+
+                  <div class="scene-card-footer">
+                    <div class="scene-card-progress">
+                      <div class="scene-card-fill" style="width: {pct}%"></div>
+                    </div>
+                    <div class="scene-card-stats">
+                      <span>{scene.translated_lines} из {scene.total_lines} строк</span>
+                      <span class="pct-text">{pct}%</span>
+                    </div>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {:else}
+          <!-- РЕЖИМ ТАБЛИЦЫ ДИАЛОГОВ -->
+          <div class="table-container">
+            {#if loadingFile}
+              <div class="loading-state">
+                <Loader2 size={32} class="spin" />
+                <p>Парсинг файла сценария через Rust...</p>
+              </div>
+            {:else}
+              <div class="scenes-grouped-view">
+                {#each visibleScenes as scene}
+                  {@const sceneEntries = filterSceneEntries(scene.entries)}
+                  {#if sceneEntries.length > 0}
+                    <!-- РАЗДЕЛИТЕЛЬ СЦЕНЫ -->
+                    <div class="scene-section-divider">
+                      <div class="scene-section-left">
+                        <Clapperboard size={15} />
+                        <span class="scene-section-title">Сцена: <strong>{scene.name}</strong></span>
+                        <span class="badge-lines">{sceneEntries.length} строк</span>
+                      </div>
+                      <div class="scene-section-right">
+                        <span>{scene.translated_lines}/{scene.total_lines} переведено</span>
+                        <div class="scene-mini-track">
+                          <div 
+                            class="scene-mini-fill" 
+                            style="width: {scene.total_lines > 0 ? (scene.translated_lines / scene.total_lines) * 100 : 0}%"
+                          ></div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <table class="grid-table">
+                      <thead>
+                        <tr>
+                          <th style="width: 50px;">#</th>
+                          <th style="width: 140px;">Персонаж</th>
+                          <th>Оригинал (EN)</th>
+                          <th>Перевод (RU)</th>
+                          <th style="width: 80px;">Статус</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {#each sceneEntries as entry}
+                          <tr 
+                            class:selected={selectedEntry?.id === entry.id}
+                            onclick={() => selectedEntry = entry}
+                          >
+                            <td class="col-line">{entry.line_number}</td>
+                            <td class="col-speaker">
+                              {#if entry.speaker}
+                                <span class="speaker-badge">{entry.speaker}</span>
+                              {:else}
+                                <span class="narrator-badge">Автор</span>
+                              {/if}
+                            </td>
+                            <td class="col-text en-text">{entry.original_text}</td>
+                            <td class="col-text ru-text">
+                              {#if entry.translated_text}
+                                <span>{entry.translated_text}</span>
+                              {:else}
+                                <span class="placeholder-text">Не переведено</span>
+                              {/if}
+                            </td>
+                            <td class="col-status">
+                              {#if entry.translated_text}
+                                <span class="status-pill status-ok">Готово</span>
+                              {:else}
+                                <span class="status-pill status-empty">Пусто</span>
+                              {/if}
+                            </td>
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  {/if}
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
 
         <!-- НИЖНИЙ ИНСПЕКТОР СТРОКИ -->
         {#if selectedEntry}
           <div class="inspector-panel">
             <div class="inspector-header">
-              <span class="inspector-title">
-                Строка #{selectedEntry.line_number} — 
-                <strong>{selectedEntry.speaker ?? "Авторский текст"}</strong>
-              </span>
+              <div class="inspector-breadcrumb">
+                <Clapperboard size={13} class="text-sky-400" />
+                <span class="inspect-scene">{selectedEntry.scene_name}</span>
+                <span class="breadcrumb-sep">/</span>
+                <span class="inspect-line">Строка #{selectedEntry.line_number}</span>
+                <span class="breadcrumb-sep">/</span>
+                <strong class="inspect-speaker">{selectedEntry.speaker ?? "Авторский текст"}</strong>
+              </div>
               <button class="btn-ai">
                 <Sparkles size={14} />
                 <span>Перевести через LM Studio</span>
@@ -627,20 +780,21 @@
     background: #0d0f12;
   }
 
-  .table-toolbar {
+  .file-toolbar {
     display: flex;
     align-items: center;
     gap: 12px;
-    padding: 10px 16px;
+    padding: 8px 16px;
     background: #12151b;
     border-bottom: 1px solid #1e232d;
+    flex-wrap: wrap;
   }
 
   .file-info-badge {
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 14px;
+    font-size: 13px;
   }
 
   .badge-lines {
@@ -649,6 +803,34 @@
     color: #94a3b8;
     padding: 2px 7px;
     border-radius: 999px;
+  }
+
+  .view-switcher {
+    display: flex;
+    background: #0d0f12;
+    border: 1px solid #232935;
+    border-radius: 6px;
+    padding: 2px;
+    gap: 2px;
+  }
+
+  .view-switcher button {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .view-switcher button.active {
+    background: #1e293b;
+    color: #38bdf8;
+    font-weight: 500;
   }
 
   .search-box {
@@ -660,7 +842,8 @@
     border-radius: 6px;
     padding: 5px 10px;
     flex: 1;
-    max-width: 400px;
+    min-width: 200px;
+    max-width: 320px;
   }
 
   .search-box input {
@@ -693,10 +876,211 @@
     border-color: #0284c7;
   }
 
+  /* SCENES NAV BAR */
+  .scenes-nav-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 16px;
+    background: #0f1217;
+    border-bottom: 1px solid #1a1f28;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .scene-nav-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #141820;
+    border: 1px solid #202734;
+    border-radius: 6px;
+    padding: 4px 9px;
+    font-size: 12px;
+    color: #94a3b8;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .scene-nav-chip:hover {
+    background: #19202c;
+    color: #cbd5e1;
+  }
+
+  .scene-nav-chip.active {
+    background: #1d2535;
+    border-color: #0284c7;
+    color: #38bdf8;
+  }
+
+  .scene-chip-title {
+    font-weight: 500;
+  }
+
+  .scene-chip-badge {
+    font-size: 10px;
+    background: #0d0f12;
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: #64748b;
+  }
+
+  .scene-chip-badge.badge-complete {
+    background: #064e3b;
+    color: #34d399;
+  }
+
+  /* FLOW VIEW */
+  .scenes-flow-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+    background: #0b0d10;
+  }
+
+  .scenes-flow-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 16px;
+  }
+
+  .scene-card {
+    background: #13171f;
+    border: 1px solid #202734;
+    border-radius: 8px;
+    padding: 14px;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .scene-card:hover {
+    background: #181d27;
+    border-color: #2b3648;
+    transform: translateY(-2px);
+  }
+
+  .scene-card.card-selected {
+    border-color: #0284c7;
+    box-shadow: 0 0 0 1px #0284c7;
+  }
+
+  .scene-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .scene-card-title-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-weight: 600;
+    font-size: 13px;
+    color: #f1f5f9;
+  }
+
+  .scene-card-seq {
+    font-size: 11px;
+    color: #64748b;
+    font-family: monospace;
+  }
+
+  .scene-card-preview {
+    font-size: 12px;
+    color: #94a3b8;
+    margin: 0;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    line-height: 1.4;
+  }
+
+  .scene-card-footer {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: auto;
+  }
+
+  .scene-card-progress {
+    height: 4px;
+    background: #1e2430;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .scene-card-fill {
+    height: 100%;
+    background: #38bdf8;
+  }
+
+  .scene-card-stats {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: #64748b;
+  }
+
+  .pct-text {
+    color: #38bdf8;
+    font-weight: 600;
+  }
+
   /* TABLE */
   .table-container {
     flex: 1;
     overflow: auto;
+  }
+
+  .scene-section-divider {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #141820;
+    border-top: 1px solid #1e2532;
+    border-bottom: 1px solid #1e2532;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: #94a3b8;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+
+  .scene-section-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #38bdf8;
+  }
+
+  .scene-section-title strong {
+    color: #f1f5f9;
+  }
+
+  .scene-section-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: #64748b;
+  }
+
+  .scene-mini-track {
+    width: 60px;
+    height: 4px;
+    background: #242c38;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .scene-mini-fill {
+    height: 100%;
+    background: #22c55e;
   }
 
   .grid-table {
@@ -706,21 +1090,18 @@
   }
 
   .grid-table th {
-    position: sticky;
-    top: 0;
-    background: #15181f;
-    padding: 8px 12px;
+    background: #111419;
+    padding: 7px 12px;
     text-align: left;
     font-size: 11px;
     font-weight: 600;
     color: #64748b;
-    border-bottom: 1px solid #232832;
-    z-index: 1;
+    border-bottom: 1px solid #1c222c;
   }
 
   .grid-table td {
     padding: 9px 12px;
-    border-bottom: 1px solid #161920;
+    border-bottom: 1px solid #14171e;
     vertical-align: top;
     user-select: text;
   }
@@ -731,11 +1112,11 @@
   }
 
   .grid-table tr:hover {
-    background: #151820;
+    background: #14171f;
   }
 
   .grid-table tr.selected {
-    background: #1c2330;
+    background: #1a2230;
   }
 
   .col-line {
@@ -808,9 +1189,28 @@
     align-items: center;
   }
 
-  .inspector-title {
-    font-size: 13px;
+  .inspector-breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+  }
+
+  .inspect-scene {
+    color: #38bdf8;
+    font-weight: 600;
+  }
+
+  .breadcrumb-sep {
+    color: #475569;
+  }
+
+  .inspect-line {
     color: #94a3b8;
+  }
+
+  .inspect-speaker {
+    color: #f8fafc;
   }
 
   .btn-ai {
