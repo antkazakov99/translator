@@ -196,7 +196,8 @@ impl GameParser for RenpyParser {
         let re_old = Regex::new(r#"^\s*old\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
         let re_new = Regex::new(r#"^\s*new\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
         let re_dialogue = Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
-        let re_label_hash = Regex::new(r#"_[0-9a-fA-F]{8}$"#).unwrap();
+        // Регулярка для отрезания хэшей Ren'Py вида _1234abcd и повторов _1234abcd_1
+        let re_label_hash = Regex::new(r#"_[0-9a-fA-F]{6,10}(?:_\d+)*$"#).unwrap();
 
         let mut in_strings = false;
         let mut in_block = false;
@@ -312,5 +313,60 @@ impl GameParser for RenpyParser {
         }
 
         Ok(graph)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_speakers() {
+        let script = r##"
+            define mc = Character("Главный Герой", color="#c8ffc8")
+            define e = Character('Erika')
+            define narrator = Character(None)
+        "##;
+        let speakers = RenpyParser::extract_speakers(script);
+        assert_eq!(speakers.get("mc").unwrap(), "Главный Герой");
+        assert_eq!(speakers.get("e").unwrap(), "Erika");
+    }
+
+    #[test]
+    fn test_parse_translation_dialogue_scene_grouping() {
+        // Проверяем, что хэши _1234abcd и повторы _1234abcd_1 схлопываются в одну сцену!
+        let rpy = r#"
+translate russian intro_scene_1234abcd:
+    # mc "Line 1"
+    mc "Строка 1"
+
+translate russian intro_scene_5678ef01:
+    # mc "Line 2"
+    mc "Строка 2"
+
+translate russian intro_scene_a20cefa7_1:
+    # mc "Line 3 (duplicate prompt)"
+    mc "Строка 3"
+
+translate russian other_scene_aabbccdd:
+    # mc "Line 4"
+    mc "Строка 4"
+
+translate russian other_scene_97ddad46_2:
+    # mc "Line 5"
+    mc "Строка 5"
+"#;
+        let parser = RenpyParser::new();
+        let graph = parser.parse_file(Path::new("intro.rpy"), rpy).unwrap();
+        
+        let mut scene_labels = Vec::new();
+        for idx in graph.node_indices() {
+            if let Some(ScenarioNode::Label(name)) = graph.get_node(idx) {
+                scene_labels.push(name.clone());
+            }
+        }
+
+        // Должно быть только ДВЕ сцены: intro_scene и other_scene!
+        assert_eq!(scene_labels, vec!["intro_scene", "other_scene"]);
     }
 }
