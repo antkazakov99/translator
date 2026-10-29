@@ -2,9 +2,37 @@ use std::collections::HashMap;
 use std::path::Path;
 use anyhow::{Context, Result};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::graph::{EdgeKind, ScenarioGraph, ScenarioNode, TranslationStatus};
 use crate::parser::GameParser;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChoiceOptionDto {
+    pub text: String,
+    pub target_jump: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChoiceBlockDto {
+    pub prompt: Option<String>,
+    pub options: Vec<ChoiceOptionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SceneEdgeDto {
+    pub from: String,       // имя исходной сцены
+    pub to: String,         // имя целевой сцены
+    pub kind: String,       // "jump" | "branch" | "choice" | "linear" | "call"
+    pub condition: Option<String>, // например "luka_corr > 0" или "Выбор: Yes"
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScriptStructure {
+    pub scene_choices: HashMap<String, Vec<ChoiceBlockDto>>,
+    pub scene_jumps: HashMap<String, Vec<(String, Option<String>)>>,
+    pub edges: Vec<SceneEdgeDto>,
+}
 
 /// Парсер и генератор файлов сценариев и локализаций Ren'Py (.rpy)
 #[derive(Debug, Default)]
@@ -178,6 +206,156 @@ impl RenpyParser {
         std::fs::write(output_path, content)
             .with_context(|| format!("Не удалось записать файл перевода: {:?}", output_path))?;
         Ok(())
+    }
+
+    /// Парсит оригинальный файл скрипта .rpy для извлечения графа: выборов (menu:), переходов (jump) и условий (if)
+    pub fn parse_script_structure(content: &str) -> ScriptStructure {
+        let mut structure = ScriptStructure::default();
+        let re_label = Regex::new(r#"^\s*label\s+([A-Za-z_]\w*)\s*:"#).unwrap();
+        let re_menu = Regex::new(r#"^\s*menu(?:\s*([A-Za-z_]\w*))?\s*:"#).unwrap();
+        let re_choice_opt = Regex::new(r#"^\s*"([^"]+)"\s*(?:if\s+[^:]+)?\s*:"#).unwrap();
+        let re_jump = Regex::new(r#"^\s*(?:if\s+(?P<cond>[^:]+):\s*)?(?P<cmd>jump|call)\s+(?P<target>[A-Za-z_]\w*)"#).unwrap();
+        let re_if = Regex::new(r#"^\s*(?:elif|if)\s+(.+?)\s*:"#).unwrap();
+        let re_else = Regex::new(r#"^\s*else\s*:"#).unwrap();
+
+        let mut current_label: Option<String> = None;
+        let mut in_menu = false;
+        let mut menu_indent = 0;
+        let mut current_menu_options: Vec<ChoiceOptionDto> = Vec::new();
+        let mut current_condition: Option<String> = None;
+        let mut last_choice_idx: Option<usize> = None;
+
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            let indent = line.len() - line.trim_start().len();
+
+            // 1. Проверяем объявление сцены (label)
+            if let Some(caps) = re_label.captures(line) {
+                if in_menu && !current_menu_options.is_empty() {
+                    if let Some(ref lbl) = current_label {
+                        structure.scene_choices.entry(lbl.clone()).or_default().push(ChoiceBlockDto {
+                            prompt: None,
+                            options: std::mem::take(&mut current_menu_options),
+                        });
+                    }
+                }
+                in_menu = false;
+                current_condition = None;
+                last_choice_idx = None;
+
+                let label_name = caps.get(1).unwrap().as_str().to_string();
+                current_label = Some(label_name);
+                continue;
+            }
+
+            let lbl = match &current_label {
+                Some(l) => l.clone(),
+                None => continue,
+            };
+
+            // 2. Проверяем начало блока menu:
+            if re_menu.is_match(line) {
+                if in_menu && !current_menu_options.is_empty() {
+                    structure.scene_choices.entry(lbl.clone()).or_default().push(ChoiceBlockDto {
+                        prompt: None,
+                        options: std::mem::take(&mut current_menu_options),
+                    });
+                }
+                in_menu = true;
+                menu_indent = indent;
+                last_choice_idx = None;
+                continue;
+            }
+
+            // Если были в menu, но отступ уменьшился
+            if in_menu && indent <= menu_indent && !re_choice_opt.is_match(line) {
+                if !current_menu_options.is_empty() {
+                    structure.scene_choices.entry(lbl.clone()).or_default().push(ChoiceBlockDto {
+                        prompt: None,
+                        options: std::mem::take(&mut current_menu_options),
+                    });
+                }
+                in_menu = false;
+                last_choice_idx = None;
+            }
+
+            // 3. Варианты выбора внутри menu
+            if in_menu {
+                if let Some(caps) = re_choice_opt.captures(line) {
+                    let opt_text = caps.get(1).unwrap().as_str().to_string();
+                    current_menu_options.push(ChoiceOptionDto {
+                        text: opt_text,
+                        target_jump: None,
+                    });
+                    last_choice_idx = Some(current_menu_options.len() - 1);
+                    continue;
+                }
+            }
+
+            // 4. Ветвления if/elif/else
+            if let Some(caps) = re_if.captures(line) {
+                current_condition = Some(caps.get(1).unwrap().as_str().trim().to_string());
+            } else if re_else.is_match(line) {
+                current_condition = Some("иначе".to_string());
+            }
+
+            // 5. Переходы jump / call
+            if let Some(caps) = re_jump.captures(line) {
+                let cmd = caps.name("cmd").unwrap().as_str();
+                let target = caps.name("target").unwrap().as_str().to_string();
+                let inline_cond = caps.name("cond").map(|c| c.as_str().trim().to_string());
+                let cond = inline_cond.or_else(|| current_condition.clone());
+
+                let kind = if in_menu {
+                    "choice".to_string()
+                } else if cond.is_some() {
+                    "branch".to_string()
+                } else if cmd == "call" {
+                    "call".to_string()
+                } else {
+                    "jump".to_string()
+                };
+
+                let condition_label = if in_menu {
+                    if let Some(idx) = last_choice_idx {
+                        if let Some(opt) = current_menu_options.get_mut(idx) {
+                            opt.target_jump = Some(target.clone());
+                            Some(format!("Выбор: \"{}\"", opt.text))
+                        } else {
+                            cond.clone()
+                        }
+                    } else {
+                        cond.clone()
+                    }
+                } else {
+                    cond.clone()
+                };
+
+                structure.edges.push(SceneEdgeDto {
+                    from: lbl.clone(),
+                    to: target.clone(),
+                    kind,
+                    condition: condition_label,
+                });
+
+                structure.scene_jumps.entry(lbl.clone()).or_default().push((target, cond));
+            }
+        }
+
+        if in_menu && !current_menu_options.is_empty() {
+            if let Some(lbl) = current_label {
+                structure.scene_choices.entry(lbl).or_default().push(ChoiceBlockDto {
+                    prompt: None,
+                    options: current_menu_options,
+                });
+            }
+        }
+
+        structure
     }
 }
 
@@ -406,5 +584,42 @@ translate russian strings:
         let (total, translated) = graph.translation_stats();
         assert_eq!(total, 1, "Дублирующиеся строки UI должны быть схлопнуты в 1 запись");
         assert_eq!(translated, 1);
+    }
+
+    #[test]
+    fn test_parse_script_structure_graph() {
+        let script = r#"
+label start:
+    mc "Hello"
+    menu:
+        "Go left":
+            jump left_path
+        "Go right":
+            jump right_path
+
+label left_path:
+    mc "On the left"
+    if gold > 10:
+        jump castle
+    else:
+        jump dungeon
+
+label right_path:
+    mc "On the right"
+    jump castle
+
+label castle:
+    mc "At the castle"
+
+label dungeon:
+    mc "In the dungeon"
+"#;
+        let structure = RenpyParser::parse_script_structure(script);
+        assert_eq!(structure.edges.len(), 5);
+        assert!(structure.edges.iter().any(|e| e.from == "start" && e.to == "left_path" && e.kind == "choice"));
+        assert!(structure.edges.iter().any(|e| e.from == "start" && e.to == "right_path" && e.kind == "choice"));
+        assert!(structure.edges.iter().any(|e| e.from == "left_path" && e.to == "castle" && e.kind == "branch"));
+        assert!(structure.edges.iter().any(|e| e.from == "left_path" && e.to == "dungeon" && e.kind == "branch"));
+        assert!(structure.edges.iter().any(|e| e.from == "right_path" && e.to == "castle" && e.kind == "jump"));
     }
 }

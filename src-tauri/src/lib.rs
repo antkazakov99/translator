@@ -4,7 +4,7 @@ pub mod project;
 
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use crate::parser::renpy::RenpyParser;
+use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto};
 use crate::parser::GameParser;
 use crate::graph::ScenarioNode;
 
@@ -69,6 +69,8 @@ pub struct SceneDto {
     pub name: String,
     pub total_lines: usize,
     pub translated_lines: usize,
+    pub choices: Vec<ChoiceBlockDto>,
+    pub jumps: Vec<String>,
     pub entries: Vec<DialogueEntryDto>,
 }
 
@@ -79,6 +81,7 @@ pub struct ParsedFileDto {
     pub total_lines: usize,
     pub translated_lines: usize,
     pub scenes: Vec<SceneDto>,
+    pub edges: Vec<SceneEdgeDto>,
 }
 
 #[tauri::command]
@@ -205,6 +208,8 @@ fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> {
                             name: target_scene_name.clone(),
                             total_lines: 0,
                             translated_lines: 0,
+                            choices: Vec::new(),
+                            jumps: Vec::new(),
                             entries: Vec::new(),
                         });
                         scenes.len() - 1
@@ -231,12 +236,54 @@ fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> {
         }
     }
 
+    // Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры
+    let orig_path_str = file_path
+        .replace(r"tl\russian\", "")
+        .replace("tl/russian/", "");
+    let orig_path = Path::new(&orig_path_str);
+
+    let script_struct = if orig_path.exists() {
+        if let Ok(orig_content) = std::fs::read_to_string(orig_path) {
+            RenpyParser::parse_script_structure(&orig_content)
+        } else {
+            Default::default()
+        }
+    } else {
+        Default::default()
+    };
+
+    // Привязываем найденные выборы (меню) и переходы к каждой сцене
+    for scene in &mut scenes {
+        if let Some(choices) = script_struct.scene_choices.get(&scene.name) {
+            scene.choices = choices.clone();
+        }
+        if let Some(jumps) = script_struct.scene_jumps.get(&scene.name) {
+            scene.jumps = jumps.iter().map(|(target, _)| target.clone()).collect();
+        }
+    }
+
+    let mut edges = script_struct.edges;
+    // Если переходов в файле не обнаружено, связываем сцены последовательно
+    if edges.is_empty() && scenes.len() > 1 {
+        for i in 0..scenes.len() - 1 {
+            if scenes[i].name != "Интерфейс и меню (strings)" && scenes[i + 1].name != "Интерфейс и меню (strings)" {
+                edges.push(SceneEdgeDto {
+                    from: scenes[i].name.clone(),
+                    to: scenes[i + 1].name.clone(),
+                    kind: "linear".to_string(),
+                    condition: None,
+                });
+            }
+        }
+    }
+
     Ok(ParsedFileDto {
         file_path: file_path.clone(),
         file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
         total_lines: file_total,
         translated_lines: file_translated,
         scenes,
+        edges,
     })
 }
 

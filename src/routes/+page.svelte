@@ -14,7 +14,13 @@
     GitBranch,
     Table,
     ArrowRight,
-    Loader2
+    Loader2,
+    CornerDownRight,
+    Zap,
+    Layers,
+    ArrowUpRight,
+    ChevronRight,
+    Network
   } from "lucide-svelte";
 
   // Стейт проекта на Svelte 5 (Runes)
@@ -49,11 +55,30 @@
     scene_name: string;
   }
 
+  interface ChoiceOption {
+    text: string;
+    target_jump: string | null;
+  }
+
+  interface ChoiceBlock {
+    prompt: string | null;
+    options: ChoiceOption[];
+  }
+
+  interface SceneEdge {
+    from: string;
+    to: string;
+    kind: "jump" | "branch" | "choice" | "linear" | "call";
+    condition: string | null;
+  }
+
   interface Scene {
     id: string;
     name: string;
     total_lines: number;
     translated_lines: number;
+    choices: ChoiceBlock[];
+    jumps: string[];
     entries: DialogueEntry[];
   }
 
@@ -63,6 +88,7 @@
     total_lines: number;
     translated_lines: number;
     scenes: Scene[];
+    edges: SceneEdge[];
   }
 
   let project = $state<ProjectSummary | null>(null);
@@ -75,6 +101,55 @@
   let filterStatus = $state<"all" | "untranslated" | "translated">("all");
   let selectedEntry = $state<DialogueEntry | null>(null);
   let viewMode = $state<"table" | "scenes">("table");
+  let graphSubMode = $state<"flow" | "grid">("flow");
+  let focusedSceneName = $state<string | null>(null);
+
+  // Статистика графа
+  let totalChoicesCount = $derived(
+    currentFile ? currentFile.scenes.reduce((acc, s) => acc + (s.choices ? s.choices.length : 0), 0) : 0
+  );
+
+  let totalEdgesCount = $derived(
+    currentFile ? (currentFile.edges ? currentFile.edges.length : 0) : 0
+  );
+
+  // Исходящие связи для сцены
+  function getOutgoingEdges(sceneName: string): SceneEdge[] {
+    if (!currentFile || !currentFile.edges) return [];
+    return currentFile.edges.filter(e => e.from === sceneName);
+  }
+
+  // Входящие связи для сцены
+  function getIncomingEdges(sceneName: string): SceneEdge[] {
+    if (!currentFile || !currentFile.edges) return [];
+    return currentFile.edges.filter(e => e.to === sceneName);
+  }
+
+  // Проверяет, ведет ли переход на сцену в текущем файле
+  function isInternalScene(targetName: string): boolean {
+    if (!currentFile) return false;
+    return currentFile.scenes.some(s => s.name === targetName);
+  }
+
+  // Сфокусироваться на сцене или перейти в неё
+  function focusScene(sceneName: string) {
+    if (!currentFile) return;
+    const targetScene = currentFile.scenes.find(s => s.name === sceneName);
+    if (targetScene) {
+      selectedSceneId = targetScene.id;
+      focusedSceneName = sceneName;
+      const el = document.getElementById(`scene-node-${targetScene.id}`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    }
+  }
+
+  // Открыть сцену в режиме таблицы диалогов
+  function openSceneInTable(sceneId: string) {
+    selectedSceneId = sceneId;
+    viewMode = 'table';
+  }
 
   // Все реплики текущего файла плоским списком (для глобального поиска)
   let allEntries = $derived(
@@ -340,40 +415,260 @@
 
         <!-- ОСНОВНОЙ ВИД -->
         {#if viewMode === 'scenes'}
-          <!-- РЕЖИМ ГРАФА И КАРТОЧЕК СЦЕН (Story Flow) -->
-          <div class="scenes-flow-container">
-            <div class="scenes-flow-grid">
-              {#each currentFile.scenes as scene, index}
-                {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
-                <div 
-                  class="scene-card" 
-                  class:card-selected={selectedSceneId === scene.id}
-                  onclick={() => { selectedSceneId = scene.id; viewMode = 'table'; }}
+          <!-- СЮЖЕТНЫЙ ГРАФ И СХЕМА ВЕТВЛЕНИЙ -->
+          <div class="story-graph-wrapper">
+            <!-- ВЕРХНЯЯ ПАНЕЛЬ ГРАФА -->
+            <div class="graph-topbar">
+              <div class="graph-title-row">
+                <Network size={16} class="text-sky-400" />
+                <span class="graph-heading">Сюжетная структура и развилки сценария</span>
+                <span class="graph-pill">{currentFile.scenes.length} сцен</span>
+                <span class="graph-pill pill-purple">{totalChoicesCount} выборов (menu)</span>
+                <span class="graph-pill pill-amber">{totalEdgesCount} переходов (jump/branch)</span>
+              </div>
+
+              <div class="graph-submode-toggles">
+                <button 
+                  class="graph-mode-btn" 
+                  class:active={graphSubMode === 'flow'}
+                  onclick={() => graphSubMode = 'flow'}
+                  title="Потоковая диаграмма с ветвлениями"
                 >
-                  <div class="scene-card-header">
-                    <div class="scene-card-title-row">
-                      <Clapperboard size={16} class="text-sky-400" />
-                      <span class="scene-card-name">{scene.name}</span>
-                    </div>
-                    <span class="scene-card-seq">#{index + 1}</span>
-                  </div>
-
-                  <p class="scene-card-preview">
-                    {scene.entries.length > 0 ? scene.entries[0].original_text : "Пустая сцена"}
-                  </p>
-
-                  <div class="scene-card-footer">
-                    <div class="scene-card-progress">
-                      <div class="scene-card-fill" style="width: {pct}%"></div>
-                    </div>
-                    <div class="scene-card-stats">
-                      <span>{scene.translated_lines} из {scene.total_lines} строк</span>
-                      <span class="pct-text">{pct}%</span>
-                    </div>
-                  </div>
-                </div>
-              {/each}
+                  <GitBranch size={14} />
+                  <span>Поток сюжета</span>
+                </button>
+                <button 
+                  class="graph-mode-btn" 
+                  class:active={graphSubMode === 'grid'}
+                  onclick={() => graphSubMode = 'grid'}
+                  title="Компактная матрица сцен"
+                >
+                  <Layers size={14} />
+                  <span>Матрица</span>
+                </button>
+              </div>
             </div>
+
+            {#if graphSubMode === 'flow'}
+              <!-- РЕЖИМ 1: ИНТЕРАКТИВНЫЙ ПОТОК СЮЖЕТА (DAG FLOW WITH BRANCHES) -->
+              <div class="story-flow-canvas">
+                <div class="story-nodes-track">
+                  {#each currentFile.scenes as scene, index}
+                    {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
+                    {@const incoming = getIncomingEdges(scene.name)}
+                    {@const outgoing = getOutgoingEdges(scene.name)}
+                    {@const isFocused = focusedSceneName === scene.name}
+
+                    <div 
+                      id={`scene-node-${scene.id}`}
+                      class="flow-scene-node"
+                      class:node-focused={isFocused}
+                      class:node-selected={selectedSceneId === scene.id}
+                    >
+                      <!-- ЗАГОЛОВОК СЦЕНЫ -->
+                      <div class="node-header">
+                        <div class="node-title-group">
+                          <span class="node-seq">#{index + 1}</span>
+                          <Clapperboard size={16} class="node-icon text-sky-400" />
+                          <h4 class="node-name">{scene.name}</h4>
+                          {#if scene.name === "Интерфейс и меню (strings)"}
+                            <span class="node-tag tag-ui">Интерфейс</span>
+                          {:else if scene.choices && scene.choices.length > 0}
+                            <span class="node-tag tag-choice">Развилка</span>
+                          {/if}
+                        </div>
+
+                        <div class="node-progress-badge" class:badge-complete={pct === 100}>
+                          <span>{scene.translated_lines}/{scene.total_lines} строк</span>
+                          <strong>{pct}%</strong>
+                        </div>
+                      </div>
+
+                      <div class="node-progress-line">
+                        <div class="node-fill" style="width: {pct}%"></div>
+                      </div>
+
+                      <!-- ВХОДЯЩИЕ ПЕРЕХОДЫ (ОТКУДА СЮДА ПРИШЛИ) -->
+                      {#if incoming.length > 0}
+                        <div class="node-incoming-box">
+                          <span class="box-label">⬅ Вход из сцен:</span>
+                          <div class="edge-chips">
+                            {#each incoming as edge}
+                              <button 
+                                class="edge-chip chip-incoming" 
+                                onclick={() => focusScene(edge.from)}
+                                title="Перейти к сцене {edge.from}"
+                              >
+                                <span>{edge.from}</span>
+                                {#if edge.condition}
+                                  <span class="edge-condition-sub">({edge.condition})</span>
+                                {/if}
+                              </button>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+
+                      <!-- ПРЕВЬЮ ДИАЛОГА -->
+                      {#if scene.entries.length > 0}
+                        <div class="node-dialogue-snippet">
+                          <span class="snippet-speaker">{scene.entries[0].speaker ?? "Автор"}:</span>
+                          <span class="snippet-text">"{scene.entries[0].original_text}"</span>
+                        </div>
+                      {/if}
+
+                      <!-- СЕКЦИЯ 1: ВЫБОРЫ В СЦЕНЕ (MENU:) -->
+                      {#if scene.choices && scene.choices.length > 0}
+                        <div class="node-choices-section">
+                          <div class="choices-section-header">
+                            <Zap size={14} class="text-purple-400" />
+                            <strong>Выбор игрока (Меню развилки):</strong>
+                          </div>
+                          {#each scene.choices as choiceBlock}
+                            <div class="choice-options-list">
+                              {#each choiceBlock.options as opt}
+                                <div class="choice-option-pill">
+                                  <span class="opt-bullet">◆</span>
+                                  <span class="opt-title">"{opt.text}"</span>
+                                  {#if opt.target_jump}
+                                    <span class="opt-arrow">➔</span>
+                                    {#if isInternalScene(opt.target_jump)}
+                                      <button 
+                                        class="target-link link-internal"
+                                        onclick={() => focusScene(opt.target_jump!)}
+                                      >
+                                        {opt.target_jump}
+                                      </button>
+                                    {:else}
+                                      <span class="target-link link-external">{opt.target_jump}</span>
+                                    {/if}
+                                  {/if}
+                                </div>
+                              {/each}
+                            </div>
+                          {/each}
+                        </div>
+                      {/if}
+
+                      <!-- СЕКЦИЯ 2: ИСХОДЯЩИЕ ВЕТВЛЕНИЯ И ПЕРЕХОДЫ (JUMP/IF) -->
+                      {#if outgoing.length > 0}
+                        <div class="node-jumps-section">
+                          <div class="jumps-section-header">
+                            <CornerDownRight size={14} class="text-amber-400" />
+                            <strong>Переходы и ветвления:</strong>
+                          </div>
+                          <div class="outgoing-chips-grid">
+                            {#each outgoing as edge}
+                              {@const isInternal = isInternalScene(edge.to)}
+                              <div class="outgoing-edge-card" class:edge-choice={edge.kind === 'choice'} class:edge-branch={edge.kind === 'branch'}>
+                                {#if edge.condition}
+                                  <div class="edge-cond-badge">
+                                    <span class="cond-icon">🔀</span>
+                                    <span class="cond-text">{edge.condition}</span>
+                                  </div>
+                                {/if}
+                                <div class="edge-dest-row">
+                                  <span class="edge-arrow">➔</span>
+                                  {#if isInternal}
+                                    <button 
+                                      class="dest-btn internal"
+                                      onclick={() => focusScene(edge.to)}
+                                      title="Фокус на сцене {edge.to}"
+                                    >
+                                      <span>{edge.to}</span>
+                                      <ChevronRight size={13} />
+                                    </button>
+                                  {:else}
+                                    <span class="dest-badge external" title="Внешняя локация игры">
+                                      <span>{edge.to}</span>
+                                      <ArrowUpRight size={12} />
+                                    </span>
+                                  {/if}
+                                </div>
+                              </div>
+                            {/each}
+                          </div>
+                        </div>
+                      {/if}
+
+                      <!-- КНОПКА ДЕЙСТВИЯ: ПЕРЕЙТИ В ТАБЛИЦУ -->
+                      <div class="node-footer-bar">
+                        <button 
+                          class="btn-open-scene-table"
+                          onclick={() => openSceneInTable(scene.id)}
+                        >
+                          <Table size={13} />
+                          <span>Открыть диалоги ({scene.total_lines} строк)</span>
+                          <ArrowRight size={13} />
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- ВИЗУАЛЬНЫЙ КОННЕКТОР МЕЖДУ СЦЕНАМИ -->
+                    {#if index < currentFile.scenes.length - 1}
+                      <div class="flow-step-connector">
+                        <div class="connector-line"></div>
+                        <div class="connector-dot">
+                          <ArrowRight size={12} class="rotate-90 text-sky-400" />
+                        </div>
+                        <div class="connector-line"></div>
+                      </div>
+                    {/if}
+                  {/each}
+                </div>
+              </div>
+            {:else}
+              <!-- РЕЖИМ 2: СЕТКА КАРТОЧЕК -->
+              <div class="scenes-flow-grid">
+                {#each currentFile.scenes as scene, index}
+                  {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
+                  {@const outgoing = getOutgoingEdges(scene.name)}
+                  <div 
+                    class="scene-card" 
+                    class:card-selected={selectedSceneId === scene.id}
+                    onclick={() => openSceneInTable(scene.id)}
+                  >
+                    <div class="scene-card-header">
+                      <div class="scene-card-title-row">
+                        <Clapperboard size={16} class="text-sky-400" />
+                        <span class="scene-card-name">{scene.name}</span>
+                      </div>
+                      <span class="scene-card-seq">#{index + 1}</span>
+                    </div>
+
+                    <p class="scene-card-preview">
+                      {scene.entries.length > 0 ? scene.entries[0].original_text : "Пустая сцена"}
+                    </p>
+
+                    <!-- Значки выборов и переходов на карточке -->
+                    <div class="scene-card-badges-row">
+                      {#if scene.choices && scene.choices.length > 0}
+                        <span class="mini-pill pill-purple">
+                          <Zap size={11} />
+                          <span>{scene.choices.length} выбор</span>
+                        </span>
+                      {/if}
+                      {#if outgoing.length > 0}
+                        <span class="mini-pill pill-amber">
+                          <CornerDownRight size={11} />
+                          <span>{outgoing.length} переход(ов)</span>
+                        </span>
+                      {/if}
+                    </div>
+
+                    <div class="scene-card-footer">
+                      <div class="scene-card-progress">
+                        <div class="scene-card-fill" style="width: {pct}%"></div>
+                      </div>
+                      <div class="scene-card-stats">
+                        <span>{scene.translated_lines} из {scene.total_lines} строк</span>
+                        <span class="pct-text">{pct}%</span>
+                      </div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
           </div>
         {:else}
           <!-- РЕЖИМ ТАБЛИЦЫ ДИАЛОГОВ -->
@@ -930,17 +1225,496 @@
     color: #34d399;
   }
 
-  /* FLOW VIEW */
-  .scenes-flow-container {
+  /* STORY GRAPH & FLOW VIEW */
+  .story-graph-wrapper {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    background: #0b0d12;
+    background-image: radial-gradient(#181f2c 1px, transparent 1px);
+    background-size: 20px 20px;
+    overflow: hidden;
+  }
+
+  .graph-topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 18px;
+    background: #0f131a;
+    border-bottom: 1px solid #1a202c;
+  }
+
+  .graph-title-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .graph-heading {
+    font-size: 13px;
+    font-weight: 600;
+    color: #e2e8f0;
+  }
+
+  .graph-pill {
+    font-size: 11px;
+    background: #18202d;
+    border: 1px solid #232d3f;
+    color: #94a3b8;
+    padding: 2px 7px;
+    border-radius: 999px;
+  }
+
+  .graph-pill.pill-purple {
+    background: rgba(168, 85, 247, 0.12);
+    border-color: rgba(168, 85, 247, 0.3);
+    color: #c084fc;
+  }
+
+  .graph-pill.pill-amber {
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.3);
+    color: #fbbf24;
+  }
+
+  .graph-submode-toggles {
+    display: flex;
+    gap: 4px;
+    background: #141923;
+    padding: 3px;
+    border-radius: 6px;
+    border: 1px solid #1e2636;
+  }
+
+  .graph-mode-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    color: #94a3b8;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .graph-mode-btn.active {
+    background: #0284c7;
+    color: #ffffff;
+  }
+
+  /* FLOW CANVAS */
+  .story-flow-canvas {
+    flex: 1;
+    overflow-y: auto;
+    padding: 28px 20px;
+  }
+
+  .story-nodes-track {
+    max-width: 820px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .flow-scene-node {
+    width: 100%;
+    background: #121620;
+    border: 1px solid #202838;
+    border-radius: 10px;
+    padding: 16px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+    transition: all 0.2s;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .flow-scene-node:hover {
+    border-color: #2e3a52;
+    background: #151a26;
+  }
+
+  .flow-scene-node.node-focused {
+    border-color: #38bdf8;
+    box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.3);
+  }
+
+  .flow-scene-node.node-selected {
+    border-color: #0284c7;
+  }
+
+  .node-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .node-title-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .node-seq {
+    font-size: 11px;
+    font-weight: 700;
+    color: #64748b;
+    font-family: monospace;
+    background: #0b0e14;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .node-name {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 700;
+    color: #f8fafc;
+  }
+
+  .node-tag {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+
+  .node-tag.tag-ui {
+    background: #1e293b;
+    color: #94a3b8;
+  }
+
+  .node-tag.tag-choice {
+    background: rgba(168, 85, 247, 0.2);
+    color: #c084fc;
+    border: 1px solid rgba(168, 85, 247, 0.4);
+  }
+
+  .node-progress-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    background: #18202d;
+    padding: 3px 8px;
+    border-radius: 6px;
+    color: #94a3b8;
+  }
+
+  .node-progress-badge.badge-complete {
+    background: rgba(16, 185, 129, 0.15);
+    color: #34d399;
+  }
+
+  .node-progress-line {
+    height: 3px;
+    background: #1b2230;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .node-fill {
+    height: 100%;
+    background: #38bdf8;
+    transition: width 0.3s;
+  }
+
+  /* Входящие связи */
+  .node-incoming-box {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #0f131a;
+    padding: 6px 10px;
+    border-radius: 6px;
+    border-left: 3px solid #38bdf8;
+  }
+
+  .box-label {
+    font-size: 11px;
+    color: #64748b;
+    white-space: nowrap;
+  }
+
+  .edge-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .edge-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #192130;
+    border: 1px solid #27344a;
+    color: #cbd5e1;
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .edge-chip:hover {
+    background: #232e42;
+    border-color: #38bdf8;
+    color: #38bdf8;
+  }
+
+  .edge-condition-sub {
+    color: #fbbf24;
+    font-size: 10px;
+  }
+
+  /* Превью диалога */
+  .node-dialogue-snippet {
+    background: #0d1016;
+    border: 1px solid #1a202c;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.4;
+    color: #94a3b8;
+  }
+
+  .snippet-speaker {
+    font-weight: 600;
+    color: #38bdf8;
+    margin-right: 4px;
+  }
+
+  .snippet-text {
+    font-style: italic;
+  }
+
+  /* ВЫБОРЫ В СЦЕНЕ (MENU:) */
+  .node-choices-section {
+    background: rgba(168, 85, 247, 0.06);
+    border: 1px solid rgba(168, 85, 247, 0.25);
+    border-radius: 8px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .choices-section-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #c084fc;
+  }
+
+  .choice-options-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-left: 8px;
+  }
+
+  .choice-option-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #141724;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 12px;
+  }
+
+  .opt-bullet {
+    color: #c084fc;
+    font-size: 10px;
+  }
+
+  .opt-title {
+    color: #f1f5f9;
+    font-weight: 500;
+  }
+
+  .opt-arrow {
+    color: #64748b;
+    font-size: 11px;
+  }
+
+  .target-link {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 4px;
+  }
+
+  .target-link.link-internal {
+    background: #0284c7;
+    color: #ffffff;
+    border: none;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  .target-link.link-internal:hover {
+    background: #0369a1;
+  }
+
+  .target-link.link-external {
+    background: #1e293b;
+    color: #94a3b8;
+  }
+
+  /* ИСХОДЯЩИЕ ПЕРЕХОДЫ И ВЕТВЛЕНИЯ */
+  .node-jumps-section {
+    background: rgba(245, 158, 11, 0.05);
+    border: 1px solid rgba(245, 158, 11, 0.22);
+    border-radius: 8px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .jumps-section-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #fbbf24;
+  }
+
+  .outgoing-chips-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .outgoing-edge-card {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    background: #141920;
+    border: 1px solid #232c3d;
+    border-radius: 6px;
+    padding: 6px 10px;
+  }
+
+  .edge-cond-badge {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: #fbbf24;
+    font-weight: 500;
+  }
+
+  .edge-dest-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .edge-arrow {
+    color: #64748b;
+    font-size: 11px;
+  }
+
+  .dest-btn.internal {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #0369a1;
+    color: #ffffff;
+    border: none;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  .dest-btn.internal:hover {
+    background: #0284c7;
+  }
+
+  .dest-badge.external {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #1e293b;
+    color: #94a3b8;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+  }
+
+  /* ФУТЕР УЗЛА */
+  .node-footer-bar {
+    display: flex;
+    justify-content: flex-end;
+    padding-top: 4px;
+    border-top: 1px solid #1a2230;
+  }
+
+  .btn-open-scene-table {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #182234;
+    border: 1px solid #263550;
+    color: #38bdf8;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-open-scene-table:hover {
+    background: #0284c7;
+    color: #ffffff;
+    border-color: #0284c7;
+  }
+
+  /* КОННЕКТОР МЕЖДУ УЗЛАМИ */
+  .flow-step-connector {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    height: 36px;
+  }
+
+  .connector-line {
+    width: 2px;
+    flex: 1;
+    background: #232d3f;
+  }
+
+  .connector-dot {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: #141a24;
+    border: 2px solid #28354c;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* СЕТКА КАРТОЧЕК */
+  .scenes-flow-grid {
     flex: 1;
     overflow-y: auto;
     padding: 24px;
-    background: #0b0d10;
-  }
-
-  .scenes-flow-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
     gap: 16px;
   }
 
@@ -997,6 +1771,33 @@
     -webkit-box-orient: vertical;
     overflow: hidden;
     line-height: 1.4;
+  }
+
+  .scene-card-badges-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .mini-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .mini-pill.pill-purple {
+    background: rgba(168, 85, 247, 0.15);
+    color: #c084fc;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+  }
+
+  .mini-pill.pill-amber {
+    background: rgba(245, 158, 11, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(245, 158, 11, 0.3);
   }
 
   .scene-card-footer {
