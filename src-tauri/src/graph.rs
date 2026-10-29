@@ -17,6 +17,8 @@ pub enum TranslationStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueData {
     pub id: String,
+    /// Исходный ID блока в движке (например, "end_scene_eri_52d5be01" в Ren'Py)
+    pub block_id: Option<String>,
     pub speaker: Option<String>,
     pub original_text: String,
     pub translated_text: Option<String>,
@@ -58,6 +60,7 @@ impl ScenarioNode {
     pub fn dialogue(speaker: Option<impl Into<String>>, original: impl Into<String>, file: impl Into<String>, line: usize) -> Self {
         Self::Dialogue(DialogueData {
             id: Uuid::new_v4().to_string(),
+            block_id: None,
             speaker: speaker.map(|s| s.into()),
             original_text: original.into(),
             translated_text: None,
@@ -163,13 +166,11 @@ impl ScenarioGraph {
     }
 
     /// Собирает скользящий контекст (N предшествующих диалогов) строго вдоль текущего пути в графе.
-    /// Благодаря этому исключается утечка контекста из параллельных альтернативных веток!
     pub fn get_parent_context(&self, start: NodeIndex, max_lines: usize) -> Vec<DialogueData> {
         let mut context = Vec::new();
         let mut current = start;
 
         while context.len() < max_lines {
-            // Ищем входящее ребро (родительский узел)
             let mut incoming = self.graph.edges_directed(current, Direction::Incoming);
             if let Some(edge) = incoming.next() {
                 let parent_idx = edge.source();
@@ -180,11 +181,10 @@ impl ScenarioGraph {
                 }
                 current = parent_idx;
             } else {
-                break; // Достигли корня сцены
+                break;
             }
         }
 
-        // Разворачиваем, чтобы реплики шли в хронологическом порядке: от старых к новым
         context.reverse();
         context
     }
@@ -213,42 +213,32 @@ mod tests {
     fn test_graph_branching_and_context_isolation() {
         let mut sg = ScenarioGraph::new();
 
-        // 1. Начало: MC говорит в баре
         let n1 = sg.add_node(ScenarioNode::dialogue(Some("MC"), "Hey bartender, what's good here?", "script.rpy", 10));
         let n2 = sg.add_node(ScenarioNode::dialogue(Some("Bartender"), "Depends. You want a fight or a drink?", "script.rpy", 11));
         sg.add_edge(n1, n2, EdgeKind::Linear);
 
-        // 2. Развилка (Choice)
         let choice = sg.add_node(ScenarioNode::choice(vec!["Fight", "Drink"]));
         sg.add_edge(n2, choice, EdgeKind::Linear);
 
-        // Ветка 1: Драка (Fight)
         let fight_1 = sg.add_node(ScenarioNode::dialogue(Some("MC"), "Let's fight!", "script.rpy", 20));
         let fight_2 = sg.add_node(ScenarioNode::dialogue(Some("Bartender"), "Eat this!", "script.rpy", 21));
         sg.add_edge(choice, fight_1, EdgeKind::Branch { option_index: 0, text: "Fight".to_string() });
         sg.add_edge(fight_1, fight_2, EdgeKind::Linear);
 
-        // Ветка 2: Выпивка (Drink)
         let drink_1 = sg.add_node(ScenarioNode::dialogue(Some("MC"), "Just beer, please.", "script.rpy", 30));
         let drink_2 = sg.add_node(ScenarioNode::dialogue(Some("Bartender"), "Here's your cold ale.", "script.rpy", 31));
         sg.add_edge(choice, drink_1, EdgeKind::Branch { option_index: 1, text: "Drink".to_string() });
         sg.add_edge(drink_1, drink_2, EdgeKind::Linear);
 
-        // ТЕСТ: Проверяем контекст для реплики из ветки Выпивки (drink_2)
         let drink_context = sg.get_parent_context(drink_2, 5);
         let texts: Vec<&str> = drink_context.iter().map(|d| d.original_text.as_str()).collect();
 
-        // Контекст ДОЛЖЕН содержать:
-        // 1. "Hey bartender, what's good here?"
-        // 2. "Depends. You want a fight or a drink?"
-        // 3. "Just beer, please."
         assert_eq!(texts, vec![
             "Hey bartender, what's good here?",
             "Depends. You want a fight or a drink?",
             "Just beer, please."
         ]);
 
-        // Контекст НЕ ДОЛЖЕН содержать ничего из ветки драки ("Let's fight!", "Eat this!")!
         assert!(!texts.contains(&"Let's fight!"));
         assert!(!texts.contains(&"Eat this!"));
     }
