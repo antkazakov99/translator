@@ -157,6 +157,11 @@ impl ScenarioGraph {
         self.graph.node_weight_mut(idx)
     }
 
+    /// Итератор по всем индексам узлов в графе
+    pub fn node_indices(&self) -> impl Iterator<Item = NodeIndex> {
+        self.graph.node_indices()
+    }
+
     /// Собирает скользящий контекст (N предшествующих диалогов) строго вдоль текущего пути в графе.
     /// Благодаря этому исключается утечка контекста из параллельных альтернативных веток!
     pub fn get_parent_context(&self, start: NodeIndex, max_lines: usize) -> Vec<DialogueData> {

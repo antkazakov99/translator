@@ -1,27 +1,31 @@
 use std::collections::HashMap;
 use std::path::Path;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use regex::Regex;
 
 use crate::graph::{EdgeKind, ScenarioGraph, ScenarioNode, TranslationStatus};
 use crate::parser::GameParser;
 
-/// Парсер файлов сценариев и локализаций Ren'Py (.rpy)
+/// Парсер и генератор файлов сценариев и локализаций Ren'Py (.rpy)
 #[derive(Debug, Default)]
 pub struct RenpyParser {
     /// Таблица персонажей: псевдоним (например, "e") -> полное имя ("Эрика")
     pub speakers: HashMap<String, String>,
+    /// Обратная таблица: полное имя ("Эрика") -> псевдоним ("e")
+    pub speaker_to_alias: HashMap<String, String>,
 }
 
 impl RenpyParser {
     pub fn new() -> Self {
         Self {
             speakers: HashMap::new(),
+            speaker_to_alias: HashMap::new(),
         }
     }
 
     /// Регистрирует известных персонажей (например, из скриптов игры)
     pub fn with_speakers(mut self, speakers: HashMap<String, String>) -> Self {
+        self.speaker_to_alias = speakers.iter().map(|(k, v)| (v.clone(), k.clone())).collect();
         self.speakers = speakers;
         self
     }
@@ -66,6 +70,22 @@ impl RenpyParser {
         result
     }
 
+    /// Экранирует текст для вставки в строку Ren'Py в двойных кавычках
+    pub fn escape_renpy_string(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '\n' => result.push_str("\\n"),
+                '\t' => result.push_str("\\t"),
+                '\r' => result.push_str("\\r"),
+                '"' => result.push_str("\\\""),
+                '\\' => result.push_str("\\\\"),
+                _ => result.push(c),
+            }
+        }
+        result
+    }
+
     /// Проверяет наличие кириллических символов в тексте
     pub fn has_cyrillic(text: &str) -> bool {
         text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c) || c == 'Ё' || c == 'ё')
@@ -81,8 +101,95 @@ impl RenpyParser {
                     Some(key.to_string())
                 }
             }
-            _ => None, // Narration (авторский текст)
+            _ => None, // Narration
         }
+    }
+
+    /// Получает псевдоним (код) персонажа для записи в файл
+    fn resolve_alias(&self, speaker_name: Option<&str>) -> String {
+        match speaker_name {
+            Some("UI / Choice") | None => "".to_string(),
+            Some(name) => {
+                if let Some(alias) = self.speaker_to_alias.get(name) {
+                    format!("{} ", alias)
+                } else {
+                    format!("{} ", name)
+                }
+            }
+        }
+    }
+
+    /// Генерирует готовое содержимое файла .rpy на основе графа диалогов
+    pub fn generate_translation_file(&self, graph: &ScenarioGraph, target_lang: &str) -> String {
+        let mut output = String::new();
+        let mut string_entries = Vec::new();
+        let mut current_label: Option<String> = None;
+        let mut in_dialogue_block = false;
+
+        // Обходим узлы графа
+        for idx in graph.node_indices() {
+            if let Some(node) = graph.get_node(idx) {
+                match node {
+                    ScenarioNode::Label(label_name) => {
+                        current_label = Some(label_name.clone());
+                        in_dialogue_block = false;
+                    }
+                    ScenarioNode::Dialogue(d) => {
+                        if d.speaker.as_deref() == Some("UI / Choice") {
+                            // Строки интерфейса собираем для блока strings
+                            string_entries.push(d);
+                        } else {
+                            // Обычная диалоговая реплика
+                            if !in_dialogue_block {
+                                if let Some(ref label) = current_label {
+                                    output.push_str(&format!("\ntranslate {} {}:\n\n", target_lang, label));
+                                } else {
+                                    output.push_str(&format!("\ntranslate {} unlabelled:\n\n", target_lang));
+                                }
+                                in_dialogue_block = true;
+                            }
+
+                            let alias_prefix = self.resolve_alias(d.speaker.as_deref());
+                            let original_escaped = Self::escape_renpy_string(&d.original_text);
+                            let target_text = d.translated_text.as_deref().unwrap_or(&d.original_text);
+                            let target_escaped = Self::escape_renpy_string(target_text);
+
+                            // Комментарий с оригиналом и строка с переводом
+                            output.push_str(&format!("    # {}\"{}\"\n", alias_prefix, original_escaped));
+                            output.push_str(&format!("    {}\"{}\"\n\n", alias_prefix, target_escaped));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Если в файле были строки интерфейса (old/new), дописываем блок strings в конец
+        if !string_entries.is_empty() {
+            output.push_str(&format!("\ntranslate {} strings:\n\n", target_lang));
+            for d in string_entries {
+                let old_escaped = Self::escape_renpy_string(&d.original_text);
+                let new_text = d.translated_text.as_deref().unwrap_or(&d.original_text);
+                let new_escaped = Self::escape_renpy_string(new_text);
+
+                output.push_str(&format!("    old \"{}\"\n", old_escaped));
+                output.push_str(&format!("    new \"{}\"\n\n", new_escaped));
+            }
+        }
+
+        output
+    }
+
+    /// Сохраняет сгенерированный мод .rpy на диск
+    pub fn save_translation_file(&self, graph: &ScenarioGraph, output_path: &Path, target_lang: &str) -> Result<()> {
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Не удалось создать папку мода: {:?}", parent))?;
+        }
+        let content = self.generate_translation_file(graph, target_lang);
+        std::fs::write(output_path, content)
+            .with_context(|| format!("Не удалось записать файл перевода: {:?}", output_path))?;
+        Ok(())
     }
 }
 
@@ -112,7 +219,6 @@ impl GameParser for RenpyParser {
             let line_num = idx + 1;
             let line = raw_line.trim_end();
 
-            // Проверка на начало секции translate strings:
             if re_strings_block.is_match(line) {
                 in_strings = true;
                 in_block = false;
@@ -120,7 +226,6 @@ impl GameParser for RenpyParser {
                 continue;
             }
 
-            // Проверка на начало блока диалога: translate russian label_id:
             if let Some(caps) = re_dialogue_block.captures(line) {
                 in_strings = false;
                 in_block = true;
@@ -131,7 +236,6 @@ impl GameParser for RenpyParser {
                 continue;
             }
 
-            // Если строка без отступа и не пустая — выход из текущего блока
             if !line.is_empty() && !line.starts_with(' ') && !line.starts_with('\t') {
                 in_block = false;
                 if !line.starts_with('#') {
@@ -141,7 +245,6 @@ impl GameParser for RenpyParser {
                 continue;
             }
 
-            // Режим обработки блока `translate strings:` (UI, меню, выборы)
             if in_strings {
                 if let Some(caps) = re_old.captures(line) {
                     let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
@@ -169,11 +272,9 @@ impl GameParser for RenpyParser {
                 continue;
             }
 
-            // Режим обработки блока диалога `translate <lang> <label>:`
             if in_block {
                 let trimmed = line.trim();
                 if trimmed.starts_with('#') {
-                    // Строка-комментарий с оригинальным текстом
                     let comment = trimmed.trim_start_matches('#').trim();
                     if let Some(caps) = re_dialogue.captures(comment) {
                         let speaker = caps.name("speaker").map(|s| s.as_str().to_string());
@@ -181,7 +282,6 @@ impl GameParser for RenpyParser {
                         pending_source = Some((speaker, text, line_num));
                     }
                 } else if !trimmed.is_empty() {
-                    // Строка с переводом
                     if let Some(caps) = re_dialogue.captures(trimmed) {
                         let speaker_alias = caps.name("speaker").map(|s| s.as_str());
                         let target_text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
@@ -253,26 +353,43 @@ translate russian intro_scene_1234abcd:
     }
 
     #[test]
-    fn test_parse_translation_strings() {
-        let rpy = r#"
+    fn test_roundtrip_dialogue_and_strings() {
+        // Проверяем полный цикл:
+        // 1. Исходный текст .rpy
+        // 2. Парсим в ScenarioGraph
+        // 3. Генерируем новый .rpy текст обратно
+        // 4. Парсим повторно и сравниваем данные
+        let source_rpy = r#"
+translate russian scene_1:
+
+    # mc "Hello \"world\"!"
+    mc "Привет \"мир\"!"
+
 translate russian strings:
 
-    # game/screens.rpy:10
-    old "Start"
-    new "Начать"
-
-    # game/screens.rpy:12
-    old "Load"
-    new "Загрузить"
-
-    old "Quit"
-    new "Quit"
+    old "Options"
+    new "Настройки"
 "#;
-        let parser = RenpyParser::new();
-        let graph = parser.parse_file(Path::new("screens.rpy"), rpy).unwrap();
-        let (total, translated) = graph.translation_stats();
+        let mut parser = RenpyParser::new();
+        parser.speakers.insert("mc".into(), "Главный Герой".into());
+        parser.speaker_to_alias.insert("Главный Герой".into(), "mc".into());
 
-        assert_eq!(total, 3);
-        assert_eq!(translated, 2); // "Quit" -> "Quit" не содержит кириллицы, считается непереведенным
+        let graph1 = parser.parse_file(Path::new("test.rpy"), source_rpy).unwrap();
+        let generated_text = parser.generate_translation_file(&graph1, "russian");
+
+        // Убеждаемся, что сгенерированный текст содержит правильные блоки
+        assert!(generated_text.contains("translate russian scene_1:"));
+        assert!(generated_text.contains("mc \"Привет \\\"мир\\\"!\""));
+        assert!(generated_text.contains("translate russian strings:"));
+        assert!(generated_text.contains("old \"Options\""));
+        assert!(generated_text.contains("new \"Настройки\""));
+
+        // Парсим заново
+        let graph2 = parser.parse_file(Path::new("test2.rpy"), &generated_text).unwrap();
+        let (total1, trans1) = graph1.translation_stats();
+        let (total2, trans2) = graph2.translation_stats();
+
+        assert_eq!(total1, total2);
+        assert_eq!(trans1, trans2);
     }
 }

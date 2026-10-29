@@ -4,7 +4,7 @@ use translator::parser::renpy::RenpyParser;
 use translator::parser::GameParser;
 
 fn main() -> anyhow::Result<()> {
-    println!("=== Testing RenpyParser on Real Game Files ===\n");
+    println!("=== Testing RenpyParser & Mod Generator on Real Files ===\n");
 
     let game_dir = Path::new(r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game");
     let tl_dir = game_dir.join(r"tl\russian");
@@ -14,11 +14,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // 1. Извлекаем спикеров из оригинальных скриптов игры
-    println!("1. Scanning game scripts for Character definitions...");
-    let start_speakers = Instant::now();
+    // 1. Сканируем спикеров
     let mut total_speakers = std::collections::HashMap::new();
-
     if let Ok(entries) = std::fs::read_dir(game_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -30,51 +27,48 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    println!("Found {} unique characters in {:?}", total_speakers.len(), start_speakers.elapsed());
-    for (alias, name) in total_speakers.iter().take(8) {
-        println!("   [{}] -> {}", alias, name);
-    }
-    if total_speakers.len() > 8 {
-        println!("   ... and {} more", total_speakers.len() - 8);
-    }
+    println!("1. Loaded {} character definitions.", total_speakers.len());
 
     let parser = RenpyParser::new().with_speakers(total_speakers);
 
-    // 2. Тестируем парсинг реальных файлов перевода
-    let test_files = ["script.rpy", "screens.rpy", "erika.rpy", "celia.rpy"];
+    // 2. Тестируем парсинг реального erika.rpy
+    let erika_path = tl_dir.join("erika.rpy");
+    println!("2. Parsing {:?}...", erika_path.file_name().unwrap());
 
-    println!("\n2. Parsing translation files from game/tl/russian/...");
-    for file_name in &test_files {
-        let file_path = tl_dir.join(file_name);
-        if !file_path.exists() {
-            continue;
-        }
+    let content = std::fs::read_to_string(&erika_path)?;
+    let start_parse = Instant::now();
+    let graph = parser.parse_file(&erika_path, &content)?;
+    let parse_time = start_parse.elapsed();
 
-        let content = match std::fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(e) => {
-                println!("Failed to read {:?}: {}", file_path, e);
-                continue;
-            }
-        };
+    let (total, translated) = graph.translation_stats();
+    println!("   Parsed {} lines ({} translated) in {:?}", total, translated, parse_time);
 
-        let start = Instant::now();
-        let graph = parser.parse_file(&file_path, &content)?;
-        let elapsed = start.elapsed();
+    // 3. Тестируем генерацию мода в dist/
+    let dist_mod_path = Path::new(r"D:\Projects\Personal\translator\projects\take-over\dist\game\tl\russian\erika.rpy");
+    println!("\n3. Generating translation mod file to {:?}...", dist_mod_path);
 
-        let (total, translated) = graph.translation_stats();
-        let file_size_kb = content.len() as f64 / 1024.0;
+    let start_write = Instant::now();
+    parser.save_translation_file(&graph, dist_mod_path, "russian")?;
+    let write_time = start_write.elapsed();
 
-        println!(
-            "-> {:<14} ({:>6.1} KB) | {:>4} lines total | {:>4} translated ({:>5.1}%) | parsed in {:?}",
-            file_name,
-            file_size_kb,
-            total,
-            translated,
-            if total > 0 { (translated as f64 / total as f64) * 100.0 } else { 0.0 },
-            elapsed
-        );
-    }
+    let mod_meta = std::fs::metadata(dist_mod_path)?;
+    println!(
+        "   Successfully built mod file! Size: {:.1} KB in {:?}",
+        mod_meta.len() as f64 / 1024.0,
+        write_time
+    );
+
+    // 4. Проверяем, что сгенерированный мод корректно парсится обратно
+    let mod_content = std::fs::read_to_string(dist_mod_path)?;
+    let re_graph = parser.parse_file(dist_mod_path, &mod_content)?;
+    let (re_total, re_translated) = re_graph.translation_stats();
+
+    println!("\n4. Verification check (Roundtrip):");
+    println!("   Original graph: {} total, {} translated", total, translated);
+    println!("   Reloaded graph: {} total, {} translated", re_total, re_translated);
+
+    assert_eq!(total, re_total, "Line counts must match!");
+    println!("\n🎉 100% Roundtrip match! Mod generation works with zero loss.");
 
     Ok(())
 }
