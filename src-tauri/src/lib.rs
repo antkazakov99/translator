@@ -2,11 +2,37 @@ pub mod graph;
 pub mod parser;
 pub mod project;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::parser::renpy::RenpyParser;
 use crate::parser::GameParser;
 use crate::graph::ScenarioNode;
+
+/// Рекурсивно собирает все файлы `.rpy`, строго игнорируя:
+/// - скрытые директории и файлы (.codex-backups, .editor-backups, .git)
+/// - файлы бэкапов (*.bak, *.backup, *.tmp)
+fn collect_rpy_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+
+            // Игнорируем скрытые папки (.codex-backups, .editor-backups, .git) и папки с бэкапами
+            if file_name.starts_with('.') || file_name.contains("backup") || file_name.contains("tmp") {
+                continue;
+            }
+
+            if path.is_dir() {
+                collect_rpy_files(&path, files);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rpy") {
+                // Исключаем любые бэкапы вида *.bak или *.bak.*
+                if !file_name.ends_with(".bak") && !file_name.contains(".bak") {
+                    files.push(path);
+                }
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationFileItem {
@@ -67,15 +93,15 @@ fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         return Err(format!("Папка игры не найдена: {}", game_dir));
     }
 
-    // 1. Ищем персонажей в оригинальных скриптах
+    // 1. Ищем персонажей в оригинальных скриптах игры (исключая папку tl)
     let mut characters_map = std::collections::HashMap::new();
-    if let Ok(entries) = std::fs::read_dir(base_path) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("rpy") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    characters_map.extend(RenpyParser::extract_speakers(&content));
-                }
+    let mut script_files = Vec::new();
+    collect_rpy_files(base_path, &mut script_files);
+    for path in script_files {
+        let path_str = path.to_string_lossy();
+        if !path_str.contains(r"\tl\") && !path_str.contains("/tl/") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                characters_map.extend(RenpyParser::extract_speakers(&content));
             }
         }
     }
@@ -83,7 +109,7 @@ fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
     let mut characters: Vec<(String, String)> = characters_map.into_iter().collect();
     characters.sort_by(|a, b| a.1.cmp(&b.1));
 
-    // 2. Ищем файлы переводов в game/tl/russian
+    // 2. Ищем файлы переводов в game/tl/russian (включая подпапки, но строго игнорируя бэкапы)
     let tl_dir = base_path.join(r"tl\russian");
     let mut files = Vec::new();
     let mut grand_total = 0;
@@ -92,31 +118,33 @@ fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
     let parser = RenpyParser::new();
 
     if tl_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&tl_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("rpy") {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        let size_kb = content.len() as f64 / 1024.0;
-                        let (total, translated) = if let Ok(graph) = parser.parse_file(&path, &content) {
-                            graph.translation_stats()
-                        } else {
-                            (0, 0)
-                        };
+        let mut tl_files = Vec::new();
+        collect_rpy_files(&tl_dir, &mut tl_files);
 
-                        grand_total += total;
-                        grand_translated += translated;
+        for path in tl_files {
+            let relative_name = path
+                .strip_prefix(&tl_dir)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().to_string());
 
-                        files.push(TranslationFileItem {
-                            name,
-                            path: path.to_string_lossy().to_string(),
-                            size_kb,
-                            total_lines: total,
-                            translated_lines: translated,
-                        });
-                    }
-                }
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let size_kb = content.len() as f64 / 1024.0;
+                let (total, translated) = if let Ok(graph) = parser.parse_file(&path, &content) {
+                    graph.translation_stats()
+                } else {
+                    (0, 0)
+                };
+
+                grand_total += total;
+                grand_translated += translated;
+
+                files.push(TranslationFileItem {
+                    name: relative_name,
+                    path: path.to_string_lossy().to_string(),
+                    size_kb,
+                    total_lines: total,
+                    translated_lines: translated,
+                });
             }
         }
     }
@@ -219,4 +247,47 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![greet, scan_game_project, parse_file_entries])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scan_and_parse_story_rpy() {
+        let game_dir = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game";
+        if Path::new(game_dir).exists() {
+            let summary = scan_game_project(game_dir.to_string()).unwrap();
+            println!("Найдены файлы ({} шт):", summary.files.len());
+            // Проверяем, что в списке нет бэкапов!
+            for f in &summary.files {
+                assert!(!f.name.contains(".bak"), "Файл бэкапа не должен попадать в проект: {}", f.name);
+                assert!(!f.path.contains(".codex-backups"), "Папка .codex-backups не должна сканироваться: {}", f.path);
+            }
+
+            let story_path = format!(r"{}\tl\russian\story.rpy", game_dir);
+            if Path::new(&story_path).exists() {
+                let parsed = parse_file_entries(story_path).unwrap();
+                println!("story.rpy распарсен: {} сцен, всего строк: {}, переведено: {}", 
+                    parsed.scenes.len(), parsed.total_lines, parsed.translated_lines);
+
+                for (i, s) in parsed.scenes.iter().enumerate().take(10) {
+                    println!("Сцена #{}: {} ({} строк, переведено: {})", i, s.name, s.total_lines, s.translated_lines);
+                }
+
+                // Проверяем, что intro и vera_intro не фрагментированы на одиночные строки
+                let intro_scene = parsed.scenes.iter().find(|s| s.name == "intro");
+                assert!(intro_scene.is_some(), "Сцена intro должна существовать");
+                let intro_lines = intro_scene.unwrap().total_lines;
+                assert!(intro_lines >= 50, "Сцена intro должна содержать не менее 50 реплик, а не по 1 строке! Найдено: {}", intro_lines);
+
+                // Проверяем, что "Интерфейс и меню (strings)" содержит дедуплицированные строки
+                let ui_scene = parsed.scenes.iter().find(|s| s.name == "Интерфейс и меню (strings)");
+                assert!(ui_scene.is_some(), "Сцена UI строк должна существовать");
+                let ui_lines = ui_scene.unwrap().total_lines;
+                println!("Уникальных строк UI в story.rpy: {}", ui_lines);
+                assert!(ui_lines < 66, "Строки UI должны быть дедуплицированы, а не 66 дубликатов! Найдено: {}", ui_lines);
+            }
+        }
+    }
 }

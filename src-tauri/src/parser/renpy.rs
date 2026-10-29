@@ -199,6 +199,7 @@ impl GameParser for RenpyParser {
         // Регулярка для отрезания хэшей Ren'Py вида _1234abcd и повторов _1234abcd_1
         let re_label_hash = Regex::new(r#"_[0-9a-fA-F]{6,10}(?:_\d+)*$"#).unwrap();
 
+        let mut seen_ui_strings: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut in_strings = false;
         let mut in_block = false;
         let mut current_block_id: Option<String> = None;
@@ -255,20 +256,35 @@ impl GameParser for RenpyParser {
                     if let Some((old_text, old_line)) = pending_old.take() {
                         let new_text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                         let is_translated = Self::has_cyrillic(&new_text);
-                        let mut dialogue = ScenarioNode::dialogue(Some("UI / Choice"), old_text, &file_path, old_line);
-                        
-                        if let Some(d) = dialogue.as_dialogue_mut() {
-                            if is_translated {
-                                d.translated_text = Some(new_text);
-                                d.status = TranslationStatus::Translated;
-                            }
-                        }
 
-                        let node_idx = graph.add_node(dialogue);
-                        if let Some(prev) = last_node_idx {
-                            graph.add_edge(prev, node_idx, EdgeKind::Linear);
+                        // Дедупликация строк UI: если точно такой же old_text уже встречался
+                        if let Some(&existing_idx) = seen_ui_strings.get(&old_text) {
+                            if is_translated {
+                                if let Some(existing_node) = graph.get_node_mut(existing_idx) {
+                                    if let Some(d) = existing_node.as_dialogue_mut() {
+                                        if d.translated_text.is_none() {
+                                            d.translated_text = Some(new_text);
+                                            d.status = TranslationStatus::Translated;
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            let mut dialogue = ScenarioNode::dialogue(Some("UI / Choice"), old_text.clone(), &file_path, old_line);
+                            if let Some(d) = dialogue.as_dialogue_mut() {
+                                if is_translated {
+                                    d.translated_text = Some(new_text);
+                                    d.status = TranslationStatus::Translated;
+                                }
+                            }
+
+                            let node_idx = graph.add_node(dialogue);
+                            if let Some(prev) = last_node_idx {
+                                graph.add_edge(prev, node_idx, EdgeKind::Linear);
+                            }
+                            last_node_idx = Some(node_idx);
+                            seen_ui_strings.insert(old_text, node_idx);
                         }
-                        last_node_idx = Some(node_idx);
                     }
                 }
                 continue;
@@ -368,5 +384,27 @@ translate russian other_scene_97ddad46_2:
 
         // Должно быть только ДВЕ сцены: intro_scene и other_scene!
         assert_eq!(scene_labels, vec!["intro_scene", "other_scene"]);
+    }
+
+    #[test]
+    fn test_ui_strings_deduplication() {
+        let rpy = r#"
+translate russian strings:
+    old "What is your name? "
+    new "Как тебя зовут? "
+
+translate russian strings:
+    old "What is your name? "
+    new "Как тебя зовут? "
+
+translate russian strings:
+    old "What is your name? "
+    new "Как тебя зовут? "
+"#;
+        let parser = RenpyParser::new();
+        let graph = parser.parse_file(Path::new("story.rpy"), rpy).unwrap();
+        let (total, translated) = graph.translation_stats();
+        assert_eq!(total, 1, "Дублирующиеся строки UI должны быть схлопнуты в 1 запись");
+        assert_eq!(translated, 1);
     }
 }
