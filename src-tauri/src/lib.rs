@@ -143,65 +143,64 @@ fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> {
         .map_err(|e| format!("Ошибка парсинга: {}", e))?;
 
     let mut scenes: Vec<SceneDto> = Vec::new();
-    let mut current_scene = SceneDto {
-        id: "default_scene".to_string(),
-        name: "Общие реплики".to_string(),
-        total_lines: 0,
-        translated_lines: 0,
-        entries: Vec::new(),
-    };
-
     let mut file_total = 0;
     let mut file_translated = 0;
+    let mut current_scene_name = "Общие диалоги".to_string();
 
     for idx in graph.node_indices() {
         if let Some(node) = graph.get_node(idx) {
             match node {
                 ScenarioNode::Label(label_name) => {
-                    // Если в текущей сцене уже были реплики, сохраняем её
-                    if !current_scene.entries.is_empty() {
-                        scenes.push(current_scene);
-                    }
-                    current_scene = SceneDto {
-                        id: format!("scene_{}", label_name),
-                        name: label_name.clone(),
-                        total_lines: 0,
-                        translated_lines: 0,
-                        entries: Vec::new(),
-                    };
+                    current_scene_name = label_name.clone();
                 }
                 ScenarioNode::Dialogue(d) => {
                     let is_trans = d.translated_text.is_some() && !d.translated_text.as_ref().unwrap().trim().is_empty();
-                    
                     file_total += 1;
-                    current_scene.total_lines += 1;
                     if is_trans {
                         file_translated += 1;
-                        current_scene.translated_lines += 1;
                     }
 
-                    // Если встретили реплики интерфейса, сгруппируем их красиво
-                    if d.speaker.as_deref() == Some("UI / Choice") && current_scene.id == "default_scene" {
-                        current_scene.name = "Интерфейс и выборы (strings)".to_string();
+                    // Для строк интерфейса сцена всегда одна: "Интерфейс и меню (strings)"
+                    let target_scene_name = if d.speaker.as_deref() == Some("UI / Choice") {
+                        "Интерфейс и меню (strings)".to_string()
+                    } else {
+                        current_scene_name.clone()
+                    };
+
+                    // Находим существующую сцену с таким именем (чтобы реплики склеивались в одну сцену)
+                    let scene_idx = if let Some(pos) = scenes.iter().position(|s| s.name == target_scene_name) {
+                        pos
+                    } else {
+                        let new_id = format!("scene_{}", scenes.len());
+                        scenes.push(SceneDto {
+                            id: new_id,
+                            name: target_scene_name.clone(),
+                            total_lines: 0,
+                            translated_lines: 0,
+                            entries: Vec::new(),
+                        });
+                        scenes.len() - 1
+                    };
+
+                    let scene = &mut scenes[scene_idx];
+                    scene.total_lines += 1;
+                    if is_trans {
+                        scene.translated_lines += 1;
                     }
 
-                    current_scene.entries.push(DialogueEntryDto {
+                    scene.entries.push(DialogueEntryDto {
                         id: d.id.clone(),
                         line_number: d.line_number,
                         speaker: d.speaker.clone(),
                         original_text: d.original_text.clone(),
                         translated_text: d.translated_text.clone(),
                         status: format!("{:?}", d.status),
-                        scene_name: current_scene.name.clone(),
+                        scene_name: target_scene_name,
                     });
                 }
                 _ => {}
             }
         }
-    }
-
-    if !current_scene.entries.is_empty() {
-        scenes.push(current_scene);
     }
 
     Ok(ParsedFileDto {

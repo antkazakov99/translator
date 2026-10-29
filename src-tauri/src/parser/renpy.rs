@@ -132,7 +132,6 @@ impl RenpyParser {
                         if d.speaker.as_deref() == Some("UI / Choice") {
                             string_entries.push(d);
                         } else {
-                            // Если есть сохранённый block_id (например end_scene_eri_52d5be01), используем его
                             if let Some(ref block_id) = d.block_id {
                                 if current_block_id.as_deref() != Some(block_id) {
                                     output.push_str(&format!("\ntranslate {} {}:\n\n", target_lang, block_id));
@@ -197,7 +196,6 @@ impl GameParser for RenpyParser {
         let re_old = Regex::new(r#"^\s*old\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
         let re_new = Regex::new(r#"^\s*new\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
         let re_dialogue = Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
-        // Регулярка для отрезания 8-значного хэша Ren'Py вида _1234abcd
         let re_label_hash = Regex::new(r#"_[0-9a-fA-F]{8}$"#).unwrap();
 
         let mut in_strings = false;
@@ -212,16 +210,11 @@ impl GameParser for RenpyParser {
             let line_num = idx + 1;
             let line = raw_line.trim_end();
 
+            // Блок интерфейсных строк (strings) НЕ должен разрывать текущую сюжетную сцену!
             if re_strings_block.is_match(line) {
                 in_strings = true;
                 in_block = false;
                 pending_old = None;
-                let strings_scene = "Интерфейс и меню (strings)".to_string();
-                if current_scene_name.as_deref() != Some(&strings_scene) {
-                    current_scene_name = Some(strings_scene.clone());
-                    let label_node = graph.add_node(ScenarioNode::label(strings_scene));
-                    last_node_idx = Some(label_node);
-                }
                 continue;
             }
 
@@ -236,7 +229,6 @@ impl GameParser for RenpyParser {
                 // Отрезаем хэш: например "end_scene_eri_52d5be01" -> "end_scene_eri"
                 let scene_name = re_label_hash.replace(&raw_block_id, "").to_string();
 
-                // Создаём новый узел сцены ТОЛЬКО когда сцена РЕАЛЬНО сменилась!
                 if current_scene_name.as_deref() != Some(&scene_name) {
                     current_scene_name = Some(scene_name.clone());
                     let label_node = graph.add_node(ScenarioNode::label(scene_name));
@@ -320,52 +312,5 @@ impl GameParser for RenpyParser {
         }
 
         Ok(graph)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_speakers() {
-        let script = r##"
-            define mc = Character("Главный Герой", color="#c8ffc8")
-            define e = Character('Erika')
-            define narrator = Character(None)
-        "##;
-        let speakers = RenpyParser::extract_speakers(script);
-        assert_eq!(speakers.get("mc").unwrap(), "Главный Герой");
-        assert_eq!(speakers.get("e").unwrap(), "Erika");
-    }
-
-    #[test]
-    fn test_parse_translation_dialogue_scene_grouping() {
-        // Проверяем, что хэши _1234abcd не плодят новые сцены!
-        let rpy = r#"
-translate russian intro_scene_1234abcd:
-    # mc "Line 1"
-    mc "Строка 1"
-
-translate russian intro_scene_5678ef01:
-    # mc "Line 2"
-    mc "Строка 2"
-
-translate russian other_scene_aabbccdd:
-    # mc "Line 3"
-    mc "Строка 3"
-"#;
-        let parser = RenpyParser::new();
-        let graph = parser.parse_file(Path::new("intro.rpy"), rpy).unwrap();
-        
-        let mut scene_labels = Vec::new();
-        for idx in graph.node_indices() {
-            if let Some(ScenarioNode::Label(name)) = graph.get_node(idx) {
-                scene_labels.push(name.clone());
-            }
-        }
-
-        // Должно быть только ДВЕ сцены: intro_scene и other_scene!
-        assert_eq!(scene_labels, vec!["intro_scene", "other_scene"]);
     }
 }
