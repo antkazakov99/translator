@@ -1,9 +1,22 @@
 [package]
-name = "translator"
+name = "translator-app"
 version = "0.1.0"
+description = "Universal Game Localization & Translation Tool"
+authors = ["Anton Kazakov"]
 edition = "2024"
 
+[lib]
+name = "translator_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
 [dependencies]
+# Tauri
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
 # Графы и структуры данных
 petgraph = { version = "0.7", features = ["serde-1"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
@@ -20,4 +33,13 @@ anyhow = "1.0"
 # Логирование
 tracing = "0.1"
 tracing-subscriber = "0.3"
-regex = "1.13.1"
+
+# Парсинг
+regex = "1.11"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
