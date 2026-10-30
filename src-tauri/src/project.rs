@@ -1,7 +1,7 @@
-﻿use std::path::{Path, PathBuf};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,7 +48,13 @@ pub struct ProjectManifest {
 }
 
 impl ProjectManifest {
-    pub fn new(id: impl Into<String>, name: impl Into<String>, engine: EngineType, game_dir: PathBuf, target_lang: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        engine: EngineType,
+        game_dir: PathBuf,
+        target_lang: impl Into<String>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: id.into(),

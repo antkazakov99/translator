@@ -6,14 +6,14 @@ pub mod project;
 pub mod rpa;
 pub mod rpyc;
 
+use crate::graph::ScenarioNode;
+use crate::parser::GameParser;
+use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto, ScriptStructure};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Instant, SystemTime};
-use serde::{Deserialize, Serialize};
-use rayon::prelude::*;
-use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto, ScriptStructure};
-use crate::parser::GameParser;
-use crate::graph::ScenarioNode;
 
 #[derive(Clone)]
 struct ParsedFileCacheEntry {
@@ -29,8 +29,9 @@ static SCRIPT_STRUCTURE_CACHE: LazyLock<
     Mutex<std::collections::HashMap<PathBuf, (SystemTime, ScriptStructure)>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-static PROJECT_SCRIPTS_CACHE: LazyLock<Mutex<std::collections::HashMap<PathBuf, (Instant, Vec<PathBuf>)>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static PROJECT_SCRIPTS_CACHE: LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, (Instant, Vec<PathBuf>)>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 static PROJECT_SPEAKERS_CACHE: LazyLock<
     Mutex<std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>>,
@@ -74,7 +75,10 @@ fn get_project_scripts(search_dir: &Path, cache_dir: &Path) -> Vec<PathBuf> {
     }
     {
         let mut cache = PROJECT_SCRIPTS_CACHE.lock().unwrap();
-        cache.insert(search_dir.to_path_buf(), (Instant::now(), all_scripts.clone()));
+        cache.insert(
+            search_dir.to_path_buf(),
+            (Instant::now(), all_scripts.clone()),
+        );
     }
     all_scripts
 }
@@ -89,7 +93,11 @@ fn collect_rpy_files(dir: &Path, files: &mut Vec<PathBuf>) {
             let file_name = path.file_name().unwrap_or_default().to_string_lossy();
 
             // Игнорируем скрытые папки (.codex-backups, .editor-backups, .git), папки с бэкапами и сторонние инжекторы _mods
-            if file_name.starts_with('.') || file_name == "_mods" || file_name.contains("backup") || file_name.contains("tmp") {
+            if file_name.starts_with('.')
+                || file_name == "_mods"
+                || file_name.contains("backup")
+                || file_name.contains("tmp")
+            {
                 continue;
             }
 
@@ -198,7 +206,10 @@ pub struct ParsedFileDto {
 
 #[tauri::command]
 fn greet(name: &str) -> String {
-    format!("Привет, {}! Мост между Svelte 5 и Rust работает идеально!", name)
+    format!(
+        "Привет, {}! Мост между Svelte 5 и Rust работает идеально!",
+        name
+    )
 }
 
 #[tauri::command]
@@ -208,7 +219,9 @@ fn resolve_game_directory(path: String) -> Result<String, String> {
         return Err(format!("Папка игры не найдена: {}", path));
     }
 
-    Ok(effective_game_directory(&selected_path).to_string_lossy().to_string())
+    Ok(effective_game_directory(&selected_path)
+        .to_string_lossy()
+        .to_string())
 }
 
 fn effective_game_directory(selected_path: &Path) -> PathBuf {
@@ -222,8 +235,14 @@ fn effective_game_directory(selected_path: &Path) -> PathBuf {
 
 /// Находит базовую директорию игры (`game`), поднимаясь по дереву каталогов от файла перевода или скрипта.
 fn find_game_root(file_path: &Path) -> PathBuf {
-    if let Some(game_dir) = CACHED_SCRIPT_PROJECTS.lock().unwrap().iter()
-        .find_map(|(cache_dir, game_dir)| file_path.starts_with(cache_dir).then(|| game_dir.clone()))
+    if let Some(game_dir) =
+        CACHED_SCRIPT_PROJECTS
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(cache_dir, game_dir)| {
+                file_path.starts_with(cache_dir).then(|| game_dir.clone())
+            })
     {
         return game_dir;
     }
@@ -251,13 +270,19 @@ fn find_game_root(file_path: &Path) -> PathBuf {
             return dir.to_path_buf();
         }
         // Если содержит характерные файлы проекта Ren'Py
-        if dir.join("options.rpy").is_file() || dir.join("screens.rpy").is_file() || dir.join("gui.rpy").is_file() {
+        if dir.join("options.rpy").is_file()
+            || dir.join("screens.rpy").is_file()
+            || dir.join("gui.rpy").is_file()
+        {
             return dir.to_path_buf();
         }
         current = dir.parent();
     }
 
-    file_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+    file_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 #[tauri::command]
@@ -276,11 +301,18 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let cache_dir = get_project_scripts_cache_dir(&base_path);
         if has_rpa_archives(&base_path) {
             rpa::RpaArchive::extract_scripts_from_game_archives(&base_path, &cache_dir)?;
-            CACHED_SCRIPT_PROJECTS.lock().unwrap().insert(cache_dir.clone(), base_path.clone());
+            CACHED_SCRIPT_PROJECTS
+                .lock()
+                .unwrap()
+                .insert(cache_dir.clone(), base_path.clone());
             collect_rpy_files(&cache_dir, &mut script_files);
         } else if cache_dir.exists() {
-            std::fs::remove_dir_all(&cache_dir)
-                .map_err(|e| format!("Не удалось удалить устаревший кэш скриптов {:?}: {}", cache_dir, e))?;
+            std::fs::remove_dir_all(&cache_dir).map_err(|e| {
+                format!(
+                    "Не удалось удалить устаревший кэш скриптов {:?}: {}",
+                    cache_dir, e
+                )
+            })?;
         }
 
         let mut characters_map: std::collections::HashMap<String, String> = script_files
@@ -288,7 +320,9 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
             .filter_map(|path| {
                 let path_str = path.to_string_lossy();
                 if !path_str.contains(r"\tl\") && !path_str.contains("/tl/") {
-                    std::fs::read_to_string(path).ok().map(|content| RenpyParser::extract_speakers(&content))
+                    std::fs::read_to_string(path)
+                        .ok()
+                        .map(|content| RenpyParser::extract_speakers(&content))
                 } else {
                     None
                 }
@@ -345,7 +379,12 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                     let relative_name = path
                         .strip_prefix(&tl_dir)
                         .map(|p| p.to_string_lossy().replace('\\', "/"))
-                        .unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().to_string());
+                        .unwrap_or_else(|_| {
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string()
+                        });
 
                     Some(TranslationFileItem {
                         name: relative_name,
@@ -362,7 +401,11 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                 grand_translated += f.translated_lines;
             }
 
-            parsed_files.sort_by(|a, b| b.size_kb.partial_cmp(&a.size_kb).unwrap_or(std::cmp::Ordering::Equal));
+            parsed_files.sort_by(|a, b| {
+                b.size_kb
+                    .partial_cmp(&a.size_kb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             files = parsed_files;
         }
 
@@ -383,7 +426,12 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                     let relative_name = path
                         .strip_prefix(&cache_dir)
                         .map(|p| p.to_string_lossy().replace('\\', "/"))
-                        .unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().to_string());
+                        .unwrap_or_else(|_| {
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string()
+                        });
 
                     Some(TranslationFileItem {
                         name: relative_name,
@@ -400,7 +448,11 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                 grand_translated += f.translated_lines;
             }
 
-            parsed_cached.sort_by(|a, b| b.size_kb.partial_cmp(&a.size_kb).unwrap_or(std::cmp::Ordering::Equal));
+            parsed_cached.sort_by(|a, b| {
+                b.size_kb
+                    .partial_cmp(&a.size_kb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             files = parsed_cached;
         }
 
@@ -419,7 +471,12 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                     let relative_name = path
                         .strip_prefix(&base_path)
                         .map(|p| p.to_string_lossy().replace('\\', "/"))
-                        .unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().to_string());
+                        .unwrap_or_else(|_| {
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string()
+                        });
 
                     Some(TranslationFileItem {
                         name: relative_name,
@@ -436,12 +493,20 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                 grand_translated += f.translated_lines;
             }
 
-            parsed_loose.sort_by(|a, b| b.size_kb.partial_cmp(&a.size_kb).unwrap_or(std::cmp::Ordering::Equal));
+            parsed_loose.sort_by(|a, b| {
+                b.size_kb
+                    .partial_cmp(&a.size_kb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             files = parsed_loose;
         }
 
         Ok(ProjectSummary {
-            game_name: base_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            game_name: base_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
             characters,
             files,
             total_lines: grand_total,
@@ -509,7 +574,8 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
         };
 
         let parser = RenpyParser::new().with_speakers(speakers_map);
-        let graph = parser.parse_file(path, &content)
+        let graph = parser
+            .parse_file(path, &content)
             .map_err(|e| format!("Ошибка парсинга: {}", e))?;
 
         // 3. Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры (с кэшированием структуры)
@@ -522,7 +588,8 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
         };
 
         // Быстрый поиск: текст выбора -> имя сцены
-        let mut choice_text_to_scene: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut choice_text_to_scene: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for (scene_name, choices) in &script_struct.scene_choices {
             for choice in choices {
                 for opt in &choice.options {
@@ -543,25 +610,29 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
                         current_scene_name = label_name.clone();
                     }
                     ScenarioNode::Dialogue(d) => {
-                        let is_trans = d.translated_text.is_some() && !d.translated_text.as_ref().unwrap().trim().is_empty();
+                        let is_trans = d.translated_text.is_some()
+                            && !d.translated_text.as_ref().unwrap().trim().is_empty();
                         file_total += 1;
                         if is_trans {
                             file_translated += 1;
                         }
 
-                        let (target_scene_name, is_menu_choice) = if d.speaker.as_deref() == Some("UI / Choice") {
-                            let trimmed_orig = d.original_text.trim();
-                            if let Some(scene) = choice_text_to_scene.get(trimmed_orig) {
-                                (scene.clone(), true)
+                        let (target_scene_name, is_menu_choice) =
+                            if d.speaker.as_deref() == Some("UI / Choice") {
+                                let trimmed_orig = d.original_text.trim();
+                                if let Some(scene) = choice_text_to_scene.get(trimmed_orig) {
+                                    (scene.clone(), true)
+                                } else {
+                                    ("Интерфейс и меню (strings)".to_string(), false)
+                                }
                             } else {
-                                ("Интерфейс и меню (strings)".to_string(), false)
-                            }
-                        } else {
-                            (current_scene_name.clone(), false)
-                        };
+                                (current_scene_name.clone(), false)
+                            };
 
                         // Находим существующую сцену с таким именем (чтобы реплики склеивались в одну сцену)
-                        let scene_idx = if let Some(pos) = scenes.iter().position(|s| s.name == target_scene_name) {
+                        let scene_idx = if let Some(pos) =
+                            scenes.iter().position(|s| s.name == target_scene_name)
+                        {
                             pos
                         } else {
                             let new_id = format!("scene_{}", scenes.len());
@@ -626,7 +697,11 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             if s.name == "Интерфейс и меню (strings)" {
                 usize::MAX
             } else {
-                script_struct.labels.iter().position(|l| l.name == s.name).unwrap_or(usize::MAX - 1)
+                script_struct
+                    .labels
+                    .iter()
+                    .position(|l| l.name == s.name)
+                    .unwrap_or(usize::MAX - 1)
             }
         });
 
@@ -649,7 +724,9 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
         // Если переходов в файле не обнаружено, связываем сцены последовательно
         if edges.is_empty() && scenes.len() > 1 {
             for i in 0..scenes.len() - 1 {
-                if scenes[i].name != "Интерфейс и меню (strings)" && scenes[i + 1].name != "Интерфейс и меню (strings)" {
+                if scenes[i].name != "Интерфейс и меню (strings)"
+                    && scenes[i + 1].name != "Интерфейс и меню (strings)"
+                {
                     edges.push(SceneEdgeDto {
                         from: scenes[i].name.clone(),
                         to: scenes[i + 1].name.clone(),
@@ -671,7 +748,10 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             let all_scripts = get_project_scripts(&search_dir, &cache_dir);
 
             let cur_file_norm = path.to_string_lossy().to_lowercase().replace('\\', "/");
-            let cur_orig_norm = orig_path.to_string_lossy().to_lowercase().replace('\\', "/");
+            let cur_orig_norm = orig_path
+                .to_string_lossy()
+                .to_lowercase()
+                .replace('\\', "/");
 
             let external_incoming_edges: Vec<SceneEdgeDto> = all_scripts
                 .into_par_iter()
@@ -717,7 +797,11 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
 
         let parsed_result = ParsedFileDto {
             file_path: file_path.clone(),
-            file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+            file_name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
             total_lines: file_total,
             translated_lines: file_translated,
             scenes,
@@ -727,11 +811,14 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
         // Сохраняем в кэш распарсенных файлов для мгновенного отклика при навигации
         {
             let mut cache = PARSED_FILE_CACHE.lock().unwrap();
-            cache.insert(file_path, ParsedFileCacheEntry {
-                file_mtime,
-                orig_mtime,
-                result: parsed_result.clone(),
-            });
+            cache.insert(
+                file_path,
+                ParsedFileCacheEntry {
+                    file_mtime,
+                    orig_mtime,
+                    result: parsed_result.clone(),
+                },
+            );
         }
 
         Ok(parsed_result)
@@ -807,7 +894,11 @@ async fn find_scene_target(
                         };
 
                         let file_name = rel_path.to_string_lossy().replace('\\', "/");
-                        let short_name = orig_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let short_name = orig_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
 
                         return Some(SceneTargetResult {
                             file_name,
@@ -843,10 +934,15 @@ async fn find_scene_target(
             if let Ok(content) = std::fs::read_to_string(&tl_path) {
                 for (idx, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
-                    if trimmed.starts_with(&tl_prefix_hash) || trimmed.starts_with(&tl_prefix_colon) {
+                    if trimmed.starts_with(&tl_prefix_hash) || trimmed.starts_with(&tl_prefix_colon)
+                    {
                         let rel_path = tl_path.strip_prefix(&tl_dir).unwrap_or(&tl_path);
                         let file_name = rel_path.to_string_lossy().replace('\\', "/");
-                        let short_name = tl_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let short_name = tl_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
                         let orig_path = base_path.join(rel_path);
 
                         return Some(SceneTargetResult {
@@ -870,10 +966,7 @@ async fn find_scene_target(
 }
 
 #[tauri::command]
-async fn pack_mod_rpa(
-    game_dir: String,
-    output_rpa_path: Option<String>,
-) -> Result<String, String> {
+async fn pack_mod_rpa(game_dir: String, output_rpa_path: Option<String>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
         let tl_dir = base_path.join(r"tl\russian");
@@ -969,14 +1062,18 @@ async fn save_project_glossary(
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
         let saved_path = glossary.save_for_project(&base_path)?;
-        Ok(format!("Глоссарий сохранен ({:?})", saved_path.file_name().unwrap_or_default()))
+        Ok(format!(
+            "Глоссарий сохранен ({:?})",
+            saved_path.file_name().unwrap_or_default()
+        ))
     })
     .await
     .map_err(|e| format!("Ошибка сохранения глоссария: {}", e))?
 }
 
 fn read_text_file_safe(path: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("Не удалось прочитать файл {:?}: {}", path, e))?;
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("Не удалось прочитать файл {:?}: {}", path, e))?;
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         Ok(String::from_utf8_lossy(&bytes[3..]).into_owned())
     } else {
@@ -1157,7 +1254,8 @@ mod tests {
     #[test]
     fn test_parse_file_entries_benchmark() {
         tauri::async_runtime::block_on(async {
-            let file_path = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\celia.rpy";
+            let file_path =
+                r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\celia.rpy";
             let file_path2 = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\folk arc.rpy";
             if !Path::new(file_path).exists() || !Path::new(file_path2).exists() {
                 return;
@@ -1170,7 +1268,10 @@ mod tests {
             let start_other = std::time::Instant::now();
             let _parsed_other = parse_file_entries(file_path2.to_string()).await.unwrap();
             let dur_other = start_other.elapsed();
-            println!("Второй файл (folk arc.rpy, скрипты проекта уже в кэше): {:?}", dur_other);
+            println!(
+                "Второй файл (folk arc.rpy, скрипты проекта уже в кэше): {:?}",
+                dur_other
+            );
 
             let start2 = std::time::Instant::now();
             let parsed2 = parse_file_entries(file_path.to_string()).await.unwrap();
@@ -1178,7 +1279,10 @@ mod tests {
             println!("Повторный клик на первый файл (из кэша файла): {:?}", dur2);
 
             assert_eq!(parsed1.total_lines, parsed2.total_lines);
-            assert!(dur2.as_millis() <= 5, "Повторный клик должен быть мгновенным из кэша!");
+            assert!(
+                dur2.as_millis() <= 5,
+                "Повторный клик должен быть мгновенным из кэша!"
+            );
         });
     }
 
@@ -1191,47 +1295,93 @@ mod tests {
                 println!("Найдены файлы ({} шт):", summary.files.len());
                 // Проверяем, что в списке нет бэкапов!
                 for f in &summary.files {
-                    assert!(!f.name.contains(".bak"), "Файл бэкапа не должен попадать в проект: {}", f.name);
-                    assert!(!f.path.contains(".codex-backups"), "Папка .codex-backups не должна сканироваться: {}", f.path);
+                    assert!(
+                        !f.name.contains(".bak"),
+                        "Файл бэкапа не должен попадать в проект: {}",
+                        f.name
+                    );
+                    assert!(
+                        !f.path.contains(".codex-backups"),
+                        "Папка .codex-backups не должна сканироваться: {}",
+                        f.path
+                    );
                 }
 
                 let story_path = format!(r"{}\tl\russian\story.rpy", game_dir);
                 if Path::new(&story_path).exists() {
                     let parsed = parse_file_entries(story_path).await.unwrap();
-                    println!("story.rpy распарсен: {} сцен, всего строк: {}, переведено: {}", 
-                        parsed.scenes.len(), parsed.total_lines, parsed.translated_lines);
+                    println!(
+                        "story.rpy распарсен: {} сцен, всего строк: {}, переведено: {}",
+                        parsed.scenes.len(),
+                        parsed.total_lines,
+                        parsed.translated_lines
+                    );
 
                     for (i, s) in parsed.scenes.iter().enumerate().take(10) {
-                        println!("Сцена #{}: {} ({} строк, переведено: {})", i, s.name, s.total_lines, s.translated_lines);
+                        println!(
+                            "Сцена #{}: {} ({} строк, переведено: {})",
+                            i, s.name, s.total_lines, s.translated_lines
+                        );
                     }
 
                     // Проверяем, что intro и vera_intro не фрагментированы на одиночные строки
                     let intro_scene = parsed.scenes.iter().find(|s| s.name == "intro");
                     assert!(intro_scene.is_some(), "Сцена intro должна существовать");
                     let intro_lines = intro_scene.unwrap().total_lines;
-                    assert!(intro_lines >= 50, "Сцена intro должна содержать не менее 50 реплик, а не по 1 строке! Найдено: {}", intro_lines);
+                    assert!(
+                        intro_lines >= 50,
+                        "Сцена intro должна содержать не менее 50 реплик, а не по 1 строке! Найдено: {}",
+                        intro_lines
+                    );
 
                     // Проверяем, что "Интерфейс и меню (strings)" содержит дедуплицированные строки
-                    let ui_scene = parsed.scenes.iter().find(|s| s.name == "Интерфейс и меню (strings)");
+                    let ui_scene = parsed
+                        .scenes
+                        .iter()
+                        .find(|s| s.name == "Интерфейс и меню (strings)");
                     assert!(ui_scene.is_some(), "Сцена UI строк должна существовать");
                     let ui_lines = ui_scene.unwrap().total_lines;
                     println!("Уникальных строк UI в story.rpy: {}", ui_lines);
-                    assert!(ui_lines < 66, "Строки UI должны быть дедуплицированы, а не 66 дубликатов! Найдено: {}", ui_lines);
+                    assert!(
+                        ui_lines < 66,
+                        "Строки UI должны быть дедуплицированы, а не 66 дубликатов! Найдено: {}",
+                        ui_lines
+                    );
                     // Проверяем поиск целевой сцены "house" (должна найтись в script.rpy)
-                    let found_house = find_scene_target(game_dir.to_string(), "house".to_string()).await.unwrap();
-                    assert!(found_house.is_some(), "Целевая сцена 'house' должна быть найдена в проекте");
+                    let found_house = find_scene_target(game_dir.to_string(), "house".to_string())
+                        .await
+                        .unwrap();
+                    assert!(
+                        found_house.is_some(),
+                        "Целевая сцена 'house' должна быть найдена в проекте"
+                    );
                     let house_loc = found_house.unwrap();
-                    println!("Найдена сцена 'house': файл {}, строка {}", house_loc.file_name, house_loc.line_number);
-                    assert_eq!(house_loc.file_name, "script.rpy", "Сцена 'house' должна находиться в script.rpy");
+                    println!(
+                        "Найдена сцена 'house': файл {}, строка {}",
+                        house_loc.file_name, house_loc.line_number
+                    );
+                    assert_eq!(
+                        house_loc.file_name, "script.rpy",
+                        "Сцена 'house' должна находиться в script.rpy"
+                    );
 
                     // Проверяем поиск сцены "PPF" в подпапке "script/locations/PPF HQ.rpy"
-                    let found_ppf = find_scene_target(game_dir.to_string(), "PPF".to_string()).await.unwrap();
+                    let found_ppf = find_scene_target(game_dir.to_string(), "PPF".to_string())
+                        .await
+                        .unwrap();
                     assert!(found_ppf.is_some(), "Сцена 'PPF' должна быть найдена");
                     let ppf_loc = found_ppf.unwrap();
-                    println!("Найдена сцена 'PPF': file_name={}, short_name={}, line={}", ppf_loc.file_name, ppf_loc.short_name, ppf_loc.line_number);
+                    println!(
+                        "Найдена сцена 'PPF': file_name={}, short_name={}, line={}",
+                        ppf_loc.file_name, ppf_loc.short_name, ppf_loc.line_number
+                    );
                     assert_eq!(ppf_loc.file_name, "script/locations/PPF HQ.rpy");
                     assert_eq!(ppf_loc.short_name, "PPF HQ.rpy");
-                    assert!(ppf_loc.file_path.contains(r"tl\russian\script\locations\PPF HQ.rpy"));
+                    assert!(
+                        ppf_loc
+                            .file_path
+                            .contains(r"tl\russian\script\locations\PPF HQ.rpy")
+                    );
                 }
             }
         });
@@ -1253,15 +1403,21 @@ mod tests {
 
             let tl_russian = Path::new(game_dir).join(r"tl\russian");
             if !tl_russian.exists() {
-                println!("tl/russian не существует в {:?}, пропускаем часть упаковки", game_dir);
+                println!(
+                    "tl/russian не существует в {:?}, пропускаем часть упаковки",
+                    game_dir
+                );
                 return;
             }
 
             // 2. Тест упаковки мода в RPA архив во временный файл
             let temp_rpa = std::env::temp_dir().join("test_command_mod.rpa");
-            let result_msg = pack_mod_rpa(game_dir.to_string(), Some(temp_rpa.to_string_lossy().to_string()))
-                .await
-                .unwrap();
+            let result_msg = pack_mod_rpa(
+                game_dir.to_string(),
+                Some(temp_rpa.to_string_lossy().to_string()),
+            )
+            .await
+            .unwrap();
             println!("Результат pack_mod_rpa: {}", result_msg);
             assert!(temp_rpa.exists(), "Архив мода должен быть создан");
 
@@ -1294,14 +1450,26 @@ mod tests {
             let summary = scan_game_project(game_dir.to_string()).await.unwrap();
             println!(
                 "Game of Whores отсканирована за {:?}! Найдено файлов: {}, всего строк: {}, персонажей: {}",
-                start.elapsed(), summary.files.len(), summary.total_lines, summary.characters.len()
+                start.elapsed(),
+                summary.files.len(),
+                summary.total_lines,
+                summary.characters.len()
             );
 
-            assert!(!summary.files.is_empty(), "Должны быть обнаружены файлы из archive.rpa");
-            assert!(summary.total_lines > 0, "Должны быть подсчитаны строки диалогов");
+            assert!(
+                !summary.files.is_empty(),
+                "Должны быть обнаружены файлы из archive.rpa"
+            );
+            assert!(
+                summary.total_lines > 0,
+                "Должны быть подсчитаны строки диалогов"
+            );
 
             for f in summary.files.iter().take(10) {
-                println!("  [Файл] {} ({:.1} КБ, строк: {})", f.name, f.size_kb, f.total_lines);
+                println!(
+                    "  [Файл] {} ({:.1} КБ, строк: {})",
+                    f.name, f.size_kb, f.total_lines
+                );
             }
 
             // Проверяем парсинг одного из файлов
@@ -1309,13 +1477,21 @@ mod tests {
             let parsed = parse_file_entries(test_file.path.clone()).await.unwrap();
             println!(
                 "Скрипт {} распарсен: {} сцен, {} реплик",
-                parsed.file_name, parsed.scenes.len(), parsed.total_lines
+                parsed.file_name,
+                parsed.scenes.len(),
+                parsed.total_lines
             );
             assert!(!parsed.scenes.is_empty(), "Сцены должны быть сформированы");
 
             // Проверяем, что в самой папке игры НЕ появилось распакованных .rpy файлов!
-            assert!(!Path::new(game_dir).join("bquest1.rpy").exists(), "Архив не должен распаковываться в папку игры");
-            assert!(!Path::new(game_dir).join("mgquest1.rpy").exists(), "Архив не должен распаковываться в папку игры");
+            assert!(
+                !Path::new(game_dir).join("bquest1.rpy").exists(),
+                "Архив не должен распаковываться в папку игры"
+            );
+            assert!(
+                !Path::new(game_dir).join("mgquest1.rpy").exists(),
+                "Архив не должен распаковываться в папку игры"
+            );
             println!("Папка игры чиста: 0 файлов распаковано в корень игры!");
         });
     }
@@ -1332,20 +1508,44 @@ mod tests {
             let summary = scan_game_project(game_dir.to_string()).await.unwrap();
             println!(
                 "Lust and Power отсканирована за {:?}! Файлов: {}, всего строк: {}, персонажей: {}",
-                start.elapsed(), summary.files.len(), summary.total_lines, summary.characters.len()
+                start.elapsed(),
+                summary.files.len(),
+                summary.total_lines,
+                summary.characters.len()
             );
 
             let empty_count = summary.files.iter().filter(|f| f.total_lines == 0).count();
             println!("Файлов с 0 строк диалогов: {}", empty_count);
-            assert_eq!(empty_count, 0, "Все пустые файлы с 0 строк диалогов должны быть отфильтрованы!");
+            assert_eq!(
+                empty_count, 0,
+                "Все пустые файлы с 0 строк диалогов должны быть отфильтрованы!"
+            );
 
-            println!("Извлеченные персонажи (всего {}):", summary.characters.len());
+            println!(
+                "Извлеченные персонажи (всего {}):",
+                summary.characters.len()
+            );
             for (alias, name) in summary.characters.iter().take(25) {
                 println!("  [{}] -> {}", alias, name);
             }
-            assert!(!summary.characters.is_empty(), "Персонажи должны быть успешно извлечены!");
-            assert!(summary.characters.iter().any(|(a, n)| a == "lis" && n == "Lisa"), "Lisa должна быть найдена");
-            assert!(summary.characters.iter().any(|(a, n)| a == "emm" && n == "Emma"), "Emma должна быть найдена");
+            assert!(
+                !summary.characters.is_empty(),
+                "Персонажи должны быть успешно извлечены!"
+            );
+            assert!(
+                summary
+                    .characters
+                    .iter()
+                    .any(|(a, n)| a == "lis" && n == "Lisa"),
+                "Lisa должна быть найдена"
+            );
+            assert!(
+                summary
+                    .characters
+                    .iter()
+                    .any(|(a, n)| a == "emm" && n == "Emma"),
+                "Emma должна быть найдена"
+            );
         });
     }
 
@@ -1356,7 +1556,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let temp_game_dir = std::env::temp_dir().join(format!("test_glossary_game_{}", unique_id));
+            let temp_game_dir =
+                std::env::temp_dir().join(format!("test_glossary_game_{}", unique_id));
             let _ = std::fs::create_dir_all(&temp_game_dir);
 
             let scanned = vec![
@@ -1364,10 +1565,10 @@ mod tests {
                 ("dh".to_string(), "The Demon Hunter".to_string()),
             ];
 
-            let mut gl = get_project_glossary(
-                temp_game_dir.to_string_lossy().to_string(),
-                Some(scanned),
-            ).await.unwrap();
+            let mut gl =
+                get_project_glossary(temp_game_dir.to_string_lossy().to_string(), Some(scanned))
+                    .await
+                    .unwrap();
 
             assert_eq!(gl.characters.len(), 2);
             let dh = gl.characters.iter_mut().find(|c| c.alias == "dh").unwrap();
@@ -1381,17 +1582,15 @@ mod tests {
                 notes: "Реликвия".to_string(),
             });
 
-            let save_msg = save_project_glossary(
-                temp_game_dir.to_string_lossy().to_string(),
-                gl,
-            ).await.unwrap();
+            let save_msg = save_project_glossary(temp_game_dir.to_string_lossy().to_string(), gl)
+                .await
+                .unwrap();
             println!("{}", save_msg);
 
             // Загружаем повторно и сверяем сохраненные данные
-            let reloaded = get_project_glossary(
-                temp_game_dir.to_string_lossy().to_string(),
-                None,
-            ).await.unwrap();
+            let reloaded = get_project_glossary(temp_game_dir.to_string_lossy().to_string(), None)
+                .await
+                .unwrap();
 
             assert_eq!(reloaded.characters.len(), 2);
             assert_eq!(reloaded.terms.len(), 1);
@@ -1413,13 +1612,18 @@ mod tests {
 
             let hilde = parse_file_entries(hilde_path.to_string()).await.unwrap();
             assert!(
-                hilde.edges.iter().any(|e| e.from == "PPF_menu" && e.to == "hilde_ar1c_selector"),
+                hilde
+                    .edges
+                    .iter()
+                    .any(|e| e.from == "PPF_menu" && e.to == "hilde_ar1c_selector"),
                 "Входящий переход PPF_menu -> hilde_ar1c_selector должен присутствовать в графе hilde arc I"
             );
 
             let ppf = parse_file_entries(ppf_path.to_string()).await.unwrap();
             assert!(
-                ppf.edges.iter().any(|e| e.from == "PPF_menu" && e.to == "hilde_ar1c_selector"),
+                ppf.edges
+                    .iter()
+                    .any(|e| e.from == "PPF_menu" && e.to == "hilde_ar1c_selector"),
                 "Исходящий переход PPF_menu -> hilde_ar1c_selector должен присутствовать в графе PPF HQ"
             );
         });
@@ -1432,7 +1636,8 @@ mod tests {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let temp_game_dir = std::env::temp_dir().join(format!("test_menu_selector_{}", unique_id));
+            let temp_game_dir =
+                std::env::temp_dir().join(format!("test_menu_selector_{}", unique_id));
             let tl_dir = temp_game_dir.join("tl").join("russian");
             std::fs::create_dir_all(&tl_dir).unwrap();
 
@@ -1473,24 +1678,53 @@ translate russian next_scene_55667788:
             let trans_path = tl_dir.join("story.rpy");
             std::fs::write(&trans_path, trans_script).unwrap();
 
-            let parsed = parse_file_entries(trans_path.to_string_lossy().to_string()).await.unwrap();
+            let parsed = parse_file_entries(trans_path.to_string_lossy().to_string())
+                .await
+                .unwrap();
 
             // Проверяем, что сцена my_selector присутствует, несмотря на отсутствие реплик персонажей
             let selector_scene = parsed.scenes.iter().find(|s| s.name == "my_selector");
-            assert!(selector_scene.is_some(), "Сцена с выбором (my_selector) должна существовать в списке сцен");
+            assert!(
+                selector_scene.is_some(),
+                "Сцена с выбором (my_selector) должна существовать в списке сцен"
+            );
             let sel = selector_scene.unwrap();
-            assert_eq!(sel.entries.len(), 2, "Два пункта меню должны быть привязаны к сцене my_selector");
-            assert!(sel.entries.iter().any(|e| e.original_text == "Go forward" && e.speaker.as_deref() == Some("Выбор в меню")));
-            assert!(sel.entries.iter().any(|e| e.original_text == "Go back" && e.speaker.as_deref() == Some("Выбор в меню")));
+            assert_eq!(
+                sel.entries.len(),
+                2,
+                "Два пункта меню должны быть привязаны к сцене my_selector"
+            );
+            assert!(
+                sel.entries.iter().any(|e| e.original_text == "Go forward"
+                    && e.speaker.as_deref() == Some("Выбор в меню"))
+            );
+            assert!(
+                sel.entries.iter().any(|e| e.original_text == "Go back"
+                    && e.speaker.as_deref() == Some("Выбор в меню"))
+            );
 
             // Проверяем, что общие строки UI остались в 'Интерфейс и меню (strings)'
-            let ui_scene = parsed.scenes.iter().find(|s| s.name == "Интерфейс и меню (strings)").unwrap();
+            let ui_scene = parsed
+                .scenes
+                .iter()
+                .find(|s| s.name == "Интерфейс и меню (strings)")
+                .unwrap();
             assert_eq!(ui_scene.entries.len(), 1);
             assert_eq!(ui_scene.entries[0].original_text, "Start Game");
 
             // Проверяем переходы из my_selector
-            assert!(parsed.edges.iter().any(|e| e.from == "my_selector" && e.to == "next_scene" && e.kind == "choice"));
-            assert!(parsed.edges.iter().any(|e| e.from == "my_selector" && e.to == "prev_scene" && e.kind == "choice"));
+            assert!(
+                parsed
+                    .edges
+                    .iter()
+                    .any(|e| e.from == "my_selector" && e.to == "next_scene" && e.kind == "choice")
+            );
+            assert!(
+                parsed
+                    .edges
+                    .iter()
+                    .any(|e| e.from == "my_selector" && e.to == "prev_scene" && e.kind == "choice")
+            );
 
             let _ = std::fs::remove_dir_all(&temp_game_dir);
         });

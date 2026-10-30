@@ -454,8 +454,16 @@ impl<'a> PickleDecoder<'a> {
 
                 // STACK_GLOBAL (Protocol 4: pops name, pops module)
                 0x93 => {
-                    let name = self.pop_val(&mut stack)?.as_str().unwrap_or_default().to_string();
-                    let module = self.pop_val(&mut stack)?.as_str().unwrap_or_default().to_string();
+                    let name = self
+                        .pop_val(&mut stack)?
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let module = self
+                        .pop_val(&mut stack)?
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
                     stack.push(StackItem::Val(PickleValue::Global { module, name }));
                 }
 
@@ -492,7 +500,10 @@ impl<'a> PickleDecoder<'a> {
                 // BUILD (inst, state)
                 b'b' => {
                     let state = self.pop_val(&mut stack)?;
-                    if let Some(StackItem::Val(PickleValue::Object { state: obj_state, .. })) = stack.last_mut() {
+                    if let Some(StackItem::Val(PickleValue::Object {
+                        state: obj_state, ..
+                    })) = stack.last_mut()
+                    {
                         *obj_state = Some(Box::new(state));
                     }
                 }
@@ -691,7 +702,8 @@ impl PickleEncoder {
     fn write_binunicode(&mut self, s: &str) {
         let bytes = s.as_bytes();
         self.buf.push(b'X');
-        self.buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(bytes);
     }
 
@@ -702,7 +714,8 @@ impl PickleEncoder {
             self.buf.extend_from_slice(bytes);
         } else {
             self.buf.push(b'B');
-            self.buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            self.buf
+                .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             self.buf.extend_from_slice(bytes);
         }
     }

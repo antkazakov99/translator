@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::LazyLock;
 
 use crate::graph::{EdgeKind, ScenarioGraph, ScenarioNode, TranslationStatus};
 use crate::parser::GameParser;
@@ -16,58 +16,46 @@ static RE_CHAR: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static RE_CUSTOM_CHARS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?:define\s+|\$\s*)?([A-Za-z_]\w*)\s*=\s*Chars\s*\(\s*['"]([^'"]+)['"]"#
-    ).unwrap()
+    Regex::new(r#"(?:define\s+|\$\s*)?([A-Za-z_]\w*)\s*=\s*Chars\s*\(\s*['"]([^'"]+)['"]"#).unwrap()
 });
 
-static RE_STRUCT_LABEL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*label\s+([A-Za-z_]\w*)\s*:"#).unwrap()
-});
+static RE_STRUCT_LABEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*label\s+([A-Za-z_]\w*)\s*:"#).unwrap());
 
-static RE_STRUCT_MENU: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*menu(?:\s*([A-Za-z_]\w*))?\s*:"#).unwrap()
-});
+static RE_STRUCT_MENU: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*menu(?:\s*([A-Za-z_]\w*))?\s*:"#).unwrap());
 
-static RE_STRUCT_CHOICE_OPT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*"([^"]+)"\s*(?:if\s+[^:]+)?\s*:"#).unwrap()
-});
+static RE_STRUCT_CHOICE_OPT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*"([^"]+)"\s*(?:if\s+[^:]+)?\s*:"#).unwrap());
 
 static RE_STRUCT_JUMP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*(?:if\s+(?P<cond>[^:]+):\s*)?(?P<cmd>jump|call)\s+(?P<target>[A-Za-z_]\w*)"#).unwrap()
+    Regex::new(r#"^\s*(?:if\s+(?P<cond>[^:]+):\s*)?(?P<cmd>jump|call)\s+(?P<target>[A-Za-z_]\w*)"#)
+        .unwrap()
 });
 
-static RE_STRUCT_IF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*(?:elif|if)\s+(.+?)\s*:"#).unwrap()
-});
+static RE_STRUCT_IF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*(?:elif|if)\s+(.+?)\s*:"#).unwrap());
 
-static RE_STRUCT_ELSE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*else\s*:"#).unwrap()
-});
+static RE_STRUCT_ELSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s*else\s*:"#).unwrap());
 
-static RE_ORIG_LABEL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*label\s+([A-Za-z0-9_.]+)\s*:"#).unwrap()
-});
+static RE_ORIG_LABEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*label\s+([A-Za-z0-9_.]+)\s*:"#).unwrap());
 
 static RE_ORIG_DIALOGUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
 });
 
-static RE_STRINGS_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^translate\s+\w+\s+strings\s*:"#).unwrap()
-});
+static RE_STRINGS_BLOCK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^translate\s+\w+\s+strings\s*:"#).unwrap());
 
-static RE_DIALOGUE_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^translate\s+\w+\s+([\w\.]+)\s*:"#).unwrap()
-});
+static RE_DIALOGUE_BLOCK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^translate\s+\w+\s+([\w\.]+)\s*:"#).unwrap());
 
-static RE_OLD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*old\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
-});
+static RE_OLD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*old\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap());
 
-static RE_NEW: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*new\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
-});
+static RE_NEW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*new\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap());
 
 static RE_DIALOGUE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
@@ -77,9 +65,8 @@ static RE_SOURCE_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*#\s*(?:game[/\\])?(?P<file>.+?\.rpy):(?P<line>\d+)"#).unwrap()
 });
 
-static RE_LABEL_HASH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"_[0-9a-fA-F]{6,10}(?:_\d+)*$"#).unwrap()
-});
+static RE_LABEL_HASH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"_[0-9a-fA-F]{6,10}(?:_\d+)*$"#).unwrap());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChoiceOptionDto {
@@ -95,9 +82,9 @@ pub struct ChoiceBlockDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneEdgeDto {
-    pub from: String,       // имя исходной сцены
-    pub to: String,         // имя целевой сцены
-    pub kind: String,       // "jump" | "branch" | "choice" | "linear" | "call"
+    pub from: String,              // имя исходной сцены
+    pub to: String,                // имя целевой сцены
+    pub kind: String,              // "jump" | "branch" | "choice" | "linear" | "call"
     pub condition: Option<String>, // например "luka_corr > 0" или "Выбор: Yes"
 }
 
@@ -134,7 +121,10 @@ impl RenpyParser {
 
     /// Регистрирует известных персонажей (например, из скриптов игры)
     pub fn with_speakers(mut self, speakers: HashMap<String, String>) -> Self {
-        self.speaker_to_alias = speakers.iter().map(|(k, v)| (v.clone(), k.clone())).collect();
+        self.speaker_to_alias = speakers
+            .iter()
+            .map(|(k, v)| (v.clone(), k.clone()))
+            .collect();
         self.speakers = speakers;
         self
     }
@@ -187,13 +177,33 @@ impl RenpyParser {
             if c == '\\' {
                 if let Some(&next) = chars.peek() {
                     match next {
-                        'n' => { result.push('\n'); chars.next(); }
-                        't' => { result.push('\t'); chars.next(); }
-                        'r' => { result.push('\r'); chars.next(); }
-                        '"' => { result.push('"'); chars.next(); }
-                        '\\' => { result.push('\\'); chars.next(); }
-                        '\'' => { result.push('\''); chars.next(); }
-                        _ => { result.push(c); }
+                        'n' => {
+                            result.push('\n');
+                            chars.next();
+                        }
+                        't' => {
+                            result.push('\t');
+                            chars.next();
+                        }
+                        'r' => {
+                            result.push('\r');
+                            chars.next();
+                        }
+                        '"' => {
+                            result.push('"');
+                            chars.next();
+                        }
+                        '\\' => {
+                            result.push('\\');
+                            chars.next();
+                        }
+                        '\'' => {
+                            result.push('\'');
+                            chars.next();
+                        }
+                        _ => {
+                            result.push(c);
+                        }
                     }
                 } else {
                     result.push(c);
@@ -223,7 +233,8 @@ impl RenpyParser {
 
     /// Проверяет наличие кириллических символов в тексте
     pub fn has_cyrillic(text: &str) -> bool {
-        text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c) || c == 'Ё' || c == 'ё')
+        text.chars()
+            .any(|c| ('\u{0400}'..='\u{04FF}').contains(&c) || c == 'Ё' || c == 'ё')
     }
 
     /// Сверхбыстрый подсчет статистики файла перевода (всего строк, переведено)
@@ -235,7 +246,11 @@ impl RenpyParser {
             for line in content.lines() {
                 let trimmed = line.trim();
                 if !trimmed.starts_with('#') && trimmed.contains('"') {
-                    if !trimmed.starts_with("define ") && !trimmed.starts_with("image ") && !trimmed.starts_with("default ") && !trimmed.starts_with('$') {
+                    if !trimmed.starts_with("define ")
+                        && !trimmed.starts_with("image ")
+                        && !trimmed.starts_with("default ")
+                        && !trimmed.starts_with('$')
+                    {
                         total += 1;
                     }
                 }
@@ -363,18 +378,28 @@ impl RenpyParser {
                         } else {
                             if let Some(ref block_id) = d.block_id {
                                 if current_block_id.as_deref() != Some(block_id) {
-                                    output.push_str(&format!("\ntranslate {} {}:\n\n", target_lang, block_id));
+                                    output.push_str(&format!(
+                                        "\ntranslate {} {}:\n\n",
+                                        target_lang, block_id
+                                    ));
                                     current_block_id = Some(block_id.clone());
                                 }
                             }
 
                             let alias_prefix = self.resolve_alias(d.speaker.as_deref());
                             let original_escaped = Self::escape_renpy_string(&d.original_text);
-                            let target_text = d.translated_text.as_deref().unwrap_or(&d.original_text);
+                            let target_text =
+                                d.translated_text.as_deref().unwrap_or(&d.original_text);
                             let target_escaped = Self::escape_renpy_string(target_text);
 
-                            output.push_str(&format!("    # {}\"{}\"\n", alias_prefix, original_escaped));
-                            output.push_str(&format!("    {}\"{}\"\n\n", alias_prefix, target_escaped));
+                            output.push_str(&format!(
+                                "    # {}\"{}\"\n",
+                                alias_prefix, original_escaped
+                            ));
+                            output.push_str(&format!(
+                                "    {}\"{}\"\n\n",
+                                alias_prefix, target_escaped
+                            ));
                         }
                     }
                     _ => {}
@@ -398,7 +423,12 @@ impl RenpyParser {
     }
 
     /// Сохраняет сгенерированный мод .rpy на диск
-    pub fn save_translation_file(&self, graph: &ScenarioGraph, output_path: &Path, target_lang: &str) -> Result<()> {
+    pub fn save_translation_file(
+        &self,
+        graph: &ScenarioGraph,
+        output_path: &Path,
+        target_lang: &str,
+    ) -> Result<()> {
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Не удалось создать папку мода: {:?}", parent))?;
@@ -433,10 +463,14 @@ impl RenpyParser {
             if let Some(caps) = RE_STRUCT_LABEL.captures(line) {
                 if in_menu && !current_menu_options.is_empty() {
                     if let Some(ref lbl) = current_label {
-                        structure.scene_choices.entry(lbl.clone()).or_default().push(ChoiceBlockDto {
-                            prompt: None,
-                            options: std::mem::take(&mut current_menu_options),
-                        });
+                        structure
+                            .scene_choices
+                            .entry(lbl.clone())
+                            .or_default()
+                            .push(ChoiceBlockDto {
+                                prompt: None,
+                                options: std::mem::take(&mut current_menu_options),
+                            });
                     }
                 }
                 in_menu = false;
@@ -460,10 +494,14 @@ impl RenpyParser {
             // 2. Проверяем начало блока menu:
             if RE_STRUCT_MENU.is_match(line) {
                 if in_menu && !current_menu_options.is_empty() {
-                    structure.scene_choices.entry(lbl.clone()).or_default().push(ChoiceBlockDto {
-                        prompt: None,
-                        options: std::mem::take(&mut current_menu_options),
-                    });
+                    structure
+                        .scene_choices
+                        .entry(lbl.clone())
+                        .or_default()
+                        .push(ChoiceBlockDto {
+                            prompt: None,
+                            options: std::mem::take(&mut current_menu_options),
+                        });
                 }
                 in_menu = true;
                 menu_indent = indent;
@@ -474,10 +512,14 @@ impl RenpyParser {
             // Если были в menu, но отступ уменьшился
             if in_menu && indent <= menu_indent && !RE_STRUCT_CHOICE_OPT.is_match(line) {
                 if !current_menu_options.is_empty() {
-                    structure.scene_choices.entry(lbl.clone()).or_default().push(ChoiceBlockDto {
-                        prompt: None,
-                        options: std::mem::take(&mut current_menu_options),
-                    });
+                    structure
+                        .scene_choices
+                        .entry(lbl.clone())
+                        .or_default()
+                        .push(ChoiceBlockDto {
+                            prompt: None,
+                            options: std::mem::take(&mut current_menu_options),
+                        });
                 }
                 in_menu = false;
                 last_choice_idx = None;
@@ -542,16 +584,24 @@ impl RenpyParser {
                     condition: condition_label,
                 });
 
-                structure.scene_jumps.entry(lbl.clone()).or_default().push((target, cond));
+                structure
+                    .scene_jumps
+                    .entry(lbl.clone())
+                    .or_default()
+                    .push((target, cond));
             }
         }
 
         if in_menu && !current_menu_options.is_empty() {
             if let Some(lbl) = current_label {
-                structure.scene_choices.entry(lbl).or_default().push(ChoiceBlockDto {
-                    prompt: None,
-                    options: current_menu_options,
-                });
+                structure
+                    .scene_choices
+                    .entry(lbl)
+                    .or_default()
+                    .push(ChoiceBlockDto {
+                        prompt: None,
+                        options: current_menu_options,
+                    });
             }
         }
 
@@ -606,7 +656,8 @@ impl RenpyParser {
                 let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                 let resolved_speaker = self.resolve_speaker(speaker_alias);
 
-                let mut dialogue = ScenarioNode::dialogue(resolved_speaker, text, &file_path, line_num);
+                let mut dialogue =
+                    ScenarioNode::dialogue(resolved_speaker, text, &file_path, line_num);
                 if let Some(d) = dialogue.as_dialogue_mut() {
                     d.block_id = Some(current_scene_name.clone());
                     d.speaker_alias = speaker_alias.map(|s| s.to_string());
@@ -702,7 +753,8 @@ impl GameParser for RenpyParser {
                     pending_old = Some((text, src_line));
                 } else if let Some(caps) = RE_NEW.captures(line) {
                     if let Some((old_text, old_line)) = pending_old.take() {
-                        let new_text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
+                        let new_text =
+                            Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                         let is_translated = Self::has_cyrillic(&new_text);
 
                         // Дедупликация строк UI: если точно такой же old_text уже встречался
@@ -718,7 +770,12 @@ impl GameParser for RenpyParser {
                                 }
                             }
                         } else {
-                            let mut dialogue = ScenarioNode::dialogue(Some("UI / Choice"), old_text.clone(), &file_path, old_line);
+                            let mut dialogue = ScenarioNode::dialogue(
+                                Some("UI / Choice"),
+                                old_text.clone(),
+                                &file_path,
+                                old_line,
+                            );
                             if let Some(d) = dialogue.as_dialogue_mut() {
                                 d.speaker_alias = Some("UI".to_string());
                                 if is_translated {
@@ -751,14 +808,23 @@ impl GameParser for RenpyParser {
                 } else if !trimmed.is_empty() {
                     if let Some(caps) = RE_DIALOGUE.captures(trimmed) {
                         let speaker_alias = caps.name("speaker").map(|s| s.as_str());
-                        let target_text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
+                        let target_text =
+                            Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
 
                         if let Some((src_speaker, src_text, src_line)) = pending_source.take() {
-                            let raw_alias = src_speaker.clone().or_else(|| speaker_alias.map(|s| s.to_string()));
-                            let resolved_speaker = self.resolve_speaker(src_speaker.as_deref().or(speaker_alias));
+                            let raw_alias = src_speaker
+                                .clone()
+                                .or_else(|| speaker_alias.map(|s| s.to_string()));
+                            let resolved_speaker =
+                                self.resolve_speaker(src_speaker.as_deref().or(speaker_alias));
                             let is_translated = Self::has_cyrillic(&target_text);
 
-                            let mut dialogue = ScenarioNode::dialogue(resolved_speaker, src_text, &file_path, src_line);
+                            let mut dialogue = ScenarioNode::dialogue(
+                                resolved_speaker,
+                                src_text,
+                                &file_path,
+                                src_line,
+                            );
                             if let Some(d) = dialogue.as_dialogue_mut() {
                                 d.block_id = current_block_id.clone();
                                 d.speaker_alias = raw_alias;
@@ -825,7 +891,7 @@ translate russian other_scene_97ddad46_2:
 "#;
         let parser = RenpyParser::new();
         let graph = parser.parse_file(Path::new("intro.rpy"), rpy).unwrap();
-        
+
         let mut scene_labels = Vec::new();
         for idx in graph.node_indices() {
             if let Some(ScenarioNode::Label(name)) = graph.get_node(idx) {
@@ -855,7 +921,10 @@ translate russian strings:
         let parser = RenpyParser::new();
         let graph = parser.parse_file(Path::new("story.rpy"), rpy).unwrap();
         let (total, translated) = graph.translation_stats();
-        assert_eq!(total, 1, "Дублирующиеся строки UI должны быть схлопнуты в 1 запись");
+        assert_eq!(
+            total, 1,
+            "Дублирующиеся строки UI должны быть схлопнуты в 1 запись"
+        );
         assert_eq!(translated, 1);
     }
 
@@ -889,10 +958,35 @@ label dungeon:
 "#;
         let structure = RenpyParser::parse_script_structure(script);
         assert_eq!(structure.edges.len(), 5);
-        assert!(structure.edges.iter().any(|e| e.from == "start" && e.to == "left_path" && e.kind == "choice"));
-        assert!(structure.edges.iter().any(|e| e.from == "start" && e.to == "right_path" && e.kind == "choice"));
-        assert!(structure.edges.iter().any(|e| e.from == "left_path" && e.to == "castle" && e.kind == "branch"));
-        assert!(structure.edges.iter().any(|e| e.from == "left_path" && e.to == "dungeon" && e.kind == "branch"));
-        assert!(structure.edges.iter().any(|e| e.from == "right_path" && e.to == "castle" && e.kind == "jump"));
+        assert!(
+            structure
+                .edges
+                .iter()
+                .any(|e| e.from == "start" && e.to == "left_path" && e.kind == "choice")
+        );
+        assert!(
+            structure
+                .edges
+                .iter()
+                .any(|e| e.from == "start" && e.to == "right_path" && e.kind == "choice")
+        );
+        assert!(
+            structure
+                .edges
+                .iter()
+                .any(|e| e.from == "left_path" && e.to == "castle" && e.kind == "branch")
+        );
+        assert!(
+            structure
+                .edges
+                .iter()
+                .any(|e| e.from == "left_path" && e.to == "dungeon" && e.kind == "branch")
+        );
+        assert!(
+            structure
+                .edges
+                .iter()
+                .any(|e| e.from == "right_path" && e.to == "castle" && e.kind == "jump")
+        );
     }
 }

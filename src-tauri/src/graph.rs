@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +58,12 @@ pub enum ScenarioNode {
 }
 
 impl ScenarioNode {
-    pub fn dialogue(speaker: Option<impl Into<String>>, original: impl Into<String>, file: impl Into<String>, line: usize) -> Self {
+    pub fn dialogue(
+        speaker: Option<impl Into<String>>,
+        original: impl Into<String>,
+        file: impl Into<String>,
+        line: usize,
+    ) -> Self {
         Self::Dialogue(DialogueData {
             id: Uuid::new_v4().to_string(),
             block_id: None,
@@ -77,7 +82,13 @@ impl ScenarioNode {
         Self::Choice(ChoiceData {
             id: Uuid::new_v4().to_string(),
             prompt: None,
-            options: options.into_iter().map(|opt| ChoiceOption { text: opt.into(), translation: None }).collect(),
+            options: options
+                .into_iter()
+                .map(|opt| ChoiceOption {
+                    text: opt.into(),
+                    translation: None,
+                })
+                .collect(),
         })
     }
 
@@ -198,7 +209,10 @@ impl ScenarioGraph {
         for node in self.graph.node_weights() {
             if let ScenarioNode::Dialogue(d) = node {
                 total += 1;
-                if d.translated_text.is_some() || d.status == TranslationStatus::Translated || d.status == TranslationStatus::Reviewed {
+                if d.translated_text.is_some()
+                    || d.status == TranslationStatus::Translated
+                    || d.status == TranslationStatus::Reviewed
+                {
                     translated += 1;
                 }
             }
@@ -215,31 +229,81 @@ mod tests {
     fn test_graph_branching_and_context_isolation() {
         let mut sg = ScenarioGraph::new();
 
-        let n1 = sg.add_node(ScenarioNode::dialogue(Some("MC"), "Hey bartender, what's good here?", "script.rpy", 10));
-        let n2 = sg.add_node(ScenarioNode::dialogue(Some("Bartender"), "Depends. You want a fight or a drink?", "script.rpy", 11));
+        let n1 = sg.add_node(ScenarioNode::dialogue(
+            Some("MC"),
+            "Hey bartender, what's good here?",
+            "script.rpy",
+            10,
+        ));
+        let n2 = sg.add_node(ScenarioNode::dialogue(
+            Some("Bartender"),
+            "Depends. You want a fight or a drink?",
+            "script.rpy",
+            11,
+        ));
         sg.add_edge(n1, n2, EdgeKind::Linear);
 
         let choice = sg.add_node(ScenarioNode::choice(vec!["Fight", "Drink"]));
         sg.add_edge(n2, choice, EdgeKind::Linear);
 
-        let fight_1 = sg.add_node(ScenarioNode::dialogue(Some("MC"), "Let's fight!", "script.rpy", 20));
-        let fight_2 = sg.add_node(ScenarioNode::dialogue(Some("Bartender"), "Eat this!", "script.rpy", 21));
-        sg.add_edge(choice, fight_1, EdgeKind::Branch { option_index: 0, text: "Fight".to_string() });
+        let fight_1 = sg.add_node(ScenarioNode::dialogue(
+            Some("MC"),
+            "Let's fight!",
+            "script.rpy",
+            20,
+        ));
+        let fight_2 = sg.add_node(ScenarioNode::dialogue(
+            Some("Bartender"),
+            "Eat this!",
+            "script.rpy",
+            21,
+        ));
+        sg.add_edge(
+            choice,
+            fight_1,
+            EdgeKind::Branch {
+                option_index: 0,
+                text: "Fight".to_string(),
+            },
+        );
         sg.add_edge(fight_1, fight_2, EdgeKind::Linear);
 
-        let drink_1 = sg.add_node(ScenarioNode::dialogue(Some("MC"), "Just beer, please.", "script.rpy", 30));
-        let drink_2 = sg.add_node(ScenarioNode::dialogue(Some("Bartender"), "Here's your cold ale.", "script.rpy", 31));
-        sg.add_edge(choice, drink_1, EdgeKind::Branch { option_index: 1, text: "Drink".to_string() });
+        let drink_1 = sg.add_node(ScenarioNode::dialogue(
+            Some("MC"),
+            "Just beer, please.",
+            "script.rpy",
+            30,
+        ));
+        let drink_2 = sg.add_node(ScenarioNode::dialogue(
+            Some("Bartender"),
+            "Here's your cold ale.",
+            "script.rpy",
+            31,
+        ));
+        sg.add_edge(
+            choice,
+            drink_1,
+            EdgeKind::Branch {
+                option_index: 1,
+                text: "Drink".to_string(),
+            },
+        );
         sg.add_edge(drink_1, drink_2, EdgeKind::Linear);
 
         let drink_context = sg.get_parent_context(drink_2, 5);
-        let texts: Vec<&str> = drink_context.iter().map(|d| d.original_text.as_str()).collect();
+        let texts: Vec<&str> = drink_context
+            .iter()
+            .map(|d| d.original_text.as_str())
+            .collect();
 
-        assert_eq!(texts, vec![
-            "Hey bartender, what's good here?",
-            "Depends. You want a fight or a drink?",
-            "Just beer, please."
-        ]);
+        assert_eq!(
+            texts,
+            vec![
+                "Hey bartender, what's good here?",
+                "Depends. You want a fight or a drink?",
+                "Just beer, please."
+            ]
+        );
 
         assert!(!texts.contains(&"Let's fight!"));
         assert!(!texts.contains(&"Eat this!"));

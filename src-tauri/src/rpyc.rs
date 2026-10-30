@@ -1,8 +1,8 @@
+use flate2::read::ZlibDecoder;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use flate2::read::ZlibDecoder;
-use serde::{Deserialize, Serialize};
 
 use crate::pickle::{PickleDecoder, PickleValue};
 
@@ -17,7 +17,7 @@ pub struct RpycSlot {
 /// Извлеченная реплика или сцена из скомпилированного .rpyc
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpycStatement {
-    pub kind: String,          // "say", "label", "menu", "jump", "call"
+    pub kind: String, // "say", "label", "menu", "jump", "call"
     pub scene_name: String,
     pub speaker: Option<String>,
     pub text: String,
@@ -38,7 +38,9 @@ impl RpycParser {
         let magic = &data[0..10];
         if magic != b"RENPY RPC2" {
             // Проверяем, не является ли файл сырым zlib потоком (старые версии Ren'Py)
-            if data[0] == 0x78 && (data[1] == 0x9c || data[1] == 0x01 || data[1] == 0x5e || data[1] == 0xda) {
+            if data[0] == 0x78
+                && (data[1] == 0x9c || data[1] == 0x01 || data[1] == 0x5e || data[1] == 0xda)
+            {
                 return Ok(vec![RpycSlot {
                     slot: 1,
                     offset: 0,
@@ -79,7 +81,9 @@ impl RpycParser {
         if end > data.len() {
             return Err(format!(
                 "Смещение слота {}..{} выходит за пределы файла ({})",
-                start, end, data.len()
+                start,
+                end,
+                data.len()
             ));
         }
 
@@ -95,8 +99,8 @@ impl RpycParser {
 
     /// Декомпилирует/парсит .rpyc файл и извлекает все диалоговые инструкции
     pub fn parse_rpyc_file(path: &Path) -> Result<Vec<RpycStatement>, String> {
-        let data = fs::read(path)
-            .map_err(|e| format!("Не удалось прочитать .rpyc {:?}: {}", path, e))?;
+        let data =
+            fs::read(path).map_err(|e| format!("Не удалось прочитать .rpyc {:?}: {}", path, e))?;
         Self::parse_rpyc_bytes(&data)
     }
 
@@ -146,7 +150,8 @@ impl RpycParser {
                         let name = Self::get_field_str(state.as_deref(), args, "name")
                             .or_else(|| Self::get_field_str(state.as_deref(), args, "_name"))
                             .unwrap_or_else(|| "unnamed_scene".to_string());
-                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        let line_number =
+                            Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
                         *current_scene = name.clone();
 
                         stmts.push(RpycStatement {
@@ -165,9 +170,10 @@ impl RpycParser {
                     }
                     "Say" => {
                         let who = Self::get_field_str(state.as_deref(), args, "who");
-                        let what = Self::get_field_str(state.as_deref(), args, "what")
-                            .unwrap_or_default();
-                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        let what =
+                            Self::get_field_str(state.as_deref(), args, "what").unwrap_or_default();
+                        let line_number =
+                            Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
 
                         stmts.push(RpycStatement {
                             kind: "say".to_string(),
@@ -179,7 +185,8 @@ impl RpycParser {
                         });
                     }
                     "Menu" => {
-                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        let line_number =
+                            Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
                         // Извлекаем элементы меню
                         let items_val = Self::get_field_val(state.as_deref(), "items");
                         if let Some(PickleValue::List(menu_items)) = items_val {
@@ -197,7 +204,11 @@ impl RpycParser {
                                     }
                                     // Если у ветки выбора есть свой блок инструкций, парсим его
                                     if t.len() >= 3 {
-                                        Self::extract_statements_from_pickle(&t[2], current_scene, stmts);
+                                        Self::extract_statements_from_pickle(
+                                            &t[2],
+                                            current_scene,
+                                            stmts,
+                                        );
                                     }
                                 }
                             }
@@ -209,7 +220,11 @@ impl RpycParser {
                             for e in entries {
                                 if let PickleValue::Tuple(t) = e {
                                     if t.len() >= 2 {
-                                        Self::extract_statements_from_pickle(&t[1], current_scene, stmts);
+                                        Self::extract_statements_from_pickle(
+                                            &t[1],
+                                            current_scene,
+                                            stmts,
+                                        );
                                     }
                                 }
                             }
@@ -217,7 +232,8 @@ impl RpycParser {
                     }
                     "Jump" => {
                         let target = Self::get_field_str(state.as_deref(), args, "target");
-                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        let line_number =
+                            Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
                         if let Some(tgt) = target {
                             stmts.push(RpycStatement {
                                 kind: "jump".to_string(),
@@ -231,7 +247,8 @@ impl RpycParser {
                     }
                     "Call" => {
                         let target = Self::get_field_str(state.as_deref(), args, "label");
-                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        let line_number =
+                            Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
                         if let Some(tgt) = target {
                             stmts.push(RpycStatement {
                                 kind: "call".to_string(),
@@ -255,7 +272,8 @@ impl RpycParser {
                         let code_str = Self::get_field_val(state.as_deref(), "code")
                             .and_then(Self::extract_pycode_source)
                             .unwrap_or_default();
-                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        let line_number =
+                            Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
                         if !varname.is_empty() {
                             stmts.push(RpycStatement {
                                 kind: "define".to_string(),
@@ -273,7 +291,8 @@ impl RpycParser {
                         let code_str = Self::get_field_val(state.as_deref(), "code")
                             .and_then(Self::extract_pycode_source)
                             .unwrap_or_default();
-                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        let line_number =
+                            Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
                         if !varname.is_empty() {
                             stmts.push(RpycStatement {
                                 kind: "default".to_string(),
@@ -290,7 +309,8 @@ impl RpycParser {
                         let py_source = code_val
                             .and_then(Self::extract_pycode_source)
                             .unwrap_or_default();
-                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        let line_number =
+                            Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
                         if !py_source.is_empty() {
                             stmts.push(RpycStatement {
                                 kind: "python".to_string(),
@@ -326,7 +346,10 @@ impl RpycParser {
         }
     }
 
-    fn get_field_val<'a>(state: Option<&'a PickleValue>, field_name: &str) -> Option<&'a PickleValue> {
+    fn get_field_val<'a>(
+        state: Option<&'a PickleValue>,
+        field_name: &str,
+    ) -> Option<&'a PickleValue> {
         match state {
             Some(PickleValue::Dict(entries)) => {
                 for (k, v) in entries {
@@ -448,7 +471,10 @@ impl RpycParser {
                 }
                 "menu" => {
                     let escaped_text = stmt.text.replace('"', "\\\"");
-                    out.push_str(&format!("        \"{}\":\n            pass\n", escaped_text));
+                    out.push_str(&format!(
+                        "        \"{}\":\n            pass\n",
+                        escaped_text
+                    ));
                 }
                 "jump" => {
                     if let Some(ref target) = stmt.target {
@@ -543,7 +569,11 @@ mod tests {
 
             let stmts = RpycParser::parse_rpyc_bytes(&payload).unwrap();
             let defines = stmts.iter().filter(|s| s.kind == "define").count();
-            println!("Декомпиляция define_vars.rpyc: инструкций {}, из них define: {}", stmts.len(), defines);
+            println!(
+                "Декомпиляция define_vars.rpyc: инструкций {}, из них define: {}",
+                stmts.len(),
+                defines
+            );
             assert!(defines > 0, "Должны быть извлечены Define инструкции!");
 
             let decompiled = RpycParser::decompile_to_rpy_text(&stmts);
@@ -562,7 +592,11 @@ mod tests {
 
             let stmts = RpycParser::parse_rpyc_bytes(&payload).unwrap();
             let py_stmts = stmts.iter().filter(|s| s.kind == "python").count();
-            println!("Декомпиляция init_Chars.rpyc: инструкций {}, из них python: {}", stmts.len(), py_stmts);
+            println!(
+                "Декомпиляция init_Chars.rpyc: инструкций {}, из них python: {}",
+                stmts.len(),
+                py_stmts
+            );
             assert!(py_stmts > 0, "Должны быть извлечены Python инструкции!");
 
             let decompiled = RpycParser::decompile_to_rpy_text(&stmts);
@@ -573,22 +607,34 @@ mod tests {
 
     #[test]
     fn test_parse_real_celia_rpyc() {
-        let celia_path = Path::new(r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\celia.rpyc");
+        let celia_path = Path::new(
+            r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\celia.rpyc",
+        );
         if !celia_path.exists() {
             return;
         }
 
         let stmts = RpycParser::parse_rpyc_file(celia_path).expect("Ошибка парсинга celia.rpyc");
         println!("Всего извлечено инструкций из celia.rpyc: {}", stmts.len());
-        assert!(!stmts.is_empty(), "Должны быть извлечены инструкции из celia.rpyc");
+        assert!(
+            !stmts.is_empty(),
+            "Должны быть извлечены инструкции из celia.rpyc"
+        );
 
         let labels = stmts.iter().filter(|s| s.kind == "label").count();
         let says = stmts.iter().filter(|s| s.kind == "say").count();
         let jumps = stmts.iter().filter(|s| s.kind == "jump").count();
-        println!("Метки сцен: {}, Диалоговые реплики: {}, Переходы: {}", labels, says, jumps);
+        println!(
+            "Метки сцен: {}, Диалоговые реплики: {}, Переходы: {}",
+            labels, says, jumps
+        );
 
         for s in stmts.iter().filter(|s| s.kind == "say").take(5) {
-            println!("  [Реплика] {}: '{}'", s.speaker.as_deref().unwrap_or("Рассказчик"), s.text);
+            println!(
+                "  [Реплика] {}: '{}'",
+                s.speaker.as_deref().unwrap_or("Рассказчик"),
+                s.text
+            );
         }
 
         assert!(says > 0, "Должны быть извлечены диалоговые реплики");
@@ -596,6 +642,9 @@ mod tests {
         let decompiled = RpycParser::decompile_to_rpy_text(&stmts);
         assert!(decompiled.contains("label end_scene_nei:"));
         assert!(decompiled.contains("The neighbor's association now serves a renewed purpose"));
-        println!("Успешно декомпилировано в .rpy (символов: {})", decompiled.len());
+        println!(
+            "Успешно декомпилировано в .rpy (символов: {})",
+            decompiled.len()
+        );
     }
 }
