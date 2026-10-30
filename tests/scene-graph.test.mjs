@@ -100,3 +100,22 @@ test('focused mode: handles external jump targets cleanly', () => {
   assert.equal(external.scene, undefined);
   assert.equal(external.role, 'outgoing');
 });
+
+test('focused mode: handles external incoming nodes from other files cleanly', () => {
+  const scenes = ['chapter2_start'].map(scene);
+  const edges = [
+    { from: 'prologue_end', to: 'chapter2_start', kind: 'jump', condition: null },
+    { from: 'chapter2_start', to: 'chapter2_end', kind: 'jump', condition: null }
+  ];
+
+  const graph = buildSceneGraph(scenes, edges, { mode: 'focused', focusName: 'chapter2_start' });
+  assert.equal(graph.nodes.length, 3);
+  assert.equal(graph.incomingCount, 1);
+  assert.equal(graph.outgoingCount, 1);
+
+  const incomingExtNode = graph.nodes.find(n => n.name === 'prologue_end');
+  assert.ok(incomingExtNode, 'External incoming node must be present');
+  assert.equal(incomingExtNode.scene, undefined, 'External node has no local scene');
+  assert.equal(incomingExtNode.role, 'incoming');
+  assert.ok(incomingExtNode.x < graph.nodes.find(n => n.name === 'chapter2_start').x);
+});

@@ -345,14 +345,18 @@
                 {#if isCenter}
                   <span class="badge-role role-badge-center">★ В фокусе</span>
                 {:else if node.role === 'incoming'}
-                  <span class="badge-role role-badge-in">← Вход</span>
+                  <span class="badge-role" class:role-badge-in={!isExternal} class:role-badge-in-ext={isExternal}>
+                    {isExternal ? '← Внешний вход' : '← Вход'}
+                  </span>
                 {:else if node.role === 'outgoing'}
-                  <span class="badge-role role-badge-out">Переход →</span>
+                  <span class="badge-role role-badge-out">
+                    {isExternal ? 'Внешний переход →' : 'Переход →'}
+                  </span>
                 {/if}
                 <small class="node-type-label">
                   {node.scene
                     ? (node.scene.choices?.length ? '◆ Развилка' : 'Сцена')
-                    : '↗ Внешняя метка'}
+                    : '↗ Другой файл'}
                 </small>
               </div>
 
@@ -360,7 +364,7 @@
 
               <span class="preview">
                 {node.scene?.entries[0]?.original_text ||
-                  (node.scene ? 'Нет диалоговых реплик' : 'Нажмите для перехода к файлу')}
+                  (isExternal ? 'Метка в другом файле: нажмите для перехода' : 'Нет диалоговых реплик')}
               </span>
             </button>
 
@@ -674,8 +678,18 @@
     border-color: #1e3a5f;
   }
 
+  .node.role-incoming.external {
+    border: 1px dashed #38bdf8;
+    background: #091a2e;
+  }
+
   .node.role-outgoing {
     border-color: #2a2c54;
+  }
+
+  .node.role-outgoing.external {
+    border: 1px dashed #d97706;
+    background: #1c150c;
   }
 
   .node.external {
@@ -720,6 +734,12 @@
     background: #1e293b;
     color: #94a3b8;
     border: 1px solid #334155;
+  }
+
+  .role-badge-in-ext {
+    background: #0c2f4d;
+    color: #38bdf8;
+    border: 1px solid #0284c7;
   }
 
   .role-badge-out {

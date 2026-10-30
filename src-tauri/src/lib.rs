@@ -333,17 +333,17 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
 
         let mut speakers_map = std::collections::HashMap::new();
-        if let Some(parent) = path.parent() {
-            let mut search_dir = parent.to_path_buf();
-            while search_dir.parent().is_some() && (search_dir.ends_with(r"tl\russian") || search_dir.ends_with("tl/russian")) {
-                search_dir = search_dir.parent().unwrap().to_path_buf();
-            }
-            let mut check_files = Vec::new();
-            collect_rpy_files(&search_dir, &mut check_files);
-            for f in check_files.into_iter().take(40) {
-                if let Ok(c) = std::fs::read_to_string(&f) {
-                    speakers_map.extend(RenpyParser::extract_speakers(&c));
-                }
+        let mut search_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        while search_dir.parent().is_some() && (search_dir.ends_with(r"tl\russian") || search_dir.ends_with("tl/russian")) {
+            search_dir = search_dir.parent().unwrap().to_path_buf();
+        }
+        let cache_dir = get_project_cache_dir(&search_dir);
+
+        let mut check_files = Vec::new();
+        collect_rpy_files(&search_dir, &mut check_files);
+        for f in check_files.into_iter().take(40) {
+            if let Ok(c) = std::fs::read_to_string(&f) {
+                speakers_map.extend(RenpyParser::extract_speakers(&c));
             }
         }
 
@@ -455,6 +455,69 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
                         kind: "linear".to_string(),
                         condition: None,
                     });
+                }
+            }
+        }
+
+        // Поиск входящих переходов из ДРУГИХ скриптов проекта в сцены текущего файла
+        let current_scene_names: std::collections::HashSet<String> = scenes
+            .iter()
+            .map(|s| s.name.clone())
+            .filter(|name| name != "Интерфейс и меню (strings)")
+            .collect();
+
+        if !current_scene_names.is_empty() {
+            let mut all_scripts = Vec::new();
+            collect_rpy_files(&search_dir, &mut all_scripts);
+            if cache_dir.exists() {
+                collect_rpy_files(&cache_dir, &mut all_scripts);
+            }
+
+            let cur_file_canon = path.canonicalize().ok();
+            let cur_orig_canon = orig_path.canonicalize().ok();
+
+            let external_incoming_edges: Vec<SceneEdgeDto> = all_scripts
+                .into_par_iter()
+                .filter(|p| {
+                    let s = p.to_string_lossy();
+                    if s.contains(r"\tl\") || s.contains("/tl/") {
+                        return false;
+                    }
+                    if let Ok(canon) = p.canonicalize() {
+                        if Some(&canon) == cur_file_canon.as_ref() || Some(&canon) == cur_orig_canon.as_ref() {
+                            return false;
+                        }
+                    } else if p.as_path() == path || p.as_path() == orig_path {
+                        return false;
+                    }
+                    true
+                })
+                .filter_map(|other_path| {
+                    let content = std::fs::read_to_string(other_path).ok()?;
+                    let other_struct = RenpyParser::parse_script_structure(&content);
+                    let mut matched = Vec::new();
+                    for edge in other_struct.edges {
+                        if current_scene_names.contains(&edge.to) {
+                            matched.push(edge);
+                        }
+                    }
+                    if matched.is_empty() {
+                        None
+                    } else {
+                        Some(matched)
+                    }
+                })
+                .flatten()
+                .collect();
+
+            for ext_edge in external_incoming_edges {
+                if !edges.iter().any(|e| {
+                    e.from == ext_edge.from
+                        && e.to == ext_edge.to
+                        && e.kind == ext_edge.kind
+                        && e.condition == ext_edge.condition
+                }) {
+                    edges.push(ext_edge);
                 }
             }
         }
