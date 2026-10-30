@@ -123,6 +123,11 @@
   const PROJECT_NAMES_KEY = "translator.project-names";
 
   onMount(() => {
+    restoreRecentProjects();
+    return watchWindowClose();
+  });
+
+  function restoreRecentProjects() {
     try {
       const saved = JSON.parse(localStorage.getItem(RECENT_PROJECTS_KEY) || "[]");
       if (Array.isArray(saved)) recentProjects = saved.filter((path): path is string => typeof path === "string");
@@ -140,9 +145,9 @@
     }
 
     if (recentProjects.length > 0) gameDir = recentProjects[0];
-  });
+  }
 
-  onMount(() => {
+  function watchWindowClose() {
     if (!isTauri()) return;
     const window = getCurrentWindow();
     let unlisten: (() => void) | undefined;
@@ -154,6 +159,7 @@
       const glossarySaved = !glossaryDirty || await saveGlossary();
       if (translationsSaved && glossarySaved) await window.destroy();
     }).then((fn) => {
+      // Компонент мог размонтироваться раньше, чем Tauri вернул функцию отписки.
       if (disposed) fn();
       else unlisten = fn;
     });
@@ -161,7 +167,7 @@
       disposed = true;
       unlisten?.();
     };
-  });
+  }
 
   function rememberProject(path: string) {
     const normalized = path.replace(/\\/g, "/").replace(/\/$/, "").toLowerCase();
@@ -765,7 +771,7 @@
 
   // Всплывающее уведомление о переходах и событиях
   let toast = $state<{ text: string; type: 'info' | 'success' | 'warning' | 'error' } | null>(null);
-  let toastTimer: any = null;
+  let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
   function showToast(text: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
     if (toastTimer) clearTimeout(toastTimer);
