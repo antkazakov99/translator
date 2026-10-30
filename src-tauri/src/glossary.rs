@@ -35,21 +35,19 @@ impl ProjectGlossary {
     /// совместимости с версиями, которые сохраняли его туда.
     pub fn load_for_project(game_dir: &Path) -> Self {
         let cache_file = get_project_cache_dir(game_dir).join("glossary.json");
-        if cache_file.exists() {
-            if let Ok(content) = fs::read_to_string(&cache_file) {
-                if let Ok(glossary) = serde_json::from_str::<ProjectGlossary>(&content) {
-                    return glossary;
-                }
-            }
+        if cache_file.exists()
+            && let Ok(content) = fs::read_to_string(&cache_file)
+            && let Ok(glossary) = serde_json::from_str::<ProjectGlossary>(&content)
+        {
+            return glossary;
         }
 
         let game_file = game_dir.join("translator_glossary.json");
-        if game_file.exists() {
-            if let Ok(content) = fs::read_to_string(&game_file) {
-                if let Ok(glossary) = serde_json::from_str::<ProjectGlossary>(&content) {
-                    return glossary;
-                }
-            }
+        if game_file.exists()
+            && let Ok(content) = fs::read_to_string(&game_file)
+            && let Ok(glossary) = serde_json::from_str::<ProjectGlossary>(&content)
+        {
+            return glossary;
         }
 
         Self::default()

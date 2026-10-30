@@ -237,14 +237,14 @@ impl RpycParser {
                         let entries_val = Self::get_field_val(state.as_deref(), "entries");
                         if let Some(PickleValue::List(entries)) = entries_val {
                             for e in entries {
-                                if let PickleValue::Tuple(t) = e {
-                                    if t.len() >= 2 {
-                                        Self::extract_statements_from_pickle(
-                                            &t[1],
-                                            current_scene,
-                                            stmts,
-                                        );
-                                    }
+                                if let PickleValue::Tuple(t) = e
+                                    && t.len() >= 2
+                                {
+                                    Self::extract_statements_from_pickle(
+                                        &t[1],
+                                        current_scene,
+                                        stmts,
+                                    );
                                 }
                             }
                         }
@@ -372,10 +372,10 @@ impl RpycParser {
         match state {
             Some(PickleValue::Dict(entries)) => {
                 for (k, v) in entries {
-                    if let PickleValue::String(key_str) = k {
-                        if key_str == field_name {
-                            return Some(v);
-                        }
+                    if let PickleValue::String(key_str) = k
+                        && key_str == field_name
+                    {
+                        return Some(v);
                     }
                 }
                 None
@@ -397,10 +397,10 @@ impl RpycParser {
         args: &[PickleValue],
         field_name: &str,
     ) -> Option<String> {
-        if let Some(val) = Self::get_field_val(state, field_name) {
-            if let Some(s) = val.as_str() {
-                return Some(s.to_string());
-            }
+        if let Some(val) = Self::get_field_val(state, field_name)
+            && let Some(s) = val.as_str()
+        {
+            return Some(s.to_string());
         }
         // Запасной вариант: первый строковый аргумент в args
         for arg in args {
@@ -416,10 +416,10 @@ impl RpycParser {
         _args: &[PickleValue],
         field_name: &str,
     ) -> Option<usize> {
-        if let Some(val) = Self::get_field_val(state, field_name) {
-            if let Some(i) = val.as_i64() {
-                return Some(i as usize);
-            }
+        if let Some(val) = Self::get_field_val(state, field_name)
+            && let Some(i) = val.as_i64()
+        {
+            return Some(i as usize);
         }
         None
     }
@@ -434,17 +434,16 @@ impl RpycParser {
                 args,
                 ..
             } => {
-                if class_name == "PyExpr" {
-                    if let Some(first) = args.first() {
-                        if let Some(s) = first.as_str() {
-                            return Some(s.to_string());
-                        }
-                    }
+                if class_name == "PyExpr"
+                    && let Some(first) = args.first()
+                    && let Some(s) = first.as_str()
+                {
+                    return Some(s.to_string());
                 }
-                if let Some(st) = state {
-                    if let Some(s) = Self::extract_pycode_source(st) {
-                        return Some(s);
-                    }
+                if let Some(st) = state
+                    && let Some(s) = Self::extract_pycode_source(st)
+                {
+                    return Some(s);
                 }
                 for a in args {
                     if let Some(s) = Self::extract_pycode_source(a) {
@@ -454,10 +453,10 @@ impl RpycParser {
                 None
             }
             PickleValue::Tuple(items) | PickleValue::List(items) => {
-                if items.len() >= 2 {
-                    if let Some(s) = Self::extract_pycode_source(&items[1]) {
-                        return Some(s);
-                    }
+                if items.len() >= 2
+                    && let Some(s) = Self::extract_pycode_source(&items[1])
+                {
+                    return Some(s);
                 }
                 for item in items {
                     if let Some(s) = Self::extract_pycode_source(item) {

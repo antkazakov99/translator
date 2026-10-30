@@ -79,10 +79,10 @@ impl PickleValue {
     pub fn get_dict_value(&self, key: &str) -> Option<&PickleValue> {
         if let PickleValue::Dict(entries) = self {
             for (k, v) in entries {
-                if let PickleValue::String(k_str) = k {
-                    if k_str == key {
-                        return Some(v);
-                    }
+                if let PickleValue::String(k_str) = k
+                    && k_str == key
+                {
+                    return Some(v);
                 }
             }
         }
@@ -658,11 +658,10 @@ pub struct PickleEncoder {
 
 impl PickleEncoder {
     pub fn new() -> Self {
-        let mut buf = Vec::new();
         // Заголовок Protocol 2
-        buf.push(0x80);
-        buf.push(0x02);
-        Self { buf }
+        Self {
+            buf: vec![0x80, 0x02],
+        }
     }
 
     /// Сериализует словарь RPA-3.0 индекса: { filename: [ (offset, length, prefix) ] }
@@ -736,5 +735,11 @@ impl PickleEncoder {
             self.buf.push(8);
             self.buf.extend_from_slice(&val.to_le_bytes());
         }
+    }
+}
+
+impl Default for PickleEncoder {
+    fn default() -> Self {
+        Self::new()
     }
 }

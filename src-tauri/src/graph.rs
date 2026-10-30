@@ -187,10 +187,10 @@ impl ScenarioGraph {
             let mut incoming = self.graph.edges_directed(current, Direction::Incoming);
             if let Some(edge) = incoming.next() {
                 let parent_idx = edge.source();
-                if let Some(node) = self.get_node(parent_idx) {
-                    if let ScenarioNode::Dialogue(d) = node {
-                        context.push(d.clone());
-                    }
+                if let Some(node) = self.get_node(parent_idx)
+                    && let ScenarioNode::Dialogue(d) = node
+                {
+                    context.push(d.clone());
                 }
                 current = parent_idx;
             } else {

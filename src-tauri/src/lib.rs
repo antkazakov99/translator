@@ -29,13 +29,16 @@ static SCRIPT_STRUCTURE_CACHE: LazyLock<
     Mutex<std::collections::HashMap<PathBuf, (SystemTime, ScriptStructure)>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-static PROJECT_SCRIPTS_CACHE: LazyLock<
-    Mutex<std::collections::HashMap<PathBuf, (Instant, Vec<PathBuf>)>>,
-> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+type ProjectScriptsCache = std::collections::HashMap<PathBuf, (Instant, Vec<PathBuf>)>;
 
-static PROJECT_SPEAKERS_CACHE: LazyLock<
-    Mutex<std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>>,
-> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static PROJECT_SCRIPTS_CACHE: LazyLock<Mutex<ProjectScriptsCache>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+type SpeakerMap = std::collections::HashMap<String, String>;
+type ProjectSpeakerCache = std::collections::HashMap<PathBuf, SpeakerMap>;
+
+static PROJECT_SPEAKERS_CACHE: LazyLock<Mutex<ProjectSpeakerCache>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 static CACHED_SCRIPT_PROJECTS: LazyLock<Mutex<std::collections::HashMap<PathBuf, PathBuf>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -44,10 +47,10 @@ fn get_cached_script_structure(path: &Path) -> Option<ScriptStructure> {
     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
     {
         let cache = SCRIPT_STRUCTURE_CACHE.lock().unwrap();
-        if let Some((cached_mtime, cached_struct)) = cache.get(path) {
-            if *cached_mtime == mtime {
-                return Some(cached_struct.clone());
-            }
+        if let Some((cached_mtime, cached_struct)) = cache.get(path)
+            && *cached_mtime == mtime
+        {
+            return Some(cached_struct.clone());
         }
     }
     let content = std::fs::read_to_string(path).ok()?;
@@ -62,10 +65,10 @@ fn get_cached_script_structure(path: &Path) -> Option<ScriptStructure> {
 fn get_project_scripts(search_dir: &Path, cache_dir: &Path) -> Vec<PathBuf> {
     {
         let cache = PROJECT_SCRIPTS_CACHE.lock().unwrap();
-        if let Some((instant, files)) = cache.get(search_dir) {
-            if instant.elapsed() < std::time::Duration::from_secs(60) {
-                return files.clone();
-            }
+        if let Some((instant, files)) = cache.get(search_dir)
+            && instant.elapsed() < std::time::Duration::from_secs(60)
+        {
+            return files.clone();
         }
     }
     let mut all_scripts = Vec::new();
@@ -389,7 +392,7 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
 
         // Подставляем имя главного героя вместо шаблонных переменных вроде [player.name]
         if let Some(player_name) = characters_map.get("player").cloned() {
-            for (_, v) in characters_map.iter_mut() {
+            for v in characters_map.values_mut() {
                 if v == "[player.name]" || v == "[player]" {
                     *v = player_name.clone();
                 }
@@ -593,10 +596,11 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
         // 1. Проверяем кэш готового распарсенного файла (мгновенный отклик при повторном клике)
         {
             let cache = PARSED_FILE_CACHE.lock().unwrap();
-            if let Some(entry) = cache.get(&file_path) {
-                if entry.file_mtime == file_mtime && entry.orig_mtime == orig_mtime {
-                    return Ok(entry.result.clone());
-                }
+            if let Some(entry) = cache.get(&file_path)
+                && entry.file_mtime == file_mtime
+                && entry.orig_mtime == orig_mtime
+            {
+                return Ok(entry.result.clone());
             }
         }
 
@@ -636,10 +640,8 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
         // 3. Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры (с кэшированием структуры)
         let script_struct = if orig_path.exists() {
             get_cached_script_structure(orig_path).unwrap_or_default()
-        } else if let Some(st) = get_cached_script_structure(path) {
-            st
         } else {
-            Default::default()
+            get_cached_script_structure(path).unwrap_or_default()
         };
 
         // Быстрый поиск: текст выбора -> имя сцены
@@ -1268,12 +1270,12 @@ async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String
                         None
                     };
 
-                    if let Some(cp) = chosen {
-                        if let Ok(orig_txt) = read_text_file_safe(&cp) {
-                            original_total_lines = Some(orig_txt.lines().count());
-                            original_content = Some(orig_txt);
-                            original_path = Some(cp.to_string_lossy().to_string());
-                        }
+                    if let Some(cp) = chosen
+                        && let Ok(orig_txt) = read_text_file_safe(&cp)
+                    {
+                        original_total_lines = Some(orig_txt.lines().count());
+                        original_content = Some(orig_txt);
+                        original_path = Some(cp.to_string_lossy().to_string());
                     }
                 }
             }

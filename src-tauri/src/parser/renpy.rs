@@ -159,7 +159,7 @@ impl RenpyParser {
 
         // Подставляем реальные имена переменных (например [player.name] -> Jack)
         if let Some(player_name) = custom_names.get("player") {
-            for (_, v) in map.iter_mut() {
+            for v in map.values_mut() {
                 if v == "[player.name]" || v == "[player]" {
                     *v = player_name.clone();
                 }
@@ -245,14 +245,14 @@ impl RenpyParser {
             let mut total = 0;
             for line in content.lines() {
                 let trimmed = line.trim();
-                if !trimmed.starts_with('#') && trimmed.contains('"') {
-                    if !trimmed.starts_with("define ")
-                        && !trimmed.starts_with("image ")
-                        && !trimmed.starts_with("default ")
-                        && !trimmed.starts_with('$')
-                    {
-                        total += 1;
-                    }
+                if !trimmed.starts_with('#')
+                    && trimmed.contains('"')
+                    && !trimmed.starts_with("define ")
+                    && !trimmed.starts_with("image ")
+                    && !trimmed.starts_with("default ")
+                    && !trimmed.starts_with('$')
+                {
+                    total += 1;
                 }
             }
             return (total, 0);
@@ -289,27 +289,24 @@ impl RenpyParser {
 
             if in_strings {
                 if trimmed.starts_with("old ") {
-                    if let Some(s) = trimmed.find('"') {
-                        if let Some(e) = trimmed.rfind('"') {
-                            if e > s {
-                                pending_old = Some(&trimmed[s + 1..e]);
-                            }
-                        }
+                    if let Some(s) = trimmed.find('"')
+                        && let Some(e) = trimmed.rfind('"')
+                        && e > s
+                    {
+                        pending_old = Some(&trimmed[s + 1..e]);
                     }
-                } else if trimmed.starts_with("new ") {
-                    if let Some(old_str) = pending_old.take() {
-                        if seen_ui_strings.insert(old_str) {
-                            total += 1;
-                            if let Some(s) = trimmed.find('"') {
-                                if let Some(e) = trimmed.rfind('"') {
-                                    if e > s {
-                                        let new_str = &trimmed[s + 1..e];
-                                        if Self::has_cyrillic(new_str) {
-                                            translated += 1;
-                                        }
-                                    }
-                                }
-                            }
+                } else if trimmed.starts_with("new ")
+                    && let Some(old_str) = pending_old.take()
+                    && seen_ui_strings.insert(old_str)
+                {
+                    total += 1;
+                    if let Some(s) = trimmed.find('"')
+                        && let Some(e) = trimmed.rfind('"')
+                        && e > s
+                    {
+                        let new_str = &trimmed[s + 1..e];
+                        if Self::has_cyrillic(new_str) {
+                            translated += 1;
                         }
                     }
                 }
@@ -370,39 +367,24 @@ impl RenpyParser {
         let mut current_block_id: Option<String> = None;
 
         for idx in graph.node_indices() {
-            if let Some(node) = graph.get_node(idx) {
-                match node {
-                    ScenarioNode::Dialogue(d) => {
-                        if d.speaker.as_deref() == Some("UI / Choice") {
-                            string_entries.push(d);
-                        } else {
-                            if let Some(ref block_id) = d.block_id {
-                                if current_block_id.as_deref() != Some(block_id) {
-                                    output.push_str(&format!(
-                                        "\ntranslate {} {}:\n\n",
-                                        target_lang, block_id
-                                    ));
-                                    current_block_id = Some(block_id.clone());
-                                }
-                            }
-
-                            let alias_prefix = self.resolve_alias(d.speaker.as_deref());
-                            let original_escaped = Self::escape_renpy_string(&d.original_text);
-                            let target_text =
-                                d.translated_text.as_deref().unwrap_or(&d.original_text);
-                            let target_escaped = Self::escape_renpy_string(target_text);
-
-                            output.push_str(&format!(
-                                "    # {}\"{}\"\n",
-                                alias_prefix, original_escaped
-                            ));
-                            output.push_str(&format!(
-                                "    {}\"{}\"\n\n",
-                                alias_prefix, target_escaped
-                            ));
-                        }
+            if let Some(ScenarioNode::Dialogue(d)) = graph.get_node(idx) {
+                if d.speaker.as_deref() == Some("UI / Choice") {
+                    string_entries.push(d);
+                } else {
+                    if let Some(ref block_id) = d.block_id
+                        && current_block_id.as_deref() != Some(block_id)
+                    {
+                        output.push_str(&format!("\ntranslate {} {}:\n\n", target_lang, block_id));
+                        current_block_id = Some(block_id.clone());
                     }
-                    _ => {}
+
+                    let alias_prefix = self.resolve_alias(d.speaker.as_deref());
+                    let original_escaped = Self::escape_renpy_string(&d.original_text);
+                    let target_text = d.translated_text.as_deref().unwrap_or(&d.original_text);
+                    let target_escaped = Self::escape_renpy_string(target_text);
+
+                    output.push_str(&format!("    # {}\"{}\"\n", alias_prefix, original_escaped));
+                    output.push_str(&format!("    {}\"{}\"\n\n", alias_prefix, target_escaped));
                 }
             }
         }
@@ -461,17 +443,18 @@ impl RenpyParser {
 
             // 1. Проверяем объявление сцены (label)
             if let Some(caps) = RE_STRUCT_LABEL.captures(line) {
-                if in_menu && !current_menu_options.is_empty() {
-                    if let Some(ref lbl) = current_label {
-                        structure
-                            .scene_choices
-                            .entry(lbl.clone())
-                            .or_default()
-                            .push(ChoiceBlockDto {
-                                prompt: None,
-                                options: std::mem::take(&mut current_menu_options),
-                            });
-                    }
+                if in_menu
+                    && !current_menu_options.is_empty()
+                    && let Some(ref lbl) = current_label
+                {
+                    structure
+                        .scene_choices
+                        .entry(lbl.clone())
+                        .or_default()
+                        .push(ChoiceBlockDto {
+                            prompt: None,
+                            options: std::mem::take(&mut current_menu_options),
+                        });
                 }
                 in_menu = false;
                 current_condition = None;
@@ -526,16 +509,14 @@ impl RenpyParser {
             }
 
             // 3. Варианты выбора внутри menu
-            if in_menu {
-                if let Some(caps) = RE_STRUCT_CHOICE_OPT.captures(line) {
-                    let opt_text = caps.get(1).unwrap().as_str().to_string();
-                    current_menu_options.push(ChoiceOptionDto {
-                        text: opt_text,
-                        target_jump: None,
-                    });
-                    last_choice_idx = Some(current_menu_options.len() - 1);
-                    continue;
-                }
+            if in_menu && let Some(caps) = RE_STRUCT_CHOICE_OPT.captures(line) {
+                let opt_text = caps.get(1).unwrap().as_str().to_string();
+                current_menu_options.push(ChoiceOptionDto {
+                    text: opt_text,
+                    target_jump: None,
+                });
+                last_choice_idx = Some(current_menu_options.len() - 1);
+                continue;
             }
 
             // 4. Ветвления if/elif/else
@@ -592,17 +573,18 @@ impl RenpyParser {
             }
         }
 
-        if in_menu && !current_menu_options.is_empty() {
-            if let Some(lbl) = current_label {
-                structure
-                    .scene_choices
-                    .entry(lbl)
-                    .or_default()
-                    .push(ChoiceBlockDto {
-                        prompt: None,
-                        options: current_menu_options,
-                    });
-            }
+        if in_menu
+            && !current_menu_options.is_empty()
+            && let Some(lbl) = current_label
+        {
+            structure
+                .scene_choices
+                .entry(lbl)
+                .or_default()
+                .push(ChoiceBlockDto {
+                    prompt: None,
+                    options: current_menu_options,
+                });
         }
 
         structure
@@ -751,46 +733,43 @@ impl GameParser for RenpyParser {
                     let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                     let src_line = pending_comment_line.take().unwrap_or(line_num);
                     pending_old = Some((text, src_line));
-                } else if let Some(caps) = RE_NEW.captures(line) {
-                    if let Some((old_text, old_line)) = pending_old.take() {
-                        let new_text =
-                            Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
-                        let is_translated = Self::has_cyrillic(&new_text);
+                } else if let Some(caps) = RE_NEW.captures(line)
+                    && let Some((old_text, old_line)) = pending_old.take()
+                {
+                    let new_text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
+                    let is_translated = Self::has_cyrillic(&new_text);
 
-                        // Дедупликация строк UI: если точно такой же old_text уже встречался
-                        if let Some(&existing_idx) = seen_ui_strings.get(&old_text) {
-                            if is_translated {
-                                if let Some(existing_node) = graph.get_node_mut(existing_idx) {
-                                    if let Some(d) = existing_node.as_dialogue_mut() {
-                                        if d.translated_text.is_none() {
-                                            d.translated_text = Some(new_text);
-                                            d.status = TranslationStatus::Translated;
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            let mut dialogue = ScenarioNode::dialogue(
-                                Some("UI / Choice"),
-                                old_text.clone(),
-                                &file_path,
-                                old_line,
-                            );
-                            if let Some(d) = dialogue.as_dialogue_mut() {
-                                d.speaker_alias = Some("UI".to_string());
-                                if is_translated {
-                                    d.translated_text = Some(new_text);
-                                    d.status = TranslationStatus::Translated;
-                                }
-                            }
-
-                            let node_idx = graph.add_node(dialogue);
-                            if let Some(prev) = last_node_idx {
-                                graph.add_edge(prev, node_idx, EdgeKind::Linear);
-                            }
-                            last_node_idx = Some(node_idx);
-                            seen_ui_strings.insert(old_text, node_idx);
+                    // Дедупликация строк UI: если точно такой же old_text уже встречался
+                    if let Some(&existing_idx) = seen_ui_strings.get(&old_text) {
+                        if is_translated
+                            && let Some(existing_node) = graph.get_node_mut(existing_idx)
+                            && let Some(d) = existing_node.as_dialogue_mut()
+                            && d.translated_text.is_none()
+                        {
+                            d.translated_text = Some(new_text);
+                            d.status = TranslationStatus::Translated;
                         }
+                    } else {
+                        let mut dialogue = ScenarioNode::dialogue(
+                            Some("UI / Choice"),
+                            old_text.clone(),
+                            &file_path,
+                            old_line,
+                        );
+                        if let Some(d) = dialogue.as_dialogue_mut() {
+                            d.speaker_alias = Some("UI".to_string());
+                            if is_translated {
+                                d.translated_text = Some(new_text);
+                                d.status = TranslationStatus::Translated;
+                            }
+                        }
+
+                        let node_idx = graph.add_node(dialogue);
+                        if let Some(prev) = last_node_idx {
+                            graph.add_edge(prev, node_idx, EdgeKind::Linear);
+                        }
+                        last_node_idx = Some(node_idx);
+                        seen_ui_strings.insert(old_text, node_idx);
                     }
                 }
                 continue;
@@ -805,41 +784,41 @@ impl GameParser for RenpyParser {
                         let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                         pending_source = Some((speaker, text, line_num));
                     }
-                } else if !trimmed.is_empty() {
-                    if let Some(caps) = RE_DIALOGUE.captures(trimmed) {
-                        let speaker_alias = caps.name("speaker").map(|s| s.as_str());
-                        let target_text =
-                            Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
+                } else if !trimmed.is_empty()
+                    && let Some(caps) = RE_DIALOGUE.captures(trimmed)
+                {
+                    let speaker_alias = caps.name("speaker").map(|s| s.as_str());
+                    let target_text =
+                        Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
 
-                        if let Some((src_speaker, src_text, src_line)) = pending_source.take() {
-                            let raw_alias = src_speaker
-                                .clone()
-                                .or_else(|| speaker_alias.map(|s| s.to_string()));
-                            let resolved_speaker =
-                                self.resolve_speaker(src_speaker.as_deref().or(speaker_alias));
-                            let is_translated = Self::has_cyrillic(&target_text);
+                    if let Some((src_speaker, src_text, src_line)) = pending_source.take() {
+                        let raw_alias = src_speaker
+                            .clone()
+                            .or_else(|| speaker_alias.map(|s| s.to_string()));
+                        let resolved_speaker =
+                            self.resolve_speaker(src_speaker.as_deref().or(speaker_alias));
+                        let is_translated = Self::has_cyrillic(&target_text);
 
-                            let mut dialogue = ScenarioNode::dialogue(
-                                resolved_speaker,
-                                src_text,
-                                &file_path,
-                                src_line,
-                            );
-                            if let Some(d) = dialogue.as_dialogue_mut() {
-                                d.block_id = current_block_id.clone();
-                                d.speaker_alias = raw_alias;
-                                if is_translated {
-                                    d.translated_text = Some(target_text);
-                                    d.status = TranslationStatus::Translated;
-                                }
+                        let mut dialogue = ScenarioNode::dialogue(
+                            resolved_speaker,
+                            src_text,
+                            &file_path,
+                            src_line,
+                        );
+                        if let Some(d) = dialogue.as_dialogue_mut() {
+                            d.block_id = current_block_id.clone();
+                            d.speaker_alias = raw_alias;
+                            if is_translated {
+                                d.translated_text = Some(target_text);
+                                d.status = TranslationStatus::Translated;
                             }
-
-                            let node_idx = graph.add_node(dialogue);
-                            if let Some(prev) = last_node_idx {
-                                graph.add_edge(prev, node_idx, EdgeKind::Linear);
-                            }
-                            last_node_idx = Some(node_idx);
                         }
+
+                        let node_idx = graph.add_node(dialogue);
+                        if let Some(prev) = last_node_idx {
+                            graph.add_edge(prev, node_idx, EdgeKind::Linear);
+                        }
+                        last_node_idx = Some(node_idx);
                     }
                 }
             }
