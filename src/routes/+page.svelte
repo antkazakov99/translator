@@ -111,6 +111,7 @@
   }
 
   let fileSearchFilter = $state("");
+  let charactersExpanded = $state(false);
   let expandedFolders = $state<Record<string, boolean>>({
     "script": true,
     "script/locations": true
@@ -610,40 +611,43 @@
           </div>
         </div>
 
-        <!-- Сниппет рекурсивного узла дерева -->
+        <!-- Сниппет компактного узла дерева в стиле современных IDE -->
         {#snippet renderTreeNode(node: FileTreeNode)}
           {#if node.isFolder}
             {@const isExp = isFolderExpanded(node.path) || fileSearchFilter.trim() !== ''}
             {@const pct = node.totalLines > 0 ? Math.round((node.translatedLines / node.totalLines) * 100) : 0}
-            <div class="tree-folder-group">
+            <div class="tree-node-group">
               <button 
-                class="tree-folder-row"
-                style="padding-left: calc(6px + {node.level * 12}px);"
+                class="tree-row tree-folder-row"
                 onclick={() => toggleFolder(node.path)}
+                title={node.path}
               >
-                <span class="folder-caret">
+                <span class="tree-caret">
                   {#if isExp}
-                    <ChevronDown size={13} />
+                    <ChevronDown size={12} />
                   {:else}
-                    <ChevronRight size={13} />
+                    <ChevronRight size={12} />
                   {/if}
                 </span>
-                <span class="folder-icon-wrap">
+                <span class="tree-icon">
                   {#if isExp}
-                    <FolderOpen size={14} class="text-amber-400" />
+                    <FolderOpen size={14} class="folder-svg text-amber-400" />
                   {:else}
-                    <Folder size={14} class="text-amber-400/80" />
+                    <Folder size={14} class="folder-svg text-amber-500/80" />
                   {/if}
                 </span>
-                <span class="tree-folder-name" title={node.path}>{node.name}</span>
-                <span class="tree-folder-count">({node.children.length})</span>
-                {#if node.totalLines > 0}
-                  <span class="tree-folder-pct" class:badge-complete={pct === 100}>{pct}%</span>
-                {/if}
+                <span class="tree-label folder-label">{node.name}</span>
+                
+                <div class="tree-meta">
+                  <span class="tree-count">{node.children.length}</span>
+                  {#if node.totalLines > 0}
+                    <span class="tree-pct-badge" class:pct-complete={pct === 100}>{pct}%</span>
+                  {/if}
+                </div>
               </button>
 
               {#if isExp}
-                <div class="tree-children-container">
+                <div class="tree-branch-children">
                   {#each node.children as child}
                     {@render renderTreeNode(child)}
                   {/each}
@@ -656,48 +660,65 @@
             {@const isSel = selectedFile?.path === f.path}
             <button 
               id={`sidebar-file-${encodeURIComponent(f.path).replace(/%/g, '_')}`}
-              class="file-item file-tree-item"
+              class="tree-row tree-file-row"
               class:active={isSel}
-              style="padding-left: calc(18px + {node.level * 12}px);"
               onclick={() => selectFile(f)}
-              title="{f.name} ({f.size_kb.toFixed(0)} KB)"
+              title="{f.name} • {f.translated_lines}/{f.total_lines} переведено ({pct}%) • {f.size_kb.toFixed(0)} KB"
             >
-              <div class="file-title-row">
-                <div class="file-name-group">
-                  <FileText size={13} class={isSel ? "text-sky-400" : "text-slate-400"} />
-                  <span class="file-name">{node.name}</span>
-                </div>
-                <span class="file-size">{f.size_kb.toFixed(0)} KB</span>
+              <span class="tree-caret-spacer"></span>
+              <span class="tree-icon">
+                <FileText size={13} class={isSel ? "file-svg text-sky-400" : "file-svg text-slate-500"} />
+              </span>
+              <span class="tree-label file-label">{node.name}</span>
+
+              <div class="tree-meta">
+                {#if pct === 100}
+                  <span class="tree-pct-badge pct-complete">100%</span>
+                {:else if pct > 0}
+                  <span class="tree-pct-badge pct-progress">{pct}%</span>
+                {/if}
               </div>
-              <div class="file-progress-row">
-                <div class="file-track">
-                  <div 
-                    class="file-fill" 
-                    style="width: {pct}%"
-                    class:fill-done={pct === 100}
-                  ></div>
+
+              {#if pct > 0}
+                <div class="tree-micro-track">
+                  <div class="tree-micro-fill" style="width: {pct}%" class:fill-done={pct === 100}></div>
                 </div>
-                <span class="file-stats">{f.translated_lines}/{f.total_lines}</span>
-                <span class="file-pct-tag" class:pct-done={pct === 100}>{pct}%</span>
-              </div>
+              {/if}
             </button>
           {/if}
         {/snippet}
 
-        <!-- Спикеры -->
+        <!-- Спикеры / Персонажи (компактный аккордеон) -->
         <div class="sidebar-section characters-section">
-          <div class="sidebar-header">
-            <Users size={14} />
-            <span>ПЕРСОНАЖИ ({project.characters.length})</span>
-          </div>
-          <div class="char-chips">
-            {#each project.characters as [alias, name]}
-              <div class="char-chip" title="Код: {alias}">
-                <span class="char-alias">[{alias}]</span>
-                <span class="char-name">{name}</span>
-              </div>
-            {/each}
-          </div>
+          <button 
+            class="characters-toggle-header" 
+            onclick={() => charactersExpanded = !charactersExpanded}
+            title={charactersExpanded ? "Свернуть список персонажей" : "Развернуть список персонажей"}
+          >
+            <div class="header-left">
+              <span class="tree-caret">
+                {#if charactersExpanded}
+                  <ChevronDown size={12} />
+                {:else}
+                  <ChevronRight size={12} />
+                {/if}
+              </span>
+              <Users size={13} class="text-sky-400" />
+              <span>ПЕРСОНАЖИ ({project.characters.length})</span>
+            </div>
+            <span class="characters-state-hint">{charactersExpanded ? "свернуть" : "раскрыть"}</span>
+          </button>
+
+          {#if charactersExpanded}
+            <div class="char-chips">
+              {#each project.characters as [alias, name]}
+                <div class="char-chip" title="Код: {alias}">
+                  <span class="char-alias">[{alias}]</span>
+                  <span class="char-name">{name}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
         </div>
       {:else}
         <div class="empty-sidebar">
@@ -1507,198 +1528,240 @@
     color: #e2e8f0;
   }
 
+  /* SIDEBAR TREE STYLES (IDE STYLE: COMPACT, PROPORTIONAL, CLEAN) */
   .file-tree-container {
     flex: 1;
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    padding-right: 2px;
+    padding: 2px 4px 8px 4px;
+    user-select: none;
   }
 
   .empty-tree-hint {
-    padding: 16px;
+    padding: 24px 16px;
     text-align: center;
     color: #64748b;
     font-size: 12px;
   }
 
-  .tree-folder-group {
+  .tree-node-group {
     display: flex;
     flex-direction: column;
   }
 
-  .tree-folder-row {
+  /* Единый стиль строки дерева (26px, гармоничные отступы, шрифт 12px) */
+  .tree-row {
+    position: relative;
     display: flex;
     align-items: center;
     gap: 6px;
+    height: 26px;
+    min-height: 26px;
+    padding: 0 8px;
     background: transparent;
-    border: 1px solid transparent;
-    border-radius: 5px;
-    padding: 4px 6px;
+    border: none;
+    border-radius: 4px;
     color: #cbd5e1;
     font-size: 12px;
-    font-weight: 500;
+    font-weight: 400;
     cursor: pointer;
     text-align: left;
-    transition: background 0.12s;
-    user-select: none;
+    width: 100%;
+    box-sizing: border-box;
+    transition: background 0.1s ease, color 0.1s ease;
   }
 
-  .tree-folder-row:hover {
-    background: #161c26;
-    color: #f1f5f9;
+  .tree-row:hover {
+    background: #171d27;
+    color: #f8fafc;
   }
 
-  .folder-caret {
-    color: #64748b;
+  .tree-file-row.active {
+    background: #18263a !important;
+    color: #ffffff !important;
+  }
+
+  .tree-file-row.active::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 3px;
+    bottom: 3px;
+    width: 2px;
+    background: #38bdf8;
+    border-radius: 999px;
+  }
+
+  .tree-caret {
     display: inline-flex;
     align-items: center;
-    width: 14px;
     justify-content: center;
+    width: 14px;
+    color: #64748b;
+    flex-shrink: 0;
   }
 
-  .folder-icon-wrap {
+  .tree-caret-spacer {
+    display: inline-flex;
+    width: 14px;
+    flex-shrink: 0;
+  }
+
+  .tree-icon {
     display: inline-flex;
     align-items: center;
+    justify-content: center;
+    width: 16px;
+    flex-shrink: 0;
   }
 
-  .tree-folder-name {
+  .tree-label {
     flex: 1;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    font-size: 12px;
   }
 
-  .tree-folder-count {
-    color: #64748b;
+  .folder-label {
+    font-weight: 500;
+    color: #e2e8f0;
+  }
+
+  .file-label {
+    color: #cbd5e1;
+  }
+
+  .tree-meta {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+
+  .tree-count {
+    color: #475569;
     font-size: 10px;
   }
 
-  .tree-folder-pct {
+  .tree-pct-badge {
     font-size: 10px;
-    color: #64748b;
-    background: #0f131a;
     padding: 1px 4px;
     border-radius: 3px;
+    font-weight: 500;
   }
 
-  .tree-children-container {
+  .tree-pct-badge.pct-complete {
+    color: #34d399;
+    background: rgba(16, 185, 129, 0.1);
+  }
+
+  .tree-pct-badge.pct-progress {
+    color: #94a3b8;
+    background: #151b24;
+  }
+
+  /* Иерархическая ветка: тонкая направляющая линия */
+  .tree-branch-children {
+    position: relative;
+    margin-left: 14px;
+    padding-left: 4px;
+    border-left: 1px solid #1a2230;
     display: flex;
     flex-direction: column;
-    gap: 1px;
   }
 
-  .file-name-group {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-    flex: 1;
-  }
-
-  .file-name-group .file-name {
-    white-space: nowrap;
+  /* Тонкая полоска прогресса на дне строки файла (2px) */
+  .tree-micro-track {
+    position: absolute;
+    bottom: 0;
+    left: 28px;
+    right: 8px;
+    height: 2px;
+    background: #1c2432;
+    border-radius: 1px;
     overflow: hidden;
-    text-overflow: ellipsis;
+    opacity: 0.6;
   }
 
-  .file-tree-item {
-    margin: 1px 0;
-    border-radius: 5px;
-    border-left: 3px solid transparent;
-    padding: 5px 8px;
+  .tree-row:hover .tree-micro-track,
+  .tree-row.active .tree-micro-track {
+    opacity: 1;
   }
 
-  .file-tree-item.active {
-    background: #142234 !important;
-    border-color: #1e3a5f !important;
-    border-left: 3px solid #38bdf8 !important;
-    color: #f8fafc;
+  .tree-micro-fill {
+    height: 100%;
+    background: #0284c7;
+  }
+
+  .tree-micro-fill.fill-done {
+    background: #10b981;
   }
 
   /* АНИМАЦИЯ ПОДСВЕТКИ ПРИ НАВИГАЦИИ */
   @keyframes fileGlowPulse {
     0% {
-      box-shadow: 0 0 0 2px #38bdf8, 0 0 16px rgba(56, 189, 248, 0.7);
-      background-color: #1e3352;
+      background-color: #1e3a5f;
+      box-shadow: inset 0 0 0 1px #38bdf8, 0 0 12px rgba(56, 189, 248, 0.4);
     }
     50% {
-      box-shadow: 0 0 0 2px #0284c7, 0 0 10px rgba(56, 189, 248, 0.35);
+      background-color: #1a2d47;
+      box-shadow: inset 0 0 0 1px #0284c7;
     }
     100% {
-      box-shadow: 0 0 0 0 transparent, 0 0 0 transparent;
-      background-color: #142234;
+      background-color: #18263a;
+      box-shadow: none;
     }
   }
 
   .file-highlight-pulse {
-    animation: fileGlowPulse 1.5s ease-out;
+    animation: fileGlowPulse 1.2s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
-  .file-pct-tag {
-    font-size: 10px;
-    color: #64748b;
-    font-weight: 600;
-  }
-
-  .file-pct-tag.pct-done {
-    color: #34d399;
-  }
-
-  .file-title-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 12px;
-    font-weight: 500;
-  }
-
-  .file-size {
-    font-size: 10px;
-    color: #64748b;
-  }
-
-  .file-progress-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 2px;
-  }
-
-  .file-track {
-    flex: 1;
-    height: 4px;
-    background: #242c38;
-    border-radius: 999px;
-    overflow: hidden;
-  }
-
-  .file-fill {
-    height: 100%;
-    background: #22c55e;
-  }
-
-  .file-fill.fill-done {
-    background: #34d399;
-  }
-
-  .file-stats {
-    font-size: 10px;
-    color: #64748b;
-  }
-
+  /* СЕКЦИЯ ПЕРСОНАЖЕЙ (КОМПАКТНЫЙ АККОРДЕОН) */
   .characters-section {
-    border-top: 1px solid #1a1f27;
-    padding: 10px 12px;
-    max-height: 180px;
+    border-top: 1px solid #1a202c;
+    padding: 4px 6px;
+    flex-shrink: 0;
+    background: #0f1217;
+  }
+
+  .characters-toggle-header {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 8px;
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    border-radius: 4px;
+    transition: background 0.1s, color 0.1s;
+  }
+
+  .characters-toggle-header:hover {
+    background: #161c24;
+    color: #e2e8f0;
+  }
+
+  .characters-state-hint {
+    font-size: 10px;
+    color: #475569;
+    text-transform: lowercase;
   }
 
   .char-chips {
     display: flex;
     flex-wrap: wrap;
-    gap: 5px;
-    max-height: 130px;
+    gap: 4px;
+    padding: 6px 8px 8px 8px;
+    max-height: 140px;
     overflow-y: auto;
   }
 
@@ -1706,10 +1769,10 @@
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    background: #181c24;
-    border: 1px solid #28303d;
-    padding: 3px 6px;
-    border-radius: 5px;
+    background: #141822;
+    border: 1px solid #202838;
+    padding: 2px 6px;
+    border-radius: 4px;
     font-size: 11px;
   }
 
