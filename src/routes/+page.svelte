@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { 
+    Folder,
     FolderOpen, 
     FileText, 
     CheckCircle2, 
@@ -20,6 +21,7 @@
     Layers,
     ArrowUpRight,
     ChevronRight,
+    ChevronDown,
     Network
   } from "lucide-svelte";
 
@@ -94,6 +96,163 @@
   let project = $state<ProjectSummary | null>(null);
   let selectedFile = $state<TranslationFile | null>(null);
   let currentFile = $state<ParsedFile | null>(null);
+
+  // Структура узла дерева файлов
+  interface FileTreeNode {
+    id: string;
+    name: string;
+    path: string;
+    isFolder: boolean;
+    file?: TranslationFile;
+    children: FileTreeNode[];
+    totalLines: number;
+    translatedLines: number;
+    level: number;
+  }
+
+  let fileSearchFilter = $state("");
+  let expandedFolders = $state<Record<string, boolean>>({
+    "script": true,
+    "script/locations": true
+  });
+
+  function toggleFolder(path: string) {
+    expandedFolders[path] = !expandedFolders[path];
+  }
+
+  function isFolderExpanded(path: string): boolean {
+    return !!expandedFolders[path];
+  }
+
+  function expandAllFolders() {
+    if (!project) return;
+    for (const f of project.files) {
+      const parts = f.name.replace(/\\/g, '/').split('/');
+      let cur = '';
+      for (let i = 0; i < parts.length - 1; i++) {
+        cur = cur ? `${cur}/${parts[i]}` : parts[i];
+        expandedFolders[cur] = true;
+      }
+    }
+  }
+
+  function collapseAllFolders() {
+    expandedFolders = {};
+  }
+
+  function expandParentsForFile(fileNameOrPath: string) {
+    const parts = fileNameOrPath.replace(/\\/g, '/').split('/');
+    let cur = '';
+    for (let i = 0; i < parts.length - 1; i++) {
+      cur = cur ? `${cur}/${parts[i]}` : parts[i];
+      expandedFolders[cur] = true;
+    }
+  }
+
+  function scrollToActiveFile(filePath: string) {
+    const domId = `sidebar-file-${encodeURIComponent(filePath).replace(/%/g, '_')}`;
+    setTimeout(() => {
+      const el = document.getElementById(domId);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        el.classList.remove('file-highlight-pulse');
+        void el.offsetWidth;
+        el.classList.add('file-highlight-pulse');
+      }
+    }, 70);
+  }
+
+  function buildFileTree(files: TranslationFile[], filter: string): FileTreeNode[] {
+    const rootNodes: FileTreeNode[] = [];
+    const folderMap = new Map<string, FileTreeNode>();
+
+    const normalizedFilter = filter.trim().toLowerCase();
+    const filteredFiles = normalizedFilter
+      ? files.filter(f => f.name.toLowerCase().includes(normalizedFilter) || f.path.toLowerCase().includes(normalizedFilter))
+      : files;
+
+    for (const file of filteredFiles) {
+      const parts = file.name.replace(/\\/g, '/').split('/');
+      let currentPath = '';
+
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const isLast = i === parts.length - 1;
+        const prevPath = currentPath;
+        currentPath = currentPath ? `${currentPath}/${part}` : part;
+
+        if (!isLast) {
+          if (!folderMap.has(currentPath)) {
+            const folderNode: FileTreeNode = {
+              id: currentPath,
+              name: part,
+              path: currentPath,
+              isFolder: true,
+              children: [],
+              totalLines: 0,
+              translatedLines: 0,
+              level: i
+            };
+            folderMap.set(currentPath, folderNode);
+
+            if (prevPath) {
+              const parent = folderMap.get(prevPath);
+              if (parent && !parent.children.some(c => c.id === currentPath)) {
+                parent.children.push(folderNode);
+              }
+            } else {
+              rootNodes.push(folderNode);
+            }
+          }
+          const folder = folderMap.get(currentPath)!;
+          folder.totalLines += file.total_lines;
+          folder.translatedLines += file.translated_lines;
+        } else {
+          const fileNode: FileTreeNode = {
+            id: file.path,
+            name: part,
+            path: file.name,
+            isFolder: false,
+            file,
+            children: [],
+            totalLines: file.total_lines,
+            translatedLines: file.translated_lines,
+            level: i
+          };
+
+          if (prevPath) {
+            const parent = folderMap.get(prevPath);
+            if (parent) {
+              parent.children.push(fileNode);
+            }
+          } else {
+            rootNodes.push(fileNode);
+          }
+        }
+      }
+    }
+
+    function sortNodes(nodes: FileTreeNode[]) {
+      nodes.sort((a, b) => {
+        if (a.isFolder !== b.isFolder) {
+          return a.isFolder ? -1 : 1;
+        }
+        return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+      });
+      for (const n of nodes) {
+        if (n.isFolder) {
+          sortNodes(n.children);
+        }
+      }
+    }
+
+    sortNodes(rootNodes);
+    return rootNodes;
+  }
+
+  let fileTree = $derived(
+    project ? buildFileTree(project.files, fileSearchFilter) : []
+  );
 
   // Навигация и фильтрация
   let selectedSceneId = $state<string>("all");
@@ -298,6 +457,8 @@
   // Загрузить выбранный файл
   async function selectFile(file: TranslationFile) {
     selectedFile = file;
+    expandParentsForFile(file.name);
+    scrollToActiveFile(file.path);
     loadingFile = true;
     errorMsg = "";
     try {
@@ -408,35 +569,120 @@
           </div>
         </div>
       {:else if project}
-        <div class="sidebar-section">
+        <!-- ДЕРЕВО ФАЙЛОВ ПРОЕКТА -->
+        <div class="sidebar-section file-tree-section">
           <div class="sidebar-header">
-            <FileText size={14} />
-            <span>ФАЙЛЫ ({project.files.length})</span>
+            <div class="header-left">
+              <FolderOpen size={14} class="text-sky-400" />
+              <span>ФАЙЛЫ ({project.files.length})</span>
+            </div>
+            <div class="header-actions">
+              <button class="icon-btn-subtle" onclick={expandAllFolders} title="Развернуть все папки">⊞</button>
+              <button class="icon-btn-subtle" onclick={collapseAllFolders} title="Свернуть все папки">⊟</button>
+            </div>
           </div>
-          <div class="file-list">
-            {#each project.files as file}
-              <button 
-                class="file-item" 
-                class:active={selectedFile?.path === file.path}
-                onclick={() => selectFile(file)}
-              >
-                <div class="file-title-row">
-                  <span class="file-name">{file.name}</span>
-                  <span class="file-size">{file.size_kb.toFixed(0)} KB</span>
-                </div>
-                <div class="file-progress-row">
-                  <div class="file-track">
-                    <div 
-                      class="file-fill" 
-                      style="width: {file.total_lines > 0 ? (file.translated_lines / file.total_lines) * 100 : 0}%"
-                    ></div>
-                  </div>
-                  <span class="file-stats">{file.translated_lines}/{file.total_lines}</span>
-                </div>
-              </button>
-            {/each}
+
+          <!-- Быстрый поиск файлов по дереву -->
+          <div class="sidebar-search-box">
+            <Search size={13} class="search-box-icon text-slate-500" />
+            <input 
+              type="text" 
+              placeholder="Поиск файла..." 
+              bind:value={fileSearchFilter}
+              class="sidebar-search-input"
+            />
+            {#if fileSearchFilter}
+              <button class="clear-search-pill" onclick={() => fileSearchFilter = ""}>✕</button>
+            {/if}
+          </div>
+
+          <!-- Контейнер дерева файлов -->
+          <div class="file-tree-container">
+            {#if fileTree.length === 0}
+              <div class="empty-tree-hint">
+                <span>Ничего не найдено</span>
+              </div>
+            {:else}
+              {#each fileTree as node}
+                {@render renderTreeNode(node)}
+              {/each}
+            {/if}
           </div>
         </div>
+
+        <!-- Сниппет рекурсивного узла дерева -->
+        {#snippet renderTreeNode(node: FileTreeNode)}
+          {#if node.isFolder}
+            {@const isExp = isFolderExpanded(node.path) || fileSearchFilter.trim() !== ''}
+            {@const pct = node.totalLines > 0 ? Math.round((node.translatedLines / node.totalLines) * 100) : 0}
+            <div class="tree-folder-group">
+              <button 
+                class="tree-folder-row"
+                style="padding-left: calc(6px + {node.level * 12}px);"
+                onclick={() => toggleFolder(node.path)}
+              >
+                <span class="folder-caret">
+                  {#if isExp}
+                    <ChevronDown size={13} />
+                  {:else}
+                    <ChevronRight size={13} />
+                  {/if}
+                </span>
+                <span class="folder-icon-wrap">
+                  {#if isExp}
+                    <FolderOpen size={14} class="text-amber-400" />
+                  {:else}
+                    <Folder size={14} class="text-amber-400/80" />
+                  {/if}
+                </span>
+                <span class="tree-folder-name" title={node.path}>{node.name}</span>
+                <span class="tree-folder-count">({node.children.length})</span>
+                {#if node.totalLines > 0}
+                  <span class="tree-folder-pct" class:badge-complete={pct === 100}>{pct}%</span>
+                {/if}
+              </button>
+
+              {#if isExp}
+                <div class="tree-children-container">
+                  {#each node.children as child}
+                    {@render renderTreeNode(child)}
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {:else if node.file}
+            {@const f = node.file}
+            {@const pct = f.total_lines > 0 ? Math.round((f.translated_lines / f.total_lines) * 100) : 0}
+            {@const isSel = selectedFile?.path === f.path}
+            <button 
+              id={`sidebar-file-${encodeURIComponent(f.path).replace(/%/g, '_')}`}
+              class="file-item file-tree-item"
+              class:active={isSel}
+              style="padding-left: calc(18px + {node.level * 12}px);"
+              onclick={() => selectFile(f)}
+              title="{f.name} ({f.size_kb.toFixed(0)} KB)"
+            >
+              <div class="file-title-row">
+                <div class="file-name-group">
+                  <FileText size={13} class={isSel ? "text-sky-400" : "text-slate-400"} />
+                  <span class="file-name">{node.name}</span>
+                </div>
+                <span class="file-size">{f.size_kb.toFixed(0)} KB</span>
+              </div>
+              <div class="file-progress-row">
+                <div class="file-track">
+                  <div 
+                    class="file-fill" 
+                    style="width: {pct}%"
+                    class:fill-done={pct === 100}
+                  ></div>
+                </div>
+                <span class="file-stats">{f.translated_lines}/{f.total_lines}</span>
+                <span class="file-pct-tag" class:pct-done={pct === 100}>{pct}%</span>
+              </div>
+            </button>
+          {/if}
+        {/snippet}
 
         <!-- Спикеры -->
         <div class="sidebar-section characters-section">
@@ -1166,70 +1412,250 @@
 
   /* SIDEBAR */
   .sidebar {
-    width: 280px;
+    width: 300px;
     background: #111419;
     border-right: 1px solid #1e232d;
     display: flex;
     flex-direction: column;
-    overflow-y: auto;
+    overflow: hidden;
   }
 
-  .sidebar-section {
-    padding: 12px;
+  .file-tree-section {
+    flex: 1;
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    min-height: 0;
+    overflow: hidden;
+    padding: 10px 10px 6px 10px;
   }
 
   .sidebar-header {
     display: flex;
     align-items: center;
-    gap: 6px;
+    justify-content: space-between;
     font-size: 11px;
     font-weight: 600;
     color: #64748b;
     letter-spacing: 0.5px;
+    margin-bottom: 6px;
   }
 
-  .file-list {
+  .header-left {
     display: flex;
-    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .header-actions {
+    display: flex;
+    align-items: center;
     gap: 4px;
   }
 
-  .file-item {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 8px 10px;
+  .icon-btn-subtle {
     background: transparent;
-    border: 1px solid transparent;
-    border-radius: 6px;
+    border: 1px solid #202735;
+    color: #94a3b8;
+    border-radius: 4px;
+    width: 20px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
     cursor: pointer;
-    text-align: left;
-    color: #cbd5e1;
     transition: all 0.15s;
   }
 
-  .file-item:hover {
-    background: #171b22;
+  .icon-btn-subtle:hover {
+    background: #1e2638;
+    color: #38bdf8;
+    border-color: #0284c7;
   }
 
-  .file-item.active {
-    background: #1c222c;
-    border-color: #2e3846;
+  .sidebar-search-box {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #0d1016;
+    border: 1px solid #232c3d;
+    border-radius: 6px;
+    padding: 5px 8px;
+    margin-bottom: 6px;
+  }
+
+  .sidebar-search-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    font-size: 11px;
+    color: #e2e8f0;
+    font-family: inherit;
+  }
+
+  .clear-search-pill {
+    background: transparent;
+    border: none;
+    color: #64748b;
+    font-size: 10px;
+    cursor: pointer;
+    padding: 0 2px;
+  }
+
+  .clear-search-pill:hover {
+    color: #e2e8f0;
+  }
+
+  .file-tree-container {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding-right: 2px;
+  }
+
+  .empty-tree-hint {
+    padding: 16px;
+    text-align: center;
+    color: #64748b;
+    font-size: 12px;
+  }
+
+  .tree-folder-group {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .tree-folder-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 4px 6px;
+    color: #cbd5e1;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.12s;
+    user-select: none;
+  }
+
+  .tree-folder-row:hover {
+    background: #161c26;
+    color: #f1f5f9;
+  }
+
+  .folder-caret {
+    color: #64748b;
+    display: inline-flex;
+    align-items: center;
+    width: 14px;
+    justify-content: center;
+  }
+
+  .folder-icon-wrap {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .tree-folder-name {
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .tree-folder-count {
+    color: #64748b;
+    font-size: 10px;
+  }
+
+  .tree-folder-pct {
+    font-size: 10px;
+    color: #64748b;
+    background: #0f131a;
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+
+  .tree-children-container {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .file-name-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .file-name-group .file-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .file-tree-item {
+    margin: 1px 0;
+    border-radius: 5px;
+    border-left: 3px solid transparent;
+    padding: 5px 8px;
+  }
+
+  .file-tree-item.active {
+    background: #142234 !important;
+    border-color: #1e3a5f !important;
+    border-left: 3px solid #38bdf8 !important;
     color: #f8fafc;
+  }
+
+  /* АНИМАЦИЯ ПОДСВЕТКИ ПРИ НАВИГАЦИИ */
+  @keyframes fileGlowPulse {
+    0% {
+      box-shadow: 0 0 0 2px #38bdf8, 0 0 16px rgba(56, 189, 248, 0.7);
+      background-color: #1e3352;
+    }
+    50% {
+      box-shadow: 0 0 0 2px #0284c7, 0 0 10px rgba(56, 189, 248, 0.35);
+    }
+    100% {
+      box-shadow: 0 0 0 0 transparent, 0 0 0 transparent;
+      background-color: #142234;
+    }
+  }
+
+  .file-highlight-pulse {
+    animation: fileGlowPulse 1.5s ease-out;
+  }
+
+  .file-pct-tag {
+    font-size: 10px;
+    color: #64748b;
+    font-weight: 600;
+  }
+
+  .file-pct-tag.pct-done {
+    color: #34d399;
   }
 
   .file-title-row {
     display: flex;
     justify-content: space-between;
-    font-size: 13px;
+    align-items: center;
+    font-size: 12px;
     font-weight: 500;
   }
 
   .file-size {
-    font-size: 11px;
+    font-size: 10px;
     color: #64748b;
   }
 
@@ -1237,6 +1663,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    margin-top: 2px;
   }
 
   .file-track {
@@ -1252,6 +1679,10 @@
     background: #22c55e;
   }
 
+  .file-fill.fill-done {
+    background: #34d399;
+  }
+
   .file-stats {
     font-size: 10px;
     color: #64748b;
@@ -1259,14 +1690,15 @@
 
   .characters-section {
     border-top: 1px solid #1a1f27;
-    flex: 1;
+    padding: 10px 12px;
+    max-height: 180px;
   }
 
   .char-chips {
     display: flex;
     flex-wrap: wrap;
     gap: 5px;
-    max-height: 160px;
+    max-height: 130px;
     overflow-y: auto;
   }
 
