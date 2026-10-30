@@ -56,6 +56,31 @@ pub fn load(source: &Path) -> Result<HashMap<String, String>, String> {
     Ok(read_store(source, &store_path(source))?.entries)
 }
 
+pub fn has_saved_edits(game_dir: &Path) -> Result<bool, String> {
+    let dir = get_project_cache_dir(game_dir).join("translations");
+    if !dir.exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(&dir)
+        .map_err(|e| format!("Не удалось прочитать папку переводов {:?}: {}", dir, e))?
+    {
+        let path = entry
+            .map_err(|e| format!("Не удалось прочитать запись перевода: {}", e))?
+            .path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = fs::read(&path)
+            .map_err(|e| format!("Не удалось прочитать перевод {:?}: {}", path, e))?;
+        let store: TranslationOverrides = serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Повреждён файл перевода {:?}: {}", path, e))?;
+        if !store.entries.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn save(source: &Path, changes: &[TranslationEdit]) -> Result<(), String> {
     if !source.is_file() || source.extension().and_then(|e| e.to_str()) != Some("rpy") {
         return Err(format!("Исходный .rpy файл не найден: {:?}", source));

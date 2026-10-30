@@ -1079,6 +1079,10 @@ async fn pack_mod_rpa(game_dir: String, output_rpa_path: Option<String>) -> Resu
         };
         ensure_output_outside_game(&out_path, std::slice::from_ref(&base_path))?;
 
+        if translation::has_saved_edits(&base_path)? {
+            return Err("RPA не собран: сохранённые в приложении правки перевода ещё не включаются в архив. Сборка остановлена, чтобы не создать устаревший мод".to_string());
+        }
+
         let count = rpa::RpaArchive::pack_mod_from_folder(&tl_dir, &out_path)?;
         Ok(format!(
             "Мод успешно собран! Упаковано {} файлов в {}",
