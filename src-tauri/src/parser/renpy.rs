@@ -58,17 +58,50 @@ impl RenpyParser {
         self
     }
 
-    /// Извлекает определения персонажей вида `define e = Character("Erika")`
+    /// Извлекает определения персонажей вида `define e = Character("Erika")`,
+    /// `e = Character('Erika')`, `player = Chars('Jack')`, и т.д.
     pub fn extract_speakers(content: &str) -> HashMap<String, String> {
-        let re = Regex::new(r#"^\s*define\s+(\w+)\s*=\s*Character\(\s*[_(\s]*['"]([^'"]+)['"]"#).unwrap();
+        let re_char = Regex::new(
+            r#"(?:define\s+|\$\s*)?([A-Za-z_]\w*)\s*=\s*(?:renpy\.)?(?:Character|DynamicCharacter|adv_character)\s*\(\s*[_(\s]*['"]([^'"]+)['"]"#
+        ).unwrap();
+        let re_custom_chars = Regex::new(
+            r#"(?:define\s+|\$\s*)?([A-Za-z_]\w*)\s*=\s*Chars\s*\(\s*['"]([^'"]+)['"]"#
+        ).unwrap();
+
         let mut map = HashMap::new();
+        let mut custom_names: HashMap<String, String> = HashMap::new();
+
         for line in content.lines() {
-            if let Some(caps) = re.captures(line) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            if let Some(caps) = re_char.captures(trimmed) {
                 let alias = caps.get(1).unwrap().as_str().to_string();
                 let name = caps.get(2).unwrap().as_str().to_string();
-                map.insert(alias, name);
+                if name != "none" && !name.is_empty() {
+                    map.insert(alias, name);
+                }
+            } else if let Some(caps) = re_custom_chars.captures(trimmed) {
+                let alias = caps.get(1).unwrap().as_str().to_string();
+                let name = caps.get(2).unwrap().as_str().to_string();
+                if name != "none" && !name.is_empty() {
+                    custom_names.insert(alias.clone(), name.clone());
+                    map.insert(alias, name);
+                }
             }
         }
+
+        // Подставляем реальные имена переменных (например [player.name] -> Jack)
+        if let Some(player_name) = custom_names.get("player") {
+            for (_, v) in map.iter_mut() {
+                if v == "[player.name]" || v == "[player]" {
+                    *v = player_name.clone();
+                }
+            }
+        }
+
         map
     }
 

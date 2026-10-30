@@ -296,8 +296,20 @@ impl RpaArchive {
         target_cache_dir: &Path,
     ) -> Result<usize, String> {
         let archive = Self::open(rpa_path)?;
+
+        const CACHE_VERSION: &str = "v2_characters_defines";
+        let version_marker = target_cache_dir.join(".cache_version");
+        let need_refresh = !version_marker.exists()
+            || std::fs::read_to_string(&version_marker).unwrap_or_default() != CACHE_VERSION;
+
+        if need_refresh && target_cache_dir.exists() {
+            let _ = fs::remove_dir_all(target_cache_dir);
+        }
+
         fs::create_dir_all(target_cache_dir)
             .map_err(|e| format!("Ошибка создания папки кэша {:?}: {}", target_cache_dir, e))?;
+
+        let _ = fs::write(&version_marker, CACHE_VERSION);
 
         let mut script_entries: Vec<RpaEntry> = Vec::new();
         let mut existing_rpy_basenames: std::collections::HashSet<String> = std::collections::HashSet::new();

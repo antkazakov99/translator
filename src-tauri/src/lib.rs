@@ -148,12 +148,12 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
             collect_rpy_files(&cache_dir, &mut script_files);
         }
 
-        let characters_map: std::collections::HashMap<String, String> = script_files
-            .into_par_iter()
+        let mut characters_map: std::collections::HashMap<String, String> = script_files
+            .par_iter()
             .filter_map(|path| {
                 let path_str = path.to_string_lossy();
                 if !path_str.contains(r"\tl\") && !path_str.contains("/tl/") {
-                    std::fs::read_to_string(&path).ok().map(|content| RenpyParser::extract_speakers(&content))
+                    std::fs::read_to_string(path).ok().map(|content| RenpyParser::extract_speakers(&content))
                 } else {
                     None
                 }
@@ -162,6 +162,15 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                 acc.extend(map);
                 acc
             });
+
+        // Подставляем имя главного героя вместо шаблонных переменных вроде [player.name]
+        if let Some(player_name) = characters_map.get("player").cloned() {
+            for (_, v) in characters_map.iter_mut() {
+                if v == "[player.name]" || v == "[player]" {
+                    *v = player_name.clone();
+                }
+            }
+        }
 
         let mut characters: Vec<(String, String)> = characters_map.into_iter().collect();
         characters.sort_by(|a, b| a.1.cmp(&b.1));
@@ -182,6 +191,9 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                     let content = std::fs::read_to_string(&path).ok()?;
                     let size_kb = content.len() as f64 / 1024.0;
                     let (total, translated) = RenpyParser::quick_translation_stats(&content);
+                    if total == 0 {
+                        return None; // Фильтруем пустые файлы перевода без строк диалогов!
+                    }
                     let relative_name = path
                         .strip_prefix(&tl_dir)
                         .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -217,6 +229,9 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                     let content = std::fs::read_to_string(&path).ok()?;
                     let size_kb = content.len() as f64 / 1024.0;
                     let (total, translated) = RenpyParser::quick_translation_stats(&content);
+                    if total == 0 {
+                        return None; // Фильтруем пустые скрипты (анимации, внутренние переменные, спеллы)!
+                    }
                     let relative_name = path
                         .strip_prefix(&cache_dir)
                         .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -241,6 +256,42 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
             files = parsed_cached;
         }
 
+        // 5. Если в tl/russian пусто и нет RPA, но есть распакованные .rpy в папке игры
+        if files.is_empty() && !script_files.is_empty() {
+            let mut parsed_loose: Vec<TranslationFileItem> = script_files
+                .into_par_iter()
+                .filter(|p| !p.starts_with(&cache_dir))
+                .filter_map(|path| {
+                    let content = std::fs::read_to_string(&path).ok()?;
+                    let size_kb = content.len() as f64 / 1024.0;
+                    let (total, translated) = RenpyParser::quick_translation_stats(&content);
+                    if total == 0 {
+                        return None; // Фильтруем скрипты без диалогов
+                    }
+                    let relative_name = path
+                        .strip_prefix(base_path)
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().to_string());
+
+                    Some(TranslationFileItem {
+                        name: relative_name,
+                        path: path.to_string_lossy().to_string(),
+                        size_kb,
+                        total_lines: total,
+                        translated_lines: translated,
+                    })
+                })
+                .collect();
+
+            for f in &parsed_loose {
+                grand_total += f.total_lines;
+                grand_translated += f.translated_lines;
+            }
+
+            parsed_loose.sort_by(|a, b| b.size_kb.partial_cmp(&a.size_kb).unwrap_or(std::cmp::Ordering::Equal));
+            files = parsed_loose;
+        }
+
         Ok(ProjectSummary {
             game_name: base_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
             characters,
@@ -260,7 +311,22 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
 
-        let parser = RenpyParser::new();
+        let mut speakers_map = std::collections::HashMap::new();
+        if let Some(parent) = path.parent() {
+            let mut search_dir = parent.to_path_buf();
+            while search_dir.parent().is_some() && (search_dir.ends_with(r"tl\russian") || search_dir.ends_with("tl/russian")) {
+                search_dir = search_dir.parent().unwrap().to_path_buf();
+            }
+            let mut check_files = Vec::new();
+            collect_rpy_files(&search_dir, &mut check_files);
+            for f in check_files.into_iter().take(40) {
+                if let Ok(c) = std::fs::read_to_string(&f) {
+                    speakers_map.extend(RenpyParser::extract_speakers(&c));
+                }
+            }
+        }
+
+        let parser = RenpyParser::new().with_speakers(speakers_map);
         let graph = parser.parse_file(path, &content)
             .map_err(|e| format!("Ошибка парсинга: {}", e))?;
 
@@ -739,6 +805,35 @@ mod tests {
             assert!(!Path::new(game_dir).join("bquest1.rpy").exists(), "Архив не должен распаковываться в папку игры");
             assert!(!Path::new(game_dir).join("mgquest1.rpy").exists(), "Архив не должен распаковываться в папку игры");
             println!("Папка игры чиста: 0 файлов распаковано в корень игры!");
+        });
+    }
+
+    #[test]
+    fn test_scan_lust_and_power() {
+        tauri::async_runtime::block_on(async {
+            let game_dir = r"F:\Games\Lust and Power\Lust and Power (0.75)\game";
+            if !Path::new(game_dir).exists() {
+                return;
+            }
+
+            let start = std::time::Instant::now();
+            let summary = scan_game_project(game_dir.to_string()).await.unwrap();
+            println!(
+                "Lust and Power отсканирована за {:?}! Файлов: {}, всего строк: {}, персонажей: {}",
+                start.elapsed(), summary.files.len(), summary.total_lines, summary.characters.len()
+            );
+
+            let empty_count = summary.files.iter().filter(|f| f.total_lines == 0).count();
+            println!("Файлов с 0 строк диалогов: {}", empty_count);
+            assert_eq!(empty_count, 0, "Все пустые файлы с 0 строк диалогов должны быть отфильтрованы!");
+
+            println!("Извлеченные персонажи (всего {}):", summary.characters.len());
+            for (alias, name) in summary.characters.iter().take(25) {
+                println!("  [{}] -> {}", alias, name);
+            }
+            assert!(!summary.characters.is_empty(), "Персонажи должны быть успешно извлечены!");
+            assert!(summary.characters.iter().any(|(a, n)| a == "lis" && n == "Lisa"), "Lisa должна быть найдена");
+            assert!(summary.characters.iter().any(|(a, n)| a == "emm" && n == "Emma"), "Emma должна быть найдена");
         });
     }
 }

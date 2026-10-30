@@ -249,6 +249,66 @@ impl RpycParser {
                             Self::extract_statements_from_pickle(block_val, current_scene, stmts);
                         }
                     }
+                    "Define" => {
+                        let varname = Self::get_field_str(state.as_deref(), args, "varname")
+                            .unwrap_or_default();
+                        let code_str = Self::get_field_val(state.as_deref(), "code")
+                            .and_then(Self::extract_pycode_source)
+                            .unwrap_or_default();
+                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        if !varname.is_empty() {
+                            stmts.push(RpycStatement {
+                                kind: "define".to_string(),
+                                scene_name: varname.clone(),
+                                speaker: Some(varname),
+                                text: code_str,
+                                line_number,
+                                target: None,
+                            });
+                        }
+                    }
+                    "Default" => {
+                        let varname = Self::get_field_str(state.as_deref(), args, "varname")
+                            .unwrap_or_default();
+                        let code_str = Self::get_field_val(state.as_deref(), "code")
+                            .and_then(Self::extract_pycode_source)
+                            .unwrap_or_default();
+                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        if !varname.is_empty() {
+                            stmts.push(RpycStatement {
+                                kind: "default".to_string(),
+                                scene_name: varname.clone(),
+                                speaker: None,
+                                text: code_str,
+                                line_number,
+                                target: None,
+                            });
+                        }
+                    }
+                    "Python" | "EarlyPython" => {
+                        let code_val = Self::get_field_val(state.as_deref(), "code");
+                        let py_source = code_val
+                            .and_then(Self::extract_pycode_source)
+                            .unwrap_or_default();
+                        let line_number = Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        if !py_source.is_empty() {
+                            stmts.push(RpycStatement {
+                                kind: "python".to_string(),
+                                scene_name: current_scene.clone(),
+                                speaker: None,
+                                text: py_source,
+                                line_number,
+                                target: None,
+                            });
+                        }
+                    }
+                    "Init" => {
+                        if let Some(block_val) = Self::get_field_val(state.as_deref(), "block") {
+                            Self::extract_statements_from_pickle(block_val, current_scene, stmts);
+                        } else if let Some(st) = state {
+                            Self::extract_statements_from_pickle(st, current_scene, stmts);
+                        }
+                    }
                     _ => {
                         // Для других узлов рекурсивно проверяем состояние
                         if let Some(st) = state {
@@ -322,6 +382,52 @@ impl RpycParser {
         None
     }
 
+    /// Рекурсивно извлекает исходный код из PyCode или PyExpr объекта pickle
+    pub fn extract_pycode_source(val: &PickleValue) -> Option<String> {
+        match val {
+            PickleValue::String(s) => Some(s.clone()),
+            PickleValue::Object {
+                class_name,
+                state,
+                args,
+                ..
+            } => {
+                if class_name == "PyExpr" {
+                    if let Some(first) = args.first() {
+                        if let Some(s) = first.as_str() {
+                            return Some(s.to_string());
+                        }
+                    }
+                }
+                if let Some(st) = state {
+                    if let Some(s) = Self::extract_pycode_source(st) {
+                        return Some(s);
+                    }
+                }
+                for a in args {
+                    if let Some(s) = Self::extract_pycode_source(a) {
+                        return Some(s);
+                    }
+                }
+                None
+            }
+            PickleValue::Tuple(items) | PickleValue::List(items) => {
+                if items.len() >= 2 {
+                    if let Some(s) = Self::extract_pycode_source(&items[1]) {
+                        return Some(s);
+                    }
+                }
+                for item in items {
+                    if let Some(s) = Self::extract_pycode_source(item) {
+                        return Some(s);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
     /// Декомпилирует список инструкций в валидный текстовый скрипт .rpy
     pub fn decompile_to_rpy_text(statements: &[RpycStatement]) -> String {
         let mut out = String::new();
@@ -352,6 +458,20 @@ impl RpycParser {
                 "call" => {
                     if let Some(ref target) = stmt.target {
                         out.push_str(&format!("    call {}\n", target));
+                    }
+                }
+                "define" => {
+                    out.push_str(&format!("define {} = {}\n", stmt.scene_name, stmt.text));
+                }
+                "default" => {
+                    out.push_str(&format!("default {} = {}\n", stmt.scene_name, stmt.text));
+                }
+                "python" => {
+                    for line in stmt.text.lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            out.push_str(&format!("$ {}\n", trimmed));
+                        }
                     }
                 }
                 _ => {}
@@ -405,16 +525,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_real_blank_rpyc() {
-        let blank_path = Path::new(r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\blank.rpyc");
-        if !blank_path.exists() {
+    fn test_inspect_init_chars_rpyc() {
+        let path = Path::new(r"F:\Games\Lust and Power\Lust and Power (0.75)\game\archive.rpa");
+        if !path.exists() {
             return;
         }
 
-        let stmts = RpycParser::parse_rpyc_file(blank_path).expect("Ошибка парсинга blank.rpyc");
-        let decompiled = RpycParser::decompile_to_rpy_text(&stmts);
-        assert!(!decompiled.is_empty());
-        println!("Decompiled blank.rpyc:\n{}", decompiled);
+        let archive = crate::rpa::RpaArchive::open(path).unwrap();
+
+        // Тестируем декомпиляцию define_vars.rpyc с извлечением Define
+        if let Some(entry) = archive.entries.get("___sys/_vars/define_vars.rpyc") {
+            let mut file = fs::File::open(path).unwrap();
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(entry.offset)).unwrap();
+            let mut payload = vec![0u8; entry.length as usize];
+            file.read_exact(&mut payload).unwrap();
+
+            let stmts = RpycParser::parse_rpyc_bytes(&payload).unwrap();
+            let defines = stmts.iter().filter(|s| s.kind == "define").count();
+            println!("Декомпиляция define_vars.rpyc: инструкций {}, из них define: {}", stmts.len(), defines);
+            assert!(defines > 0, "Должны быть извлечены Define инструкции!");
+
+            let decompiled = RpycParser::decompile_to_rpy_text(&stmts);
+            assert!(decompiled.contains("define lis = Character('Lisa'"));
+            assert!(decompiled.contains("define emm = Character('Emma'"));
+            println!("Успешно декомпилированы персонажи (Lisa, Emma) в define_vars.rpy!");
+        }
+
+        // Тестируем декомпиляцию init_Chars.rpyc с извлечением Python
+        if let Some(entry) = archive.entries.get("___sys/_vars/init_Chars.rpyc") {
+            let mut file = fs::File::open(path).unwrap();
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(entry.offset)).unwrap();
+            let mut payload = vec![0u8; entry.length as usize];
+            file.read_exact(&mut payload).unwrap();
+
+            let stmts = RpycParser::parse_rpyc_bytes(&payload).unwrap();
+            let py_stmts = stmts.iter().filter(|s| s.kind == "python").count();
+            println!("Декомпиляция init_Chars.rpyc: инструкций {}, из них python: {}", stmts.len(), py_stmts);
+            assert!(py_stmts > 0, "Должны быть извлечены Python инструкции!");
+
+            let decompiled = RpycParser::decompile_to_rpy_text(&stmts);
+            assert!(decompiled.contains("player") && decompiled.contains("Chars('Jack'"));
+            println!("Успешно декомпилирован главный герой Jack в init_Chars.rpy!");
+        }
     }
 
     #[test]
