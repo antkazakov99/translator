@@ -34,6 +34,11 @@
     notes: string;
   }
 
+  interface AutofillResult<T> {
+    items: T[];
+    failed_batches: number;
+  }
+
   let {
     show = false,
     gameDir = "",
@@ -148,6 +153,10 @@
     }
   }
 
+  function failedBatchesMessage(count: number) {
+    return `Часть ответов модели не удалось разобрать (пакетов с ошибкой: ${count}). Эти записи остались без изменений, запустите обработку ещё раз.`;
+  }
+
   async function startCharactersAutofill() {
     isProcessing = true;
     errorMessage = null;
@@ -155,7 +164,7 @@
     saveSettings();
 
     try {
-      const updated = await invoke<CharacterGlossaryEntry[]>("autofill_glossary_characters", {
+      const { items: updated, failed_batches: failedBatches } = await invoke<AutofillResult<CharacterGlossaryEntry>>("autofill_glossary_characters", {
         gameDir,
         apiUrl: apiUrl.trim(),
         model: selectedModel.trim(),
@@ -181,6 +190,7 @@
       statsSummary.updatedChars = changedCount;
       hasResults = true;
       progressStep = `Готово! Обновлено персонажей: ${changedCount}`;
+      if (failedBatches > 0) errorMessage = failedBatchesMessage(failedBatches);
     } catch (e) {
       errorMessage = `Не удалось заполнить персонажей: ${String(e)}`;
     } finally {
@@ -220,7 +230,7 @@
       }
 
       progressStep = "Перевод и категоризация терминов через LLM...";
-      const updated = await invoke<TermGlossaryEntry[]>("autofill_glossary_terms", {
+      const { items: updated, failed_batches: failedBatches } = await invoke<AutofillResult<TermGlossaryEntry>>("autofill_glossary_terms", {
         apiUrl: apiUrl.trim(),
         model: selectedModel.trim(),
         terms: currentTermsList,
@@ -239,6 +249,7 @@
       statsSummary.updatedTerms = changedCount + newExtractedCount;
       hasResults = true;
       progressStep = `Готово! Терминов обновлено/добавлено: ${statsSummary.updatedTerms}`;
+      if (failedBatches > 0) errorMessage = failedBatchesMessage(failedBatches);
     } catch (e) {
       errorMessage = `Не удалось обработать термины: ${String(e)}`;
     } finally {

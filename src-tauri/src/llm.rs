@@ -7,6 +7,14 @@ use std::path::Path;
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// Результат пакетного автозаполнения. Сбой отдельного пакета не отменяет
+/// уже полученные переводы, поэтому число сбоев передаётся интерфейсу.
+#[derive(Debug, Serialize)]
+pub struct AutofillResult<T> {
+    pub items: Vec<T>,
+    pub failed_batches: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
@@ -201,23 +209,17 @@ async fn call_chat_completion(
     Ok(text)
 }
 
-/// Очищает строку ответа нейросети от Markdown-блоков (```json ... ```)
+/// Находит в ответе нейросети первый JSON-массив объектов: вне зависимости от
+/// Markdown-блоков, пояснений и объекта-обёртки вида `{"items":[...]}`
 fn extract_json_content(raw: &str) -> &str {
     let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix("```json") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim();
-        }
-    }
-    if let Some(rest) = trimmed.strip_prefix("```") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim();
-        }
-    }
-    // Если внутри есть [ ... ], вырезаем JSON массив
-    if let (Some(start), Some(end)) = (trimmed.find('['), trimmed.rfind(']')) {
-        if start < end {
-            return &trimmed[start..=end];
+    for (start, _) in trimmed.match_indices('[') {
+        let mut values =
+            serde_json::Deserializer::from_str(&trimmed[start..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(serde_json::Value::Array(items))) = values.next()
+            && items.iter().all(serde_json::Value::is_object)
+        {
+            return &trimmed[start..start + values.byte_offset()];
         }
     }
     trimmed
@@ -286,7 +288,7 @@ pub async fn autofill_characters(
     mut characters: Vec<CharacterGlossaryEntry>,
     only_empty: bool,
     samples: HashMap<String, Vec<String>>,
-) -> Result<Vec<CharacterGlossaryEntry>, String> {
+) -> Result<AutofillResult<CharacterGlossaryEntry>, String> {
     // Выбираем только те, что нуждаются в обработке
     let indices_to_process: Vec<usize> = characters
         .iter()
@@ -304,7 +306,10 @@ pub async fn autofill_characters(
         .collect();
 
     if indices_to_process.is_empty() {
-        return Ok(characters);
+        return Ok(AutofillResult {
+            items: characters,
+            failed_batches: 0,
+        });
     }
 
     info!(
@@ -335,6 +340,7 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
 
     // Обрабатываем пачками по 15 персонажей, чтобы не перегружать контекст модели
     const BATCH_SIZE: usize = 15;
+    let mut failed_batches = 0;
     for chunk in indices_to_process.chunks(BATCH_SIZE) {
         let mut user_prompt = String::from("Characters to translate and determine gender:\n\n");
         for &idx in chunk {
@@ -377,6 +383,7 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
                     e, raw_response
                 );
                 // Пробуем продолжить без падения
+                failed_batches += 1;
                 continue;
             }
         };
@@ -421,7 +428,10 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
         }
     }
 
-    Ok(characters)
+    Ok(AutofillResult {
+        items: characters,
+        failed_batches,
+    })
 }
 
 /// Автозаполнение и перевод терминов в глоссарии через LLM
@@ -430,7 +440,7 @@ pub async fn autofill_terms(
     model: &str,
     mut terms: Vec<TermGlossaryEntry>,
     only_empty: bool,
-) -> Result<Vec<TermGlossaryEntry>, String> {
+) -> Result<AutofillResult<TermGlossaryEntry>, String> {
     let indices_to_process: Vec<usize> = terms
         .iter()
         .enumerate()
@@ -445,7 +455,10 @@ pub async fn autofill_terms(
         .collect();
 
     if indices_to_process.is_empty() {
-        return Ok(terms);
+        return Ok(AutofillResult {
+            items: terms,
+            failed_batches: 0,
+        });
     }
 
     info!(
@@ -470,6 +483,7 @@ Respond ONLY with a valid JSON array of objects:
 ]"#;
 
     const BATCH_SIZE: usize = 20;
+    let mut failed_batches = 0;
     for chunk in indices_to_process.chunks(BATCH_SIZE) {
         let mut user_prompt = String::from("Terms to translate into Russian:\n\n");
         for &idx in chunk {
@@ -496,6 +510,7 @@ Respond ONLY with a valid JSON array of objects:
             Ok(parsed) => parsed,
             Err(e) => {
                 warn!("Не удалось распарсить JSON терминов от LLM: {}", e);
+                failed_batches += 1;
                 continue;
             }
         };
@@ -530,7 +545,10 @@ Respond ONLY with a valid JSON array of objects:
         }
     }
 
-    Ok(terms)
+    Ok(AutofillResult {
+        items: terms,
+        failed_batches,
+    })
 }
 
 /// Сканирует текст игры и извлекает ключевые термины, локации и титулы через LLM
@@ -663,6 +681,17 @@ mod tests {
 
         let with_text = format!("Here is the JSON:\n{}\nHope it helps!", clean);
         assert_eq!(extract_json_content(&with_text), clean);
+
+        let fenced_with_text = format!("Response:\n```json\n{}\n```\nEnjoy!", clean);
+        assert_eq!(extract_json_content(&fenced_with_text), clean);
+
+        let wrapped = format!(r#"{{"items":{},"total":1}}"#, clean);
+        assert_eq!(extract_json_content(&wrapped), clean);
+
+        let numbered_note = format!("Found [3] names [1]:\n{}\nSee [2].", clean);
+        assert_eq!(extract_json_content(&numbered_note), clean);
+
+        assert_eq!(extract_json_content("  no json here "), "no json here");
     }
 
     #[test]
