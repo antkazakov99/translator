@@ -1,5 +1,7 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import { FileCode, Loader2, Clapperboard } from 'lucide-svelte';
+  import SceneNodeIcon from './SceneNodeIcon.svelte';
   import {
     buildSceneGraph,
     NODE_WIDTH,
@@ -17,7 +19,12 @@
     onselect,
     onnavigate,
     onopen,
+    onviewcode,
+    onback,
+    showSidebar = false,
+    ontogglesidebar = null,
     busy = false,
+    busyTarget = null,
   }: {
     scenes: GraphScene[];
     edges: GraphEdge[];
@@ -25,8 +32,22 @@
     onselect: (scene: GraphScene) => void;
     onnavigate: (name: string) => void;
     onopen: (id: string) => void;
+    onviewcode?: (scene: GraphScene) => void;
+    onback?: (() => void) | null;
+    showSidebar?: boolean;
+    ontogglesidebar?: (() => void) | null;
     busy?: boolean;
+    busyTarget?: string | null;
   } = $props();
+
+  let localBusyTarget = $state<string | null>(null);
+
+  // Сбрасываем локальный таргет поиска, когда операция навигации завершена
+  $effect(() => {
+    if (!busy) {
+      localBusyTarget = null;
+    }
+  });
 
   let zoom = $state(1);
   let viewport: HTMLDivElement;
@@ -149,6 +170,7 @@
     if (node.scene) {
       onselect(node.scene);
     } else {
+      localBusyTarget = node.name;
       onnavigate(node.name);
     }
   }
@@ -158,12 +180,49 @@
   <!-- Верхний тулбар графа -->
   <div class="toolbar">
     <div class="toolbar-info">
+      {#if !showSidebar && ontogglesidebar}
+        <button
+          type="button"
+          class="btn-sidebar-burger"
+          onclick={ontogglesidebar}
+          title="Показать список сцен"
+        >
+          <Clapperboard size={14} />
+        </button>
+        <div class="subtoolbar-divider"></div>
+      {/if}
+      {#if onback}
+        <button
+          type="button"
+          class="btn-graph-back"
+          onclick={onback}
+          disabled={busy}
+          title="Вернуться к предыдущему графу сценария"
+        >
+          ← Назад к графу
+        </button>
+        <div class="subtoolbar-divider"></div>
+      {/if}
       {#if selected}
-        <span class="focus-title-badge">🎯 Сцена:</span>
-        <strong class="focus-scene-name">{selected.name}</strong>
-        <span class="info-sep">·</span>
+        <div class="toolbar-scene-heading">
+          <SceneNodeIcon scene={selected} size={13} />
+          <span class="focus-title-badge">Сцена:</span>
+          <strong class="focus-scene-name" title={selected.name}>{selected.name}</strong>
+          {#if onviewcode}
+            <button
+              type="button"
+              class="btn-toolbar-code"
+              onclick={() => onviewcode?.(selected!)}
+              title="Посмотреть исходный код сцены в файле (.rpy)"
+            >
+              <FileCode size={11} />
+              <span>Код</span>
+            </button>
+          {/if}
+        </div>
+        <div class="subtoolbar-divider"></div>
         <span class="info-stat">← Входов: <strong>{graph.incomingTotalRaw}</strong></span>
-        <span class="info-sep">·</span>
+        <div class="subtoolbar-divider"></div>
         <span class="info-stat">Выходов: <strong>{graph.outgoingTotalRaw}</strong> →</span>
       {/if}
     </div>
@@ -179,6 +238,7 @@
           >{size}</button>
         {/each}
       </div>
+      <div class="subtoolbar-divider"></div>
       <button onclick={() => setZoom(zoom / 1.2)} aria-label="Уменьшить масштаб">−</button>
       <button onclick={() => setZoom(1)} title="Масштаб 100%">{Math.round(zoom * 100)}%</button>
       <button onclick={() => setZoom(zoom * 1.2)} aria-label="Увеличить масштаб">+</button>
@@ -371,8 +431,8 @@
             </div>
           {/if}
 
-        <!-- SVG-связи между узлами -->
-        <svg width={graph.width} height={graph.height} aria-label="Связи между сценами">
+        <!-- SVG-связи между узлами (под карточками) -->
+        <svg class="graph-connections-svg" width={graph.width} height={graph.height} aria-hidden="true">
           <defs>
             <marker
               id="scene-arrow"
@@ -382,7 +442,17 @@
               refY="4"
               orient="auto-start-reverse"
             >
-              <path d="M 0 0 L 8 4 L 0 8 z" fill="#94a3b8" />
+              <path d="M 0 0 L 8 4 L 0 8 z" fill="#64748b" />
+            </marker>
+            <marker
+              id="scene-arrow-choice"
+              markerWidth="8"
+              markerHeight="8"
+              refX="7"
+              refY="4"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 0 L 8 4 L 0 8 z" fill="#8b5cf6" />
             </marker>
             <marker
               id="scene-arrow-active"
@@ -398,20 +468,18 @@
 
           {#each graph.links as edge (edge.id)}
             {@const isRelated = edge.from === selected?.name || edge.to === selected?.name}
+            {@const isChoice = edge.kind === 'choice' || edge.kind === 'branch'}
             <g
+              class="edge-path-group"
               class:related={isRelated}
-              class:branch={edge.kind === 'choice' || edge.kind === 'branch'}
+              class:branch={isChoice}
             >
               <path
                 d={edge.path}
                 fill="none"
                 stroke-width={isRelated ? "2.5" : "1.8"}
-                marker-end={isRelated ? "url(#scene-arrow-active)" : "url(#scene-arrow)"}
+                marker-end={isRelated ? "url(#scene-arrow-active)" : isChoice ? "url(#scene-arrow-choice)" : "url(#scene-arrow)"}
               />
-              <text x={edge.labelX} y={edge.labelY} text-anchor="middle">
-                <title>{edge.condition || edge.kind}: {edge.from} → {edge.to}</title>
-                {(edge.condition || edge.kind).slice(0, 28)}{(edge.condition?.length ?? 0) > 28 ? '…' : ''}
-              </text>
             </g>
           {/each}
         </svg>
@@ -420,6 +488,7 @@
         {#each graph.nodes as node (node.id)}
           {@const isCenter = node.role === 'center' || node.scene?.id === selected?.id}
           {@const isExternal = !node.scene}
+          {@const isThisNodeBusy = isExternal && busy && ((busyTarget != null && busyTarget === node.name) || localBusyTarget === node.name)}
           {@const pct = node.scene && node.scene.total_lines > 0
             ? Math.round((node.scene.translated_lines / node.scene.total_lines) * 100)
             : 0}
@@ -430,6 +499,7 @@
             class:role-incoming={node.role === 'incoming'}
             class:role-outgoing={node.role === 'outgoing'}
             class:external={isExternal}
+            class:navigating={isThisNodeBusy}
             style:left={`${node.x}px`}
             style:top={`${node.y}px`}
             style:width={`${NODE_WIDTH}px`}
@@ -437,6 +507,7 @@
           >
             <button
               class="node-main"
+              class:is-navigating={isThisNodeBusy}
               disabled={busy && isExternal}
               onclick={() => handleNodeClick(node)}
               title={node.name}
@@ -460,12 +531,15 @@
                 </small>
               </div>
 
-              <strong class="node-name">{node.name}</strong>
+              <strong class="node-name">
+                <SceneNodeIcon scene={node.scene} isExternal={isExternal} size={13} />
+                <span>{node.name}</span>
+              </strong>
 
               <span class="preview">
                 {node.scene?.entries[0]?.original_text ||
                   (isExternal
-                    ? 'Метка в другом файле: нажмите для перехода'
+                    ? (isThisNodeBusy ? 'Поиск перехода по файлам проекта...' : 'Метка в другом файле: нажмите для перехода')
                     : (node.scene?.choices?.length ? 'Меню выбора (без реплик персонажей)' : 'Маршрутизатор сюжета (без реплик)'))}
               </span>
             </button>
@@ -476,71 +550,102 @@
                   <span class="node-stats">
                     {node.scene.translated_lines}/{node.scene.total_lines} строк ({pct}%)
                   </span>
-                  <button
-                    class="btn-open-dialogues"
-                    onclick={() => onopen(node.scene!.id)}
-                    title="Открыть диалоги сцены в таблице"
-                  >
-                    Диалоги →
-                  </button>
+                  <div class="node-footer-btns">
+                    {#if onviewcode}
+                      <button
+                        type="button"
+                        class="btn-code-node"
+                        onclick={(e) => { e.stopPropagation(); onviewcode?.(node.scene!); }}
+                        title="Посмотреть исходный код сцены в файле (.rpy)"
+                      >
+                        <FileCode size={11} />
+                        <span>Код</span>
+                      </button>
+                    {/if}
+                    <button
+                      class="btn-open-dialogues"
+                      onclick={() => onopen(node.scene!.id)}
+                      title="Открыть диалоги сцены в таблице"
+                    >
+                      Диалоги →
+                    </button>
+                  </div>
                 {:else}
-                  <span class="node-badge-router" title="Метка содержит меню или переходы, но не имеет диалоговых строк">
-                    Развилка / Меню
-                  </span>
-                  <span class="node-stats-empty">
-                    0 строк диалогов
-                  </span>
+                  <div class="node-footer-btns ml-auto">
+                    {#if onviewcode}
+                      <button
+                        type="button"
+                        class="btn-code-node"
+                        onclick={(e) => { e.stopPropagation(); onviewcode?.(node.scene!); }}
+                        title="Посмотреть реализацию развилки/меню в коде (.rpy)"
+                      >
+                        <FileCode size={11} />
+                        <span>Код</span>
+                      </button>
+                    {/if}
+                    <span class="node-badge-router" title="Метка содержит меню или переходы, но не имеет диалоговых строк">
+                      Развилка / Меню
+                    </span>
+                  </div>
                 {/if}
               </div>
             {:else}
-              <div class="node-footer external-footer">
-                <span>{busy ? 'Поиск...' : 'Другой файл проекта'}</span>
+              <div class="node-footer external-footer" class:external-busy={isThisNodeBusy}>
+                {#if isThisNodeBusy}
+                  <span class="external-search-pill">
+                    <Loader2 size={11} class="spin" />
+                    <span>Поиск...</span>
+                  </span>
+                {:else}
+                  <span>Другой файл проекта</span>
+                {/if}
               </div>
             {/if}
           </div>
         {/each}
+
+        <!-- Слой плашек-лейблов переходов (над карточками) -->
+        <svg class="graph-labels-svg" width={graph.width} height={graph.height} aria-label="Метки переходов">
+          {#each graph.links as edge (edge.id)}
+            {@const isRelated = edge.from === selected?.name || edge.to === selected?.name}
+            {@const isChoice = edge.kind === 'choice' || edge.kind === 'branch'}
+            {@const isSelf = edge.from === edge.to}
+            {@const cleanText = edge.condition
+              ? edge.condition.replace(/^Выбор:\s*"?/, '').replace(/"?$/, '').trim()
+              : edge.kind}
+            {@const fullText = isSelf
+              ? `↺ ${cleanText}`
+              : isChoice
+                ? `◆ ${cleanText}`
+                : cleanText}
+            {@const displayText = fullText.length > 17 ? fullText.slice(0, 16) + '…' : fullText}
+            {@const pillWidth = Math.min(136, Math.max(36, Math.round(displayText.length * 6.4 + 16)))}
+            <g
+              class="edge-label-group"
+              class:related={isRelated}
+              class:branch={isChoice}
+              class:self-loop={isSelf}
+              transform="translate({edge.labelX}, {edge.labelY})"
+            >
+              <rect
+                x={-pillWidth / 2}
+                y={-10}
+                width={pillWidth}
+                height={20}
+                rx="10"
+                ry="10"
+                class="label-badge"
+              />
+              <text x="0" y="3.5" text-anchor="middle" class="label-text">
+                {displayText}
+              </text>
+              <title>{edge.from} → {edge.to} ({edge.condition || edge.kind})</title>
+            </g>
+          {/each}
+        </svg>
       </div>
     </div>
   </div>
-
-  <!-- Нижняя панель детальных связей текущей сцены -->
-  {#if selected}
-    <div class="details">
-      <div class="details-title">
-        <span>Связи сцены: <strong class="text-sky-300">{selected.name}</strong></span>
-      </div>
-
-      {#if activeLinks.length === 0}
-        <span class="no-links-text">У сцены нет зафиксированных переходов.</span>
-      {/if}
-
-      <div class="details-links-row">
-        {#each activeLinks as edge (edge.id)}
-          {@const outgoing = edge.from === selected.name}
-          <button
-            class="link-pill"
-            class:pill-out={outgoing}
-            class:pill-in={!outgoing}
-            disabled={busy}
-            onclick={() => onnavigate(outgoing ? edge.to : edge.from)}
-            title="Перейти к сцене"
-          >
-            <span class="pill-arrow">{outgoing ? '→' : '←'}</span>
-            <span class="pill-target">{outgoing ? edge.to : edge.from}</span>
-            <small class="pill-cond">{edge.condition || edge.kind}</small>
-          </button>
-        {/each}
-
-        {#each selected.choices ?? [] as choice}
-          {#each choice.options.filter(option => !option.target_jump) as option}
-            <span class="link-pill pill-dead-end" title="У варианта не указан переход jump">
-              ◆ {option.text} <small>(локальный блок)</small>
-            </span>
-          {/each}
-        {/each}
-      </div>
-    </div>
-  {/if}
 </div>
 
 <style>
@@ -557,32 +662,132 @@
   .toolbar {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 12px;
-    padding: 8px 14px;
-    background: #0f172a;
-    border-bottom: 1px solid #1e293b;
-    flex-wrap: wrap;
+    height: 42px;
+    min-height: 42px;
+    max-height: 42px;
+    box-sizing: border-box;
+    padding: 0 14px;
+    background: #0e1219;
+    border-bottom: 1px solid #1a2230;
+    flex-shrink: 0;
+  }
+
+  .btn-sidebar-burger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    min-height: 24px;
+    max-width: 24px;
+    max-height: 24px;
+    box-sizing: border-box;
+    padding: 0;
+    margin: 0;
+    background: #141923;
+    border: 1px solid #1e2636;
+    border-radius: 4px;
+    color: #94a3b8;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    flex-shrink: 0;
+  }
+
+  .btn-sidebar-burger :global(svg) {
+    display: block;
+    flex-shrink: 0;
+  }
+
+  .btn-sidebar-burger:hover {
+    background: #1e293b;
+    border-color: #38bdf8;
+    color: #f1f5f9;
+  }
+
+  .btn-graph-back {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    height: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    padding: 0 8px;
+    background: #18202d;
+    border: 1px solid #232d3f;
+    border-radius: 4px;
+    color: #38bdf8;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1;
+    box-sizing: border-box;
+    cursor: pointer;
+    margin: 0;
+    transition: all 0.12s;
+  }
+
+  .btn-graph-back:hover:not(:disabled) {
+    background: #1f2b3e;
+    border-color: #38bdf8;
+    color: #f0f9ff;
+  }
+
+  .btn-graph-back:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .toolbar-info {
-    margin-right: auto;
-    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
     color: #94a3b8;
   }
 
-  .toolbar-info strong {
-    color: #e2e8f0;
+  .subtoolbar-divider {
+    width: 1px;
+    height: 18px;
+    background: #1e2636;
+    margin: 0 4px;
+    flex-shrink: 0;
   }
 
-  .info-sep {
-    color: #475569;
-    margin: 0 4px;
+  .info-stat {
+    font-size: 11px;
+    color: #94a3b8;
+    white-space: nowrap;
+  }
+
+  .info-stat strong {
+    color: #f1f5f9;
+    font-weight: 600;
   }
 
   .zoom-controls {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+
+  .zoom-controls button {
+    height: 26px;
+    min-height: 26px;
+    max-height: 26px;
+    box-sizing: border-box;
+    padding: 0 8px;
+    font-size: 11.5px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
 
   button {
@@ -774,8 +979,10 @@
     display: flex;
     align-items: center;
     gap: 3px;
-    margin-right: 6px;
-    padding: 2px 6px;
+    margin-right: 2px;
+    height: 26px;
+    box-sizing: border-box;
+    padding: 0 6px;
     background: #0f172a;
     border: 1px solid #1e293b;
     border-radius: 6px;
@@ -787,7 +994,13 @@
   }
 
   .page-size-btn {
-    padding: 1px 5px;
+    height: 20px;
+    padding: 0 5px;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
     background: transparent;
     border: 1px solid transparent;
     border-radius: 4px;
@@ -849,32 +1062,115 @@
   }
 
   /* SVG Links */
-  svg {
+  .graph-connections-svg {
     position: absolute;
     inset: 0;
     overflow: visible;
     pointer-events: none;
+    z-index: 1;
   }
 
-  g {
+  .graph-labels-svg {
+    position: absolute;
+    inset: 0;
+    overflow: visible;
+    pointer-events: none;
+    z-index: 15;
+  }
+
+  .edge-path-group {
     stroke: #475569;
   }
 
-  g.branch {
+  .edge-path-group.branch {
     stroke: #8b5cf6;
   }
 
-  g.related {
+  .edge-path-group.related {
     stroke: #0284c7;
   }
 
-  text {
-    fill: #e2e8f0;
-    stroke: #090d16;
-    stroke-width: 4px;
-    paint-order: stroke;
-    font: 11px system-ui, sans-serif;
-    font-weight: 500;
+  .edge-label-group {
+    stroke: none;
+    pointer-events: auto;
+    cursor: default;
+  }
+
+  .label-badge {
+    fill: #182232;
+    stroke: #475569;
+    stroke-width: 1.2px;
+    filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
+    transition: fill 0.15s, stroke 0.15s;
+  }
+
+  .label-text {
+    fill: #cbd5e1;
+    stroke: none;
+    font: 10px system-ui, -apple-system, sans-serif;
+    font-weight: 600;
+    pointer-events: none;
+    user-select: none;
+    transition: fill 0.15s;
+  }
+
+  /* Choice / Branch (Purple) - clearly distinguished from blue node */
+  .edge-label-group.branch .label-badge {
+    fill: #22123b;
+    stroke: #8b5cf6;
+  }
+  .edge-label-group.branch .label-text {
+    fill: #f3e8ff;
+    font-weight: 600;
+  }
+
+  /* Related Choice (Highlighted Purple) - stays purple, does not turn blue */
+  .edge-label-group.branch.related .label-badge {
+    fill: #2e104f;
+    stroke: #c084fc;
+    stroke-width: 1.5px;
+    filter: drop-shadow(0 0 6px rgba(168, 85, 247, 0.45));
+  }
+  .edge-label-group.branch.related .label-text {
+    fill: #ffffff;
+    font-weight: 700;
+  }
+
+  /* Self-loop (Cyan) */
+  .edge-label-group.self-loop .label-badge {
+    fill: #0c2744;
+    stroke: #0284c7;
+  }
+  .edge-label-group.self-loop .label-text {
+    fill: #7dd3fc;
+  }
+  .edge-label-group.self-loop.related .label-badge {
+    fill: #0e375e;
+    stroke: #38bdf8;
+    stroke-width: 1.5px;
+  }
+  .edge-label-group.self-loop.related .label-text {
+    fill: #ffffff;
+    font-weight: 700;
+  }
+
+  /* Jump / Condition Related (Slate, NOT cyan) */
+  .edge-label-group.related:not(.branch):not(.self-loop) .label-badge {
+    fill: #222f42;
+    stroke: #94a3b8;
+    stroke-width: 1.5px;
+    filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.6));
+  }
+  .edge-label-group.related:not(.branch):not(.self-loop) .label-text {
+    fill: #ffffff;
+    font-weight: 700;
+  }
+
+  .edge-label-group:hover .label-badge {
+    stroke: #f8fafc;
+  }
+  .edge-label-group:hover .label-text {
+    fill: #ffffff;
   }
 
   /* Карточки узлов */
@@ -887,6 +1183,7 @@
     overflow: hidden;
     display: flex;
     flex-direction: column;
+    z-index: 2;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
     transition: border-color 0.15s, box-shadow 0.15s, transform 0.1s;
   }
@@ -984,12 +1281,21 @@
   }
 
   .node-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     color: #f1f5f9;
     font-size: 13px;
+  }
+
+  .node-name span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .preview {
@@ -1011,6 +1317,8 @@
     padding: 5px 10px;
     font-size: 11px;
     background: #0a0f1d;
+    min-height: 31px;
+    box-sizing: border-box;
   }
 
   .node-stats {
@@ -1019,7 +1327,8 @@
   }
 
   .node-badge-router {
-    padding: 1px 6px;
+    margin-left: auto;
+    padding: 2px 7px;
     border-radius: 4px;
     background: #1e1b4b;
     border: 1px solid #4338ca;
@@ -1028,9 +1337,10 @@
     font-weight: 600;
   }
 
-  .node-stats-empty {
-    color: #64748b;
-    font-size: 10px;
+  .toolbar-scene-heading {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
   }
 
   .focus-title-badge {
@@ -1040,9 +1350,75 @@
   }
 
   .focus-scene-name {
-    color: #38bdf8;
-    font-size: 12.5px;
+    color: #f1f5f9;
+    font-size: 13px;
     font-weight: 700;
+  }
+
+  .btn-toolbar-code {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    height: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    padding: 0 7px;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1;
+    background: #111a2e;
+    border: 1px solid #273549;
+    border-radius: 4px;
+    color: #94a3b8;
+    cursor: pointer;
+    box-sizing: border-box;
+    transition: all 0.15s;
+  }
+
+  .btn-toolbar-code:hover {
+    background: #1e293b;
+    border-color: #0284c7;
+    color: #38bdf8;
+  }
+
+  .node-footer-btns {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .ml-auto {
+    margin-left: auto;
+  }
+
+  .btn-code-node {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    height: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    padding: 0 7px;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1;
+    background: #111a2e;
+    border: 1px solid #273549;
+    border-radius: 4px;
+    color: #94a3b8;
+    cursor: pointer;
+    box-sizing: border-box;
+    transition: all 0.15s;
+  }
+
+  .btn-code-node:hover {
+    background: #1e293b;
+    border-color: #0284c7;
+    color: #38bdf8;
   }
 
   .btn-open-dialogues {
@@ -1063,79 +1439,32 @@
     font-size: 10.5px;
   }
 
-  /* Нижняя панель деталей */
-  .details {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    max-height: 140px;
-    overflow-y: auto;
-    padding: 10px 14px;
-    background: #090d16;
-    border-top: 1px solid #1e293b;
-    font-size: 12px;
-  }
-
-  .details-title {
-    font-size: 12px;
-    color: #94a3b8;
-  }
-
-  .details-links-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-wrap: wrap;
-  }
-
-  .link-pill {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 3px 9px;
-    border-radius: 6px;
-    font-size: 11.5px;
-    background: #131d2e;
-    border: 1px solid #293548;
-    cursor: pointer;
-  }
-
-  .link-pill:hover {
-    border-color: #38bdf8;
-  }
-
-  .pill-arrow {
-    font-weight: 700;
-  }
-
-  .pill-in .pill-arrow {
+  .external-footer.external-busy {
     color: #38bdf8;
   }
 
-  .pill-out .pill-arrow {
-    color: #a855f7;
+  .external-search-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: #38bdf8;
+    font-weight: 600;
   }
 
-  .pill-target {
-    color: #e2e8f0;
-    font-weight: 500;
+  .node.external.navigating {
+    border-color: #38bdf8 !important;
+    background: #091a2e !important;
+    box-shadow: 0 0 18px rgba(56, 189, 248, 0.35) !important;
   }
 
-  .pill-cond {
-    color: #94a3b8;
-    font-size: 10px;
+  .node-main:disabled {
+    opacity: 0.85;
+    cursor: wait;
   }
 
-  .pill-dead-end {
-    color: #64748b;
-    background: #0f172a;
-    border: 1px dashed #334155;
-    cursor: default;
-  }
-
-  .no-links-text {
-    color: #64748b;
-    font-size: 11.5px;
+  .node-main.is-navigating:disabled {
+    opacity: 1;
+    cursor: wait;
   }
 
   .empty {
