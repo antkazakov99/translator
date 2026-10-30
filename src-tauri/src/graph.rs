@@ -181,6 +181,11 @@ impl ScenarioGraph {
         self.graph.node_indices()
     }
 
+    /// Реплики графа в порядке файла
+    pub fn dialogues(&self) -> impl Iterator<Item = &DialogueData> {
+        self.graph.node_weights().filter_map(ScenarioNode::as_dialogue)
+    }
+
     /// Собирает скользящий контекст (N предшествующих диалогов) строго вдоль текущего пути в графе.
     pub fn get_parent_context(&self, start: NodeIndex, max_lines: usize) -> Vec<DialogueData> {
         let mut context = Vec::new();
