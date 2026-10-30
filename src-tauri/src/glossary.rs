@@ -108,6 +108,9 @@ fn auto_detect_gender(name: &str) -> String {
             "boy" | "man" | "guy" | "king" | "prince" | "brother" | "father" | "son" | "hunter" | "bartender" | "guard" => {
                 return "male".to_string();
             }
+            "creature" | "monster" | "beast" | "entity" | "ghost" | "spirit" | "slime" | "demon" | "shadow" | "thing" => {
+                return "neuter".to_string();
+            }
             _ => {}
         }
     }
@@ -126,16 +129,20 @@ mod tests {
             ("lis".to_string(), "Lisa".to_string()),
             ("wg".to_string(), "The warrior girl".to_string()),
             ("m".to_string(), "The man".to_string()),
+            ("cr".to_string(), "Shadow Creature".to_string()),
         ];
 
         glossary.merge_with_scanned_characters(&scanned);
-        assert_eq!(glossary.characters.len(), 3);
+        assert_eq!(glossary.characters.len(), 4);
 
         let wg = glossary.characters.iter().find(|c| c.alias == "wg").unwrap();
         assert_eq!(wg.gender, "female");
 
         let m = glossary.characters.iter().find(|c| c.alias == "m").unwrap();
         assert_eq!(m.gender, "male");
+
+        let cr = glossary.characters.iter().find(|c| c.alias == "cr").unwrap();
+        assert_eq!(cr.gender, "neuter");
 
         let json = serde_json::to_string_pretty(&glossary).unwrap();
         assert!(json.contains("warrior girl"));
