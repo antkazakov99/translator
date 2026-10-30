@@ -3,6 +3,7 @@
   import SceneGraph from "../lib/SceneGraph.svelte";
   import SceneNodeIcon from "../lib/SceneNodeIcon.svelte";
   import SourceViewerModal from "../lib/SourceViewerModal.svelte";
+  import GlossaryAiModal from "../lib/GlossaryAiModal.svelte";
   import { invoke, isTauri } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -608,6 +609,7 @@
 
   // Состояние глоссария проекта
   let showGlossaryModal = $state(false);
+  let showGlossaryAiModal = $state(false);
   let glossaryTab = $state<'characters' | 'terms'>('characters');
   let glossary = $state<ProjectGlossary>({ characters: [], terms: [] });
   let loadingGlossary = $state(false);
@@ -616,6 +618,13 @@
   let glossaryProjectPath = $state<string | null>(null);
   let selectedGlossaryChar = $state<CharacterGlossaryEntry | null>(null);
   let selectedGlossaryTerm = $state<TermGlossaryEntry | null>(null);
+
+  function handleGlossaryAiApply(updatedChars: CharacterGlossaryEntry[], updatedTerms: TermGlossaryEntry[]) {
+    glossary.characters = updatedChars;
+    glossary.terms = updatedTerms;
+    glossaryDirty = true;
+    showToast("Глоссарий обновлён через нейросеть!", "info");
+  }
 
   // Фильтры глоссария
   let glossarySearch = $state("");
@@ -2779,6 +2788,14 @@
           </div>
           <div class="modal-header-actions">
             <button 
+              class="btn-modal-ai"
+              onclick={() => showGlossaryAiModal = true}
+              title="Автозаполнение через нейросеть (LM Studio / Ollama)"
+            >
+              <Sparkles size={14} class="text-violet-400" />
+              <span>Заполнить через ИИ</span>
+            </button>
+            <button 
               class="btn-modal-save" 
               class:dirty={glossaryDirty}
               onclick={saveGlossary} 
@@ -3527,6 +3544,17 @@
     targetLineNumber={sourceViewerTargetLine}
     scenes={currentFile ? currentFile.scenes.map(s => ({ id: s.id, name: s.name })) : []}
     onclose={() => showSourceViewer = false}
+  />
+
+  <!-- МОДАЛЬНОЕ ОКНО ИИ-АВТОЗАПОЛНЕНИЯ ГЛОССАРИЯ -->
+  <GlossaryAiModal
+    show={showGlossaryAiModal}
+    gameDir={gameDir}
+    characters={glossary.characters}
+    terms={glossary.terms}
+    initialTab={glossaryTab}
+    onapply={handleGlossaryAiApply}
+    onclose={() => showGlossaryAiModal = false}
   />
 
   <!-- ВСПЛЫВАЮЩИЙ ТОАСТ НАВИГАЦИИ -->
@@ -6535,6 +6563,28 @@
     display: flex;
     align-items: center;
     gap: 10px;
+  }
+
+  .btn-modal-ai {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #1e1b4b;
+    border: 1px solid #4338ca;
+    color: #c7d2fe;
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .btn-modal-ai:hover {
+    background: #312e81;
+    border-color: #6366f1;
+    color: #ffffff;
+    box-shadow: 0 0 12px rgba(99, 102, 241, 0.35);
   }
 
   .btn-modal-save {

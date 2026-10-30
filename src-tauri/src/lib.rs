@@ -6,6 +6,7 @@ pub mod project;
 pub mod rpa;
 pub mod rpyc;
 pub mod translation;
+pub mod llm;
 
 use crate::graph::ScenarioNode;
 use crate::parser::GameParser;
@@ -1390,6 +1391,51 @@ async fn reveal_in_system_explorer(file_path: String) -> Result<(), String> {
     .map_err(|e| format!("Ошибка задачи проводника: {}", e))?
 }
 
+#[tauri::command]
+async fn check_llm_models(api_url: String) -> Result<Vec<String>, String> {
+    llm::check_models(&api_url).await
+}
+
+#[tauri::command]
+async fn autofill_glossary_characters(
+    game_dir: String,
+    api_url: String,
+    model: String,
+    characters: Vec<glossary::CharacterGlossaryEntry>,
+    only_empty: bool,
+) -> Result<Vec<glossary::CharacterGlossaryEntry>, String> {
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let aliases: Vec<String> = characters.iter().map(|c| c.alias.clone()).collect();
+    let samples = tauri::async_runtime::spawn_blocking(move || {
+        llm::collect_character_dialogue_samples(&base_path, &aliases)
+    })
+    .await
+    .map_err(|e| format!("Ошибка сбора контекста персонажей: {}", e))?;
+
+    llm::autofill_characters(&api_url, &model, characters, only_empty, samples).await
+}
+
+#[tauri::command]
+async fn autofill_glossary_terms(
+    api_url: String,
+    model: String,
+    terms: Vec<glossary::TermGlossaryEntry>,
+    only_empty: bool,
+) -> Result<Vec<glossary::TermGlossaryEntry>, String> {
+    llm::autofill_terms(&api_url, &model, terms, only_empty).await
+}
+
+#[tauri::command]
+async fn extract_glossary_terms_from_game(
+    game_dir: String,
+    api_url: String,
+    model: String,
+    max_terms: Option<usize>,
+) -> Result<Vec<glossary::TermGlossaryEntry>, String> {
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    llm::extract_terms_from_game_script(&api_url, &model, &base_path, max_terms.unwrap_or(20)).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1410,7 +1456,11 @@ pub fn run() {
             save_file_translations,
             read_source_file,
             open_in_system_editor,
-            reveal_in_system_explorer
+            reveal_in_system_explorer,
+            check_llm_models,
+            autofill_glossary_characters,
+            autofill_glossary_terms,
+            extract_glossary_terms_from_game
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
