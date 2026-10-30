@@ -36,6 +36,9 @@ static PROJECT_SPEAKERS_CACHE: LazyLock<
     Mutex<std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>>,
 > = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+static CACHED_SCRIPT_PROJECTS: LazyLock<Mutex<std::collections::HashMap<PathBuf, PathBuf>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
 fn get_cached_script_structure(path: &Path) -> Option<ScriptStructure> {
     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
     {
@@ -138,6 +141,10 @@ pub fn get_project_cache_dir(game_dir: &Path) -> PathBuf {
         .join(format!("{}_{}", folder_name, hash))
 }
 
+fn get_project_scripts_cache_dir(game_dir: &Path) -> PathBuf {
+    get_project_cache_dir(game_dir).join("scripts")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationFileItem {
     pub name: String,
@@ -215,6 +222,12 @@ fn effective_game_directory(selected_path: &Path) -> PathBuf {
 
 /// Находит базовую директорию игры (`game`), поднимаясь по дереву каталогов от файла перевода или скрипта.
 fn find_game_root(file_path: &Path) -> PathBuf {
+    if let Some(game_dir) = CACHED_SCRIPT_PROJECTS.lock().unwrap().iter()
+        .find_map(|(cache_dir, game_dir)| file_path.starts_with(cache_dir).then(|| game_dir.clone()))
+    {
+        return game_dir;
+    }
+
     // 1. Если файл находится внутри папки перевода tl/<lang>/..., то корневая папка игры — папка НАД папкой tl
     let s = file_path.to_string_lossy();
     for marker in &[r"\tl\", "/tl/"] {
@@ -260,10 +273,14 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         collect_rpy_files(&base_path, &mut script_files);
 
         // 2. Если в папке игры есть архивы .rpa — распаковываем ТОЛЬКО скрипты в изолированный AppData кэш
-        let cache_dir = get_project_cache_dir(&base_path);
+        let cache_dir = get_project_scripts_cache_dir(&base_path);
         if has_rpa_archives(&base_path) {
-            let _ = rpa::RpaArchive::extract_scripts_from_game_archives(&base_path, &cache_dir);
+            rpa::RpaArchive::extract_scripts_from_game_archives(&base_path, &cache_dir)?;
+            CACHED_SCRIPT_PROJECTS.lock().unwrap().insert(cache_dir.clone(), base_path.clone());
             collect_rpy_files(&cache_dir, &mut script_files);
+        } else if cache_dir.exists() {
+            std::fs::remove_dir_all(&cache_dir)
+                .map_err(|e| format!("Не удалось удалить устаревший кэш скриптов {:?}: {}", cache_dir, e))?;
         }
 
         let mut characters_map: std::collections::HashMap<String, String> = script_files
@@ -467,7 +484,7 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
 
         let search_dir = find_game_root(path);
-        let cache_dir = get_project_cache_dir(&search_dir);
+        let cache_dir = get_project_scripts_cache_dir(&search_dir);
 
         // 2. Персонажи / speakers: берем из кэша проекта, если есть
         let speakers_map = {
@@ -745,7 +762,7 @@ async fn find_scene_target(
         }
 
         let tl_dir = base_path.join(r"tl\russian");
-        let cache_dir = get_project_cache_dir(&base_path);
+        let cache_dir = get_project_scripts_cache_dir(&base_path);
 
         let mut script_files = Vec::new();
         collect_rpy_files(&base_path, &mut script_files);
@@ -1018,7 +1035,7 @@ async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String
                 }
             } else {
                 let game_root = find_game_root(path);
-                let cache_dir = get_project_cache_dir(&game_root);
+                let cache_dir = get_project_scripts_cache_dir(&game_root);
                 let rel = path.strip_prefix(game_root.join("tl").join("russian")).ok();
                 if let Some(r) = rel {
                     let in_game = game_root.join(r);
@@ -1075,19 +1092,8 @@ async fn open_in_system_editor(file_path: String) -> Result<(), String> {
         if !path.exists() {
             return Err(format!("Файл не существует: {}", file_path));
         }
-        #[cfg(target_os = "windows")]
-        {
-            use std::process::Command;
-            Command::new("cmd")
-                .args(["/C", "start", "", &file_path])
-                .spawn()
-                .map_err(|e| format!("Не удалось открыть файл: {}", e))?;
-            Ok(())
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            open::that(&file_path).map_err(|e| format!("Не удалось открыть файл: {}", e))
-        }
+        tauri_plugin_opener::open_path(path, None::<&str>)
+            .map_err(|e| format!("Не удалось открыть файл: {}", e))
     })
     .await
     .map_err(|e| format!("Ошибка задачи открытия: {}", e))?

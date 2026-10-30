@@ -1,13 +1,46 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use serde::{Deserialize, Serialize};
 
 use crate::pickle::{PickleDecoder, PickleEncoder, PickleValue};
+
+const CACHE_VERSION: &str = "v3_safe_scripts";
+
+fn safe_output_path(root: &Path, name: &str) -> Result<PathBuf, String> {
+    let normalized = name.replace('\\', "/");
+    let relative = Path::new(&normalized);
+    if normalized.is_empty() || relative.components().any(|part| !matches!(part, Component::Normal(_))) {
+        return Err(format!("Недопустимый путь в RPA: {}", name));
+    }
+
+    let root_real = root.canonicalize()
+        .map_err(|e| format!("Не удалось проверить папку {:?}: {}", root, e))?;
+    let mut output = root.to_path_buf();
+    let mut parts = relative.components().peekable();
+    while let Some(Component::Normal(part)) = parts.next() {
+        output.push(part);
+        if output.symlink_metadata().is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(format!("Путь RPA содержит ссылку: {}", name));
+        }
+        if parts.peek().is_some() {
+            if !output.exists() {
+                fs::create_dir(&output)
+                    .map_err(|e| format!("Не удалось создать папку {:?}: {}", output, e))?;
+            }
+            let real = output.canonicalize()
+                .map_err(|e| format!("Не удалось проверить папку {:?}: {}", output, e))?;
+            if !real.starts_with(&root_real) {
+                return Err(format!("Путь RPA выходит за пределы целевой папки: {}", name));
+            }
+        }
+    }
+    Ok(output)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpaEntryDto {
@@ -190,8 +223,7 @@ impl RpaArchive {
 
         let mut extracted_count = 0;
         for entry in archive.entries.values() {
-            let relative_clean = entry.name.replace('\\', "/");
-            let out_file_path = target_dir.join(&relative_clean);
+            let out_file_path = safe_output_path(target_dir, &entry.name)?;
             Self::extract_file(rpa_path, entry, &out_file_path)?;
             extracted_count += 1;
         }
@@ -284,6 +316,9 @@ impl RpaArchive {
         }
 
         let count = collected_files.len();
+        for (name, _) in &mut collected_files {
+            *name = format!("tl/russian/{}", name);
+        }
         Self::create_archive(out_rpa_path, &collected_files)?;
         Ok(count)
     }
@@ -297,19 +332,17 @@ impl RpaArchive {
     ) -> Result<usize, String> {
         let archive = Self::open(rpa_path)?;
 
-        const CACHE_VERSION: &str = "v2_characters_defines";
         let version_marker = target_cache_dir.join(".cache_version");
         let need_refresh = !version_marker.exists()
             || std::fs::read_to_string(&version_marker).unwrap_or_default() != CACHE_VERSION;
 
         if need_refresh && target_cache_dir.exists() {
-            let _ = fs::remove_dir_all(target_cache_dir);
+            fs::remove_dir_all(target_cache_dir)
+                .map_err(|e| format!("Не удалось обновить кэш скриптов {:?}: {}", target_cache_dir, e))?;
         }
 
         fs::create_dir_all(target_cache_dir)
             .map_err(|e| format!("Ошибка создания папки кэша {:?}: {}", target_cache_dir, e))?;
-
-        let _ = fs::write(&version_marker, CACHE_VERSION);
 
         let mut script_entries: Vec<RpaEntry> = Vec::new();
         let mut existing_rpy_basenames: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -348,14 +381,10 @@ impl RpaArchive {
                 rel_clean
             };
 
-            let out_file = target_cache_dir.join(&target_rel_path);
+            let out_file = safe_output_path(target_cache_dir, &target_rel_path)?;
             if out_file.exists() {
                 processed += 1;
                 continue;
-            }
-
-            if let Some(parent) = out_file.parent() {
-                let _ = fs::create_dir_all(parent);
             }
 
             file.seek(SeekFrom::Start(entry.offset))
@@ -365,18 +394,25 @@ impl RpaArchive {
                 .map_err(|e| format!("Ошибка чтения файла {}: {}", entry.name, e))?;
 
             if is_rpyc {
-                if let Ok(stmts) = crate::rpyc::RpycParser::parse_rpyc_bytes(&payload) {
-                    let rpy_code = crate::rpyc::RpycParser::decompile_to_rpy_text(&stmts);
-                    let _ = fs::write(&out_file, rpy_code);
-                } else {
-                    let _ = fs::write(&out_file, &payload);
-                }
+                let stmts = match crate::rpyc::RpycParser::parse_rpyc_bytes(&payload) {
+                    Ok(stmts) => stmts,
+                    Err(error) => {
+                        tracing::warn!(file = %entry.name, %error, "RPYC не декомпилирован");
+                        continue;
+                    }
+                };
+                let rpy_code = crate::rpyc::RpycParser::decompile_to_rpy_text(&stmts);
+                fs::write(&out_file, rpy_code)
+                    .map_err(|e| format!("Не удалось записать {:?}: {}", out_file, e))?;
             } else {
-                let _ = fs::write(&out_file, &payload);
+                fs::write(&out_file, &payload)
+                    .map_err(|e| format!("Не удалось записать {:?}: {}", out_file, e))?;
             }
             processed += 1;
         }
 
+        fs::write(&version_marker, CACHE_VERSION)
+            .map_err(|e| format!("Не удалось сохранить версию кэша {:?}: {}", version_marker, e))?;
         Ok(processed)
     }
 
@@ -385,17 +421,41 @@ impl RpaArchive {
         game_dir: &Path,
         target_cache_dir: &Path,
     ) -> Result<usize, String> {
-        let mut total_extracted = 0;
-        if let Ok(entries) = fs::read_dir(game_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("rpa") {
-                    if let Ok(count) = Self::extract_and_decompile_scripts(&path, target_cache_dir) {
-                        total_extracted += count;
-                    }
-                }
+        let mut archives = Vec::new();
+        for entry in fs::read_dir(game_dir)
+            .map_err(|e| format!("Не удалось прочитать папку игры {:?}: {}", game_dir, e))?
+        {
+            let path = entry.map_err(|e| format!("Ошибка чтения папки игры: {}", e))?.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("rpa") {
+                archives.push(path);
             }
         }
+        archives.sort();
+
+        let mut fingerprint = format!("{}\n", CACHE_VERSION);
+        for path in &archives {
+            let metadata = fs::metadata(path)
+                .map_err(|e| format!("Не удалось проверить архив {:?}: {}", path, e))?;
+            fingerprint.push_str(&format!("{:?}|{}|{:?}\n", path, metadata.len(), metadata.modified().ok()));
+        }
+        let fingerprint_file = target_cache_dir.join(".archive_fingerprint");
+        if fs::read_to_string(&fingerprint_file).ok().as_deref() != Some(&fingerprint)
+            && target_cache_dir.exists()
+        {
+            fs::remove_dir_all(target_cache_dir)
+                .map_err(|e| format!("Не удалось обновить кэш скриптов {:?}: {}", target_cache_dir, e))?;
+        }
+
+        let mut total_extracted = 0;
+        for path in archives {
+            total_extracted += Self::extract_and_decompile_scripts(&path, target_cache_dir)?;
+        }
+        if !target_cache_dir.exists() {
+            fs::create_dir_all(target_cache_dir)
+                .map_err(|e| format!("Не удалось создать кэш скриптов {:?}: {}", target_cache_dir, e))?;
+        }
+        fs::write(&fingerprint_file, fingerprint)
+            .map_err(|e| format!("Не удалось сохранить состояние кэша {:?}: {}", fingerprint_file, e))?;
         Ok(total_extracted)
     }
 }
@@ -419,14 +479,13 @@ fn collect_folder_files_for_mod(
             if path.is_dir() {
                 collect_folder_files_for_mod(root, &path, acc)?;
             } else if path.is_file() {
-                if let Ok(data) = fs::read(&path) {
-                    let rel_path = path
-                        .strip_prefix(root)
-                        .map(|p| p.to_string_lossy().replace('\\', "/"))
-                        .unwrap_or_else(|_| file_name.to_string());
-
-                    acc.push((rel_path, data));
-                }
+                let data = fs::read(&path)
+                    .map_err(|e| format!("Не удалось прочитать файл мода {:?}: {}", path, e))?;
+                let rel_path = path
+                    .strip_prefix(root)
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .map_err(|e| format!("Не удалось определить путь файла мода {:?}: {}", path, e))?;
+                acc.push((rel_path, data));
             }
         }
     }
@@ -474,6 +533,53 @@ mod tests {
         assert_eq!(img, vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
 
         // Очищаем временную папку
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_reject_archive_path_traversal() {
+        let temp_dir = std::env::temp_dir().join(format!("translator_rpa_path_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let archive_path = temp_dir.join("malicious.rpa");
+        RpaArchive::create_archive(&archive_path, &[("../escaped.txt".into(), b"bad".to_vec())]).unwrap();
+
+        assert!(RpaArchive::extract_all(&archive_path, &temp_dir.join("output")).is_err());
+        assert!(!temp_dir.join("escaped.txt").exists());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_mod_archive_keeps_translation_prefix() {
+        let temp_dir = std::env::temp_dir().join(format!("translator_rpa_mod_{}", uuid::Uuid::new_v4()));
+        let source = temp_dir.join("game").join("tl").join("russian");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("story.rpy"), "translate russian strings:\n").unwrap();
+        let archive_path = temp_dir.join("mod.rpa");
+
+        assert_eq!(RpaArchive::pack_mod_from_folder(&source, &archive_path).unwrap(), 1);
+        let archive = RpaArchive::open(&archive_path).unwrap();
+        assert!(archive.entries.contains_key("tl/russian/story.rpy"));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_archive_change_refreshes_scripts_without_deleting_glossary() {
+        let temp_dir = std::env::temp_dir().join(format!("translator_rpa_cache_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let cache_dir = temp_dir.join("cache");
+        let scripts_dir = cache_dir.join("scripts");
+        fs::create_dir_all(&game_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join("glossary.json"), "saved").unwrap();
+        let archive_path = game_dir.join("archive.rpa");
+        RpaArchive::create_archive(&archive_path, &[("story.rpy".into(), b"first".to_vec())]).unwrap();
+        RpaArchive::extract_scripts_from_game_archives(&game_dir, &scripts_dir).unwrap();
+        assert_eq!(fs::read(scripts_dir.join("story.rpy")).unwrap(), b"first");
+
+        RpaArchive::create_archive(&archive_path, &[("story.rpy".into(), b"second version".to_vec())]).unwrap();
+        RpaArchive::extract_scripts_from_game_archives(&game_dir, &scripts_dir).unwrap();
+        assert_eq!(fs::read(scripts_dir.join("story.rpy")).unwrap(), b"second version");
+        assert_eq!(fs::read_to_string(cache_dir.join("glossary.json")).unwrap(), "saved");
         let _ = fs::remove_dir_all(&temp_dir);
     }
 

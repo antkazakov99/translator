@@ -354,9 +354,11 @@
     onclick={(e) => {
       if (e.target === e.currentTarget) onclose();
     }}
+    onkeydown={(e) => { if (e.key === 'Escape') onclose(); }}
     role="dialog"
     aria-modal="true"
     aria-label="Просмотр исходного кода скрипта"
+    tabindex="-1"
   >
     <div class="source-modal-container">
       <!-- ШАПКА МОДАЛЬНОГО ОКНА -->

@@ -49,7 +49,7 @@
   } from "lucide-svelte";
 
   // Стейт проекта на Svelte 5 (Runes)
-  let gameDir = $state("F:\\Playnite\\Games\\0b588a07-1844-467f-8459-e5629642a1bf\\Installed\\game");
+  let gameDir = $state("");
   let recentProjects = $state<string[]>([]);
   let projectNames = $state<Record<string, string>>({});
   let editingProjectPath = $state<string | null>(null);
@@ -64,6 +64,8 @@
   let fileSkeletonTimer: ReturnType<typeof setTimeout> | null = null;
   let fileSkeletonShownAt = 0;
   let fileSelectSeq = 0;
+  let projectScanSeq = 0;
+  let glossaryLoadSeq = 0;
   let tableContainerEl = $state<HTMLElement | null>(null);
   let errorMsg = $state("");
 
@@ -892,24 +894,43 @@
   // Сканировать проект
   async function scanProject() {
     if (!gameDir.trim()) return;
+    const selectedPath = gameDir.trim();
+    const seq = ++projectScanSeq;
+    ++fileSelectSeq;
+    ++glossaryLoadSeq;
+    if (fileSkeletonTimer) clearTimeout(fileSkeletonTimer);
+    fileSkeletonTimer = null;
+    loadingFile = false;
+    showFileSkeleton = false;
     loadingProject = true;
     errorMsg = "";
+    project = null;
+    selectedFile = null;
+    currentFile = null;
+    selectedEntry = null;
+    selectedSceneId = "all";
+    glossary = { characters: [], terms: [] };
+    selectedGlossaryChar = null;
+    selectedGlossaryTerm = null;
     try {
-      const selectedPath = gameDir.trim();
       const scanPath = await invoke<string>("resolve_game_directory", { path: selectedPath });
-      project = await invoke<ProjectSummary>("scan_game_project", { gameDir: scanPath });
+      if (seq !== projectScanSeq || gameDir.trim() !== selectedPath) return;
+      const summary = await invoke<ProjectSummary>("scan_game_project", { gameDir: scanPath });
+      if (seq !== projectScanSeq || gameDir.trim() !== selectedPath) return;
+      project = summary;
       graphHistory = [];
       rememberProject(selectedPath);
-      loadingProject = false;
-      loadGlossary(true);
-      if (project.files.length > 0) {
+      void loadGlossary(true);
+      if (summary.files.length > 0) {
         // Микропауза для отрисовки сайдбара и статов перед загрузкой первого файла
         await new Promise(r => setTimeout(r, 20));
-        selectFile(project.files[0]);
+        if (seq !== projectScanSeq || gameDir.trim() !== selectedPath) return;
+        void selectFile(summary.files[0]);
       }
     } catch (e) {
-      errorMsg = String(e);
-      loadingProject = false;
+      if (seq === projectScanSeq) errorMsg = String(e);
+    } finally {
+      if (seq === projectScanSeq) loadingProject = false;
     }
   }
 
@@ -951,6 +972,7 @@
           await new Promise(r => setTimeout(r, minDisplayTime - elapsed));
         }
       }
+      if (seq !== fileSelectSeq) return false;
 
       currentFile = parsed;
       focusedSceneName = null;
@@ -965,9 +987,7 @@
         selectedSceneId = "all";
       }
 
-      if (currentFile.scenes.length > 0 && currentFile.scenes[0].entries.length > 0) {
-        selectedEntry = currentFile.scenes[0].entries[0];
-      }
+      selectedEntry = currentFile.scenes.find(s => s.id === selectedSceneId)?.entries[0] ?? null;
 
       if (tableContainerEl) {
         tableContainerEl.scrollTop = 0;
@@ -1191,24 +1211,24 @@
 
   async function loadGlossary(silent = false) {
     if (!gameDir.trim()) return;
+    const path = gameDir.trim();
+    const seq = ++glossaryLoadSeq;
+    const characters = project?.characters ?? null;
     if (!silent) loadingGlossary = true;
     try {
       const res = await invoke<ProjectGlossary>("get_project_glossary", {
-        gameDir: gameDir.trim(),
-        scannedCharacters: project?.characters ?? null
+        gameDir: path,
+        scannedCharacters: characters
       });
+      if (seq !== glossaryLoadSeq || gameDir.trim() !== path) return;
       glossary = res;
       glossaryDirty = false;
-      if (!selectedGlossaryChar && glossary.characters.length > 0) {
-        selectedGlossaryChar = glossary.characters[0];
-      }
-      if (!selectedGlossaryTerm && glossary.terms.length > 0) {
-        selectedGlossaryTerm = glossary.terms[0];
-      }
+      selectedGlossaryChar = glossary.characters[0] ?? null;
+      selectedGlossaryTerm = glossary.terms[0] ?? null;
     } catch (e) {
-      if (!silent) showToast(`Ошибка загрузки глоссария: ${e}`, "error");
+      if (!silent && seq === glossaryLoadSeq) showToast(`Ошибка загрузки глоссария: ${e}`, "error");
     } finally {
-      if (!silent) loadingGlossary = false;
+      if (!silent && seq === glossaryLoadSeq) loadingGlossary = false;
     }
   }
 
@@ -2384,8 +2404,11 @@
     <div 
       class="modal-backdrop" 
       onclick={(e) => { if (e.target === e.currentTarget) showToolsModal = false; }}
+      onkeydown={(e) => { if (e.key === 'Escape') showToolsModal = false; }}
       role="dialog"
       aria-modal="true"
+      aria-label="Студия архивов RPA и байткода RPYC"
+      tabindex="-1"
     >
       <div class="tools-modal">
         <div class="tools-modal-header">
@@ -2635,8 +2658,11 @@
     <div 
       class="modal-backdrop" 
       onclick={(e) => { if (e.target === e.currentTarget) showGlossaryModal = false; }}
+      onkeydown={(e) => { if (e.key === 'Escape') showGlossaryModal = false; }}
       role="dialog"
       aria-modal="true"
+      aria-label="Глоссарий проекта"
+      tabindex="-1"
     >
       <div class="tools-modal glossary-modal">
         <!-- Заголовок модального окна глоссария -->
@@ -3042,10 +3068,11 @@
 
                 <div class="sidebar-edit-content">
                   <div class="edit-group">
-                    <label class="edit-label">
+                    <label class="edit-label" for="character-translation">
                       <span>Русский перевод имени:</span>
                     </label>
                     <input 
+                      id="character-translation"
                       type="text" 
                       bind:value={selectedGlossaryChar.translated_name} 
                       oninput={() => glossaryDirty = true}
@@ -3056,10 +3083,10 @@
                   </div>
 
                   <div class="edit-group">
-                    <label class="edit-label">
+                    <div class="edit-label" id="character-gender-label">
                       <span>Грамматический род (для согласования окончаний):</span>
-                    </label>
-                    <div class="gender-cards-grid">
+                    </div>
+                    <div class="gender-cards-grid" role="group" aria-labelledby="character-gender-label">
                       <button 
                         type="button" 
                         class="gender-card gender-card-male"
@@ -3115,10 +3142,11 @@
                   </div>
 
                   <div class="edit-group">
-                    <label class="edit-label">
+                    <label class="edit-label" for="character-notes">
                       <span>Контекст персонажа / Стиль речи:</span>
                     </label>
                     <textarea 
+                      id="character-notes"
                       bind:value={selectedGlossaryChar.notes} 
                       oninput={() => glossaryDirty = true}
                       rows="4" 
@@ -3149,10 +3177,11 @@
 
                 <div class="sidebar-edit-content">
                   <div class="edit-group">
-                    <label class="edit-label">
+                    <label class="edit-label" for="term-source">
                       <span>Исходный термин (EN):</span>
                     </label>
                     <input 
+                      id="term-source"
                       type="text" 
                       bind:value={selectedGlossaryTerm.source_term} 
                       oninput={() => glossaryDirty = true}
@@ -3161,10 +3190,11 @@
                   </div>
 
                   <div class="edit-group">
-                    <label class="edit-label">
+                    <label class="edit-label" for="term-translation">
                       <span>Русский перевод (RU):</span>
                     </label>
                     <input 
+                      id="term-translation"
                       type="text" 
                       bind:value={selectedGlossaryTerm.translated_term} 
                       oninput={() => glossaryDirty = true}
@@ -3174,10 +3204,11 @@
                   </div>
 
                   <div class="edit-group">
-                    <label class="edit-label">
+                    <label class="edit-label" for="term-category">
                       <span>Категория термина:</span>
                     </label>
                     <select 
+                      id="term-category"
                       bind:value={selectedGlossaryTerm.category} 
                       onchange={() => glossaryDirty = true}
                       class="sidebar-select"
@@ -3190,10 +3221,11 @@
                   </div>
 
                   <div class="edit-group">
-                    <label class="edit-label">
+                    <label class="edit-label" for="term-notes">
                       <span>Заметки / Контекст:</span>
                     </label>
                     <textarea 
+                      id="term-notes"
                       bind:value={selectedGlossaryTerm.notes} 
                       oninput={() => glossaryDirty = true}
                       rows="3" 
@@ -5703,6 +5735,7 @@
     margin: 0;
     display: -webkit-box;
     -webkit-line-clamp: 2;
+    line-clamp: 2;
     -webkit-box-orient: vertical;
     overflow: hidden;
     line-height: 1.4;
@@ -6052,12 +6085,6 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
-  }
-
-  .inspect-col label {
-    font-size: 11px;
-    font-weight: 600;
-    color: #64748b;
   }
 
   .text-box-en {
