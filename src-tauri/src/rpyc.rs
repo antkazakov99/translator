@@ -97,14 +97,18 @@ impl RpycParser {
     pub fn parse_rpyc_file(path: &Path) -> Result<Vec<RpycStatement>, String> {
         let data = fs::read(path)
             .map_err(|e| format!("Не удалось прочитать .rpyc {:?}: {}", path, e))?;
+        Self::parse_rpyc_bytes(&data)
+    }
 
-        let slots = Self::read_slots(&data)?;
+    /// Декомпилирует/парсит байты .rpyc из памяти и извлекает диалоговые инструкции
+    pub fn parse_rpyc_bytes(data: &[u8]) -> Result<Vec<RpycStatement>, String> {
+        let slots = Self::read_slots(data)?;
         let slot1 = slots
             .iter()
             .find(|s| s.slot == 1)
             .ok_or_else(|| "В файле .rpyc отсутствует Slot 1 (AST байткод)".to_string())?;
 
-        let decompressed_ast = Self::decompress_slot(&data, slot1)?;
+        let decompressed_ast = Self::decompress_slot(data, slot1)?;
 
         let mut decoder = PickleDecoder::new(&decompressed_ast);
         let root_val = decoder

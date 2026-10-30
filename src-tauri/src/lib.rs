@@ -21,8 +21,8 @@ fn collect_rpy_files(dir: &Path, files: &mut Vec<PathBuf>) {
             let path = entry.path();
             let file_name = path.file_name().unwrap_or_default().to_string_lossy();
 
-            // Игнорируем скрытые папки (.codex-backups, .editor-backups, .git) и папки с бэкапами
-            if file_name.starts_with('.') || file_name.contains("backup") || file_name.contains("tmp") {
+            // Игнорируем скрытые папки (.codex-backups, .editor-backups, .git), папки с бэкапами и сторонние инжекторы _mods
+            if file_name.starts_with('.') || file_name == "_mods" || file_name.contains("backup") || file_name.contains("tmp") {
                 continue;
             }
 
@@ -36,6 +36,42 @@ fn collect_rpy_files(dir: &Path, files: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+/// Проверяет наличие архивов `.rpa` в директории игры
+fn has_rpa_archives(dir: &Path) -> bool {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("rpa") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Возвращает путь к изолированной папке кэша в AppData для конкретной игры,
+/// чтобы оригинальная папка игры никогда не засорялась распакованными файлами.
+pub fn get_project_cache_dir(game_dir: &Path) -> PathBuf {
+    let local_app_data = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    game_dir.to_string_lossy().to_lowercase().hash(&mut hasher);
+    let hash = format!("{:012x}", hasher.finish());
+
+    let folder_name = game_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "game".to_string());
+
+    local_app_data
+        .join("TranslatorApp")
+        .join("projects_cache")
+        .join(format!("{}_{}", folder_name, hash))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +141,13 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let mut script_files = Vec::new();
         collect_rpy_files(base_path, &mut script_files);
 
+        // 2. Если в папке игры есть архивы .rpa — распаковываем ТОЛЬКО скрипты в изолированный AppData кэш
+        let cache_dir = get_project_cache_dir(base_path);
+        if has_rpa_archives(base_path) {
+            let _ = rpa::RpaArchive::extract_scripts_from_game_archives(base_path, &cache_dir);
+            collect_rpy_files(&cache_dir, &mut script_files);
+        }
+
         let characters_map: std::collections::HashMap<String, String> = script_files
             .into_par_iter()
             .filter_map(|path| {
@@ -123,7 +166,7 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let mut characters: Vec<(String, String)> = characters_map.into_iter().collect();
         characters.sort_by(|a, b| a.1.cmp(&b.1));
 
-        // 2. Ищем файлы переводов в game/tl/russian в параллельных потоках (сверхбыстрый подсчет строк)
+        // 3. Ищем файлы переводов в game/tl/russian в параллельных потоках (сверхбыстрый подсчет строк)
         let tl_dir = base_path.join(r"tl\russian");
         let mut files = Vec::new();
         let mut grand_total = 0;
@@ -161,6 +204,41 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
 
             parsed_files.sort_by(|a, b| b.size_kb.partial_cmp(&a.size_kb).unwrap_or(std::cmp::Ordering::Equal));
             files = parsed_files;
+        }
+
+        // 4. Если в tl/russian пусто (новый перевод), но в кэше есть скрипты из RPA — выводим их как базу для перевода
+        if files.is_empty() && cache_dir.exists() {
+            let mut cached_files = Vec::new();
+            collect_rpy_files(&cache_dir, &mut cached_files);
+
+            let mut parsed_cached: Vec<TranslationFileItem> = cached_files
+                .into_par_iter()
+                .filter_map(|path| {
+                    let content = std::fs::read_to_string(&path).ok()?;
+                    let size_kb = content.len() as f64 / 1024.0;
+                    let (total, translated) = RenpyParser::quick_translation_stats(&content);
+                    let relative_name = path
+                        .strip_prefix(&cache_dir)
+                        .map(|p| p.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().to_string());
+
+                    Some(TranslationFileItem {
+                        name: relative_name,
+                        path: path.to_string_lossy().to_string(),
+                        size_kb,
+                        total_lines: total,
+                        translated_lines: translated,
+                    })
+                })
+                .collect();
+
+            for f in &parsed_cached {
+                grand_total += f.total_lines;
+                grand_translated += f.translated_lines;
+            }
+
+            parsed_cached.sort_by(|a, b| b.size_kb.partial_cmp(&a.size_kb).unwrap_or(std::cmp::Ordering::Equal));
+            files = parsed_cached;
         }
 
         Ok(ProjectSummary {
@@ -261,6 +339,9 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             } else {
                 Default::default()
             }
+        } else if let Ok(content) = std::fs::read_to_string(&file_path) {
+            // Если сам файл уже является оригинальным скриптом (например из AppData кэша)
+            RenpyParser::parse_script_structure(&content)
         } else {
             Default::default()
         };
@@ -325,9 +406,13 @@ async fn find_scene_target(
         }
 
         let tl_dir = base_path.join(r"tl\russian");
+        let cache_dir = get_project_cache_dir(base_path);
 
         let mut script_files = Vec::new();
         collect_rpy_files(base_path, &mut script_files);
+        if cache_dir.exists() {
+            collect_rpy_files(&cache_dir, &mut script_files);
+        }
 
         // 1. Сначала ищем в оригинальных скриптах игры (быстрее всего)
         let orig_scripts: Vec<_> = script_files
@@ -353,7 +438,11 @@ async fn find_scene_target(
                         || trimmed.starts_with(&pattern_screen_colon)
                         || trimmed.starts_with(&pattern_screen_paren)
                     {
-                        let rel_path = orig_path.strip_prefix(base_path).unwrap_or(&orig_path);
+                        let rel_path = if orig_path.starts_with(&cache_dir) {
+                            orig_path.strip_prefix(&cache_dir).unwrap_or(&orig_path)
+                        } else {
+                            orig_path.strip_prefix(base_path).unwrap_or(&orig_path)
+                        };
                         let tl_path = tl_dir.join(rel_path);
                         let resolved_tl_path = if tl_path.exists() {
                             tl_path.to_string_lossy().to_string()
@@ -612,6 +701,44 @@ mod tests {
             // Очищаем временные файлы
             let _ = std::fs::remove_file(&temp_rpa);
             let _ = std::fs::remove_dir_all(&temp_unpack_dir);
+        });
+    }
+
+    #[test]
+    fn test_scan_packed_game_of_whores() {
+        tauri::async_runtime::block_on(async {
+            let game_dir = r"F:\Games\Game of Whores\Game of Whores (0.34)\game";
+            if !Path::new(game_dir).exists() {
+                return;
+            }
+
+            let start = std::time::Instant::now();
+            let summary = scan_game_project(game_dir.to_string()).await.unwrap();
+            println!(
+                "Game of Whores отсканирована за {:?}! Найдено файлов: {}, всего строк: {}, персонажей: {}",
+                start.elapsed(), summary.files.len(), summary.total_lines, summary.characters.len()
+            );
+
+            assert!(!summary.files.is_empty(), "Должны быть обнаружены файлы из archive.rpa");
+            assert!(summary.total_lines > 0, "Должны быть подсчитаны строки диалогов");
+
+            for f in summary.files.iter().take(10) {
+                println!("  [Файл] {} ({:.1} КБ, строк: {})", f.name, f.size_kb, f.total_lines);
+            }
+
+            // Проверяем парсинг одного из файлов
+            let test_file = &summary.files[0];
+            let parsed = parse_file_entries(test_file.path.clone()).await.unwrap();
+            println!(
+                "Скрипт {} распарсен: {} сцен, {} реплик",
+                parsed.file_name, parsed.scenes.len(), parsed.total_lines
+            );
+            assert!(!parsed.scenes.is_empty(), "Сцены должны быть сформированы");
+
+            // Проверяем, что в самой папке игры НЕ появилось распакованных .rpy файлов!
+            assert!(!Path::new(game_dir).join("bquest1.rpy").exists(), "Архив не должен распаковываться в папку игры");
+            assert!(!Path::new(game_dir).join("mgquest1.rpy").exists(), "Архив не должен распаковываться в папку игры");
+            println!("Папка игры чиста: 0 файлов распаковано в корень игры!");
         });
     }
 }

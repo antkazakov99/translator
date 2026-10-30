@@ -287,6 +287,105 @@ impl RpaArchive {
         Self::create_archive(out_rpa_path, &collected_files)?;
         Ok(count)
     }
+
+    /// Извлекает ТОЛЬКО скрипты (.rpy и .rpyc) из архива в указанную папку кэша,
+    /// и автоматически декомпилирует .rpyc в .rpy (если исходный .rpy отсутствует).
+    /// Это гарантирует, что 2+ ГБ медиа-файлов НЕ распаковываются, а папка игры НЕ засоряется.
+    pub fn extract_and_decompile_scripts(
+        rpa_path: &Path,
+        target_cache_dir: &Path,
+    ) -> Result<usize, String> {
+        let archive = Self::open(rpa_path)?;
+        fs::create_dir_all(target_cache_dir)
+            .map_err(|e| format!("Ошибка создания папки кэша {:?}: {}", target_cache_dir, e))?;
+
+        let mut script_entries: Vec<RpaEntry> = Vec::new();
+        let mut existing_rpy_basenames: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for (name, entry) in &archive.entries {
+            if name.ends_with(".rpy") {
+                let base = name.trim_end_matches(".rpy").to_string();
+                existing_rpy_basenames.insert(base);
+                script_entries.push(entry.clone());
+            }
+        }
+
+        for (name, entry) in &archive.entries {
+            if name.ends_with(".rpyc") {
+                let base = name.trim_end_matches(".rpyc").to_string();
+                if !existing_rpy_basenames.contains(&base) {
+                    script_entries.push(entry.clone());
+                }
+            }
+        }
+
+        if script_entries.is_empty() {
+            return Ok(0);
+        }
+
+        let mut file = File::open(rpa_path)
+            .map_err(|e| format!("Не удалось открыть RPA архив {:?}: {}", rpa_path, e))?;
+
+        let mut processed = 0;
+        for entry in script_entries {
+            let rel_clean = entry.name.replace('\\', "/");
+            let is_rpyc = rel_clean.ends_with(".rpyc");
+            let target_rel_path = if is_rpyc {
+                format!("{}.rpy", rel_clean.trim_end_matches(".rpyc"))
+            } else {
+                rel_clean
+            };
+
+            let out_file = target_cache_dir.join(&target_rel_path);
+            if out_file.exists() {
+                processed += 1;
+                continue;
+            }
+
+            if let Some(parent) = out_file.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+
+            file.seek(SeekFrom::Start(entry.offset))
+                .map_err(|e| format!("Ошибка перемещения в RPA: {}", e))?;
+            let mut payload = vec![0u8; entry.length as usize];
+            file.read_exact(&mut payload)
+                .map_err(|e| format!("Ошибка чтения файла {}: {}", entry.name, e))?;
+
+            if is_rpyc {
+                if let Ok(stmts) = crate::rpyc::RpycParser::parse_rpyc_bytes(&payload) {
+                    let rpy_code = crate::rpyc::RpycParser::decompile_to_rpy_text(&stmts);
+                    let _ = fs::write(&out_file, rpy_code);
+                } else {
+                    let _ = fs::write(&out_file, &payload);
+                }
+            } else {
+                let _ = fs::write(&out_file, &payload);
+            }
+            processed += 1;
+        }
+
+        Ok(processed)
+    }
+
+    /// Проверяет наличие архивов .rpa в папке игры и извлекает/декомпилирует все скрипты в папку кэша
+    pub fn extract_scripts_from_game_archives(
+        game_dir: &Path,
+        target_cache_dir: &Path,
+    ) -> Result<usize, String> {
+        let mut total_extracted = 0;
+        if let Ok(entries) = fs::read_dir(game_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("rpa") {
+                    if let Ok(count) = Self::extract_and_decompile_scripts(&path, target_cache_dir) {
+                        total_extracted += count;
+                    }
+                }
+            }
+        }
+        Ok(total_extracted)
+    }
 }
 
 /// Рекурсивно собирает файлы для создания мода
@@ -364,5 +463,68 @@ mod tests {
 
         // Очищаем временную папку
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_read_real_game_of_whores_archive() {
+        let path = Path::new(r"F:\Games\Game of Whores\Game of Whores (0.34)\game\archive.rpa");
+        if !path.exists() {
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        let archive = RpaArchive::open(path).expect("Ошибка открытия archive.rpa в Game of Whores");
+        println!("archive.rpa открыт за {:?}! Всего файлов в индексе: {}", start.elapsed(), archive.entries.len());
+
+        let mut rpy_count = 0;
+        let mut rpyc_count = 0;
+        let mut script_names = Vec::new();
+
+        for name in archive.entries.keys() {
+            if name.ends_with(".rpy") {
+                rpy_count += 1;
+                script_names.push(name.clone());
+            } else if name.ends_with(".rpyc") {
+                rpyc_count += 1;
+                script_names.push(name.clone());
+            }
+        }
+
+        println!("Найдено .rpy: {}, .rpyc: {}", rpy_count, rpyc_count);
+        for s in script_names.iter().take(15) {
+            println!("  [Скрипт] {}", s);
+        }
+
+        // Тестируем извлечение и декомпиляцию brothel_keyhole.rpyc прямо из архива!
+        if let Some(entry) = archive.entries.get("brothel_keyhole.rpyc") {
+            let mut file = File::open(path).unwrap();
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(entry.offset)).unwrap();
+            let mut payload = vec![0u8; entry.length as usize];
+            file.read_exact(&mut payload).unwrap();
+
+            let slots = crate::rpyc::RpycParser::read_slots(&payload).unwrap();
+            let slot1 = slots.iter().find(|s| s.slot == 1).unwrap();
+            let decomp_ast = crate::rpyc::RpycParser::decompress_slot(&payload, slot1).unwrap();
+            let mut dec = crate::pickle::PickleDecoder::new(&decomp_ast);
+            let _val = dec.decode().unwrap();
+
+            let temp_rpyc = std::env::temp_dir().join("test_extract.rpyc");
+            fs::write(&temp_rpyc, &payload).unwrap();
+            let stmts = crate::rpyc::RpycParser::parse_rpyc_file(&temp_rpyc).unwrap();
+            let rpy_code = crate::rpyc::RpycParser::decompile_to_rpy_text(&stmts);
+            println!("Декомпилировано brothel_keyhole.rpyc из архива:\n  Инструкций: {}, Строк: {}", stmts.len(), rpy_code.lines().count());
+            let _ = fs::remove_file(&temp_rpyc);
+        }
+
+        // БЕНЧМАРК: извлечение и декомпиляция ВСЕХ 204 скриптов во временную папку
+        let bench_dir = std::env::temp_dir().join("gow_scripts_bench");
+        let bench_start = std::time::Instant::now();
+        let decompiled_count = RpaArchive::extract_and_decompile_scripts(path, &bench_dir).expect("Ошибка пакетной декомпиляции");
+        println!(
+            "БЕНЧМАРК: извлечено и декомпилировано {} скриптов за {:?} в {:?}",
+            decompiled_count, bench_start.elapsed(), bench_dir
+        );
+        let _ = fs::remove_dir_all(&bench_dir);
     }
 }

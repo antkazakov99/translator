@@ -123,6 +123,19 @@ impl RenpyParser {
     /// без построения графа petgraph, без регулярных выражений и без генерации UUID.
     /// Работает в 100+ раз быстрее полного парсинга.
     pub fn quick_translation_stats(content: &str) -> (usize, usize) {
+        if !content.contains("translate ") {
+            let mut total = 0;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !trimmed.starts_with('#') && trimmed.contains('"') {
+                    if !trimmed.starts_with("define ") && !trimmed.starts_with("image ") && !trimmed.starts_with("default ") && !trimmed.starts_with('$') {
+                        total += 1;
+                    }
+                }
+            }
+            return (total, 0);
+        }
+
         let mut total = 0;
         let mut translated = 0;
         let mut seen_ui_strings = std::collections::HashSet::new();
@@ -438,6 +451,73 @@ impl RenpyParser {
 
         structure
     }
+
+    /// Парсит оригинальный или декомпилированный скрипт .rpy (где нет блоков translate)
+    pub fn parse_original_script(&self, path: &Path, content: &str) -> Result<ScenarioGraph> {
+        let mut graph = ScenarioGraph::new();
+        let file_path = path.to_string_lossy().to_string();
+
+        let re_label = Regex::new(r#"^\s*label\s+([A-Za-z0-9_.]+)\s*:"#).unwrap();
+        let re_dialogue = Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
+
+        let mut current_scene_name = "Общие диалоги".to_string();
+        let mut last_node_idx = None;
+
+        for (idx, raw_line) in content.lines().enumerate() {
+            let line_num = idx + 1;
+            let trimmed = raw_line.trim();
+
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+
+            if let Some(caps) = re_label.captures(trimmed) {
+                let label_name = caps.get(1).unwrap().as_str().to_string();
+                current_scene_name = label_name.clone();
+                let label_node = graph.add_node(ScenarioNode::label(label_name));
+                last_node_idx = Some(label_node);
+                continue;
+            }
+
+            // Исключаем ключевые команды движка
+            if trimmed.starts_with('$')
+                || trimmed.starts_with("jump ")
+                || trimmed.starts_with("call ")
+                || trimmed.starts_with("scene ")
+                || trimmed.starts_with("show ")
+                || trimmed.starts_with("hide ")
+                || trimmed.starts_with("with ")
+                || trimmed.starts_with("play ")
+                || trimmed.starts_with("stop ")
+                || trimmed.starts_with("define ")
+                || trimmed.starts_with("default ")
+                || trimmed.starts_with("python")
+                || trimmed.starts_with("init ")
+                || trimmed.starts_with("return")
+            {
+                continue;
+            }
+
+            if let Some(caps) = re_dialogue.captures(trimmed) {
+                let speaker_alias = caps.name("speaker").map(|s| s.as_str());
+                let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
+                let resolved_speaker = self.resolve_speaker(speaker_alias);
+
+                let mut dialogue = ScenarioNode::dialogue(resolved_speaker, text, &file_path, line_num);
+                if let Some(d) = dialogue.as_dialogue_mut() {
+                    d.block_id = Some(current_scene_name.clone());
+                }
+
+                let node_idx = graph.add_node(dialogue);
+                if let Some(prev) = last_node_idx {
+                    graph.add_edge(prev, node_idx, EdgeKind::Linear);
+                }
+                last_node_idx = Some(node_idx);
+            }
+        }
+
+        Ok(graph)
+    }
 }
 
 impl GameParser for RenpyParser {
@@ -447,6 +527,10 @@ impl GameParser for RenpyParser {
 
     /// Парсит `.rpy` файл и группирует реплики по реальным смысловым сценам
     fn parse_file(&self, path: &Path, content: &str) -> Result<ScenarioGraph> {
+        if !content.contains("translate ") {
+            return self.parse_original_script(path, content);
+        }
+
         let mut graph = ScenarioGraph::new();
         let file_path = path.to_string_lossy().to_string();
 
