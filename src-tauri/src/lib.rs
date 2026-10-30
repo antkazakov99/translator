@@ -19,6 +19,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime};
 
+/// Язык перевода: имя папки `tl/<язык>` и блоков `translate <язык>`.
+pub(crate) const TL_LANG: &str = "russian";
+
 /// Стабильный FNV-1a хэш для воспроизводимых имён кэш-папок между
 /// запусками и версиями компилятора (в отличие от DefaultHasher).
 pub fn stable_hash_str(s: &str) -> u64 {
@@ -32,7 +35,20 @@ pub fn stable_hash_str(s: &str) -> u64 {
 
 /// Путь к папке `tl/russian` внутри директории игры.
 fn tl_lang_dir(game_dir: &Path) -> PathBuf {
-    game_dir.join("tl").join("russian")
+    game_dir.join("tl").join(TL_LANG)
+}
+
+/// Путь к исходному скрипту: убирает сегмент `tl/<язык>` из пути файла перевода.
+fn original_script_path(path: &Path) -> PathBuf {
+    let parts: Vec<Component> = path.components().collect();
+    let tl_pos = parts.windows(2).position(|pair| {
+        pair[0].as_os_str().eq_ignore_ascii_case("tl")
+            && pair[1].as_os_str().eq_ignore_ascii_case(TL_LANG)
+    });
+    match tl_pos {
+        Some(pos) => parts[..pos].iter().chain(&parts[pos + 2..]).collect(),
+        None => path.to_path_buf(),
+    }
 }
 
 static PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
@@ -303,19 +319,27 @@ fn effective_game_directory(selected_path: &Path) -> PathBuf {
     }
 }
 
+fn is_dir_named(dir: &Path, name: &str) -> bool {
+    dir.file_name()
+        .is_some_and(|dir_name| dir_name.eq_ignore_ascii_case(name))
+}
+
+/// Признаки корня игры. Папка языка `tl/<язык>` повторяет файлы игры
+/// (options.rpy, screens.rpy), поэтому корнем считаться не может.
+fn is_game_root(dir: &Path) -> bool {
+    let is_language_dir = dir.parent().is_some_and(|parent| is_dir_named(parent, "tl"));
+    is_dir_named(dir, "game")
+        || (!is_language_dir
+            && (dir.join("tl").is_dir()
+                || dir.join("options.rpy").is_file()
+                || dir.join("screens.rpy").is_file()
+                || dir.join("gui.rpy").is_file()))
+}
+
 fn known_game_directory(file_path: &Path) -> Option<PathBuf> {
     file_path
         .ancestors()
-        .find(|dir| {
-            dir.is_dir()
-                && (dir
-                    .file_name()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("game"))
-                    || dir.join("tl").is_dir()
-                    || dir.join("options.rpy").is_file()
-                    || dir.join("screens.rpy").is_file()
-                    || dir.join("gui.rpy").is_file())
-        })
+        .find(|dir| dir.is_dir() && is_game_root(dir))
         .map(Path::to_path_buf)
 }
 
@@ -372,42 +396,12 @@ fn find_game_root(file_path: &Path) -> PathBuf {
         return game_dir;
     }
 
-    // 1. Если файл находится внутри папки перевода tl/<lang>/..., то корневая папка игры — папка НАД папкой tl
-    let s = file_path.to_string_lossy();
-    for marker in &[r"\tl\", "/tl/"] {
-        if let Some(pos) = s.to_lowercase().find(marker) {
-            let base = PathBuf::from(&s[..pos]);
-            if base.exists() {
-                return base;
-            }
-        }
-    }
-
-    // 2. Если файл является оригинальным скриптом (или из кэша), поднимаемся по родителям
-    let mut current = file_path.parent();
-    while let Some(dir) = current {
-        // Если это директория `game`
-        if dir.file_name().and_then(|n| n.to_str()) == Some("game") {
-            return dir.to_path_buf();
-        }
-        // Если содержит папку tl
-        if dir.join("tl").is_dir() {
-            return dir.to_path_buf();
-        }
-        // Если содержит характерные файлы проекта Ren'Py
-        if dir.join("options.rpy").is_file()
-            || dir.join("screens.rpy").is_file()
-            || dir.join("gui.rpy").is_file()
-        {
-            return dir.to_path_buf();
-        }
-        current = dir.parent();
-    }
-
-    file_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
+    known_game_directory(file_path).unwrap_or_else(|| {
+        file_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    })
 }
 
 #[tauri::command]
@@ -574,10 +568,8 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             .and_then(|m| m.modified())
             .map_err(|e| format!("Не удалось получить свойства файла: {}", e))?;
 
-        let orig_path_str = file_path
-            .replace(r"tl\russian\", "")
-            .replace("tl/russian/", "");
-        let orig_path = Path::new(&orig_path_str);
+        let orig_path = original_script_path(path);
+        let orig_path = orig_path.as_path();
         let orig_mtime = if orig_path.exists() {
             std::fs::metadata(orig_path).and_then(|m| m.modified()).ok()
         } else {
@@ -1017,8 +1009,8 @@ async fn find_scene_target(
             })
             .collect();
 
-        let tl_prefix_hash = format!("translate russian {}_", target_name);
-        let tl_prefix_colon = format!("translate russian {}:", target_name);
+        let tl_prefix_hash = format!("translate {} {}_", TL_LANG, target_name);
+        let tl_prefix_colon = format!("translate {} {}:", TL_LANG, target_name);
 
         let tl_found = tl_scripts.into_par_iter().find_map_any(|tl_path| {
             if let Ok(content) = std::fs::read_to_string(&tl_path) {
@@ -1287,10 +1279,7 @@ async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String
         if is_translation {
             translation_path = Some(file_path.clone());
             // Пробуем найти оригинальный файл скрипта
-            let direct_orig = file_path
-                .replace(r"tl\russian\", "")
-                .replace("tl/russian/", "");
-            let direct_path = PathBuf::from(&direct_orig);
+            let direct_path = original_script_path(path);
 
             if direct_path.exists() && direct_path != path {
                 if let Ok(orig_txt) = read_text_file_safe(&direct_path) {
@@ -1301,7 +1290,7 @@ async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String
             } else {
                 let game_root = find_game_root(path);
                 let cache_dir = get_project_scripts_cache_dir(&game_root);
-                let rel = path.strip_prefix(game_root.join("tl").join("russian")).ok();
+                let rel = path.strip_prefix(tl_lang_dir(&game_root)).ok();
                 if let Some(r) = rel {
                     let in_game = game_root.join(r);
                     let in_cache = cache_dir.join(r);
@@ -1328,7 +1317,7 @@ async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String
             original_total_lines = Some(total_lines);
             let game_root = find_game_root(path);
             if let Ok(rel) = path.strip_prefix(&game_root) {
-                let tl_cand = game_root.join("tl").join("russian").join(rel);
+                let tl_cand = tl_lang_dir(&game_root).join(rel);
                 if tl_cand.exists() {
                     translation_path = Some(tl_cand.to_string_lossy().to_string());
                 }
@@ -1473,6 +1462,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_game_root_of_translation_files() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("translator_game_root_{}", uuid::Uuid::new_v4()));
+        for game_dir in [
+            temp_dir.join("VN").join("game"),
+            temp_dir.join("NoGameFolder"),
+            temp_dir.join("tl").join("VN").join("game"),
+        ] {
+            let tl_dir = tl_lang_dir(&game_dir);
+            std::fs::create_dir_all(tl_dir.join("script")).unwrap();
+            // Такие файлы создаёт `renpy generate translations`
+            for name in ["options.rpy", "screens.rpy", "gui.rpy", "story.rpy"] {
+                std::fs::write(tl_dir.join(name), "").unwrap();
+            }
+            std::fs::write(tl_dir.join("script").join("arc.rpy"), "").unwrap();
+            std::fs::write(game_dir.join("story.rpy"), "").unwrap();
+
+            assert_eq!(find_game_root(&tl_dir.join("story.rpy")), game_dir);
+            assert_eq!(find_game_root(&tl_dir.join("script").join("arc.rpy")), game_dir);
+            assert_eq!(find_game_root(&game_dir.join("story.rpy")), game_dir);
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_original_script_path_strips_language_folder() {
+        assert_eq!(
+            original_script_path(Path::new(r"D:\VN\game\tl\russian\script\arc.rpy")),
+            Path::new(r"D:\VN\game\script\arc.rpy")
+        );
+        assert_eq!(
+            original_script_path(Path::new("D:/VN/game/TL/Russian/story.rpy")),
+            Path::new("D:/VN/game/story.rpy")
+        );
+        assert_eq!(
+            original_script_path(Path::new(r"D:\tl\russianish\story.rpy")),
+            Path::new(r"D:\tl\russianish\story.rpy")
+        );
+    }
+
+    #[test]
+    fn test_saved_edit_of_translation_file_blocks_stale_export() {
+        tauri::async_runtime::block_on(async {
+            let temp_dir = std::env::temp_dir()
+                .join(format!("translator_saved_edit_{}", uuid::Uuid::new_v4()));
+            let game_dir = temp_dir.join("game");
+            let tl_dir = tl_lang_dir(&game_dir);
+            std::fs::create_dir_all(&tl_dir).unwrap();
+            std::fs::write(tl_dir.join("options.rpy"), "translate russian strings:\n").unwrap();
+            let story = tl_dir.join("story.rpy");
+            std::fs::write(&story, "translate russian strings:\n").unwrap();
+
+            let edit = translation::TranslationEdit {
+                key: "line-1".into(),
+                text: "Привет".into(),
+            };
+            translation::save(&story, &[edit]).unwrap();
+
+            assert!(translation::has_saved_edits(&game_dir).unwrap());
+            assert_eq!(translation::load(&story).unwrap().get("line-1").unwrap(), "Привет");
+            assert!(
+                pack_mod_rpa(game_dir.to_string_lossy().to_string(), None)
+                    .await
+                    .is_err()
+            );
+
+            let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+            let _ = std::fs::remove_dir_all(&temp_dir);
+        });
+    }
+
+    #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_parse_file_entries_benchmark() {
         tauri::async_runtime::block_on(async {
             let file_path =
