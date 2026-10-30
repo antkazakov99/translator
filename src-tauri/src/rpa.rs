@@ -425,7 +425,7 @@ impl RpaArchive {
 
         let count = collected_files.len();
         for (name, _) in &mut collected_files {
-            *name = format!("tl/russian/{}", name);
+            *name = format!("tl/{}/{}", crate::TL_LANG, name);
         }
         Self::create_archive_from_paths(out_rpa_path, &collected_files)?;
         Ok(count)
