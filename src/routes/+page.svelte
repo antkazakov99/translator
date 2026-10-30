@@ -675,15 +675,14 @@
                 {#if pct === 100}
                   <span class="tree-pct-badge pct-complete">100%</span>
                 {:else if pct > 0}
-                  <span class="tree-pct-badge pct-progress">{pct}%</span>
+                  <div class="tree-progress-capsule" title="{pct}% переведено">
+                    <div class="tree-capsule-track">
+                      <div class="tree-capsule-fill" style="width: {pct}%"></div>
+                    </div>
+                    <span class="tree-capsule-val">{pct}%</span>
+                  </div>
                 {/if}
               </div>
-
-              {#if pct > 0}
-                <div class="tree-micro-track">
-                  <div class="tree-micro-fill" style="width: {pct}%" class:fill-done={pct === 100}></div>
-                </div>
-              {/if}
             </button>
           {/if}
         {/snippet}
@@ -1560,7 +1559,7 @@
     min-height: 26px;
     padding: 0 8px;
     background: transparent;
-    border: none;
+    border: 1px solid transparent;
     border-radius: 4px;
     color: #cbd5e1;
     font-size: 12px;
@@ -1569,7 +1568,7 @@
     text-align: left;
     width: 100%;
     box-sizing: border-box;
-    transition: background 0.1s ease, color 0.1s ease;
+    transition: background 0.1s ease, color 0.1s ease, border-color 0.1s ease;
   }
 
   .tree-row:hover {
@@ -1578,7 +1577,8 @@
   }
 
   .tree-file-row.active {
-    background: #18263a !important;
+    background: #152336 !important;
+    border: 1px solid #233e62 !important;
     color: #ffffff !important;
   }
 
@@ -1586,9 +1586,9 @@
     content: '';
     position: absolute;
     left: 0;
-    top: 3px;
-    bottom: 3px;
-    width: 2px;
+    top: 4px;
+    bottom: 4px;
+    width: 2.5px;
     background: #38bdf8;
     border-radius: 999px;
   }
@@ -1655,12 +1655,55 @@
 
   .tree-pct-badge.pct-complete {
     color: #34d399;
-    background: rgba(16, 185, 129, 0.1);
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(52, 211, 153, 0.25);
   }
 
   .tree-pct-badge.pct-progress {
     color: #94a3b8;
     background: #151b24;
+  }
+
+  /* Мини-капсула прогресса в правой колонке метаданных строки */
+  .tree-progress-capsule {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #131922;
+    padding: 1px 4px;
+    border-radius: 3px;
+    border: 1px solid #1f2735;
+  }
+
+  .tree-capsule-track {
+    width: 20px;
+    height: 3px;
+    background: #252f40;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+
+  .tree-capsule-fill {
+    height: 100%;
+    background: #0284c7;
+    border-radius: 999px;
+  }
+
+  .tree-capsule-val {
+    font-size: 10px;
+    color: #94a3b8;
+    font-weight: 500;
+    min-width: 20px;
+    text-align: right;
+  }
+
+  .tree-row.active .tree-progress-capsule {
+    background: #0f1c2d;
+    border-color: #213c5f;
+  }
+
+  .tree-row.active .tree-capsule-val {
+    color: #bae6fd;
   }
 
   /* Иерархическая ветка: тонкая направляющая линия */
@@ -1673,45 +1716,20 @@
     flex-direction: column;
   }
 
-  /* Тонкая полоска прогресса на дне строки файла (2px) */
-  .tree-micro-track {
-    position: absolute;
-    bottom: 0;
-    left: 28px;
-    right: 8px;
-    height: 2px;
-    background: #1c2432;
-    border-radius: 1px;
-    overflow: hidden;
-    opacity: 0.6;
-  }
-
-  .tree-row:hover .tree-micro-track,
-  .tree-row.active .tree-micro-track {
-    opacity: 1;
-  }
-
-  .tree-micro-fill {
-    height: 100%;
-    background: #0284c7;
-  }
-
-  .tree-micro-fill.fill-done {
-    background: #10b981;
-  }
-
   /* АНИМАЦИЯ ПОДСВЕТКИ ПРИ НАВИГАЦИИ */
   @keyframes fileGlowPulse {
     0% {
       background-color: #1e3a5f;
-      box-shadow: inset 0 0 0 1px #38bdf8, 0 0 12px rgba(56, 189, 248, 0.4);
+      border-color: #38bdf8 !important;
+      box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
     }
     50% {
       background-color: #1a2d47;
-      box-shadow: inset 0 0 0 1px #0284c7;
+      border-color: #0284c7 !important;
     }
     100% {
-      background-color: #18263a;
+      background-color: #152336;
+      border-color: #233e62 !important;
       box-shadow: none;
     }
   }
