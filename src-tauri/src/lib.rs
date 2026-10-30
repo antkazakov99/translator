@@ -150,6 +150,40 @@ fn effective_game_directory(selected_path: &Path) -> PathBuf {
     }
 }
 
+/// Находит базовую директорию игры (`game`), поднимаясь по дереву каталогов от файла перевода или скрипта.
+fn find_game_root(file_path: &Path) -> PathBuf {
+    // 1. Если файл находится внутри папки перевода tl/<lang>/..., то корневая папка игры — папка НАД папкой tl
+    let s = file_path.to_string_lossy();
+    for marker in &[r"\tl\", "/tl/"] {
+        if let Some(pos) = s.to_lowercase().find(marker) {
+            let base = PathBuf::from(&s[..pos]);
+            if base.exists() {
+                return base;
+            }
+        }
+    }
+
+    // 2. Если файл является оригинальным скриптом (или из кэша), поднимаемся по родителям
+    let mut current = file_path.parent();
+    while let Some(dir) = current {
+        // Если это директория `game`
+        if dir.file_name().and_then(|n| n.to_str()) == Some("game") {
+            return dir.to_path_buf();
+        }
+        // Если содержит папку tl
+        if dir.join("tl").is_dir() {
+            return dir.to_path_buf();
+        }
+        // Если содержит характерные файлы проекта Ren'Py
+        if dir.join("options.rpy").is_file() || dir.join("screens.rpy").is_file() || dir.join("gui.rpy").is_file() {
+            return dir.to_path_buf();
+        }
+        current = dir.parent();
+    }
+
+    file_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+}
+
 #[tauri::command]
 async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -333,10 +367,7 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
 
         let mut speakers_map = std::collections::HashMap::new();
-        let mut search_dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-        while search_dir.parent().is_some() && (search_dir.ends_with(r"tl\russian") || search_dir.ends_with("tl/russian")) {
-            search_dir = search_dir.parent().unwrap().to_path_buf();
-        }
+        let search_dir = find_game_root(path);
         let cache_dir = get_project_cache_dir(&search_dir);
 
         let mut check_files = Vec::new();
@@ -1057,6 +1088,29 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&temp_game_dir);
             let _ = std::fs::remove_dir_all(get_project_cache_dir(&temp_game_dir));
+        });
+    }
+
+    #[test]
+    fn test_real_ppf_and_hilde_cross_file_flow() {
+        tauri::async_runtime::block_on(async {
+            let hilde_path = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\tl\russian\script\locations\arc1 hilde\hilde arc I.rpy";
+            let ppf_path = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\tl\russian\script\locations\PPF HQ.rpy";
+            if !Path::new(hilde_path).exists() || !Path::new(ppf_path).exists() {
+                return;
+            }
+
+            let hilde = parse_file_entries(hilde_path.to_string()).await.unwrap();
+            assert!(
+                hilde.edges.iter().any(|e| e.from == "PPF_menu" && e.to == "hilde_ar1c_selector"),
+                "Входящий переход PPF_menu -> hilde_ar1c_selector должен присутствовать в графе hilde arc I"
+            );
+
+            let ppf = parse_file_entries(ppf_path.to_string()).await.unwrap();
+            assert!(
+                ppf.edges.iter().any(|e| e.from == "PPF_menu" && e.to == "hilde_ar1c_selector"),
+                "Исходящий переход PPF_menu -> hilde_ar1c_selector должен присутствовать в графе PPF HQ"
+            );
         });
     }
 
