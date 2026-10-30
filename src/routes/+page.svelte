@@ -22,7 +22,15 @@
     ArrowUpRight,
     ChevronRight,
     ChevronDown,
-    Network
+    Network,
+    Package,
+    Archive,
+    Trash2,
+    FileCode,
+    Download,
+    Upload,
+    X,
+    Copy
   } from "lucide-svelte";
 
   // Стейт проекта на Svelte 5 (Runes)
@@ -483,6 +491,160 @@
       loadingFile = false;
     }
   }
+
+  // Управление студией RPA и RPYC
+  let showToolsModal = $state(false);
+  let toolsActiveTab = $state<'rpa' | 'rpyc'>('rpa');
+
+  let packingMod = $state(false);
+  let cleaningCache = $state(false);
+  let unpackingRpa = $state(false);
+  let decompilingRpyc = $state(false);
+
+  // Поля вкладки RPA
+  let unpackSourceRpa = $state("");
+  let unpackTargetDir = $state("");
+  let unpackResultMsg = $state("");
+  let packModCustomPath = $state("");
+
+  // Поля вкладки RPYC
+  let decompileRpycPath = $state("");
+  let decompileOutputRpyPath = $state("");
+  let decompiledCodePreview = $state("");
+  let cleanTlOnly = $state(true);
+
+  // 1. Быстрая сборка RPA мода в один клик
+  async function quickPackMod() {
+    if (!gameDir.trim()) {
+      showToast("Укажите путь к папке игры", "warning");
+      return;
+    }
+    packingMod = true;
+    try {
+      const msg = await invoke<string>("pack_mod_rpa", {
+        gameDir: gameDir.trim(),
+        outputRpaPath: null
+      });
+      showToast(msg, "success");
+    } catch (e) {
+      showToast(`Ошибка сборки мода: ${e}`, "error");
+    } finally {
+      packingMod = false;
+    }
+  }
+
+  // 2. Быстрая очистка кэша .rpyc
+  async function quickCleanCache() {
+    if (!gameDir.trim()) {
+      showToast("Укажите путь к папке игры", "warning");
+      return;
+    }
+    cleaningCache = true;
+    try {
+      const count = await invoke<number>("clean_rpyc_cache", {
+        gameDir: gameDir.trim(),
+        tlOnly: true
+      });
+      showToast(`Кэш .rpyc очищен (${count} файлов). Ren'Py соберет свежий байткод!`, "success");
+    } catch (e) {
+      showToast(`Ошибка очистки кэша: ${e}`, "error");
+    } finally {
+      cleaningCache = false;
+    }
+  }
+
+  // 3. Распаковка произвольного RPA архива
+  async function executeUnpackRpa() {
+    if (!unpackSourceRpa.trim() || !unpackTargetDir.trim()) {
+      showToast("Укажите путь к .rpa архиву и целевую папку", "warning");
+      return;
+    }
+    unpackingRpa = true;
+    unpackResultMsg = "";
+    try {
+      const count = await invoke<number>("unpack_rpa", {
+        rpaPath: unpackSourceRpa.trim(),
+        targetDir: unpackTargetDir.trim()
+      });
+      unpackResultMsg = `Успешно распаковано ${count} файлов в "${unpackTargetDir.trim()}"`;
+      showToast(unpackResultMsg, "success");
+    } catch (e) {
+      unpackResultMsg = `Ошибка: ${e}`;
+      showToast(unpackResultMsg, "error");
+    } finally {
+      unpackingRpa = false;
+    }
+  }
+
+  // 4. Сборка RPA мода с кастомным путем
+  async function executePackCustomRpa() {
+    if (!gameDir.trim()) {
+      showToast("Укажите путь к папке игры", "warning");
+      return;
+    }
+    packingMod = true;
+    try {
+      const msg = await invoke<string>("pack_mod_rpa", {
+        gameDir: gameDir.trim(),
+        outputRpaPath: packModCustomPath.trim() || null
+      });
+      showToast(msg, "success");
+    } catch (e) {
+      showToast(`Ошибка сборки: ${e}`, "error");
+    } finally {
+      packingMod = false;
+    }
+  }
+
+  // 5. Декомпиляция .rpyc в .rpy
+  async function executeDecompileRpyc() {
+    if (!decompileRpycPath.trim()) {
+      showToast("Укажите путь к .rpyc файлу", "warning");
+      return;
+    }
+    decompilingRpyc = true;
+    try {
+      const code = await invoke<string>("decompile_rpyc_file", {
+        rpycPath: decompileRpycPath.trim(),
+        outputRpyPath: decompileOutputRpyPath.trim() || null
+      });
+      decompiledCodePreview = code;
+      const lines = code.split("\n").length;
+      showToast(`Декомпиляция завершена: ${lines} строк кода!`, "success");
+    } catch (e) {
+      showToast(`Ошибка декомпиляции: ${e}`, "error");
+    } finally {
+      decompilingRpyc = false;
+    }
+  }
+
+  // 6. Копирование декомпилированного кода в буфер
+  async function copyDecompiledCode() {
+    if (!decompiledCodePreview) return;
+    try {
+      await navigator.clipboard.writeText(decompiledCodePreview);
+      showToast("Код скопирован в буфер обмена!", "success");
+    } catch {
+      showToast("Не удалось скопировать код", "error");
+    }
+  }
+
+  // 7. Очистка кэша из модального окна
+  async function executeCleanCacheModal() {
+    if (!gameDir.trim()) return;
+    cleaningCache = true;
+    try {
+      const count = await invoke<number>("clean_rpyc_cache", {
+        gameDir: gameDir.trim(),
+        tlOnly: cleanTlOnly
+      });
+      showToast(`Удалено ${count} кэш-файлов .rpyc (${cleanTlOnly ? 'только tl/russian' : 'вся папка game'})`, "success");
+    } catch (e) {
+      showToast(`Ошибка очистки: ${e}`, "error");
+    } finally {
+      cleaningCache = false;
+    }
+  }
 </script>
 
 <div class="app-shell">
@@ -510,6 +672,48 @@
           <Play size={15} />
         {/if}
         <span>Сканировать</span>
+      </button>
+    </div>
+
+    <!-- Быстрые действия с RPA и RPYC -->
+    <div class="topbar-actions">
+      <button 
+        onclick={quickPackMod} 
+        disabled={packingMod || !gameDir} 
+        class="btn-top-tool btn-pack" 
+        title="Собрать tl/russian в автономный russian_mod.rpa (RPA-3.0)"
+      >
+        {#if packingMod}
+          <Loader2 size={13} class="spin text-amber-400" />
+          <span>Сборка...</span>
+        {:else}
+          <Package size={14} class="text-amber-400" />
+          <span>Собрать RPA</span>
+        {/if}
+      </button>
+
+      <button 
+        onclick={quickCleanCache} 
+        disabled={cleaningCache || !gameDir} 
+        class="btn-top-tool btn-clean" 
+        title="Удалить скомпилированные .rpyc файлы из tl/russian"
+      >
+        {#if cleaningCache}
+          <Loader2 size={13} class="spin text-rose-400" />
+          <span>Очистка...</span>
+        {:else}
+          <Trash2 size={14} class="text-rose-400" />
+          <span>Очистить .rpyc</span>
+        {/if}
+      </button>
+
+      <button 
+        onclick={() => showToolsModal = true} 
+        class="btn-top-tool btn-studio" 
+        title="Студия: упаковка/распаковка RPA и декомпилятор RPYC"
+      >
+        <Archive size={14} class="text-sky-400" />
+        <span>RPA / RPYC Студия</span>
       </button>
     </div>
 
@@ -1227,6 +1431,257 @@
     </main>
   </div>
 
+  <!-- МОДАЛЬНОЕ ОКНО RPA & RPYC STUDIO -->
+  {#if showToolsModal}
+    <div 
+      class="modal-backdrop" 
+      onclick={(e) => { if (e.target === e.currentTarget) showToolsModal = false; }}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div class="tools-modal">
+        <div class="tools-modal-header">
+          <div class="modal-title-wrap">
+            <Archive size={18} class="text-sky-400" />
+            <h3>Студия Ren'Py: Архивы RPA и Байткод RPYC</h3>
+          </div>
+          <button class="btn-close-modal" onclick={() => showToolsModal = false} aria-label="Закрыть">
+            <X size={16} />
+          </button>
+        </div>
+
+        <div class="tools-tab-bar">
+          <button 
+            class="tools-tab" 
+            class:tab-active={toolsActiveTab === 'rpa'}
+            onclick={() => toolsActiveTab = 'rpa'}
+          >
+            <Package size={15} />
+            <span>Архивы RPA (Сборка & Распаковка)</span>
+          </button>
+          <button 
+            class="tools-tab" 
+            class:tab-active={toolsActiveTab === 'rpyc'}
+            onclick={() => toolsActiveTab = 'rpyc'}
+          >
+            <FileCode size={15} />
+            <span>Байткод RPYC (Декомпилятор & Кэш)</span>
+          </button>
+        </div>
+
+        <div class="tools-modal-body">
+          {#if toolsActiveTab === 'rpa'}
+            <!-- ВКЛАДКА RPA -->
+            <div class="tools-cards-grid">
+              <!-- Карточка 1: Сборка RPA мода -->
+              <div class="tool-card">
+                <div class="tool-card-head">
+                  <div class="tool-head-title">
+                    <Package size={16} class="text-amber-400" />
+                    <h4>Экспорт мода перевода (RPA-3.0)</h4>
+                  </div>
+                  <span class="tool-badge">Для игроков</span>
+                </div>
+                <p class="tool-desc">
+                  Упаковывает папку <code>tl/russian</code> со всеми скриптами, шрифтами и графикой в единый <code>.rpa</code> файл. Игрокам нужно лишь скопировать его в папку <code>game/</code>.
+                </p>
+
+                <div class="tool-form-group">
+                  <span class="tool-field-label">Папка источника (tl/russian)</span>
+                  <div class="tool-readonly-path">{gameDir ? `${gameDir}\\tl\\russian` : 'Папка игры не выбрана'}</div>
+                </div>
+
+                <div class="tool-form-group">
+                  <span class="tool-field-label">Путь к итоговому файлу RPA (по умолчанию в game/)</span>
+                  <input 
+                    type="text" 
+                    bind:value={packModCustomPath} 
+                    placeholder={gameDir ? `${gameDir}\\russian_mod.rpa` : "Куда сохранить .rpa..."} 
+                    class="tool-input"
+                  />
+                </div>
+
+                <button 
+                  class="btn-tool-action btn-pack-action" 
+                  onclick={executePackCustomRpa} 
+                  disabled={packingMod || !gameDir}
+                >
+                  {#if packingMod}
+                    <Loader2 size={15} class="spin" />
+                    <span>Упаковка файлов в RPA-3.0...</span>
+                  {:else}
+                    <Download size={15} />
+                    <span>Собрать и экспортировать RPA мод</span>
+                  {/if}
+                </button>
+              </div>
+
+              <!-- Карточка 2: Распаковка RPA архива -->
+              <div class="tool-card">
+                <div class="tool-card-head">
+                  <div class="tool-head-title">
+                    <Archive size={16} class="text-sky-400" />
+                    <h4>Распаковка RPA архива</h4>
+                  </div>
+                  <span class="tool-badge tool-badge-cyan">Экстрактор</span>
+                </div>
+                <p class="tool-desc">
+                  Извлекает скрипты, текстуры, фоны и музыку из запакованных архивов игры (<code>archive.rpa</code>, <code>scripts.rpa</code>, <code>images.rpa</code>).
+                </p>
+
+                <div class="tool-form-group">
+                  <span class="tool-field-label">Путь к .rpa архиву</span>
+                  <input 
+                    type="text" 
+                    bind:value={unpackSourceRpa} 
+                    placeholder="Например: C:\\Game\\game\\archive.rpa" 
+                    class="tool-input"
+                  />
+                </div>
+
+                <div class="tool-form-group">
+                  <span class="tool-field-label">Куда распаковать (целевая папка)</span>
+                  <input 
+                    type="text" 
+                    bind:value={unpackTargetDir} 
+                    placeholder="Например: C:\\Game\\game\\extracted" 
+                    class="tool-input"
+                  />
+                </div>
+
+                <button 
+                  class="btn-tool-action btn-unpack-action" 
+                  onclick={executeUnpackRpa} 
+                  disabled={unpackingRpa}
+                >
+                  {#if unpackingRpa}
+                    <Loader2 size={15} class="spin" />
+                    <span>Извлечение файлов из архива...</span>
+                  {:else}
+                    <Upload size={15} />
+                    <span>Распаковать архив</span>
+                  {/if}
+                </button>
+
+                {#if unpackResultMsg}
+                  <div class="tool-result-box">{unpackResultMsg}</div>
+                {/if}
+              </div>
+            </div>
+
+          {:else}
+            <!-- ВКЛАДКА RPYC -->
+            <div class="tools-cards-grid">
+              <!-- Карточка 1: Декомпилятор -->
+              <div class="tool-card full-width-card">
+                <div class="tool-card-head">
+                  <div class="tool-head-title">
+                    <FileCode size={16} class="text-emerald-400" />
+                    <h4>Декомпилятор байткода .rpyc в исходный код .rpy</h4>
+                  </div>
+                  <span class="tool-badge tool-badge-green">Pure Rust AST</span>
+                </div>
+                <p class="tool-desc">
+                  Восстанавливает человекочитаемые диалоги, сцены (label), ветвления (menu) и переходы (jump) прямо из скомпилированного байткода Ren'Py без необходимости в Python!
+                </p>
+
+                <div class="tool-inline-form">
+                  <div class="tool-form-group flex-1">
+                    <span class="tool-field-label">Путь к скомпилированному файлу .rpyc</span>
+                    <input 
+                      type="text" 
+                      bind:value={decompileRpycPath} 
+                      placeholder={gameDir ? `${gameDir}\\celia.rpyc` : "Путь к .rpyc..."} 
+                      class="tool-input"
+                    />
+                  </div>
+
+                  <div class="tool-form-group flex-1">
+                    <span class="tool-field-label">Сохранить как .rpy (опционально)</span>
+                    <input 
+                      type="text" 
+                      bind:value={decompileOutputRpyPath} 
+                      placeholder="Например: D:\\output\\decompiled.rpy" 
+                      class="tool-input"
+                    />
+                  </div>
+
+                  <div class="tool-form-action-wrap">
+                    <button 
+                      class="btn-tool-action btn-decompile-action" 
+                      onclick={executeDecompileRpyc} 
+                      disabled={decompilingRpyc}
+                    >
+                      {#if decompilingRpyc}
+                        <Loader2 size={15} class="spin" />
+                        <span>Декомпиляция...</span>
+                      {:else}
+                        <Zap size={15} />
+                        <span>Декомпилировать</span>
+                      {/if}
+                    </button>
+                  </div>
+                </div>
+
+                {#if decompiledCodePreview}
+                  <div class="decompile-preview-wrap">
+                    <div class="preview-header">
+                      <span>Предпросмотр декомпилированного кода:</span>
+                      <button class="btn-copy-code" onclick={copyDecompiledCode}>
+                        <Copy size={13} />
+                        <span>Копировать код</span>
+                      </button>
+                    </div>
+                    <textarea readonly class="decompile-code-area" value={decompiledCodePreview}></textarea>
+                  </div>
+                {/if}
+              </div>
+
+              <!-- Карточка 2: Очистка кэша .rpyc -->
+              <div class="tool-card full-width-card">
+                <div class="tool-card-head">
+                  <div class="tool-head-title">
+                    <Trash2 size={16} class="text-rose-400" />
+                    <h4>Очистка устаревшего кэша скомпилированных скриптов .rpyc</h4>
+                  </div>
+                  <span class="tool-badge tool-badge-rose">Cache Flush</span>
+                </div>
+                <p class="tool-desc">
+                  Устраняет частую проблему Ren'Py, когда движок запускает старый скомпилированный байткод вместо свежепереведенных файлов .rpy.
+                </p>
+
+                <div class="cache-options-row">
+                  <label class="radio-label">
+                    <input type="radio" bind:group={cleanTlOnly} value={true} />
+                    <span>Только файлы перевода в <code>tl/russian</code> (Рекомендуется, безопасно)</span>
+                  </label>
+                  <label class="radio-label">
+                    <input type="radio" bind:group={cleanTlOnly} value={false} />
+                    <span>Все файлы .rpyc во всей папке <code>game/</code></span>
+                  </label>
+                </div>
+
+                <button 
+                  class="btn-tool-action btn-clean-action" 
+                  onclick={executeCleanCacheModal} 
+                  disabled={cleaningCache || !gameDir}
+                >
+                  {#if cleaningCache}
+                    <Loader2 size={15} class="spin" />
+                    <span>Удаление кэша...</span>
+                  {:else}
+                    <Trash2 size={15} />
+                    <span>Очистить кэш .rpyc</span>
+                  {/if}
+                </button>
+              </div>
+            </div>
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
+
   <!-- ВСПЛЫВАЮЩИЙ ТОАСТ НАВИГАЦИИ -->
   {#if toast}
     <div class="toast-notification toast-{toast.type}">
@@ -1406,6 +1861,466 @@
     background: #1e293b;
     border-radius: 999px;
     overflow: hidden;
+  }
+
+  /* TOPBAR ACTIONS FOR RPA & RPYC */
+  .topbar-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .btn-top-tool {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: #11141c;
+    border: 1px solid #252c3c;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    color: #cbd5e1;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+  }
+
+  .btn-top-tool:hover:not(:disabled) {
+    background: #182030;
+    border-color: #3b82f6;
+    color: #f8fafc;
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.2);
+  }
+
+  .btn-top-tool:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-top-tool.btn-pack:hover:not(:disabled) {
+    border-color: #f59e0b;
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.25);
+  }
+
+  .btn-top-tool.btn-clean:hover:not(:disabled) {
+    border-color: #f43f5e;
+    box-shadow: 0 0 10px rgba(244, 63, 94, 0.25);
+  }
+
+  .btn-top-tool.btn-studio {
+    background: #0f1c2e;
+    border-color: #1e3a5f;
+    color: #38bdf8;
+  }
+
+  .btn-top-tool.btn-studio:hover {
+    background: #132a48;
+    border-color: #38bdf8;
+    color: #e0f2fe;
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.3);
+  }
+
+  /* MODAL WINDOW FOR RPA & RPYC STUDIO */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: rgba(4, 7, 12, 0.75);
+    backdrop-filter: blur(8px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    animation: modalFadeIn 0.18s ease-out;
+  }
+
+  @keyframes modalFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .tools-modal {
+    background: #0f121a;
+    border: 1px solid #1e2638;
+    border-radius: 12px;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(56, 189, 248, 0.1);
+    width: 100%;
+    max-width: 860px;
+    max-height: 88vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    animation: modalScaleUp 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  @keyframes modalScaleUp {
+    from { transform: scale(0.96) translateY(8px); }
+    to { transform: scale(1) translateY(0); }
+  }
+
+  .tools-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 20px;
+    background: #141824;
+    border-bottom: 1px solid #1e2638;
+  }
+
+  .modal-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .modal-title-wrap h3 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: #f1f5f9;
+  }
+
+  .btn-close-modal {
+    background: transparent;
+    border: none;
+    color: #64748b;
+    cursor: pointer;
+    padding: 6px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+
+  .btn-close-modal:hover {
+    background: #1e2638;
+    color: #f1f5f9;
+  }
+
+  .tools-tab-bar {
+    display: flex;
+    background: #0d0f16;
+    border-bottom: 1px solid #1a2232;
+    padding: 0 16px;
+  }
+
+  .tools-tab {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 18px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: #94a3b8;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .tools-tab:hover {
+    color: #f1f5f9;
+  }
+
+  .tools-tab.tab-active {
+    color: #38bdf8;
+    border-bottom-color: #38bdf8;
+    background: rgba(56, 189, 248, 0.05);
+  }
+
+  .tools-modal-body {
+    padding: 20px;
+    overflow-y: auto;
+    max-height: calc(88vh - 120px);
+  }
+
+  .tools-cards-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+
+  .tool-card {
+    background: #131722;
+    border: 1px solid #1e2638;
+    border-radius: 10px;
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .tool-card.full-width-card {
+    grid-column: 1 / -1;
+  }
+
+  .tool-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .tool-head-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .tool-head-title h4 {
+    margin: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: #f8fafc;
+  }
+
+  .tool-badge {
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+    font-weight: 600;
+  }
+
+  .tool-badge-cyan {
+    background: rgba(56, 189, 248, 0.15);
+    color: #38bdf8;
+    border-color: rgba(56, 189, 248, 0.3);
+  }
+
+  .tool-badge-green {
+    background: rgba(52, 211, 153, 0.15);
+    color: #34d399;
+    border-color: rgba(52, 211, 153, 0.3);
+  }
+
+  .tool-badge-rose {
+    background: rgba(244, 63, 94, 0.15);
+    color: #f43f5e;
+    border-color: rgba(244, 63, 94, 0.3);
+  }
+
+  .tool-desc {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #94a3b8;
+  }
+
+  .tool-desc code {
+    background: #090c12;
+    padding: 2px 5px;
+    border-radius: 4px;
+    color: #38bdf8;
+    font-size: 11px;
+    border: 1px solid #1a2232;
+  }
+
+  .tool-form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .tool-field-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: #cbd5e1;
+  }
+
+  .tool-readonly-path {
+    background: #0b0e14;
+    border: 1px solid #1a2232;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: #64748b;
+    font-family: monospace;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .tool-input {
+    background: #0b0e14;
+    border: 1px solid #232c3e;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: #f1f5f9;
+    font-family: monospace;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .tool-input:focus {
+    border-color: #38bdf8;
+  }
+
+  .btn-tool-action {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 9px 16px;
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    border: none;
+    transition: all 0.15s ease;
+  }
+
+  .btn-tool-action:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-pack-action {
+    background: #d97706;
+    color: #ffffff;
+  }
+
+  .btn-pack-action:hover:not(:disabled) {
+    background: #b45309;
+    box-shadow: 0 0 16px rgba(217, 119, 6, 0.4);
+  }
+
+  .btn-unpack-action {
+    background: #0284c7;
+    color: #ffffff;
+  }
+
+  .btn-unpack-action:hover:not(:disabled) {
+    background: #0369a1;
+    box-shadow: 0 0 16px rgba(2, 132, 199, 0.4);
+  }
+
+  .btn-decompile-action {
+    background: #059669;
+    color: #ffffff;
+    height: 34px;
+    white-space: nowrap;
+  }
+
+  .btn-decompile-action:hover:not(:disabled) {
+    background: #047857;
+    box-shadow: 0 0 16px rgba(5, 150, 105, 0.4);
+  }
+
+  .btn-clean-action {
+    background: #e11d48;
+    color: #ffffff;
+  }
+
+  .btn-clean-action:hover:not(:disabled) {
+    background: #be123c;
+    box-shadow: 0 0 16px rgba(225, 29, 72, 0.4);
+  }
+
+  .tool-result-box {
+    background: #0c121d;
+    border: 1px solid #1a2b42;
+    color: #7dd3fc;
+    font-size: 12px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-family: monospace;
+  }
+
+  .tool-inline-form {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+  }
+
+  .flex-1 {
+    flex: 1;
+  }
+
+  .tool-form-action-wrap {
+    margin-bottom: 0;
+  }
+
+  .decompile-preview-wrap {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .preview-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    color: #94a3b8;
+  }
+
+  .btn-copy-code {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: #182030;
+    border: 1px solid #233048;
+    border-radius: 5px;
+    padding: 4px 10px;
+    font-size: 11px;
+    color: #7dd3fc;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-copy-code:hover {
+    background: #202c44;
+    border-color: #38bdf8;
+    color: #f0f9ff;
+  }
+
+  .decompile-code-area {
+    width: 100%;
+    height: 240px;
+    background: #080a0f;
+    border: 1px solid #1a2232;
+    border-radius: 6px;
+    padding: 12px;
+    font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    color: #e2e8f0;
+    resize: vertical;
+    outline: none;
+    box-sizing: border-box;
+  }
+
+  .cache-options-row {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #0a0d14;
+    padding: 10px 14px;
+    border-radius: 6px;
+    border: 1px solid #1a2232;
+  }
+
+  .radio-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: #cbd5e1;
+    cursor: pointer;
+  }
+
+  .radio-label code {
+    background: #131824;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #f43f5e;
   }
 
   .progress-fill {

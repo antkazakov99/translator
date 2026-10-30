@@ -4032,6 +4032,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "flate2",
  "petgraph",
  "rayon",
  "regex",

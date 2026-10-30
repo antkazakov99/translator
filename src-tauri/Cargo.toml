@@ -37,6 +37,7 @@ tracing-subscriber = "0.3"
 
 # Парсинг
 regex = "1.11"
+flate2 = "1.0"
 
 [profile.release]
 codegen-units = 1

@@ -1,6 +1,9 @@
 pub mod graph;
 pub mod parser;
+pub mod pickle;
 pub mod project;
+pub mod rpa;
+pub mod rpyc;
 
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
@@ -421,11 +424,95 @@ async fn find_scene_target(
     .map_err(|e| format!("Ошибка задачи поиска сцены: {}", e))?
 }
 
+#[tauri::command]
+async fn pack_mod_rpa(
+    game_dir: String,
+    output_rpa_path: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = Path::new(&game_dir);
+        let tl_dir = base_path.join(r"tl\russian");
+        if !tl_dir.exists() {
+            return Err("Папка перевода tl/russian не найдена в директории игры".to_string());
+        }
+
+        let out_path = if let Some(ref p) = output_rpa_path {
+            PathBuf::from(p)
+        } else {
+            base_path.join("russian_mod.rpa")
+        };
+
+        let count = rpa::RpaArchive::pack_mod_from_folder(&tl_dir, &out_path)?;
+        Ok(format!(
+            "Мод успешно собран! Упаковано {} файлов в {}",
+            count,
+            out_path.to_string_lossy()
+        ))
+    })
+    .await
+    .map_err(|e| format!("Ошибка сборки RPA мода: {}", e))?
+}
+
+#[tauri::command]
+async fn unpack_rpa(rpa_path: String, target_dir: String) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let src = Path::new(&rpa_path);
+        let dst = Path::new(&target_dir);
+        rpa::RpaArchive::extract_all(src, dst)
+    })
+    .await
+    .map_err(|e| format!("Ошибка распаковки RPA: {}", e))?
+}
+
+#[tauri::command]
+async fn clean_rpyc_cache(game_dir: String, tl_only: bool) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = Path::new(&game_dir);
+        rpyc::RpycParser::clean_cache(base_path, tl_only)
+    })
+    .await
+    .map_err(|e| format!("Ошибка очистки кэша .rpyc: {}", e))?
+}
+
+#[tauri::command]
+async fn decompile_rpyc_file(
+    rpyc_path: String,
+    output_rpy_path: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = Path::new(&rpyc_path);
+        let stmts = rpyc::RpycParser::parse_rpyc_file(path)?;
+        let rpy_text = rpyc::RpycParser::decompile_to_rpy_text(&stmts);
+
+        if let Some(ref out_p) = output_rpy_path {
+            let out_path = Path::new(out_p);
+            if let Some(parent) = out_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(out_path, &rpy_text)
+                .map_err(|e| format!("Не удалось сохранить декомпилированный .rpy: {}", e))?;
+        }
+
+        Ok(rpy_text)
+    })
+    .await
+    .map_err(|e| format!("Ошибка декомпиляции: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, scan_game_project, parse_file_entries, find_scene_target])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            scan_game_project,
+            parse_file_entries,
+            find_scene_target,
+            pack_mod_rpa,
+            unpack_rpa,
+            clean_rpyc_cache,
+            decompile_rpyc_file
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -486,6 +573,45 @@ mod tests {
                     assert!(ppf_loc.file_path.contains(r"tl\russian\script\locations\PPF HQ.rpy"));
                 }
             }
+        });
+    }
+
+    #[test]
+    fn test_rpa_and_rpyc_tauri_commands() {
+        tauri::async_runtime::block_on(async {
+            let game_dir = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game";
+            if !Path::new(game_dir).exists() {
+                return;
+            }
+
+            // 1. Тест декомпиляции celia.rpyc через команду decompile_rpyc_file
+            let celia_rpyc = format!(r"{}\celia.rpyc", game_dir);
+            let decompiled = decompile_rpyc_file(celia_rpyc, None).await.unwrap();
+            assert!(decompiled.contains("label end_scene_nei:"));
+            println!("Команда decompile_rpyc_file успешно декомпилировала celia.rpyc!");
+
+            // 2. Тест упаковки мода в RPA архив во временный файл
+            let temp_rpa = std::env::temp_dir().join("test_command_mod.rpa");
+            let result_msg = pack_mod_rpa(game_dir.to_string(), Some(temp_rpa.to_string_lossy().to_string()))
+                .await
+                .unwrap();
+            println!("Результат pack_mod_rpa: {}", result_msg);
+            assert!(temp_rpa.exists(), "Архив мода должен быть создан");
+
+            // 3. Тест распаковки созданного мода через unpack_rpa
+            let temp_unpack_dir = std::env::temp_dir().join("test_command_unpacked");
+            let unpacked_count = unpack_rpa(
+                temp_rpa.to_string_lossy().to_string(),
+                temp_unpack_dir.to_string_lossy().to_string(),
+            )
+            .await
+            .unwrap();
+            println!("Распаковано файлов мода: {}", unpacked_count);
+            assert!(unpacked_count > 0);
+
+            // Очищаем временные файлы
+            let _ = std::fs::remove_file(&temp_rpa);
+            let _ = std::fs::remove_dir_all(&temp_unpack_dir);
         });
     }
 }
