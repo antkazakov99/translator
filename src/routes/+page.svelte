@@ -30,7 +30,11 @@
     Download,
     Upload,
     X,
-    Copy
+    Copy,
+    BookOpen,
+    Plus,
+    Save,
+    BookMarked
   } from "lucide-svelte";
 
   // Стейт проекта на Svelte 5 (Runes)
@@ -100,6 +104,28 @@
     translated_lines: number;
     scenes: Scene[];
     edges: SceneEdge[];
+  }
+
+  // Интерфейсы глоссария проекта
+  interface CharacterGlossaryEntry {
+    alias: string;
+    original_name: string;
+    translated_name: string;
+    gender: string; // "male" | "female" | "unknown"
+    notes: string;
+  }
+
+  interface TermGlossaryEntry {
+    id: string;
+    source_term: string;
+    translated_term: string;
+    category: string; // "general" | "location" | "title" | "item"
+    notes: string;
+  }
+
+  interface ProjectGlossary {
+    characters: CharacterGlossaryEntry[];
+    terms: TermGlossaryEntry[];
   }
 
   let project = $state<ProjectSummary | null>(null);
@@ -303,40 +329,116 @@
     return map;
   });
 
-  function getSpeakerInfo(speaker: string | null | undefined, speakerAlias?: string | null): { alias: string | null; name: string; isNarrator: boolean; isUi: boolean } {
+  // Состояние глоссария проекта
+  let showGlossaryModal = $state(false);
+  let glossaryTab = $state<'characters' | 'terms'>('characters');
+  let glossary = $state<ProjectGlossary>({ characters: [], terms: [] });
+  let loadingGlossary = $state(false);
+  let savingGlossary = $state(false);
+  let glossaryDirty = $state(false);
+
+  // Фильтры глоссария
+  let glossarySearch = $state("");
+  let glossaryGenderFilter = $state<"all" | "male" | "female" | "unknown">("all");
+  let glossaryCategoryFilter = $state<"all" | "general" | "location" | "title" | "item">("all");
+
+  // Добавление термина
+  let newTermSource = $state("");
+  let newTermTranslation = $state("");
+  let newTermCategory = $state("general");
+  let newTermNotes = $state("");
+
+  // Добавление персонажа вручную
+  let showAddChar = $state(false);
+  let newCharAlias = $state("");
+  let newCharName = $state("");
+  let newCharTranslation = $state("");
+  let newCharGender = $state("unknown");
+
+  // Быстрый кэш маппинга персонажей глоссария
+  let glossaryCharByAlias = $derived.by(() => {
+    const map = new Map<string, CharacterGlossaryEntry>();
+    for (const c of glossary.characters) {
+      map.set(c.alias.toLowerCase(), c);
+    }
+    return map;
+  });
+
+  let glossaryCharByName = $derived.by(() => {
+    const map = new Map<string, CharacterGlossaryEntry>();
+    for (const c of glossary.characters) {
+      map.set(c.original_name.toLowerCase(), c);
+    }
+    return map;
+  });
+
+  function getSpeakerInfo(speaker: string | null | undefined, speakerAlias?: string | null): { 
+    alias: string | null; 
+    name: string; 
+    translatedName: string | null;
+    gender: string;
+    notes: string;
+    isNarrator: boolean; 
+    isUi: boolean;
+  } {
     if (!speaker && !speakerAlias) {
-      return { alias: null, name: "Автор", isNarrator: true, isUi: false };
+      return { alias: null, name: "Автор", translatedName: null, gender: "unknown", notes: "", isNarrator: true, isUi: false };
     }
 
     if (speaker === "UI / Choice" || speakerAlias === "UI") {
-      return { alias: "UI", name: "Интерфейс", isNarrator: false, isUi: true };
+      return { alias: "UI", name: "Интерфейс", translatedName: null, gender: "unknown", notes: "", isNarrator: false, isUi: true };
     }
+
+    let alias: string | null = null;
+    let name = (speaker || speakerAlias || "").trim();
 
     // 1. Если бэкенд передал оба поля и они различаются
     if (speakerAlias && speaker && speakerAlias !== speaker) {
-      return { alias: speakerAlias, name: speaker, isNarrator: false, isUi: false };
+      alias = speakerAlias;
+      name = speaker;
+    } else {
+      const raw = name;
+      const lower = raw.toLowerCase();
+
+      // 2. Если raw — это известный алиас (например, "lis" -> alias="lis", name="Lisa")
+      if (charAliasToName.has(lower)) {
+        alias = raw;
+        name = charAliasToName.get(lower)!;
+      }
+      // 3. Если raw — это известное имя (например, "Lisa" -> alias="lis", name="Lisa")
+      else if (charNameToAlias.has(lower)) {
+        alias = charNameToAlias.get(lower)!;
+        name = raw;
+      } else if (speakerAlias) {
+        alias = speakerAlias;
+        name = raw;
+      } else {
+        alias = raw;
+        name = raw;
+      }
     }
 
-    const raw = (speaker || speakerAlias || "").trim();
-    const lower = raw.toLowerCase();
-
-    // 2. Если raw — это известный алиас (например, "lis" -> alias="lis", name="Lisa")
-    if (charAliasToName.has(lower)) {
-      return { alias: raw, name: charAliasToName.get(lower)!, isNarrator: false, isUi: false };
+    // Сопоставление с глоссарием проекта
+    let glEntry: CharacterGlossaryEntry | undefined;
+    if (alias && glossaryCharByAlias.has(alias.toLowerCase())) {
+      glEntry = glossaryCharByAlias.get(alias.toLowerCase());
+    } else if (name && glossaryCharByName.has(name.toLowerCase())) {
+      glEntry = glossaryCharByName.get(name.toLowerCase());
     }
 
-    // 3. Если raw — это известное имя (например, "Lisa" -> alias="lis", name="Lisa")
-    if (charNameToAlias.has(lower)) {
-      return { alias: charNameToAlias.get(lower)!, name: raw, isNarrator: false, isUi: false };
-    }
+    const translatedName = glEntry?.translated_name?.trim() ? glEntry.translated_name.trim() : null;
+    const gender = glEntry?.gender || "unknown";
+    const notes = glEntry?.notes || "";
 
-    // 4. Если задан только speakerAlias
-    if (speakerAlias) {
-      return { alias: speakerAlias, name: raw, isNarrator: false, isUi: false };
-    }
-
-    // 5. Запасной вариант: имя без тега или тег равен имени
-    return { alias: raw, name: raw, isNarrator: false, isUi: false };
+    return { 
+      alias, 
+      name, 
+      translatedName,
+      gender,
+      notes,
+      isNarrator: false, 
+      isUi: false 
+    };
   }
 
   // Исходящие связи для сцены
@@ -510,6 +612,7 @@
     try {
       project = await invoke<ProjectSummary>("scan_game_project", { gameDir });
       loadingProject = false;
+      loadGlossary(true);
       if (project.files.length > 0) {
         // Микропауза для отрисовки сайдбара и статов перед загрузкой первого файла
         await new Promise(r => setTimeout(r, 20));
@@ -703,7 +806,160 @@
       cleaningCache = false;
     }
   }
+
+  // --- УПРАВЛЕНИЕ ГЛОССАРИЕМ ПРОЕКТА ---
+  let filteredGlossaryCharacters = $derived.by(() => {
+    const q = glossarySearch.trim().toLowerCase();
+    return glossary.characters.filter(c => {
+      if (glossaryGenderFilter !== 'all' && c.gender !== glossaryGenderFilter) {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        c.alias.toLowerCase().includes(q) ||
+        c.original_name.toLowerCase().includes(q) ||
+        c.translated_name.toLowerCase().includes(q) ||
+        c.notes.toLowerCase().includes(q)
+      );
+    });
+  });
+
+  let filteredGlossaryTerms = $derived.by(() => {
+    const q = glossarySearch.trim().toLowerCase();
+    return glossary.terms.filter(t => {
+      if (glossaryCategoryFilter !== 'all' && t.category !== glossaryCategoryFilter) {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        t.source_term.toLowerCase().includes(q) ||
+        t.translated_term.toLowerCase().includes(q) ||
+        t.notes.toLowerCase().includes(q)
+      );
+    });
+  });
+
+  let glossaryStats = $derived.by(() => {
+    const totalChars = glossary.characters.length;
+    const translatedChars = glossary.characters.filter(c => c.translated_name.trim().length > 0).length;
+    const maleChars = glossary.characters.filter(c => c.gender === 'male').length;
+    const femaleChars = glossary.characters.filter(c => c.gender === 'female').length;
+    const unknownChars = glossary.characters.filter(c => c.gender === 'unknown' || !c.gender).length;
+    const totalTerms = glossary.terms.length;
+    return { totalChars, translatedChars, maleChars, femaleChars, unknownChars, totalTerms };
+  });
+
+  async function loadGlossary(silent = false) {
+    if (!gameDir.trim()) return;
+    if (!silent) loadingGlossary = true;
+    try {
+      const res = await invoke<ProjectGlossary>("get_project_glossary", {
+        gameDir: gameDir.trim(),
+        scannedCharacters: project?.characters ?? null
+      });
+      glossary = res;
+      glossaryDirty = false;
+    } catch (e) {
+      if (!silent) showToast(`Ошибка загрузки глоссария: ${e}`, "error");
+    } finally {
+      if (!silent) loadingGlossary = false;
+    }
+  }
+
+  async function openGlossary() {
+    showGlossaryModal = true;
+    await loadGlossary();
+  }
+
+  async function saveGlossary() {
+    if (!gameDir.trim()) {
+      showToast("Укажите путь к папке игры", "warning");
+      return;
+    }
+    savingGlossary = true;
+    try {
+      const msg = await invoke<string>("save_project_glossary", {
+        gameDir: gameDir.trim(),
+        glossary
+      });
+      glossaryDirty = false;
+      showToast(msg, "success");
+    } catch (e) {
+      showToast(`Ошибка сохранения глоссария: ${e}`, "error");
+    } finally {
+      savingGlossary = false;
+    }
+  }
+
+  function updateCharacterGender(char: CharacterGlossaryEntry, gender: "male" | "female" | "unknown") {
+    char.gender = gender;
+    glossaryDirty = true;
+  }
+
+  function addGlossaryTerm() {
+    const src = newTermSource.trim();
+    const tr = newTermTranslation.trim();
+    if (!src) {
+      showToast("Введите исходный термин", "warning");
+      return;
+    }
+    const newEntry: TermGlossaryEntry = {
+      id: `term_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      source_term: src,
+      translated_term: tr,
+      category: newTermCategory,
+      notes: newTermNotes.trim()
+    };
+    glossary.terms = [newEntry, ...glossary.terms];
+    newTermSource = "";
+    newTermTranslation = "";
+    newTermNotes = "";
+    glossaryDirty = true;
+    showToast(`Термин "${src}" добавлен в глоссарий`, "success");
+  }
+
+  function removeGlossaryTerm(id: string) {
+    glossary.terms = glossary.terms.filter(t => t.id !== id);
+    glossaryDirty = true;
+    showToast("Термин удален из глоссария", "info");
+  }
+
+  function addCustomCharacter() {
+    const alias = newCharAlias.trim().toLowerCase();
+    const name = newCharName.trim();
+    if (!alias || !name) {
+      showToast("Укажите алиас и оригинальное имя персонажа", "warning");
+      return;
+    }
+    if (glossary.characters.some(c => c.alias.toLowerCase() === alias)) {
+      showToast(`Персонаж с кодом [${alias}] уже есть в глоссарии`, "warning");
+      return;
+    }
+    glossary.characters.push({
+      alias,
+      original_name: name,
+      translated_name: newCharTranslation.trim(),
+      gender: newCharGender,
+      notes: ""
+    });
+    glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
+    newCharAlias = "";
+    newCharName = "";
+    newCharTranslation = "";
+    newCharGender = "unknown";
+    showAddChar = false;
+    glossaryDirty = true;
+    showToast(`Персонаж [${alias}] ${name} добавлен в глоссарий`, "success");
+  }
 </script>
+
+<!-- Горячая клавиша Ctrl+S для быстрого сохранения глоссария -->
+<svelte:window onkeydown={(e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 's' && showGlossaryModal) {
+    e.preventDefault();
+    saveGlossary();
+  }
+}} />
 
 <div class="app-shell">
   <!-- ВЕРХНИЙ ТУЛБАР -->
@@ -772,6 +1028,18 @@
       >
         <Archive size={14} class="text-sky-400" />
         <span>RPA / RPYC Студия</span>
+      </button>
+
+      <button 
+        onclick={openGlossary} 
+        class="btn-top-tool btn-glossary" 
+        title="Глоссарий проекта: имена персонажей, пол (М/Ж) и словарь терминов"
+      >
+        <BookOpen size={14} class="text-emerald-400" />
+        <span>Глоссарий</span>
+        {#if glossary.characters.length > 0 || glossary.terms.length > 0}
+          <span class="topbar-badge">{glossary.characters.length + glossary.terms.length}</span>
+        {/if}
       </button>
     </div>
 
@@ -950,34 +1218,53 @@
           {/if}
         {/snippet}
 
-        <!-- Спикеры / Персонажи (компактный аккордеон) -->
+        <!-- Спикеры / Персонажи (компактный аккордеон с глоссарием) -->
         <div class="sidebar-section characters-section">
-          <button 
-            class="characters-toggle-header" 
-            onclick={() => charactersExpanded = !charactersExpanded}
-            title={charactersExpanded ? "Свернуть список персонажей" : "Развернуть список персонажей"}
-          >
-            <div class="header-left">
-              <span class="tree-caret">
-                {#if charactersExpanded}
-                  <ChevronDown size={12} />
-                {:else}
-                  <ChevronRight size={12} />
-                {/if}
-              </span>
-              <Users size={13} class="text-sky-400" />
-              <span>ПЕРСОНАЖИ ({project.characters.length})</span>
-            </div>
-            <span class="characters-state-hint">{charactersExpanded ? "свернуть" : "раскрыть"}</span>
-          </button>
+          <div class="characters-header-wrap">
+            <button 
+              class="characters-toggle-header" 
+              onclick={() => charactersExpanded = !charactersExpanded}
+              title={charactersExpanded ? "Свернуть список персонажей" : "Развернуть список персонажей"}
+            >
+              <div class="header-left">
+                <span class="tree-caret">
+                  {#if charactersExpanded}
+                    <ChevronDown size={12} />
+                  {:else}
+                    <ChevronRight size={12} />
+                  {/if}
+                </span>
+                <Users size={13} class="text-sky-400" />
+                <span>ПЕРСОНАЖИ ({project.characters.length})</span>
+              </div>
+            </button>
+            <button 
+              class="btn-sidebar-glossary" 
+              onclick={openGlossary} 
+              title="Открыть глоссарий персонажей и терминов"
+            >
+              <BookOpen size={11} class="text-emerald-400" />
+              <span>Глоссарий</span>
+            </button>
+          </div>
 
           {#if charactersExpanded}
             <div class="char-chips">
               {#each project.characters as [alias, name]}
-                <div class="char-chip" title="Код: {alias}">
+                {@const gl = glossaryCharByAlias.get(alias.toLowerCase())}
+                <button 
+                  class="char-chip char-chip-interactive" 
+                  onclick={() => { glossarySearch = alias; openGlossary(); }}
+                  title="Открыть [{alias}] в глоссарии"
+                >
                   <span class="char-alias">[{alias}]</span>
-                  <span class="char-name">{name}</span>
-                </div>
+                  <span class="char-name">{gl?.translated_name ? gl.translated_name : name}</span>
+                  {#if gl?.gender === 'male'}
+                    <span class="gender-pill gender-male" title="Мужской род">М</span>
+                  {:else if gl?.gender === 'female'}
+                    <span class="gender-pill gender-female" title="Женский род">Ж</span>
+                  {/if}
+                </button>
               {/each}
             </div>
           {/if}
@@ -1199,9 +1486,14 @@
                               <span class="char-name">Интерфейс:</span>
                             </span>
                           {:else}
-                            <span class="char-chip char-chip-snippet" title="Код: {spk.alias}">
+                            <span class="char-chip char-chip-snippet" title="Код: {spk.alias || '—'}">
                               {#if spk.alias}<span class="char-alias">[{spk.alias}]</span>{/if}
-                              <span class="char-name">{spk.name}:</span>
+                              <span class="char-name">{spk.translatedName ? spk.translatedName : spk.name}:</span>
+                              {#if spk.gender === 'male'}
+                                <span class="gender-pill gender-male" title="Мужской род">М</span>
+                              {:else if spk.gender === 'female'}
+                                <span class="gender-pill gender-female" title="Женский род">Ж</span>
+                              {/if}
                             </span>
                           {/if}
                           <span class="snippet-text">"{scene.entries[0].original_text}"</span>
@@ -1436,11 +1728,19 @@
                                   <span class="char-name">Интерфейс</span>
                                 </span>
                               {:else}
-                                <span class="char-chip" title="Код: {spk.alias}">
+                                <span class="char-chip" title="Код: {spk.alias || '—'}">
                                   {#if spk.alias}
                                     <span class="char-alias">[{spk.alias}]</span>
                                   {/if}
-                                  <span class="char-name">{spk.name}</span>
+                                  <span class="char-name">{spk.translatedName ? spk.translatedName : spk.name}</span>
+                                  {#if spk.translatedName && spk.translatedName !== spk.name}
+                                    <span class="char-orig-sub">({spk.name})</span>
+                                  {/if}
+                                  {#if spk.gender === 'male'}
+                                    <span class="gender-pill gender-male" title="Мужской род">М</span>
+                                  {:else if spk.gender === 'female'}
+                                    <span class="gender-pill gender-female" title="Женский род">Ж</span>
+                                  {/if}
                                 </span>
                               {/if}
                             </td>
@@ -1489,10 +1789,30 @@
                     <strong class="char-name">Интерфейс</strong>
                   </span>
                 {:else}
-                  <span class="char-chip char-chip-inspect" title="Код: {spk.alias}">
-                    {#if spk.alias}<span class="char-alias">[{spk.alias}]</span>{/if}
-                    <strong class="char-name">{spk.name}</strong>
-                  </span>
+                  <div class="inspect-speaker-group">
+                    <span class="char-chip char-chip-inspect" title="Код: {spk.alias || '—'}">
+                      {#if spk.alias}<span class="char-alias">[{spk.alias}]</span>{/if}
+                      <strong class="char-name">{spk.translatedName ? spk.translatedName : spk.name}</strong>
+                      {#if spk.translatedName && spk.translatedName !== spk.name}
+                        <span class="char-orig-sub">({spk.name})</span>
+                      {/if}
+                      {#if spk.gender === 'male'}
+                        <span class="gender-pill gender-male" title="Мужской род (он)">М</span>
+                      {:else if spk.gender === 'female'}
+                        <span class="gender-pill gender-female" title="Женский род (она)">Ж</span>
+                      {/if}
+                    </span>
+                    {#if spk.notes}
+                      <span class="inspect-char-notes" title="Заметки персонажа">💡 {spk.notes}</span>
+                    {/if}
+                    <button 
+                      class="btn-micro-glossary" 
+                      onclick={() => { glossarySearch = spk.alias || spk.name; openGlossary(); }}
+                      title="Редактировать в глоссарии"
+                    >
+                      <BookOpen size={11} />
+                    </button>
+                  </div>
                 {/if}
               </div>
               <button class="btn-ai">
@@ -1772,6 +2092,455 @@
               </div>
             </div>
           {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- МОДАЛЬНОЕ ОКНО ГЛОССАРИЯ (ПЕРСОНАЖИ И ТЕРМИНЫ) -->
+  {#if showGlossaryModal}
+    <div 
+      class="modal-backdrop" 
+      onclick={(e) => { if (e.target === e.currentTarget) showGlossaryModal = false; }}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div class="tools-modal glossary-modal">
+        <!-- Заголовок модального окна глоссария -->
+        <div class="tools-modal-header">
+          <div class="modal-title-wrap">
+            <BookOpen size={20} class="text-emerald-400" />
+            <div>
+              <h3>Глоссарий проекта: Персонажи и Терминология</h3>
+              <p class="modal-subtitle">Имена, грамматический род (М/Ж) для согласования окончаний и словарь терминов</p>
+            </div>
+          </div>
+          <div class="modal-header-actions">
+            <button 
+              class="btn-modal-save" 
+              class:dirty={glossaryDirty}
+              onclick={saveGlossary} 
+              disabled={savingGlossary}
+            >
+              {#if savingGlossary}
+                <Loader2 size={14} class="spin" />
+                <span>Сохранение...</span>
+              {:else}
+                <Save size={14} />
+                <span>{glossaryDirty ? 'Сохранить изменения *' : 'Сохранено'}</span>
+              {/if}
+            </button>
+            <button class="btn-close-modal" onclick={() => showGlossaryModal = false} aria-label="Закрыть">
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+
+        <!-- Переключатель вкладок: Персонажи / Термины -->
+        <div class="tools-tab-bar">
+          <button 
+            class="tools-tab" 
+            class:tab-active={glossaryTab === 'characters'}
+            onclick={() => glossaryTab = 'characters'}
+          >
+            <Users size={15} />
+            <span>Персонажи ({glossaryStats.totalChars})</span>
+            {#if glossaryStats.translatedChars > 0}
+              <span class="tab-badge-accent">{glossaryStats.translatedChars} переведено</span>
+            {/if}
+          </button>
+          <button 
+            class="tools-tab" 
+            class:tab-active={glossaryTab === 'terms'}
+            onclick={() => glossaryTab = 'terms'}
+          >
+            <BookMarked size={15} />
+            <span>Термины и локации ({glossaryStats.totalTerms})</span>
+          </button>
+        </div>
+
+        <!-- Тулбар фильтрации и поиска внутри глоссария -->
+        <div class="glossary-toolbar">
+          <div class="glossary-search-box">
+            <Search size={14} class="search-box-icon text-slate-400" />
+            <input 
+              type="text" 
+              bind:value={glossarySearch} 
+              placeholder={glossaryTab === 'characters' ? "Поиск по алиасу, имени, переводу или заметкам..." : "Поиск по термину, переводу..."}
+              class="glossary-search-input"
+            />
+            {#if glossarySearch}
+              <button class="btn-clear-search" onclick={() => glossarySearch = ""}>
+                <X size={12} />
+              </button>
+            {/if}
+          </div>
+
+          {#if glossaryTab === 'characters'}
+            <!-- Фильтр по полу -->
+            <div class="gender-filter-group">
+              <span class="filter-label">Пол:</span>
+              <button 
+                class="btn-filter-pill" 
+                class:active={glossaryGenderFilter === 'all'} 
+                onclick={() => glossaryGenderFilter = 'all'}
+              >
+                Все ({glossaryStats.totalChars})
+              </button>
+              <button 
+                class="btn-filter-pill filter-male" 
+                class:active={glossaryGenderFilter === 'male'} 
+                onclick={() => glossaryGenderFilter = 'male'}
+              >
+                М ({glossaryStats.maleChars})
+              </button>
+              <button 
+                class="btn-filter-pill filter-female" 
+                class:active={glossaryGenderFilter === 'female'} 
+                onclick={() => glossaryGenderFilter = 'female'}
+              >
+                Ж ({glossaryStats.femaleChars})
+              </button>
+              <button 
+                class="btn-filter-pill filter-unknown" 
+                class:active={glossaryGenderFilter === 'unknown'} 
+                onclick={() => glossaryGenderFilter = 'unknown'}
+              >
+                — ({glossaryStats.unknownChars})
+              </button>
+            </div>
+
+            <button 
+              class="btn-toggle-add-char" 
+              onclick={() => showAddChar = !showAddChar}
+              title="Добавить вручную динамического персонажа"
+            >
+              <Plus size={14} />
+              <span>{showAddChar ? 'Отмена' : '+ Персонаж'}</span>
+            </button>
+          {:else}
+            <!-- Фильтр по категории терминов -->
+            <div class="category-filter-group">
+              <span class="filter-label">Категория:</span>
+              <button 
+                class="btn-filter-pill" 
+                class:active={glossaryCategoryFilter === 'all'} 
+                onclick={() => glossaryCategoryFilter = 'all'}
+              >
+                Все
+              </button>
+              <button 
+                class="btn-filter-pill" 
+                class:active={glossaryCategoryFilter === 'general'} 
+                onclick={() => glossaryCategoryFilter = 'general'}
+              >
+                Общие
+              </button>
+              <button 
+                class="btn-filter-pill" 
+                class:active={glossaryCategoryFilter === 'location'} 
+                onclick={() => glossaryCategoryFilter = 'location'}
+              >
+                Локации
+              </button>
+              <button 
+                class="btn-filter-pill" 
+                class:active={glossaryCategoryFilter === 'title'} 
+                onclick={() => glossaryCategoryFilter = 'title'}
+              >
+                Титулы
+              </button>
+              <button 
+                class="btn-filter-pill" 
+                class:active={glossaryCategoryFilter === 'item'} 
+                onclick={() => glossaryCategoryFilter = 'item'}
+              >
+                Предметы
+              </button>
+            </div>
+          {/if}
+        </div>
+
+        <!-- Форма быстрого добавления нового персонажа (если раскрыта) -->
+        {#if glossaryTab === 'characters' && showAddChar}
+          <div class="add-char-panel">
+            <div class="add-char-row">
+              <div class="field-item">
+                <span class="field-label">Алиас (код в script.rpy):</span>
+                <input type="text" bind:value={newCharAlias} placeholder="напр. emm" class="glossary-input" />
+              </div>
+              <div class="field-item">
+                <span class="field-label">Имя в игре (EN):</span>
+                <input type="text" bind:value={newCharName} placeholder="Emma" class="glossary-input" />
+              </div>
+              <div class="field-item">
+                <span class="field-label">Перевод имени (RU):</span>
+                <input type="text" bind:value={newCharTranslation} placeholder="Эмма" class="glossary-input" />
+              </div>
+              <div class="field-item">
+                <span class="field-label">Пол персонажа:</span>
+                <div class="gender-toggle-group">
+                  <button 
+                    class="btn-gender-toggle gender-male" 
+                    class:active={newCharGender === 'male'} 
+                    onclick={() => newCharGender = 'male'}
+                  >М</button>
+                  <button 
+                    class="btn-gender-toggle gender-female" 
+                    class:active={newCharGender === 'female'} 
+                    onclick={() => newCharGender = 'female'}
+                  >Ж</button>
+                  <button 
+                    class="btn-gender-toggle gender-unknown" 
+                    class:active={newCharGender === 'unknown'} 
+                    onclick={() => newCharGender = 'unknown'}
+                  >—</button>
+                </div>
+              </div>
+              <button class="btn-confirm-add" onclick={addCustomCharacter}>
+                <Plus size={14} />
+                <span>Добавить</span>
+              </button>
+            </div>
+          </div>
+        {/if}
+
+        <!-- Форма добавления нового термина (всегда доступна во вкладке терминов) -->
+        {#if glossaryTab === 'terms'}
+          <div class="add-term-panel">
+            <div class="add-term-row">
+              <div class="field-item flex-2">
+                <span class="field-label">Исходный термин (EN):</span>
+                <input 
+                  type="text" 
+                  bind:value={newTermSource} 
+                  placeholder="напр. Demon Hunter, Magic Guild" 
+                  class="glossary-input" 
+                  onkeydown={(e) => { if (e.key === 'Enter') addGlossaryTerm(); }}
+                />
+              </div>
+              <div class="field-item flex-2">
+                <span class="field-label">Русский перевод (RU):</span>
+                <input 
+                  type="text" 
+                  bind:value={newTermTranslation} 
+                  placeholder="Охотник на демонов, Гильдия магов" 
+                  class="glossary-input" 
+                  onkeydown={(e) => { if (e.key === 'Enter') addGlossaryTerm(); }}
+                />
+              </div>
+              <div class="field-item flex-1">
+                <span class="field-label">Категория:</span>
+                <select bind:value={newTermCategory} class="glossary-select">
+                  <option value="general">Общий термин</option>
+                  <option value="location">Локация / Место</option>
+                  <option value="title">Титул / Звание</option>
+                  <option value="item">Предмет / Артефакт</option>
+                </select>
+              </div>
+              <div class="field-item flex-2">
+                <span class="field-label">Заметки / Контекст:</span>
+                <input 
+                  type="text" 
+                  bind:value={newTermNotes} 
+                  placeholder="напр. древний орден" 
+                  class="glossary-input" 
+                  onkeydown={(e) => { if (e.key === 'Enter') addGlossaryTerm(); }}
+                />
+              </div>
+              <button class="btn-confirm-add" onclick={addGlossaryTerm}>
+                <Plus size={14} />
+                <span>Добавить</span>
+              </button>
+            </div>
+          </div>
+        {/if}
+
+        <!-- Тело таблицы глоссария -->
+        <div class="glossary-table-container">
+          {#if loadingGlossary}
+            <div class="glossary-loading">
+              <Loader2 size={28} class="spin text-emerald-400" />
+              <span>Загрузка глоссария проекта...</span>
+            </div>
+          {:else if glossaryTab === 'characters'}
+            {#if filteredGlossaryCharacters.length === 0}
+              <div class="glossary-empty-state">
+                <Users size={32} class="text-slate-600" />
+                <p>Персонажи не найдены по текущему запросу или фильтру</p>
+              </div>
+            {:else}
+              <table class="glossary-table">
+                <thead>
+                  <tr>
+                    <th style="width: 100px;">Алиас</th>
+                    <th style="width: 180px;">Имя в игре (EN)</th>
+                    <th style="width: 220px;">Перевод имени (RU)</th>
+                    <th style="width: 140px; text-align: center;">Пол (род)</th>
+                    <th>Заметки для AI / локализатора</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each filteredGlossaryCharacters as char}
+                    <tr>
+                      <td class="col-alias">
+                        <span class="char-alias-badge">[{char.alias}]</span>
+                      </td>
+                      <td class="col-orig-name">
+                        <strong>{char.original_name}</strong>
+                      </td>
+                      <td class="col-input">
+                        <input 
+                          type="text" 
+                          bind:value={char.translated_name} 
+                          oninput={() => glossaryDirty = true}
+                          placeholder={char.original_name} 
+                          class="glossary-input"
+                        />
+                      </td>
+                      <td class="col-gender">
+                        <div class="gender-toggle-group">
+                          <button 
+                            type="button"
+                            class="btn-gender-toggle gender-male" 
+                            class:active={char.gender === 'male'}
+                            onclick={() => updateCharacterGender(char, 'male')}
+                            title="Мужской род (он сказал, красивый)"
+                          >
+                            М
+                          </button>
+                          <button 
+                            type="button"
+                            class="btn-gender-toggle gender-female" 
+                            class:active={char.gender === 'female'}
+                            onclick={() => updateCharacterGender(char, 'female')}
+                            title="Женский род (она сказала, красивая)"
+                          >
+                            Ж
+                          </button>
+                          <button 
+                            type="button"
+                            class="btn-gender-toggle gender-unknown" 
+                            class:active={char.gender === 'unknown' || !char.gender}
+                            onclick={() => updateCharacterGender(char, 'unknown')}
+                            title="Не указан (нейтрально / не определено)"
+                          >
+                            —
+                          </button>
+                        </div>
+                      </td>
+                      <td class="col-input">
+                        <input 
+                          type="text" 
+                          bind:value={char.notes} 
+                          oninput={() => glossaryDirty = true}
+                          placeholder="Стиль речи, обращение ('на ты'), характер..." 
+                          class="glossary-input"
+                        />
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {/if}
+          {:else}
+            <!-- Вкладка ТЕРМИНЫ -->
+            {#if filteredGlossaryTerms.length === 0}
+              <div class="glossary-empty-state">
+                <BookMarked size={32} class="text-slate-600" />
+                <p>В глоссарии пока нет терминов. Добавьте первый термин выше!</p>
+              </div>
+            {:else}
+              <table class="glossary-table">
+                <thead>
+                  <tr>
+                    <th style="width: 220px;">Исходный термин (EN)</th>
+                    <th style="width: 240px;">Перевод (RU)</th>
+                    <th style="width: 150px;">Категория</th>
+                    <th>Заметки / Контекст</th>
+                    <th style="width: 50px; text-align: center;"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each filteredGlossaryTerms as term}
+                    <tr>
+                      <td class="col-orig-name">
+                        <input 
+                          type="text" 
+                          bind:value={term.source_term} 
+                          oninput={() => glossaryDirty = true}
+                          class="glossary-input"
+                        />
+                      </td>
+                      <td class="col-input">
+                        <input 
+                          type="text" 
+                          bind:value={term.translated_term} 
+                          oninput={() => glossaryDirty = true}
+                          placeholder="Перевод на русский..." 
+                          class="glossary-input"
+                        />
+                      </td>
+                      <td class="col-category">
+                        <select 
+                          bind:value={term.category} 
+                          onchange={() => glossaryDirty = true}
+                          class="glossary-select"
+                        >
+                          <option value="general">Общий</option>
+                          <option value="location">Локация</option>
+                          <option value="title">Титул</option>
+                          <option value="item">Предмет</option>
+                        </select>
+                      </td>
+                      <td class="col-input">
+                        <input 
+                          type="text" 
+                          bind:value={term.notes} 
+                          oninput={() => glossaryDirty = true}
+                          placeholder="Контекст или пояснение..." 
+                          class="glossary-input"
+                        />
+                      </td>
+                      <td class="col-action">
+                        <button 
+                          class="btn-delete-row" 
+                          onclick={() => removeGlossaryTerm(term.id)} 
+                          title="Удалить термин"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {/if}
+          {/if}
+        </div>
+
+        <!-- Подвал модального окна глоссария -->
+        <div class="glossary-modal-footer">
+          <div class="footer-path-info">
+            <span class="info-dot" class:dirty={glossaryDirty}></span>
+            {#if glossaryDirty}
+              <span class="text-amber-400">Есть несохраненные правки в глоссарии</span>
+            {:else}
+              <span class="text-slate-400">Все изменения сохранены в кэш проекта и translator_glossary.json</span>
+            {/if}
+          </div>
+          <div class="footer-actions">
+            <button class="btn-secondary" onclick={() => showGlossaryModal = false}>Закрыть</button>
+            <button class="btn-primary-save" onclick={saveGlossary} disabled={savingGlossary}>
+              {#if savingGlossary}
+                <Loader2 size={14} class="spin" />
+                <span>Сохранение...</span>
+              {:else}
+                <Save size={14} />
+                <span>Сохранить глоссарий</span>
+              {/if}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -4131,5 +4900,631 @@
     width: 100%;
     margin-top: 8px;
     border-radius: 999px;
+  }
+
+  /* GLOSSARY STYLES */
+  .char-chip-interactive {
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  .char-chip-interactive:hover {
+    background: #1b2232;
+    border-color: #38bdf8;
+    transform: translateY(-1px);
+  }
+
+  .char-orig-sub {
+    font-size: 10px;
+    color: #64748b;
+    margin-left: 2px;
+  }
+
+  .gender-pill {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 1px 4px;
+    border-radius: 3px;
+    margin-left: 3px;
+    flex-shrink: 0;
+  }
+
+  .gender-pill.gender-male {
+    background: rgba(56, 189, 248, 0.2);
+    color: #38bdf8;
+    border: 1px solid rgba(56, 189, 248, 0.4);
+  }
+
+  .gender-pill.gender-female {
+    background: rgba(244, 63, 94, 0.2);
+    color: #fb7185;
+    border: 1px solid rgba(244, 63, 94, 0.4);
+  }
+
+  .gender-pill.gender-unknown {
+    background: rgba(148, 163, 184, 0.15);
+    color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, 0.3);
+  }
+
+  .inspect-speaker-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .inspect-char-notes {
+    font-size: 11px;
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.08);
+    border: 1px dashed rgba(56, 189, 248, 0.25);
+    padding: 2px 8px;
+    border-radius: 4px;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .btn-micro-glossary {
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    color: #34d399;
+    padding: 3px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s ease;
+  }
+
+  .btn-micro-glossary:hover {
+    background: rgba(16, 185, 129, 0.25);
+    color: #ffffff;
+  }
+
+  .characters-header-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-right: 8px;
+  }
+
+  .btn-sidebar-glossary {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: rgba(16, 185, 129, 0.12);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    color: #34d399;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .btn-sidebar-glossary:hover {
+    background: rgba(16, 185, 129, 0.25);
+    border-color: #34d399;
+    color: #ffffff;
+  }
+
+  .btn-top-tool.btn-glossary {
+    border-color: rgba(16, 185, 129, 0.35);
+    background: rgba(16, 185, 129, 0.08);
+    color: #a7f3d0;
+  }
+
+  .btn-top-tool.btn-glossary:hover {
+    background: rgba(16, 185, 129, 0.18);
+    border-color: #34d399;
+    color: #ffffff;
+  }
+
+  .topbar-badge {
+    background: rgba(16, 185, 129, 0.3);
+    color: #6ee7b7;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 999px;
+    margin-left: 2px;
+  }
+
+  /* GLOSSARY MODAL */
+  .glossary-modal {
+    max-width: 1080px;
+    max-height: 90vh;
+  }
+
+  .modal-subtitle {
+    margin: 2px 0 0 0;
+    font-size: 11px;
+    color: #64748b;
+    font-weight: 400;
+  }
+
+  .modal-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .btn-modal-save {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #142820;
+    border: 1px solid #1e4a38;
+    color: #34d399;
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .btn-modal-save:hover:not(:disabled) {
+    background: #10b981;
+    border-color: #10b981;
+    color: #ffffff;
+    box-shadow: 0 0 12px rgba(16, 185, 129, 0.3);
+  }
+
+  .btn-modal-save.dirty {
+    background: #3c2415;
+    border-color: #f59e0b;
+    color: #fcd34d;
+    animation: pulseDirty 2s infinite ease-in-out;
+  }
+
+  @keyframes pulseDirty {
+    0%, 100% { border-color: #f59e0b; }
+    50% { border-color: #fbbf24; box-shadow: 0 0 10px rgba(245, 158, 11, 0.3); }
+  }
+
+  .tab-badge-accent {
+    background: rgba(16, 185, 129, 0.2);
+    color: #34d399;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-weight: 600;
+  }
+
+  .glossary-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 20px;
+    background: #11151f;
+    border-bottom: 1px solid #1a2232;
+    flex-wrap: wrap;
+  }
+
+  .glossary-search-box {
+    position: relative;
+    flex: 1;
+    min-width: 240px;
+    display: flex;
+    align-items: center;
+  }
+
+  .glossary-search-input {
+    width: 100%;
+    background: #0a0d14;
+    border: 1px solid #232c3f;
+    border-radius: 6px;
+    padding: 7px 30px 7px 32px;
+    color: #f1f5f9;
+    font-size: 12px;
+    outline: none;
+    transition: all 0.15s;
+  }
+
+  .glossary-search-input:focus {
+    border-color: #10b981;
+    box-shadow: 0 0 0 1px #10b981;
+  }
+
+  .btn-clear-search {
+    position: absolute;
+    right: 8px;
+    background: transparent;
+    border: none;
+    color: #64748b;
+    cursor: pointer;
+    padding: 3px;
+    display: flex;
+    align-items: center;
+    border-radius: 3px;
+  }
+
+  .gender-filter-group,
+  .category-filter-group {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .filter-label {
+    font-size: 11px;
+    color: #64748b;
+    margin-right: 4px;
+  }
+
+  .btn-filter-pill {
+    background: #141924;
+    border: 1px solid #20293b;
+    color: #94a3b8;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 4px 10px;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .btn-filter-pill:hover {
+    color: #f1f5f9;
+    border-color: #334155;
+  }
+
+  .btn-filter-pill.active {
+    background: #1e293b;
+    border-color: #475569;
+    color: #f8fafc;
+  }
+
+  .btn-filter-pill.filter-male.active {
+    background: rgba(56, 189, 248, 0.2);
+    border-color: #38bdf8;
+    color: #7dd3fc;
+  }
+
+  .btn-filter-pill.filter-female.active {
+    background: rgba(244, 63, 94, 0.2);
+    border-color: #fb7185;
+    color: #fda4af;
+  }
+
+  .btn-filter-pill.filter-unknown.active {
+    background: rgba(148, 163, 184, 0.2);
+    border-color: #94a3b8;
+    color: #cbd5e1;
+  }
+
+  .btn-toggle-add-char {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #141f2e;
+    border: 1px solid #23354f;
+    color: #38bdf8;
+    padding: 5px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-toggle-add-char:hover {
+    background: #1c2b40;
+    border-color: #38bdf8;
+  }
+
+  .add-char-panel,
+  .add-term-panel {
+    background: #0d111a;
+    border-bottom: 1px solid #1a2232;
+    padding: 12px 20px;
+  }
+
+  .add-char-row,
+  .add-term-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .field-item {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+    min-width: 130px;
+  }
+
+  .field-item.flex-2 {
+    flex: 2;
+    min-width: 180px;
+  }
+
+  .field-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: #64748b;
+  }
+
+  .btn-confirm-add {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: #064e3b;
+    border: 1px solid #10b981;
+    color: #6ee7b7;
+    padding: 7px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    height: 33px;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+
+  .btn-confirm-add:hover {
+    background: #10b981;
+    color: #ffffff;
+  }
+
+  /* ТАБЛИЦА ГЛОССАРИЯ */
+  .glossary-table-container {
+    flex: 1;
+    overflow-y: auto;
+    padding: 0;
+    background: #0a0d14;
+    min-height: 280px;
+  }
+
+  .glossary-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  .glossary-table th {
+    position: sticky;
+    top: 0;
+    background: #111520;
+    padding: 9px 14px;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    color: #94a3b8;
+    border-bottom: 1px solid #1c2436;
+    z-index: 10;
+  }
+
+  .glossary-table td {
+    padding: 7px 12px;
+    border-bottom: 1px solid #141926;
+    vertical-align: middle;
+  }
+
+  .glossary-table tr:hover {
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  .char-alias-badge {
+    display: inline-block;
+    font-family: monospace;
+    font-size: 11px;
+    font-weight: 700;
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.08);
+    border: 1px solid rgba(56, 189, 248, 0.2);
+    padding: 2px 7px;
+    border-radius: 4px;
+  }
+
+  .col-orig-name strong {
+    color: #f1f5f9;
+    font-size: 13px;
+  }
+
+  .glossary-input {
+    width: 100%;
+    background: #10141e;
+    border: 1px solid #1e2638;
+    border-radius: 5px;
+    padding: 6px 10px;
+    color: #f8fafc;
+    font-size: 12px;
+    outline: none;
+    transition: all 0.15s;
+    box-sizing: border-box;
+  }
+
+  .glossary-input:focus {
+    border-color: #10b981;
+    background: #121824;
+    box-shadow: 0 0 0 1px #10b981;
+  }
+
+  .glossary-select {
+    width: 100%;
+    background: #10141e;
+    border: 1px solid #1e2638;
+    border-radius: 5px;
+    padding: 6px 8px;
+    color: #f8fafc;
+    font-size: 12px;
+    outline: none;
+    box-sizing: border-box;
+    cursor: pointer;
+  }
+
+  .glossary-select:focus {
+    border-color: #10b981;
+  }
+
+  /* ТРЕХПОЗИЦИОННЫЙ ПЕРЕКЛЮЧАТЕЛЬ ПОЛА М / Ж / — */
+  .gender-toggle-group {
+    display: inline-flex;
+    align-items: center;
+    background: #0c0f17;
+    border: 1px solid #1b2232;
+    border-radius: 6px;
+    padding: 2px;
+    gap: 2px;
+  }
+
+  .btn-gender-toggle {
+    background: transparent;
+    border: 1px solid transparent;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 700;
+    width: 28px;
+    height: 24px;
+    border-radius: 4px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.12s ease;
+  }
+
+  .btn-gender-toggle:hover {
+    color: #f1f5f9;
+    background: #161c28;
+  }
+
+  .btn-gender-toggle.gender-male.active {
+    background: #0c2d48;
+    border-color: #0284c7;
+    color: #38bdf8;
+    box-shadow: 0 0 8px rgba(56, 189, 248, 0.35);
+  }
+
+  .btn-gender-toggle.gender-female.active {
+    background: #471223;
+    border-color: #e11d48;
+    color: #fb7185;
+    box-shadow: 0 0 8px rgba(244, 63, 94, 0.35);
+  }
+
+  .btn-gender-toggle.gender-unknown.active {
+    background: #1e293b;
+    border-color: #475569;
+    color: #cbd5e1;
+  }
+
+  .btn-delete-row {
+    background: transparent;
+    border: none;
+    color: #64748b;
+    cursor: pointer;
+    padding: 5px;
+    border-radius: 4px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+
+  .btn-delete-row:hover {
+    background: rgba(244, 63, 94, 0.15);
+    color: #fb7185;
+  }
+
+  .glossary-loading,
+  .glossary-empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 60px 20px;
+    color: #64748b;
+    text-align: center;
+  }
+
+  .glossary-modal-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 20px;
+    background: #11141e;
+    border-top: 1px solid #1a2232;
+  }
+
+  .footer-path-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+  }
+
+  .info-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #10b981;
+  }
+
+  .info-dot.dirty {
+    background: #f59e0b;
+    box-shadow: 0 0 6px #f59e0b;
+  }
+
+  .footer-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .btn-secondary {
+    background: #161c28;
+    border: 1px solid #232d40;
+    color: #cbd5e1;
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-secondary:hover {
+    background: #1e2638;
+    color: #f8fafc;
+  }
+
+  .btn-primary-save {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: #059669;
+    border: 1px solid #10b981;
+    color: #ffffff;
+    padding: 6px 16px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-primary-save:hover:not(:disabled) {
+    background: #10b981;
+    box-shadow: 0 0 12px rgba(16, 185, 129, 0.4);
+  }
+
+  .btn-primary-save:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 </style>

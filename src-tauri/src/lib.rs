@@ -1,3 +1,4 @@
+pub mod glossary;
 pub mod graph;
 pub mod parser;
 pub mod pickle;
@@ -656,6 +657,37 @@ async fn decompile_rpyc_file(
     .map_err(|e| format!("Ошибка декомпиляции: {}", e))?
 }
 
+#[tauri::command]
+async fn get_project_glossary(
+    game_dir: String,
+    scanned_characters: Option<Vec<(String, String)>>,
+) -> Result<glossary::ProjectGlossary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = Path::new(&game_dir);
+        let mut gl = glossary::ProjectGlossary::load_for_project(base_path);
+        if let Some(ref chars) = scanned_characters {
+            gl.merge_with_scanned_characters(chars);
+        }
+        Ok(gl)
+    })
+    .await
+    .map_err(|e| format!("Ошибка загрузки глоссария: {}", e))?
+}
+
+#[tauri::command]
+async fn save_project_glossary(
+    game_dir: String,
+    glossary: glossary::ProjectGlossary,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = Path::new(&game_dir);
+        let saved_path = glossary.save_for_project(base_path)?;
+        Ok(format!("Глоссарий сохранен ({:?})", saved_path.file_name().unwrap_or_default()))
+    })
+    .await
+    .map_err(|e| format!("Ошибка сохранения глоссария: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -668,7 +700,9 @@ pub fn run() {
             pack_mod_rpa,
             unpack_rpa,
             clean_rpyc_cache,
-            decompile_rpyc_file
+            decompile_rpyc_file,
+            get_project_glossary,
+            save_project_glossary
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -836,6 +870,59 @@ mod tests {
             assert!(!summary.characters.is_empty(), "Персонажи должны быть успешно извлечены!");
             assert!(summary.characters.iter().any(|(a, n)| a == "lis" && n == "Lisa"), "Lisa должна быть найдена");
             assert!(summary.characters.iter().any(|(a, n)| a == "emm" && n == "Emma"), "Emma должна быть найдена");
+        });
+    }
+
+    #[test]
+    fn test_glossary_commands() {
+        tauri::async_runtime::block_on(async {
+            let unique_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let temp_game_dir = std::env::temp_dir().join(format!("test_glossary_game_{}", unique_id));
+            let _ = std::fs::create_dir_all(&temp_game_dir);
+
+            let scanned = vec![
+                ("lis".to_string(), "Lisa".to_string()),
+                ("dh".to_string(), "The Demon Hunter".to_string()),
+            ];
+
+            let mut gl = get_project_glossary(
+                temp_game_dir.to_string_lossy().to_string(),
+                Some(scanned),
+            ).await.unwrap();
+
+            assert_eq!(gl.characters.len(), 2);
+            let dh = gl.characters.iter_mut().find(|c| c.alias == "dh").unwrap();
+            dh.translated_name = "Охотник на демонов".to_string();
+
+            gl.terms.push(glossary::TermGlossaryEntry {
+                id: "term_1".to_string(),
+                source_term: "Demon Blade".to_string(),
+                translated_term: "Клинок демона".to_string(),
+                category: "item".to_string(),
+                notes: "Реликвия".to_string(),
+            });
+
+            let save_msg = save_project_glossary(
+                temp_game_dir.to_string_lossy().to_string(),
+                gl,
+            ).await.unwrap();
+            println!("{}", save_msg);
+
+            // Загружаем повторно и сверяем сохраненные данные
+            let reloaded = get_project_glossary(
+                temp_game_dir.to_string_lossy().to_string(),
+                None,
+            ).await.unwrap();
+
+            assert_eq!(reloaded.characters.len(), 2);
+            assert_eq!(reloaded.terms.len(), 1);
+            assert_eq!(reloaded.terms[0].translated_term, "Клинок демона");
+
+            let _ = std::fs::remove_dir_all(&temp_game_dir);
+            let _ = std::fs::remove_dir_all(get_project_cache_dir(&temp_game_dir));
         });
     }
 }
