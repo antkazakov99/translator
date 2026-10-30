@@ -27,8 +27,15 @@ pub struct SceneEdgeDto {
     pub condition: Option<String>, // например "luka_corr > 0" или "Выбор: Yes"
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LabelInfoDto {
+    pub name: String,
+    pub line_number: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScriptStructure {
+    pub labels: Vec<LabelInfoDto>,
     pub scene_choices: HashMap<String, Vec<ChoiceBlockDto>>,
     pub scene_jumps: HashMap<String, Vec<(String, Option<String>)>>,
     pub edges: Vec<SceneEdgeDto>,
@@ -352,7 +359,8 @@ impl RenpyParser {
         let mut current_condition: Option<String> = None;
         let mut last_choice_idx: Option<usize> = None;
 
-        for line in content.lines() {
+        for (idx, line) in content.lines().enumerate() {
+            let line_num = idx + 1;
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
@@ -375,6 +383,10 @@ impl RenpyParser {
                 last_choice_idx = None;
 
                 let label_name = caps.get(1).unwrap().as_str().to_string();
+                structure.labels.push(LabelInfoDto {
+                    name: label_name.clone(),
+                    line_number: line_num,
+                });
                 current_label = Some(label_name);
                 continue;
             }
@@ -573,6 +585,7 @@ impl GameParser for RenpyParser {
         let re_old = Regex::new(r#"^\s*old\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
         let re_new = Regex::new(r#"^\s*new\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
         let re_dialogue = Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
+        let re_source_comment = Regex::new(r#"^\s*#\s*(?:game[/\\])?(?P<file>.+?\.rpy):(?P<line>\d+)"#).unwrap();
         // Регулярка для отрезания хэшей Ren'Py вида _1234abcd и повторов _1234abcd_1
         let re_label_hash = Regex::new(r#"_[0-9a-fA-F]{6,10}(?:_\d+)*$"#).unwrap();
 
@@ -581,6 +594,7 @@ impl GameParser for RenpyParser {
         let mut in_block = false;
         let mut current_block_id: Option<String> = None;
         let mut current_scene_name: Option<String> = None;
+        let mut pending_comment_line: Option<usize> = None;
         let mut pending_old: Option<(String, usize)> = None;
         let mut pending_source: Option<(Option<String>, String, usize)> = None;
         let mut last_node_idx = None;
@@ -626,9 +640,17 @@ impl GameParser for RenpyParser {
             }
 
             if in_strings {
+                if let Some(caps) = re_source_comment.captures(line) {
+                    if let Ok(line_val) = caps.name("line").unwrap().as_str().parse::<usize>() {
+                        pending_comment_line = Some(line_val);
+                    }
+                    continue;
+                }
+
                 if let Some(caps) = re_old.captures(line) {
                     let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
-                    pending_old = Some((text, line_num));
+                    let src_line = pending_comment_line.take().unwrap_or(line_num);
+                    pending_old = Some((text, src_line));
                 } else if let Some(caps) = re_new.captures(line) {
                     if let Some((old_text, old_line)) = pending_old.take() {
                         let new_text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());

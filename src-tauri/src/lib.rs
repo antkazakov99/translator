@@ -351,6 +351,35 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
         let graph = parser.parse_file(path, &content)
             .map_err(|e| format!("Ошибка парсинга: {}", e))?;
 
+        // Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры ДО группировки строк
+        let orig_path_str = file_path
+            .replace(r"tl\russian\", "")
+            .replace("tl/russian/", "");
+        let orig_path = Path::new(&orig_path_str);
+
+        let script_struct = if orig_path.exists() {
+            if let Ok(orig_content) = std::fs::read_to_string(orig_path) {
+                RenpyParser::parse_script_structure(&orig_content)
+            } else {
+                Default::default()
+            }
+        } else if let Ok(content) = std::fs::read_to_string(&file_path) {
+            // Если сам файл уже является оригинальным скриптом (например из AppData кэша)
+            RenpyParser::parse_script_structure(&content)
+        } else {
+            Default::default()
+        };
+
+        // Быстрый поиск: текст выбора -> имя сцены
+        let mut choice_text_to_scene: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for (scene_name, choices) in &script_struct.scene_choices {
+            for choice in choices {
+                for opt in &choice.options {
+                    choice_text_to_scene.insert(opt.text.trim().to_string(), scene_name.clone());
+                }
+            }
+        }
+
         let mut scenes: Vec<SceneDto> = Vec::new();
         let mut file_total = 0;
         let mut file_translated = 0;
@@ -369,11 +398,15 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
                             file_translated += 1;
                         }
 
-                        // Для строк интерфейса сцена всегда одна: "Интерфейс и меню (strings)"
-                        let target_scene_name = if d.speaker.as_deref() == Some("UI / Choice") {
-                            "Интерфейс и меню (strings)".to_string()
+                        let (target_scene_name, is_menu_choice) = if d.speaker.as_deref() == Some("UI / Choice") {
+                            let trimmed_orig = d.original_text.trim();
+                            if let Some(scene) = choice_text_to_scene.get(trimmed_orig) {
+                                (scene.clone(), true)
+                            } else {
+                                ("Интерфейс и меню (strings)".to_string(), false)
+                            }
                         } else {
-                            current_scene_name.clone()
+                            (current_scene_name.clone(), false)
                         };
 
                         // Находим существующую сцену с таким именем (чтобы реплики склеивались в одну сцену)
@@ -399,11 +432,18 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
                             scene.translated_lines += 1;
                         }
 
+                        let mut speaker = d.speaker.clone();
+                        let mut speaker_alias = d.speaker_alias.clone();
+                        if is_menu_choice {
+                            speaker = Some("Выбор в меню".to_string());
+                            speaker_alias = Some("Choice".to_string());
+                        }
+
                         scene.entries.push(DialogueEntryDto {
                             id: d.id.clone(),
                             line_number: d.line_number,
-                            speaker: d.speaker.clone(),
-                            speaker_alias: d.speaker_alias.clone(),
+                            speaker,
+                            speaker_alias,
                             original_text: d.original_text.clone(),
                             translated_text: d.translated_text.clone(),
                             status: format!("{:?}", d.status),
@@ -415,24 +455,34 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             }
         }
 
-        // Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры
-        let orig_path_str = file_path
-            .replace(r"tl\russian\", "")
-            .replace("tl/russian/", "");
-        let orig_path = Path::new(&orig_path_str);
-
-        let script_struct = if orig_path.exists() {
-            if let Ok(orig_content) = std::fs::read_to_string(orig_path) {
-                RenpyParser::parse_script_structure(&orig_content)
-            } else {
-                Default::default()
+        // Гарантируем, что ВСЕ сюжетные сцены/метки из оригинального файла присутствуют в списке сцен
+        for label_info in &script_struct.labels {
+            if !scenes.iter().any(|s| s.name == label_info.name) {
+                scenes.push(SceneDto {
+                    id: format!("scene_{}", scenes.len()),
+                    name: label_info.name.clone(),
+                    total_lines: 0,
+                    translated_lines: 0,
+                    choices: Vec::new(),
+                    jumps: Vec::new(),
+                    entries: Vec::new(),
+                });
             }
-        } else if let Ok(content) = std::fs::read_to_string(&file_path) {
-            // Если сам файл уже является оригинальным скриптом (например из AppData кэша)
-            RenpyParser::parse_script_structure(&content)
-        } else {
-            Default::default()
-        };
+        }
+
+        // Упорядочиваем сцены в порядке объявления в оригинальном скрипте
+        scenes.sort_by_key(|s| {
+            if s.name == "Интерфейс и меню (strings)" {
+                usize::MAX
+            } else {
+                script_struct.labels.iter().position(|l| l.name == s.name).unwrap_or(usize::MAX - 1)
+            }
+        });
+
+        // Переиндексируем ID сцен
+        for (idx, scene) in scenes.iter_mut().enumerate() {
+            scene.id = format!("scene_{}", idx);
+        }
 
         // Привязываем найденные выборы (меню) и переходы к каждой сцене
         for scene in &mut scenes {
@@ -1007,6 +1057,77 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&temp_game_dir);
             let _ = std::fs::remove_dir_all(get_project_cache_dir(&temp_game_dir));
+        });
+    }
+
+    #[test]
+    fn test_menu_selector_scene_and_choices() {
+        tauri::async_runtime::block_on(async {
+            let unique_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let temp_game_dir = std::env::temp_dir().join(format!("test_menu_selector_{}", unique_id));
+            let tl_dir = temp_game_dir.join("tl").join("russian");
+            std::fs::create_dir_all(&tl_dir).unwrap();
+
+            let orig_script = r#"
+label start:
+    mc "Hello"
+
+label my_selector:
+    menu:
+        "Go forward":
+            jump next_scene
+        "Go back":
+            jump prev_scene
+
+label next_scene:
+    mc "Next"
+"#;
+            let orig_path = temp_game_dir.join("story.rpy");
+            std::fs::write(&orig_path, orig_script).unwrap();
+
+            let trans_script = r#"
+translate russian start_11223344:
+    mc "Привет"
+
+translate russian strings:
+    old "Go forward"
+    new "Идти вперед"
+
+    old "Go back"
+    new "Идти назад"
+
+    old "Start Game"
+    new "Начать игру"
+
+translate russian next_scene_55667788:
+    mc "Дальше"
+"#;
+            let trans_path = tl_dir.join("story.rpy");
+            std::fs::write(&trans_path, trans_script).unwrap();
+
+            let parsed = parse_file_entries(trans_path.to_string_lossy().to_string()).await.unwrap();
+
+            // Проверяем, что сцена my_selector присутствует, несмотря на отсутствие реплик персонажей
+            let selector_scene = parsed.scenes.iter().find(|s| s.name == "my_selector");
+            assert!(selector_scene.is_some(), "Сцена с выбором (my_selector) должна существовать в списке сцен");
+            let sel = selector_scene.unwrap();
+            assert_eq!(sel.entries.len(), 2, "Два пункта меню должны быть привязаны к сцене my_selector");
+            assert!(sel.entries.iter().any(|e| e.original_text == "Go forward" && e.speaker.as_deref() == Some("Выбор в меню")));
+            assert!(sel.entries.iter().any(|e| e.original_text == "Go back" && e.speaker.as_deref() == Some("Выбор в меню")));
+
+            // Проверяем, что общие строки UI остались в 'Интерфейс и меню (strings)'
+            let ui_scene = parsed.scenes.iter().find(|s| s.name == "Интерфейс и меню (strings)").unwrap();
+            assert_eq!(ui_scene.entries.len(), 1);
+            assert_eq!(ui_scene.entries[0].original_text, "Start Game");
+
+            // Проверяем переходы из my_selector
+            assert!(parsed.edges.iter().any(|e| e.from == "my_selector" && e.to == "next_scene" && e.kind == "choice"));
+            assert!(parsed.edges.iter().any(|e| e.from == "my_selector" && e.to == "prev_scene" && e.kind == "choice"));
+
+            let _ = std::fs::remove_dir_all(&temp_game_dir);
         });
     }
 }
