@@ -303,6 +303,7 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneTargetResult {
     pub file_name: String,
+    pub short_name: String,
     pub file_path: String,
     pub original_path: String,
     pub line_number: usize,
@@ -319,6 +320,8 @@ async fn find_scene_target(
         if !base_path.exists() {
             return Err(format!("Путь к игре не существует: {}", game_dir));
         }
+
+        let tl_dir = base_path.join(r"tl\russian");
 
         let mut script_files = Vec::new();
         collect_rpy_files(base_path, &mut script_files);
@@ -347,16 +350,20 @@ async fn find_scene_target(
                         || trimmed.starts_with(&pattern_screen_colon)
                         || trimmed.starts_with(&pattern_screen_paren)
                     {
-                        let file_name = orig_path.file_name()?.to_string_lossy().to_string();
-                        let tl_path = base_path.join(r"tl\russian").join(&file_name);
+                        let rel_path = orig_path.strip_prefix(base_path).unwrap_or(&orig_path);
+                        let tl_path = tl_dir.join(rel_path);
                         let resolved_tl_path = if tl_path.exists() {
                             tl_path.to_string_lossy().to_string()
                         } else {
                             orig_path.to_string_lossy().to_string()
                         };
 
+                        let file_name = rel_path.to_string_lossy().replace('\\', "/");
+                        let short_name = orig_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+
                         return Some(SceneTargetResult {
                             file_name,
+                            short_name,
                             file_path: resolved_tl_path,
                             original_path: orig_path.to_string_lossy().to_string(),
                             line_number: idx + 1,
@@ -389,10 +396,14 @@ async fn find_scene_target(
                 for (idx, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
                     if trimmed.starts_with(&tl_prefix_hash) || trimmed.starts_with(&tl_prefix_colon) {
-                        let file_name = tl_path.file_name()?.to_string_lossy().to_string();
-                        let orig_path = base_path.join(&file_name);
+                        let rel_path = tl_path.strip_prefix(&tl_dir).unwrap_or(&tl_path);
+                        let file_name = rel_path.to_string_lossy().replace('\\', "/");
+                        let short_name = tl_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        let orig_path = base_path.join(rel_path);
+
                         return Some(SceneTargetResult {
                             file_name,
+                            short_name,
                             file_path: tl_path.to_string_lossy().to_string(),
                             original_path: orig_path.to_string_lossy().to_string(),
                             line_number: idx + 1,
@@ -464,6 +475,15 @@ mod tests {
                     let house_loc = found_house.unwrap();
                     println!("Найдена сцена 'house': файл {}, строка {}", house_loc.file_name, house_loc.line_number);
                     assert_eq!(house_loc.file_name, "script.rpy", "Сцена 'house' должна находиться в script.rpy");
+
+                    // Проверяем поиск сцены "PPF" в подпапке "script/locations/PPF HQ.rpy"
+                    let found_ppf = find_scene_target(game_dir.to_string(), "PPF".to_string()).await.unwrap();
+                    assert!(found_ppf.is_some(), "Сцена 'PPF' должна быть найдена");
+                    let ppf_loc = found_ppf.unwrap();
+                    println!("Найдена сцена 'PPF': file_name={}, short_name={}, line={}", ppf_loc.file_name, ppf_loc.short_name, ppf_loc.line_number);
+                    assert_eq!(ppf_loc.file_name, "script/locations/PPF HQ.rpy");
+                    assert_eq!(ppf_loc.short_name, "PPF HQ.rpy");
+                    assert!(ppf_loc.file_path.contains(r"tl\russian\script\locations\PPF HQ.rpy"));
                 }
             }
         });

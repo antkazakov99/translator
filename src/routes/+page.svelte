@@ -176,6 +176,7 @@
     try {
       const found = await invoke<{
         file_name: string;
+        short_name: string;
         file_path: string;
         original_path: string;
         line_number: number;
@@ -190,21 +191,43 @@
         return;
       }
 
-      // Находим файл в проекте
-      const targetFile = project?.files.find(f => 
-        f.name.toLowerCase() === found.file_name.toLowerCase() ||
-        f.path.toLowerCase() === found.file_path.toLowerCase()
-      );
+      // Нормализуем пути для надежного сравнения (слэши, подпапки, имя файла)
+      const norm = (s: string) => s.replace(/\\/g, '/').toLowerCase();
+      const targetPath = norm(found.file_path);
+      const targetNameNormalized = norm(found.file_name);
+      const targetShort = norm(found.short_name);
+
+      let targetFile = project?.files.find(f => {
+        const fp = norm(f.path);
+        const fn = norm(f.name);
+        return fp === targetPath ||
+               fn === targetNameNormalized ||
+               fn === targetShort ||
+               fn.endsWith('/' + targetShort) ||
+               fp.endsWith('/' + targetShort);
+      });
+
+      // Если файл есть на диске, но не был в списке tl/, добавляем его динамически
+      if (!targetFile && project) {
+        targetFile = {
+          name: found.file_name,
+          path: found.file_path,
+          size_kb: 0,
+          total_lines: 0,
+          translated_lines: 0
+        };
+        project.files.push(targetFile);
+      }
 
       if (targetFile) {
-        showToast(`Переход в ${found.file_name} ➔ сцена "${targetName}" (строка ${found.line_number})`, "success");
+        showToast(`Переход в ${found.short_name} ➔ сцена "${targetName}" (строка ${found.line_number})`, "success");
         await selectFile(targetFile);
         // Небольшая задержка на отрисовку DOM после парсинга файла
         setTimeout(() => {
           focusScene(targetName);
         }, 150);
       } else {
-        showToast(`Сцена найдена в ${found.file_name}:${found.line_number}, но файл не в списке перевода`, "warning");
+        showToast(`Сцена найдена в ${found.short_name}:${found.line_number}, но файл не найден`, "warning");
       }
     } catch (e) {
       showToast(`Ошибка поиска: ${e}`, "error");
