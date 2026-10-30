@@ -1475,6 +1475,23 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+/// Игра с папкой `tl/russian` и несжатыми `.rpy` (папка `game`).
+#[cfg(test)]
+pub(crate) const TEST_TRANSLATED_GAME: &str = "TRANSLATOR_TEST_TRANSLATED_GAME";
+/// Игра с `archive.rpa` и файлом `brothel_keyhole.rpyc` внутри (папка `game`).
+#[cfg(test)]
+pub(crate) const TEST_RPA_GAME: &str = "TRANSLATOR_TEST_RPA_GAME";
+/// Игра с персонажами в `___sys/_vars/*.rpyc` внутри `archive.rpa` (папка `game`).
+#[cfg(test)]
+pub(crate) const TEST_CHARACTERS_GAME: &str = "TRANSLATOR_TEST_CHARACTERS_GAME";
+
+/// Папка игры для тестов на реальных данных: `cargo test -- --ignored`
+/// с заданной переменной окружения. Без неё такие тесты ничего не проверяют.
+#[cfg(test)]
+pub(crate) fn local_test_game(env_var: &str) -> Option<String> {
+    std::env::var(env_var).ok().filter(|path| Path::new(path).exists())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1555,10 +1572,12 @@ mod tests {
     #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_parse_file_entries_benchmark() {
         tauri::async_runtime::block_on(async {
-            let file_path =
-                r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\celia.rpy";
-            let file_path2 = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\folk arc.rpy";
-            if !Path::new(file_path).exists() || !Path::new(file_path2).exists() {
+            let Some(game_dir) = local_test_game(TEST_TRANSLATED_GAME) else {
+                return;
+            };
+            let file_path = Path::new(&game_dir).join("celia.rpy").to_string_lossy().to_string();
+            let file_path2 = Path::new(&game_dir).join("folk arc.rpy").to_string_lossy().to_string();
+            if !Path::new(&file_path).exists() || !Path::new(&file_path2).exists() {
                 return;
             }
             let start = std::time::Instant::now();
@@ -1588,10 +1607,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_scan_and_parse_story_rpy() {
         tauri::async_runtime::block_on(async {
-            let game_dir = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game";
-            if Path::new(game_dir).exists() {
+            if let Some(game_dir) = local_test_game(TEST_TRANSLATED_GAME) {
+                let game_dir = game_dir.as_str();
                 let summary = scan_game_project(game_dir.to_string()).await.unwrap();
                 println!("Найдены файлы ({} шт):", summary.files.len());
                 // Проверяем, что в списке нет бэкапов!
@@ -1689,12 +1709,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_rpa_and_rpyc_tauri_commands() {
         tauri::async_runtime::block_on(async {
-            let game_dir = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game";
-            if !Path::new(game_dir).exists() {
+            let Some(game_dir) = local_test_game(TEST_TRANSLATED_GAME) else {
                 return;
-            }
+            };
+            let game_dir = game_dir.as_str();
 
             // 1. Тест декомпиляции celia.rpyc через команду decompile_rpyc_file
             let celia_rpyc = format!(r"{}\celia.rpyc", game_dir);
@@ -1741,12 +1762,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_scan_packed_game_of_whores() {
         tauri::async_runtime::block_on(async {
-            let game_dir = r"F:\Games\Game of Whores\Game of Whores (0.34)\game";
-            if !Path::new(game_dir).exists() {
+            let Some(game_dir) = local_test_game(TEST_RPA_GAME) else {
                 return;
-            }
+            };
+            let game_dir = game_dir.as_str();
 
             let start = std::time::Instant::now();
             let summary = scan_game_project(game_dir.to_string()).await.unwrap();
@@ -1799,12 +1821,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_scan_lust_and_power() {
         tauri::async_runtime::block_on(async {
-            let game_dir = r"F:\Games\Lust and Power\Lust and Power (0.75)\game";
-            if !Path::new(game_dir).exists() {
+            let Some(game_dir) = local_test_game(TEST_CHARACTERS_GAME) else {
                 return;
-            }
+            };
+            let game_dir = game_dir.as_str();
 
             let start = std::time::Instant::now();
             let summary = scan_game_project(game_dir.to_string()).await.unwrap();
@@ -2014,13 +2037,20 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_real_ppf_and_hilde_cross_file_flow() {
         tauri::async_runtime::block_on(async {
-            let hilde_path = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\tl\russian\script\locations\arc1 hilde\hilde arc I.rpy";
-            let ppf_path = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\tl\russian\script\locations\PPF HQ.rpy";
-            if !Path::new(hilde_path).exists() || !Path::new(ppf_path).exists() {
+            let Some(game_dir) = local_test_game(TEST_TRANSLATED_GAME) else {
+                return;
+            };
+            let locations = tl_lang_dir(Path::new(&game_dir)).join("script").join("locations");
+            let hilde_path = locations.join("arc1 hilde").join("hilde arc I.rpy");
+            let ppf_path = locations.join("PPF HQ.rpy");
+            if !hilde_path.exists() || !ppf_path.exists() {
                 return;
             }
+            let hilde_path = hilde_path.to_string_lossy();
+            let ppf_path = ppf_path.to_string_lossy();
 
             let hilde = parse_file_entries(hilde_path.to_string()).await.unwrap();
             assert!(
