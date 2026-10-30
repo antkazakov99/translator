@@ -1,8 +1,7 @@
-use crate::{find_game_root, get_project_cache_dir};
+use crate::{find_game_root, get_project_cache_dir, stable_hash_str};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -22,11 +21,10 @@ struct TranslationOverrides {
 }
 
 fn store_path(source: &Path) -> PathBuf {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.to_string_lossy().to_lowercase().hash(&mut hasher);
+    let hash = stable_hash_str(&source.to_string_lossy().to_lowercase());
     get_project_cache_dir(&find_game_root(source))
         .join("translations")
-        .join(format!("{:016x}.json", hasher.finish()))
+        .join(format!("{:016x}.json", hash))
 }
 
 fn read_store(source: &Path, path: &Path) -> Result<TranslationOverrides, String> {

@@ -17,6 +17,22 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Instant, SystemTime};
 
+/// Стабильный FNV-1a хэш для воспроизводимых имён кэш-папок между
+/// запусками и версиями компилятора (в отличие от DefaultHasher).
+pub fn stable_hash_str(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Путь к папке `tl/russian` внутри директории игры.
+fn tl_lang_dir(game_dir: &Path) -> PathBuf {
+    game_dir.join("tl").join("russian")
+}
+
 #[derive(Clone)]
 struct ParsedFileCacheEntry {
     file_mtime: SystemTime,
@@ -132,16 +148,13 @@ fn has_rpa_archives(dir: &Path) -> bool {
 
 /// Возвращает путь к изолированной папке кэша в AppData для конкретной игры,
 /// чтобы оригинальная папка игры никогда не засорялась распакованными файлами.
+/// Использует FNV-1a — стабильный хэш, воспроизводимый между версиями компилятора.
 pub fn get_project_cache_dir(game_dir: &Path) -> PathBuf {
     let local_app_data = std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir());
 
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    game_dir.to_string_lossy().to_lowercase().hash(&mut hasher);
-    let hash = format!("{:012x}", hasher.finish());
+    let hash = format!("{:012x}", stable_hash_str(&game_dir.to_string_lossy().to_lowercase()));
 
     let folder_name = game_dir
         .file_name()
@@ -176,6 +189,42 @@ pub struct ProjectSummary {
     pub total_translated: usize,
 }
 
+/// Параллельно строит список `TranslationFileItem` из набора путей.
+/// Фильтрует файлы без диалоговых строк (`total == 0`).
+/// `base_dir` используется для получения относительного имени файла.
+fn build_translation_file_items(
+    paths: Vec<PathBuf>,
+    base_dir: &Path,
+) -> Vec<TranslationFileItem> {
+    paths
+        .into_par_iter()
+        .filter_map(|path| {
+            let content = std::fs::read_to_string(&path).ok()?;
+            let size_kb = content.len() as f64 / 1024.0;
+            let (total, translated) = RenpyParser::quick_translation_stats(&content);
+            if total == 0 {
+                return None;
+            }
+            let relative_name = path
+                .strip_prefix(base_dir)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                });
+            Some(TranslationFileItem {
+                name: relative_name,
+                path: path.to_string_lossy().to_string(),
+                size_kb,
+                total_lines: total,
+                translated_lines: translated,
+            })
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueEntryDto {
     pub id: String,
@@ -208,14 +257,6 @@ pub struct ParsedFileDto {
     pub translated_lines: usize,
     pub scenes: Vec<SceneDto>,
     pub edges: Vec<SceneEdgeDto>,
-}
-
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!(
-        "Привет, {}! Мост между Svelte 5 и Rust работает идеально!",
-        name
-    )
 }
 
 #[tauri::command]
@@ -419,7 +460,7 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         }
 
         // 3. Ищем файлы переводов в game/tl/russian в параллельных потоках (сверхбыстрый подсчет строк)
-        let tl_dir = base_path.join(r"tl\russian");
+        let tl_dir = tl_lang_dir(&base_path);
         let mut files = Vec::new();
         let mut grand_total = 0;
         let mut grand_translated = 0;
@@ -428,34 +469,7 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
             let mut tl_files = Vec::new();
             collect_rpy_files(&tl_dir, &mut tl_files);
 
-            let mut parsed_files: Vec<TranslationFileItem> = tl_files
-                .into_par_iter()
-                .filter_map(|path| {
-                    let content = std::fs::read_to_string(&path).ok()?;
-                    let size_kb = content.len() as f64 / 1024.0;
-                    let (total, translated) = RenpyParser::quick_translation_stats(&content);
-                    if total == 0 {
-                        return None; // Фильтруем пустые файлы перевода без строк диалогов!
-                    }
-                    let relative_name = path
-                        .strip_prefix(&tl_dir)
-                        .map(|p| p.to_string_lossy().replace('\\', "/"))
-                        .unwrap_or_else(|_| {
-                            path.file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string()
-                        });
-
-                    Some(TranslationFileItem {
-                        name: relative_name,
-                        path: path.to_string_lossy().to_string(),
-                        size_kb,
-                        total_lines: total,
-                        translated_lines: translated,
-                    })
-                })
-                .collect();
+            let mut parsed_files = build_translation_file_items(tl_files, &tl_dir);
 
             for f in &parsed_files {
                 grand_total += f.total_lines;
@@ -475,34 +489,7 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
             let mut cached_files = Vec::new();
             collect_rpy_files(&cache_dir, &mut cached_files);
 
-            let mut parsed_cached: Vec<TranslationFileItem> = cached_files
-                .into_par_iter()
-                .filter_map(|path| {
-                    let content = std::fs::read_to_string(&path).ok()?;
-                    let size_kb = content.len() as f64 / 1024.0;
-                    let (total, translated) = RenpyParser::quick_translation_stats(&content);
-                    if total == 0 {
-                        return None; // Фильтруем пустые скрипты (анимации, внутренние переменные, спеллы)!
-                    }
-                    let relative_name = path
-                        .strip_prefix(&cache_dir)
-                        .map(|p| p.to_string_lossy().replace('\\', "/"))
-                        .unwrap_or_else(|_| {
-                            path.file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string()
-                        });
-
-                    Some(TranslationFileItem {
-                        name: relative_name,
-                        path: path.to_string_lossy().to_string(),
-                        size_kb,
-                        total_lines: total,
-                        translated_lines: translated,
-                    })
-                })
-                .collect();
+            let mut parsed_cached = build_translation_file_items(cached_files, &cache_dir);
 
             for f in &parsed_cached {
                 grand_total += f.total_lines;
@@ -519,35 +506,11 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
 
         // 5. Если в tl/russian пусто и нет RPA, но есть распакованные .rpy в папке игры
         if files.is_empty() && !script_files.is_empty() {
-            let mut parsed_loose: Vec<TranslationFileItem> = script_files
-                .into_par_iter()
+            let loose: Vec<PathBuf> = script_files
+                .into_iter()
                 .filter(|p| !p.starts_with(&cache_dir))
-                .filter_map(|path| {
-                    let content = std::fs::read_to_string(&path).ok()?;
-                    let size_kb = content.len() as f64 / 1024.0;
-                    let (total, translated) = RenpyParser::quick_translation_stats(&content);
-                    if total == 0 {
-                        return None; // Фильтруем скрипты без диалогов
-                    }
-                    let relative_name = path
-                        .strip_prefix(&base_path)
-                        .map(|p| p.to_string_lossy().replace('\\', "/"))
-                        .unwrap_or_else(|_| {
-                            path.file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string()
-                        });
-
-                    Some(TranslationFileItem {
-                        name: relative_name,
-                        path: path.to_string_lossy().to_string(),
-                        size_kb,
-                        total_lines: total,
-                        translated_lines: translated,
-                    })
-                })
                 .collect();
+            let mut parsed_loose = build_translation_file_items(loose, &base_path);
 
             for f in &parsed_loose {
                 grand_total += f.total_lines;
@@ -945,7 +908,7 @@ async fn find_scene_target(
             return Err(format!("Путь к игре не существует: {}", game_dir));
         }
 
-        let tl_dir = base_path.join(r"tl\russian");
+        let tl_dir = tl_lang_dir(&base_path);
         let cache_dir = get_project_scripts_cache_dir(&base_path);
 
         let mut script_files = Vec::new();
@@ -1066,7 +1029,7 @@ async fn find_scene_target(
 async fn pack_mod_rpa(game_dir: String, output_rpa_path: Option<String>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
-        let tl_dir = base_path.join(r"tl\russian");
+        let tl_dir = tl_lang_dir(&base_path);
         if !tl_dir.exists() {
             return Err("Папка перевода tl/russian не найдена в директории игры".to_string());
         }
@@ -1438,11 +1401,14 @@ async fn extract_glossary_terms_from_game(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Инициализируем трассировку логов (info!, warn!, error! будут выводиться в консоль)
+    #[cfg(debug_assertions)]
+    tracing_subscriber::fmt::init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            greet,
             resolve_game_directory,
             scan_game_project,
             parse_file_entries,
@@ -1620,7 +1586,7 @@ mod tests {
             assert!(decompiled.contains("label end_scene_nei:"));
             println!("Команда decompile_rpyc_file успешно декомпилировала celia.rpyc!");
 
-            let tl_russian = Path::new(game_dir).join(r"tl\russian");
+            let tl_russian = tl_lang_dir(Path::new(game_dir));
             if !tl_russian.exists() {
                 println!(
                     "tl/russian не существует в {:?}, пропускаем часть упаковки",
