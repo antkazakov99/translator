@@ -1393,7 +1393,7 @@ async fn autofill_glossary_characters(
     model: String,
     characters: Vec<glossary::CharacterGlossaryEntry>,
     only_empty: bool,
-) -> Result<Vec<glossary::CharacterGlossaryEntry>, String> {
+) -> Result<llm::AutofillResult<glossary::CharacterGlossaryEntry>, String> {
     let base_path = effective_game_directory(Path::new(&game_dir));
     let aliases: Vec<String> = characters.iter().map(|c| c.alias.clone()).collect();
     let samples = tauri::async_runtime::spawn_blocking(move || {
@@ -1411,7 +1411,7 @@ async fn autofill_glossary_terms(
     model: String,
     terms: Vec<glossary::TermGlossaryEntry>,
     only_empty: bool,
-) -> Result<Vec<glossary::TermGlossaryEntry>, String> {
+) -> Result<llm::AutofillResult<glossary::TermGlossaryEntry>, String> {
     llm::autofill_terms(&api_url, &model, terms, only_empty).await
 }
 
