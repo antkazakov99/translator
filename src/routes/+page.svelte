@@ -458,10 +458,19 @@
   let scenePickerSearch = $state("");
   let graphSceneSearch = $state("");
 
-  // Текущая выбранная сцена для селектора
+  // Сцены, доступные в табличном виде:
+  // По умолчанию отображаются только сцены с диалогами (total_lines > 0).
+  // Но если пользователь перешел из графа, выбрав сцену-селектор/хаб без диалогов (s.id === selectedSceneId),
+  // она также включается в список!
+  let tableScenes = $derived.by(() => {
+    if (!currentFile) return [];
+    return currentFile.scenes.filter(s => s.total_lines > 0 || s.id === selectedSceneId);
+  });
+
+  // Текущая выбранная сцена для селектора в таблице
   let currentSceneIndex = $derived.by(() => {
     if (!currentFile || selectedSceneId === "all") return -1;
-    return currentFile.scenes.findIndex(s => s.id === selectedSceneId);
+    return tableScenes.findIndex(s => s.id === selectedSceneId);
   });
 
   let currentScene = $derived.by(() => {
@@ -470,37 +479,37 @@
   });
 
   let isPrevSceneDisabled = $derived.by(() => {
-    if (!currentFile || currentFile.scenes.length === 0) return true;
+    if (tableScenes.length === 0) return true;
     if (selectedSceneId === "all") return true;
     return currentSceneIndex <= 0;
   });
 
   let isNextSceneDisabled = $derived.by(() => {
-    if (!currentFile || currentFile.scenes.length === 0) return true;
-    if (selectedSceneId === "all") return currentFile.scenes.length === 0;
-    return currentSceneIndex >= currentFile.scenes.length - 1;
+    if (tableScenes.length === 0) return true;
+    if (selectedSceneId === "all") return tableScenes.length === 0;
+    return currentSceneIndex >= tableScenes.length - 1;
   });
 
   function goToPrevScene() {
-    if (!currentFile || currentFile.scenes.length === 0) return;
+    if (tableScenes.length === 0) return;
     if (selectedSceneId === "all") return;
     const idx = currentSceneIndex;
     if (idx > 0) {
-      selectedSceneId = currentFile.scenes[idx - 1].id;
+      selectedSceneId = tableScenes[idx - 1].id;
     } else if (idx === 0) {
       selectedSceneId = "all";
     }
   }
 
   function goToNextScene() {
-    if (!currentFile || currentFile.scenes.length === 0) return;
+    if (tableScenes.length === 0) return;
     if (selectedSceneId === "all") {
-      selectedSceneId = currentFile.scenes[0].id;
+      selectedSceneId = tableScenes[0].id;
       return;
     }
     const idx = currentSceneIndex;
-    if (idx >= 0 && idx < currentFile.scenes.length - 1) {
-      selectedSceneId = currentFile.scenes[idx + 1].id;
+    if (idx >= 0 && idx < tableScenes.length - 1) {
+      selectedSceneId = tableScenes[idx + 1].id;
     }
   }
 
@@ -513,7 +522,7 @@
   let filteredScenesForPicker = $derived.by(() => {
     if (!currentFile) return [];
     const q = scenePickerSearch.trim().toLowerCase();
-    if (!q) return currentFile.scenes;
+    if (!q) return tableScenes;
     return currentFile.scenes.filter(s => s.name.toLowerCase().includes(q));
   });
 
@@ -893,10 +902,11 @@
     try {
       currentFile = await invoke<ParsedFile>("parse_file_entries", { filePath: file.path });
       focusedSceneName = null;
-      // По умолчанию выбираем первую реальную сюжетную сцену (или все, если сцена одна)
+      // По умолчанию выбираем первую реальную сюжетную сцену с диалогами
       if (currentFile.scenes.length > 1) {
+        const firstStoryWithLines = currentFile.scenes.find(s => s.name !== "Интерфейс и меню (strings)" && s.total_lines > 0);
         const firstStory = currentFile.scenes.find(s => s.name !== "Интерфейс и меню (strings)");
-        selectedSceneId = firstStory ? firstStory.id : currentFile.scenes[0].id;
+        selectedSceneId = firstStoryWithLines ? firstStoryWithLines.id : (firstStory ? firstStory.id : currentFile.scenes[0].id);
       } else if (currentFile.scenes.length > 0) {
         selectedSceneId = currentFile.scenes[0].id;
       } else {
@@ -1721,9 +1731,15 @@
                   </span>
                   {#if currentScene}
                     {@const pct = currentScene.total_lines > 0 ? Math.round((currentScene.translated_lines / currentScene.total_lines) * 100) : 0}
-                    <span class="scene-picker-badge" class:badge-complete={pct === 100}>
-                      {currentScene.translated_lines}/{currentScene.total_lines} ({pct}%)
-                    </span>
+                    {#if currentScene.total_lines > 0}
+                      <span class="scene-picker-badge" class:badge-complete={pct === 100}>
+                        {currentScene.translated_lines}/{currentScene.total_lines} ({pct}%)
+                      </span>
+                    {:else}
+                      <span class="scene-picker-badge badge-router">
+                        Развилка (0 строк)
+                      </span>
+                    {/if}
                   {/if}
                   <ChevronDown size={13} class="picker-caret" />
                 </button>
@@ -1750,7 +1766,7 @@
                         onclick={() => selectScene('all')}
                       >
                         <Clapperboard size={13} class="text-slate-400" />
-                        <span class="scene-item-title">Все сцены ({currentFile.scenes.length})</span>
+                        <span class="scene-item-title">Все сцены с диалогами ({tableScenes.filter(s => s.total_lines > 0).length})</span>
                       </button>
 
                       {#each filteredScenesForPicker as scene, idx}
@@ -1762,9 +1778,15 @@
                         >
                           <span class="scene-item-seq">#{idx + 1}</span>
                           <span class="scene-item-title">{scene.name}</span>
-                          <span class="scene-item-badge" class:badge-complete={pct === 100}>
-                            {scene.translated_lines}/{scene.total_lines} ({pct}%)
-                          </span>
+                          {#if scene.total_lines > 0}
+                            <span class="scene-item-badge" class:badge-complete={pct === 100}>
+                              {scene.translated_lines}/{scene.total_lines} ({pct}%)
+                            </span>
+                          {:else}
+                            <span class="scene-item-badge badge-router">
+                              Развилка (0 строк)
+                            </span>
+                          {/if}
                         </button>
                       {/each}
                       {#if filteredScenesForPicker.length === 0}
@@ -2123,6 +2145,28 @@
                         {/each}
                       </tbody>
                     </table>
+                  {:else if selectedSceneId === scene.id}
+                    <div class="empty-scene-card">
+                      <div class="empty-scene-icon-wrap">
+                        <GitBranch size={30} class="text-sky-400" />
+                      </div>
+                      <div class="empty-scene-info">
+                        <h3>Сцена «{scene.name}» не содержит диалоговых строк</h3>
+                        <p>
+                          Эта метка используется в сценарии игры как меню выбора или маршрутизатор сюжета
+                          {#if (scene.choices?.length ?? 0) > 0}
+                            (вариантов меню: {scene.choices.length})
+                          {/if}
+                          {#if (scene.jumps?.length ?? 0) > 0}
+                            (переходов jump/call: {scene.jumps.length})
+                          {/if}.
+                        </p>
+                        <button type="button" class="btn-return-graph" onclick={() => viewMode = 'scenes'}>
+                          <GitBranch size={14} />
+                          <span>Открыть переходы этой сцены в графе →</span>
+                        </button>
+                      </div>
+                    </div>
                   {/if}
                 {/each}
               </div>
@@ -5052,6 +5096,68 @@
   .scene-picker-badge.badge-complete {
     background: rgba(16, 185, 129, 0.15);
     color: #34d399;
+  }
+
+  .scene-picker-badge.badge-router {
+    background: rgba(99, 102, 241, 0.2);
+    border: 1px solid rgba(99, 102, 241, 0.4);
+    color: #a5b4fc;
+  }
+
+  .empty-scene-card {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 32px 28px;
+    margin: 20px;
+    background: #0f172a;
+    border: 1px dashed #334155;
+    border-radius: 12px;
+  }
+
+  .empty-scene-icon-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 56px;
+    height: 56px;
+    border-radius: 12px;
+    background: #1e293b;
+    border: 1px solid #38bdf840;
+    flex-shrink: 0;
+  }
+
+  .empty-scene-info h3 {
+    margin: 0 0 6px 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: #f1f5f9;
+  }
+
+  .empty-scene-info p {
+    margin: 0 0 12px 0;
+    font-size: 13px;
+    color: #94a3b8;
+    line-height: 1.5;
+  }
+
+  .btn-return-graph {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 6px 12px;
+    background: #0284c7;
+    border: 1px solid #38bdf8;
+    border-radius: 6px;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 0.15s;
+  }
+
+  .btn-return-graph:hover {
+    background: #0369a1;
   }
 
   .picker-caret {

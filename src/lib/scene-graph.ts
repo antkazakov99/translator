@@ -441,15 +441,12 @@ export function buildFullSceneGraph(scenes: GraphScene[], sourceEdges: GraphEdge
 }
 
 /**
- * Основная точка входа построения графа
+ * Основная точка входа построения графа (всегда сфокусированный граф окрестности)
  */
 export function buildSceneGraph(
   scenes: GraphScene[],
   sourceEdges: GraphEdge[],
   options?: FocusedGraphOptions
 ): GraphData {
-  if (options?.mode === 'focused') {
-    return buildFocusedSceneGraph(scenes, sourceEdges, options);
-  }
-  return buildFullSceneGraph(scenes, sourceEdges);
+  return buildFocusedSceneGraph(scenes, sourceEdges, options);
 }

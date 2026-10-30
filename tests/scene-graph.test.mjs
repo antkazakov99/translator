@@ -1,7 +1,7 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildSceneGraph, buildFocusedSceneGraph } from '../src/lib/scene-graph.ts';
+import { buildSceneGraph, buildFocusedSceneGraph, buildFullSceneGraph } from '../src/lib/scene-graph.ts';
 
 const scene = (name) => ({ id: name, name, total_lines: 0, translated_lines: 0, entries: [], choices: [], jumps: [] });
 
@@ -11,7 +11,9 @@ test('branches use actual edges and keep unrelated scenes disconnected', () => {
     { from: 'start', to: 'right', kind: 'choice', condition: 'No' }
   ]);
   assert.equal(graph.links.length, 2);
-  const [start, left, right] = graph.nodes;
+  const start = graph.nodes.find(n => n.name === 'start');
+  const left = graph.nodes.find(n => n.name === 'left');
+  const right = graph.nodes.find(n => n.name === 'right');
   assert.ok(left.x > start.x);
   assert.equal(left.x, right.x);
   assert.notEqual(left.y, right.y);
@@ -19,7 +21,7 @@ test('branches use actual edges and keep unrelated scenes disconnected', () => {
 });
 
 test('cycles, self loops, external labels and similar names remain distinct', () => {
-  const graph = buildSceneGraph(['end', 'end_scene'].map(scene), [
+  const graph = buildFullSceneGraph(['end', 'end_scene'].map(scene), [
     { from: 'end', to: 'end_scene', kind: 'jump', condition: null },
     { from: 'end_scene', to: 'end', kind: 'jump', condition: null },
     { from: 'end', to: 'end', kind: 'jump', condition: null },

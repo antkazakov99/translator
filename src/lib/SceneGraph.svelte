@@ -28,7 +28,6 @@
     busy?: boolean;
   } = $props();
 
-  let graphMode = $state<'focused' | 'all'>('focused');
   let zoom = $state(1);
   let viewport: HTMLDivElement;
   let drag: { x: number; y: number; left: number; top: number } | null = null;
@@ -58,7 +57,6 @@
 
   let graph = $derived(
     buildSceneGraph(scenes, edges, {
-      mode: graphMode,
       focusName: selected?.name ?? null,
       incomingPage,
       incomingPageSize: pageSize,
@@ -89,18 +87,13 @@
     const name = selected?.name;
     if (name) {
       void tick().then(() => {
-        if (graphMode === 'focused') {
-          // В сфокусированном режиме центрируем на центральном узле
-          const centerNode = graph.nodes.find(n => n.role === 'center');
-          if (centerNode && viewport) {
-            viewport.scrollTo({
-              left: (centerNode.x + NODE_WIDTH / 2) * zoom - viewport.clientWidth / 2,
-              top: (centerNode.y + NODE_HEIGHT / 2) * zoom - viewport.clientHeight / 2,
-              behavior: 'smooth',
-            });
-          }
-        } else {
-          centerOnNode(name);
+        const centerNode = graph.nodes.find(n => n.role === 'center');
+        if (centerNode && viewport) {
+          viewport.scrollTo({
+            left: (centerNode.x + NODE_WIDTH / 2) * zoom - viewport.clientWidth / 2,
+            top: (centerNode.y + NODE_HEIGHT / 2) * zoom - viewport.clientHeight / 2,
+            behavior: 'smooth',
+          });
         }
       });
     }
@@ -164,54 +157,28 @@
 <div class="graph-view">
   <!-- Верхний тулбар графа -->
   <div class="toolbar">
-    <div class="mode-toggles">
-      <button
-        class="mode-btn"
-        class:btn-active={graphMode === 'focused'}
-        onclick={() => graphMode = 'focused'}
-        title="Локальный граф: только текущая сцена и связанные с ней входы/выходы (быстро и без лагов)"
-      >
-        🎯 Только связанные
-      </button>
-      <button
-        class="mode-btn"
-        class:btn-active={graphMode === 'all'}
-        onclick={() => graphMode = 'all'}
-        title="Показать все сцены файла целиком"
-      >
-        🌐 Весь граф
-      </button>
-    </div>
-
     <div class="toolbar-info">
-      {#if graphMode === 'focused'}
-        {#if selected}
-          <span>
-            В фокусе: <strong class="text-sky-400">{selected.name}</strong>
-            <span class="info-sep">·</span>
-            ← Входов: <strong>{graph.incomingTotalRaw}</strong>
-            <span class="info-sep">·</span>
-            Выходов: <strong>{graph.outgoingTotalRaw}</strong> →
-          </span>
-        {/if}
-      {:else}
-        <span>{graph.nodes.length} узлов · {graph.links.length} связей</span>
+      {#if selected}
+        <span class="focus-title-badge">🎯 Сцена:</span>
+        <strong class="focus-scene-name">{selected.name}</strong>
+        <span class="info-sep">·</span>
+        <span class="info-stat">← Входов: <strong>{graph.incomingTotalRaw}</strong></span>
+        <span class="info-sep">·</span>
+        <span class="info-stat">Выходов: <strong>{graph.outgoingTotalRaw}</strong> →</span>
       {/if}
     </div>
 
     <div class="zoom-controls">
-      {#if graphMode === 'focused'}
-        <div class="page-size-picker" title="Лимит отображения узлов на страницу">
-          <span class="page-size-label">По:</span>
-          {#each [10, 25, 50] as size}
-            <button
-              class="page-size-btn"
-              class:size-active={pageSize === size}
-              onclick={() => { pageSize = size; incomingPage = 1; outgoingPage = 1; }}
-            >{size}</button>
-          {/each}
-        </div>
-      {/if}
+      <div class="page-size-picker" title="Лимит отображения узлов на страницу">
+        <span class="page-size-label">По:</span>
+        {#each [10, 25, 50] as size}
+          <button
+            class="page-size-btn"
+            class:size-active={pageSize === size}
+            onclick={() => { pageSize = size; incomingPage = 1; outgoingPage = 1; }}
+          >{size}</button>
+        {/each}
+      </div>
       <button onclick={() => setZoom(zoom / 1.2)} aria-label="Уменьшить масштаб">−</button>
       <button onclick={() => setZoom(1)} title="Масштаб 100%">{Math.round(zoom * 100)}%</button>
       <button onclick={() => setZoom(zoom * 1.2)} aria-label="Увеличить масштаб">+</button>
@@ -223,11 +190,7 @@
   </div>
 
   <div class="hint">
-    {#if graphMode === 'focused'}
-      💡 Кликните на левый или правый узел, чтобы моментально переключить фокус на него · Колесико с Ctrl — масштаб
-    {:else}
-      💡 Перетаскивайте фон · Ctrl + колесо — масштаб · Выберите узел для просмотра связей
-    {/if}
+    💡 Кликните на входящий (слева) или исходящий (справа) узел для перехода к нему · Колесико с Ctrl — масштаб
   </div>
 
   <!-- Область холста (Viewport) -->
@@ -276,8 +239,7 @@
         style:transform={`scale(${zoom})`}
       >
         <!-- Заголовки колонок в сфокусированном режиме -->
-        {#if graphMode === 'focused'}
-          <!-- Левая колонка: Входящие переходы -->
+        <!-- Левая колонка: Входящие переходы -->
           <div class="column-header-banner banner-in" style:left="60px" style:width="{NODE_WIDTH}px">
             <div class="banner-top-row">
               <span class="banner-badge">
@@ -408,7 +370,6 @@
               {/if}
             </div>
           {/if}
-        {/if}
 
         <!-- SVG-связи между узлами -->
         <svg width={graph.width} height={graph.height} aria-label="Связи между сценами">
@@ -503,22 +464,33 @@
 
               <span class="preview">
                 {node.scene?.entries[0]?.original_text ||
-                  (isExternal ? 'Метка в другом файле: нажмите для перехода' : 'Нет диалоговых реплик')}
+                  (isExternal
+                    ? 'Метка в другом файле: нажмите для перехода'
+                    : (node.scene?.choices?.length ? 'Меню выбора (без реплик персонажей)' : 'Маршрутизатор сюжета (без реплик)'))}
               </span>
             </button>
 
             {#if node.scene}
               <div class="node-footer">
-                <span class="node-stats">
-                  {node.scene.translated_lines}/{node.scene.total_lines} строк ({pct}%)
-                </span>
-                <button
-                  class="btn-open-dialogues"
-                  onclick={() => onopen(node.scene!.id)}
-                  title="Открыть диалоги сцены в таблице"
-                >
-                  Диалоги →
-                </button>
+                {#if node.scene.total_lines > 0}
+                  <span class="node-stats">
+                    {node.scene.translated_lines}/{node.scene.total_lines} строк ({pct}%)
+                  </span>
+                  <button
+                    class="btn-open-dialogues"
+                    onclick={() => onopen(node.scene!.id)}
+                    title="Открыть диалоги сцены в таблице"
+                  >
+                    Диалоги →
+                  </button>
+                {:else}
+                  <span class="node-badge-router" title="Метка содержит меню или переходы, но не имеет диалоговых строк">
+                    Развилка / Меню
+                  </span>
+                  <span class="node-stats-empty">
+                    0 строк диалогов
+                  </span>
+                {/if}
               </div>
             {:else}
               <div class="node-footer external-footer">
@@ -590,37 +562,6 @@
     background: #0f172a;
     border-bottom: 1px solid #1e293b;
     flex-wrap: wrap;
-  }
-
-  .mode-toggles {
-    display: inline-flex;
-    background: #090d16;
-    padding: 3px;
-    border-radius: 7px;
-    border: 1px solid #1e293b;
-    gap: 3px;
-  }
-
-  .mode-btn {
-    border: none;
-    background: transparent;
-    color: #94a3b8;
-    padding: 4px 10px;
-    border-radius: 5px;
-    font-size: 11.5px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.15s ease;
-  }
-
-  .mode-btn:hover {
-    color: #f1f5f9;
-  }
-
-  .mode-btn.btn-active {
-    background: #1e293b;
-    color: #38bdf8;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
   }
 
   .toolbar-info {
@@ -1075,6 +1016,33 @@
   .node-stats {
     color: #64748b;
     font-size: 10.5px;
+  }
+
+  .node-badge-router {
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: #1e1b4b;
+    border: 1px solid #4338ca;
+    color: #a5b4fc;
+    font-size: 10px;
+    font-weight: 600;
+  }
+
+  .node-stats-empty {
+    color: #64748b;
+    font-size: 10px;
+  }
+
+  .focus-title-badge {
+    color: #94a3b8;
+    font-size: 11.5px;
+    font-weight: 500;
+  }
+
+  .focus-scene-name {
+    color: #38bdf8;
+    font-size: 12.5px;
+    font-weight: 700;
   }
 
   .btn-open-dialogues {
