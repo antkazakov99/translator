@@ -23,6 +23,7 @@ petgraph = { version = "0.7", features = ["serde-1"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
+parking_lot = "0.12"
 
 # Сериализация
 serde = { version = "1.0", features = ["derive"] }

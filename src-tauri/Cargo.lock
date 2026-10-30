@@ -4487,6 +4487,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "flate2",
+ "parking_lot",
  "petgraph",
  "rayon",
  "regex",
