@@ -60,7 +60,7 @@ export interface FocusedGraphOptions {
 
 export const NODE_WIDTH = 270;
 export const NODE_HEIGHT = 140;
-export const GAP_X = 140;
+export const GAP_X = 210;
 export const GAP_Y = 24;
 
 export function collectAllEdges(scenes: GraphScene[], sourceEdges: GraphEdge[]): GraphEdge[] {
@@ -190,7 +190,7 @@ export function buildFocusedSceneGraph(
   const centerX = startX + NODE_WIDTH + GAP_X;
   const rightX = centerX + NODE_WIDTH + GAP_X;
 
-  const topPadding = 125;
+  const topPadding = 135;
   const midY = topPadding + maxContentHeight / 2;
 
   // Центральный узел
@@ -241,19 +241,20 @@ export function buildFocusedSceneGraph(
   for (const fromNode of incomingNodes) {
     const edgesGroup = inGroups.get(fromNode.name) ?? [];
     edgesGroup.forEach((edge, groupIdx) => {
-      const offset = (groupIdx - (edgesGroup.length - 1) / 2) * 12;
+      const offset = (groupIdx - (edgesGroup.length - 1) / 2) * 14;
       const sx = fromNode.x + NODE_WIDTH;
       const sy = fromNode.y + NODE_HEIGHT / 2 + offset;
-      const tx = centerNode.x;
+      const tx = centerNode.x - 2;
       const ty = centerNode.y + NODE_HEIGHT / 2 + offset;
       const bend = GAP_X / 2;
       const path = `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`;
+      const staggerX = edgesGroup.length > 1 ? (groupIdx - (edgesGroup.length - 1) / 2) * 16 : 0;
       links.push({
         ...edge,
         id: links.length,
         path,
-        labelX: (sx + tx) / 2,
-        labelY: (sy + ty) / 2 - 10,
+        labelX: (sx + tx) / 2 + staggerX,
+        labelY: (sy + ty) / 2,
       });
     });
   }
@@ -271,38 +272,41 @@ export function buildFocusedSceneGraph(
   for (const toNode of outgoingNodes) {
     const edgesGroup = outGroups.get(toNode.name) ?? [];
     edgesGroup.forEach((edge, groupIdx) => {
-      const offset = (groupIdx - (edgesGroup.length - 1) / 2) * 12;
+      const offset = (groupIdx - (edgesGroup.length - 1) / 2) * 14;
       const sx = centerNode.x + NODE_WIDTH;
       const sy = centerNode.y + NODE_HEIGHT / 2 + offset;
-      const tx = toNode.x;
+      const tx = toNode.x - 2;
       const ty = toNode.y + NODE_HEIGHT / 2 + offset;
       const bend = GAP_X / 2;
       const path = `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`;
+      const staggerX = edgesGroup.length > 1 ? (groupIdx - (edgesGroup.length - 1) / 2) * 16 : 0;
       links.push({
         ...edge,
         id: links.length,
         path,
-        labelX: (sx + tx) / 2,
-        labelY: (sy + ty) / 2 - 10,
+        labelX: (sx + tx) / 2 + staggerX,
+        labelY: (sy + ty) / 2,
       });
     });
   }
 
-  // Петли в себя (Self-loops)
-  for (const edge of selfLoops) {
-    const sx = centerNode.x + NODE_WIDTH * 0.75;
+  // Петли в себя (Self-loops): плавные концентрические арки сверху с вертикальным вхождением
+  selfLoops.forEach((edge, loopIdx) => {
+    const halfSpan = 38 + loopIdx * 20;
+    const loopHeight = 48 + loopIdx * 20;
+    const sx = centerNode.x + NODE_WIDTH / 2 + halfSpan;
     const sy = centerNode.y;
-    const tx = centerNode.x + NODE_WIDTH * 0.25;
-    const ty = centerNode.y;
-    const path = `M ${sx} ${sy} C ${sx + 20} ${sy - 50}, ${tx - 20} ${ty - 50}, ${tx} ${ty}`;
+    const tx = centerNode.x + NODE_WIDTH / 2 - halfSpan;
+    const ty = centerNode.y - 2;
+    const path = `M ${sx} ${sy} C ${sx + 4} ${sy - loopHeight * 1.05}, ${tx - 4} ${ty - loopHeight * 1.05}, ${tx} ${ty}`;
     links.push({
       ...edge,
       id: links.length,
       path,
       labelX: centerNode.x + NODE_WIDTH / 2,
-      labelY: centerNode.y - 40,
+      labelY: centerNode.y - loopHeight - 2,
     });
-  }
+  });
 
   const width = rightX + NODE_WIDTH + 80;
   const height = Math.max(520, midY + maxContentHeight / 2 + 80);
@@ -405,9 +409,24 @@ export function buildFullSceneGraph(scenes: GraphScene[], sourceEdges: GraphEdge
   const links: GraphLink[] = fileEdges.map((edge, index) => {
     const from = byName.get(edge.from)!;
     const to = byName.get(edge.to)!;
+    if (edge.from === edge.to) {
+      const halfSpan = 38;
+      const loopHeight = 48;
+      const loopSx = from.x + NODE_WIDTH / 2 + halfSpan;
+      const loopSy = from.y;
+      const loopTx = from.x + NODE_WIDTH / 2 - halfSpan;
+      const loopTy = from.y - 2;
+      return {
+        ...edge,
+        id: index,
+        path: `M ${loopSx} ${loopSy} C ${loopSx + 4} ${loopSy - loopHeight * 1.05}, ${loopTx - 4} ${loopTy - loopHeight * 1.05}, ${loopTx} ${loopTy}`,
+        labelX: from.x + NODE_WIDTH / 2,
+        labelY: from.y - loopHeight - 2,
+      };
+    }
     const sx = from.x + NODE_WIDTH;
     const sy = from.y + NODE_HEIGHT / 2;
-    const tx = to.x;
+    const tx = to.x - 2;
     const ty = to.y + NODE_HEIGHT / 2;
     const lane = 32 + (index % 5) * 14;
     const forward = tx > sx;
@@ -420,7 +439,7 @@ export function buildFullSceneGraph(scenes: GraphScene[], sourceEdges: GraphEdge
       id: index,
       path,
       labelX: forward ? (sx + tx) / 2 : from.x + NODE_WIDTH / 2,
-      labelY: forward ? (sy + ty) / 2 - 10 : from.y - lane - 8,
+      labelY: forward ? (sy + ty) / 2 : from.y - lane - 8,
     };
   });
 
