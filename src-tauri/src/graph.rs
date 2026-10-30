@@ -25,6 +25,8 @@ pub struct DialogueData {
     pub translated_text: Option<String>,
     pub file_path: String,
     pub line_number: usize,
+    /// Строки файла перевода с этим текстом: одна реплика или все повторы `new`
+    pub target_lines: Vec<usize>,
     pub instruction: Option<String>,
     pub status: TranslationStatus,
 }
@@ -73,6 +75,7 @@ impl ScenarioNode {
             translated_text: None,
             file_path: file.into(),
             line_number: line,
+            target_lines: Vec::new(),
             instruction: None,
             status: TranslationStatus::Untranslated,
         })

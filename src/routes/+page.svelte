@@ -1149,6 +1149,7 @@
       showToast("Укажите путь к папке игры", "warning");
       return;
     }
+    if (!(await saveTranslations())) return;
     packingMod = true;
     try {
       const msg = await invoke<string>("pack_mod_rpa", {
@@ -1216,6 +1217,7 @@
       showToast("Укажите путь к папке игры", "warning");
       return;
     }
+    if (!(await saveTranslations())) return;
     packingMod = true;
     try {
       const msg = await invoke<string>("pack_mod_rpa", {
