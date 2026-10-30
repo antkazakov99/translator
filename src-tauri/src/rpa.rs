@@ -417,7 +417,7 @@ impl RpaArchive {
         }
 
         let mut collected_files: Vec<(String, PathBuf)> = Vec::new();
-        collect_folder_files_for_mod(source_folder, source_folder, &mut collected_files)?;
+        collect_folder_files_for_mod(source_folder, source_folder, 0, &mut collected_files)?;
 
         if collected_files.is_empty() {
             return Err("Не найдено файлов для упаковки в мод".to_string());
@@ -651,8 +651,12 @@ impl RpaArchive {
 fn collect_folder_files_for_mod(
     root: &Path,
     current: &Path,
+    depth: usize,
     acc: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), String> {
+    if depth > crate::MAX_SCAN_DEPTH {
+        return Err(format!("Слишком глубокая вложенность папки мода: {:?}", current));
+    }
     let entries = fs::read_dir(current)
         .map_err(|e| format!("Не удалось прочитать папку мода {:?}: {}", current, e))?;
     for entry in entries {
@@ -667,7 +671,7 @@ fn collect_folder_files_for_mod(
         }
 
         if path.is_dir() {
-            collect_folder_files_for_mod(root, &path, acc)?;
+            collect_folder_files_for_mod(root, &path, depth + 1, acc)?;
         } else if path.is_file() {
             let rel_path = path
                 .strip_prefix(root)

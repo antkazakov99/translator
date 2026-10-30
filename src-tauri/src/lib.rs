@@ -104,10 +104,24 @@ fn get_project_scripts(search_dir: &Path, cache_dir: &Path) -> Vec<PathBuf> {
     all_scripts
 }
 
+/// Максимальная глубина рекурсивного обхода каталогов скриптов Ren'Py
+pub(crate) const MAX_SCAN_DEPTH: usize = 20;
+
+/// Ограничение на количество сканируемых скриптов при быстром извлечении спикеров,
+/// чтобы не блокировать первичный скан проекта чтением сотен файлов.
+const MAX_SPEAKER_SCAN_FILES: usize = 40;
+
 /// Рекурсивно собирает все файлы `.rpy`, строго игнорируя:
 /// - скрытые директории и файлы (.codex-backups, .editor-backups, .git)
 /// - файлы бэкапов (*.bak, *.backup, *.tmp)
 fn collect_rpy_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    collect_rpy_files_depth(dir, files, 0);
+}
+
+fn collect_rpy_files_depth(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -123,7 +137,7 @@ fn collect_rpy_files(dir: &Path, files: &mut Vec<PathBuf>) {
             }
 
             if path.is_dir() {
-                collect_rpy_files(&path, files);
+                collect_rpy_files_depth(&path, files, depth + 1);
             } else if path.extension().and_then(|e| e.to_str()) == Some("rpy") {
                 // Исключаем любые бэкапы вида *.bak или *.bak.*
                 if !file_name.ends_with(".bak") && !file_name.contains(".bak") {
