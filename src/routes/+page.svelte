@@ -128,20 +128,86 @@
   // Проверяет, ведет ли переход на сцену в текущем файле
   function isInternalScene(targetName: string): boolean {
     if (!currentFile) return false;
-    return currentFile.scenes.some(s => s.name === targetName);
+    return currentFile.scenes.some(s => s.name === targetName || s.name.startsWith(targetName));
   }
 
   // Сфокусироваться на сцене или перейти в неё
   function focusScene(sceneName: string) {
     if (!currentFile) return;
-    const targetScene = currentFile.scenes.find(s => s.name === sceneName);
+    let targetScene = currentFile.scenes.find(s => s.name === sceneName);
+    if (!targetScene) {
+      targetScene = currentFile.scenes.find(s => s.name.startsWith(sceneName) || sceneName.startsWith(s.name));
+    }
     if (targetScene) {
       selectedSceneId = targetScene.id;
-      focusedSceneName = sceneName;
+      focusedSceneName = targetScene.name;
       const el = document.getElementById(`scene-node-${targetScene.id}`);
       if (el) {
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
+    }
+  }
+
+  // Всплывающее уведомление о переходах и событиях
+  let toast = $state<{ text: string; type: 'info' | 'success' | 'warning' | 'error' } | null>(null);
+  let toastTimer: any = null;
+
+  function showToast(text: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') {
+    if (toastTimer) clearTimeout(toastTimer);
+    toast = { text, type };
+    toastTimer = setTimeout(() => {
+      toast = null;
+    }, 4500);
+  }
+
+  // Интерактивный переход к сцене: внутри текущего файла или между файлами проекта
+  async function navigateOrFocusScene(targetName: string) {
+    if (!targetName) return;
+
+    // 1. Если сцена есть в текущем файле — моментальный фокус
+    if (isInternalScene(targetName)) {
+      focusScene(targetName);
+      showToast(`Сцена "${targetName}" в фокусе (текущий файл)`, "info");
+      return;
+    }
+
+    // 2. Иначе ищем в проекте через Rust бэкенд
+    showToast(`Поиск перехода к "${targetName}" по файлам проекта...`, "info");
+    try {
+      const found = await invoke<{
+        file_name: string;
+        file_path: string;
+        original_path: string;
+        line_number: number;
+        scene_name: string;
+      } | null>("find_scene_target", {
+        gameDir,
+        targetName
+      });
+
+      if (!found) {
+        showToast(`Метка "${targetName}" — внешняя локация / системный вызов Ren'Py`, "warning");
+        return;
+      }
+
+      // Находим файл в проекте
+      const targetFile = project?.files.find(f => 
+        f.name.toLowerCase() === found.file_name.toLowerCase() ||
+        f.path.toLowerCase() === found.file_path.toLowerCase()
+      );
+
+      if (targetFile) {
+        showToast(`Переход в ${found.file_name} ➔ сцена "${targetName}" (строка ${found.line_number})`, "success");
+        await selectFile(targetFile);
+        // Небольшая задержка на отрисовку DOM после парсинга файла
+        setTimeout(() => {
+          focusScene(targetName);
+        }, 150);
+      } else {
+        showToast(`Сцена найдена в ${found.file_name}:${found.line_number}, но файл не в списке перевода`, "warning");
+      }
+    } catch (e) {
+      showToast(`Ошибка поиска: ${e}`, "error");
     }
   }
 
@@ -556,7 +622,7 @@
                             {#each incoming as edge}
                               <button 
                                 class="edge-chip chip-incoming" 
-                                onclick={() => focusScene(edge.from)}
+                                onclick={() => navigateOrFocusScene(edge.from)}
                                 title="Перейти к сцене {edge.from}"
                               >
                                 <span>{edge.from}</span>
@@ -592,16 +658,21 @@
                                   <span class="opt-title">"{opt.text}"</span>
                                   {#if opt.target_jump}
                                     <span class="opt-arrow">➔</span>
-                                    {#if isInternalScene(opt.target_jump)}
-                                      <button 
-                                        class="target-link link-internal"
-                                        onclick={() => focusScene(opt.target_jump!)}
-                                      >
-                                        {opt.target_jump}
-                                      </button>
-                                    {:else}
-                                      <span class="target-link link-external">{opt.target_jump}</span>
-                                    {/if}
+                                    {@const isInt = isInternalScene(opt.target_jump)}
+                                    <button 
+                                      class="target-link"
+                                      class:link-internal={isInt}
+                                      class:link-external={!isInt}
+                                      onclick={() => navigateOrFocusScene(opt.target_jump!)}
+                                      title={isInt ? `Перейти к сцене ${opt.target_jump} в этом файле` : `Перейти к ${opt.target_jump} (межфайловый переход)`}
+                                    >
+                                      <span>{opt.target_jump}</span>
+                                      {#if isInt}
+                                        <ChevronRight size={11} />
+                                      {:else}
+                                        <ArrowUpRight size={11} />
+                                      {/if}
+                                    </button>
                                   {/if}
                                 </div>
                               {/each}
@@ -629,21 +700,20 @@
                                 {/if}
                                 <div class="edge-dest-row">
                                   <span class="edge-arrow">➔</span>
-                                  {#if isInternal}
-                                    <button 
-                                      class="dest-btn internal"
-                                      onclick={() => focusScene(edge.to)}
-                                      title="Фокус на сцене {edge.to}"
-                                    >
-                                      <span>{edge.to}</span>
+                                  <button 
+                                    class="dest-btn"
+                                    class:internal={isInternal}
+                                    class:external={!isInternal}
+                                    onclick={() => navigateOrFocusScene(edge.to)}
+                                    title={isInternal ? `Фокус на сцене ${edge.to} (в текущем файле)` : `Перейти к сцене ${edge.to} в проекте (межфайловый переход)`}
+                                  >
+                                    <span>{edge.to}</span>
+                                    {#if isInternal}
                                       <ChevronRight size={13} />
-                                    </button>
-                                  {:else}
-                                    <span class="dest-badge external" title="Внешняя локация игры">
-                                      <span>{edge.to}</span>
+                                    {:else}
                                       <ArrowUpRight size={12} />
-                                    </span>
-                                  {/if}
+                                    {/if}
+                                  </button>
                                 </div>
                               </div>
                             {/each}
@@ -866,6 +936,22 @@
       {/if}
     </main>
   </div>
+
+  <!-- ВСПЛЫВАЮЩИЙ ТОАСТ НАВИГАЦИИ -->
+  {#if toast}
+    <div class="toast-notification toast-{toast.type}">
+      {#if toast.type === 'success'}
+        <CheckCircle2 size={16} class="toast-icon text-emerald-400" />
+      {:else if toast.type === 'warning'}
+        <AlertCircle size={16} class="toast-icon text-amber-400" />
+      {:else if toast.type === 'error'}
+        <AlertCircle size={16} class="toast-icon text-rose-400" />
+      {:else}
+        <Sparkles size={16} class="toast-icon text-sky-400" />
+      {/if}
+      <span class="toast-text">{toast.text}</span>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -1700,8 +1786,20 @@
   }
 
   .target-link.link-external {
-    background: #1e293b;
-    color: #94a3b8;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: #182232;
+    border: 1px solid #273750;
+    color: #93c5fd;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .target-link.link-external:hover {
+    background: #202d44;
+    border-color: #38bdf8;
+    color: #ffffff;
   }
 
   /* ИСХОДЯЩИЕ ПЕРЕХОДЫ И ВЕТВЛЕНИЯ */
@@ -1759,34 +1857,88 @@
     font-size: 11px;
   }
 
-  .dest-btn.internal {
+  .dest-btn {
     display: inline-flex;
     align-items: center;
     gap: 4px;
-    background: #0369a1;
-    color: #ffffff;
-    border: none;
     padding: 3px 8px;
     border-radius: 4px;
     font-size: 11px;
     font-weight: 600;
     cursor: pointer;
-    transition: background 0.15s;
+    transition: all 0.15s ease;
+  }
+
+  .dest-btn.internal {
+    background: #0369a1;
+    color: #ffffff;
+    border: 1px solid #0284c7;
   }
 
   .dest-btn.internal:hover {
     background: #0284c7;
+    box-shadow: 0 0 10px rgba(56, 189, 248, 0.3);
   }
 
-  .dest-badge.external {
-    display: inline-flex;
+  .dest-btn.external {
+    background: #182232;
+    border: 1px solid #273750;
+    color: #93c5fd;
+  }
+
+  .dest-btn.external:hover {
+    background: #202d44;
+    border-color: #38bdf8;
+    color: #ffffff;
+    box-shadow: 0 0 12px rgba(56, 189, 248, 0.25);
+  }
+
+  /* ВСПЛЫВАЮЩИЙ ТОАСТ НАВИГАЦИИ */
+  .toast-notification {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 9999;
+    display: flex;
     align-items: center;
-    gap: 4px;
-    background: #1e293b;
-    color: #94a3b8;
-    padding: 3px 8px;
-    border-radius: 4px;
-    font-size: 11px;
+    gap: 10px;
+    background: #121620;
+    border: 1px solid #243044;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.7);
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: #f1f5f9;
+    animation: toastSlideUp 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .toast-notification.toast-success {
+    background: #0a1b16;
+    border-color: rgba(52, 211, 153, 0.4);
+    color: #ecfdf5;
+  }
+
+  .toast-notification.toast-warning {
+    background: #1c180e;
+    border-color: rgba(251, 191, 36, 0.4);
+    color: #fef3c7;
+  }
+
+  .toast-notification.toast-error {
+    background: #1f1013;
+    border-color: rgba(244, 63, 94, 0.4);
+    color: #ffe4e6;
+  }
+
+  @keyframes toastSlideUp {
+    from {
+      opacity: 0;
+      transform: translateY(12px) scale(0.97);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
   }
 
   /* ФУТЕР УЗЛА */

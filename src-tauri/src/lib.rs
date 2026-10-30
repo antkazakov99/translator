@@ -300,11 +300,121 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
     .map_err(|e| format!("Ошибка задачи парсинга: {}", e))?
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SceneTargetResult {
+    pub file_name: String,
+    pub file_path: String,
+    pub original_path: String,
+    pub line_number: usize,
+    pub scene_name: String,
+}
+
+#[tauri::command]
+async fn find_scene_target(
+    game_dir: String,
+    target_name: String,
+) -> Result<Option<SceneTargetResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = Path::new(&game_dir);
+        if !base_path.exists() {
+            return Err(format!("Путь к игре не существует: {}", game_dir));
+        }
+
+        let mut script_files = Vec::new();
+        collect_rpy_files(base_path, &mut script_files);
+
+        // 1. Сначала ищем в оригинальных скриптах игры (быстрее всего)
+        let orig_scripts: Vec<_> = script_files
+            .iter()
+            .filter(|p| {
+                let s = p.to_string_lossy();
+                !s.contains(r"\tl\") && !s.contains("/tl/")
+            })
+            .cloned()
+            .collect();
+
+        let pattern_label_colon = format!("label {}:", target_name);
+        let pattern_label_space = format!("label {} ", target_name);
+        let pattern_screen_colon = format!("screen {}:", target_name);
+        let pattern_screen_paren = format!("screen {}(", target_name);
+
+        let found = orig_scripts.into_par_iter().find_map_any(|orig_path| {
+            if let Ok(content) = std::fs::read_to_string(&orig_path) {
+                for (idx, line) in content.lines().enumerate() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with(&pattern_label_colon)
+                        || trimmed.starts_with(&pattern_label_space)
+                        || trimmed.starts_with(&pattern_screen_colon)
+                        || trimmed.starts_with(&pattern_screen_paren)
+                    {
+                        let file_name = orig_path.file_name()?.to_string_lossy().to_string();
+                        let tl_path = base_path.join(r"tl\russian").join(&file_name);
+                        let resolved_tl_path = if tl_path.exists() {
+                            tl_path.to_string_lossy().to_string()
+                        } else {
+                            orig_path.to_string_lossy().to_string()
+                        };
+
+                        return Some(SceneTargetResult {
+                            file_name,
+                            file_path: resolved_tl_path,
+                            original_path: orig_path.to_string_lossy().to_string(),
+                            line_number: idx + 1,
+                            scene_name: target_name.clone(),
+                        });
+                    }
+                }
+            }
+            None
+        });
+
+        if found.is_some() {
+            return Ok(found);
+        }
+
+        // 2. Если не нашли в оригинале, ищем в tl/russian (по блокам translate russian <target>:)
+        let tl_scripts: Vec<_> = script_files
+            .into_iter()
+            .filter(|p| {
+                let s = p.to_string_lossy();
+                s.contains(r"\tl\") || s.contains("/tl/")
+            })
+            .collect();
+
+        let tl_prefix_hash = format!("translate russian {}_", target_name);
+        let tl_prefix_colon = format!("translate russian {}:", target_name);
+
+        let tl_found = tl_scripts.into_par_iter().find_map_any(|tl_path| {
+            if let Ok(content) = std::fs::read_to_string(&tl_path) {
+                for (idx, line) in content.lines().enumerate() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with(&tl_prefix_hash) || trimmed.starts_with(&tl_prefix_colon) {
+                        let file_name = tl_path.file_name()?.to_string_lossy().to_string();
+                        let orig_path = base_path.join(&file_name);
+                        return Some(SceneTargetResult {
+                            file_name,
+                            file_path: tl_path.to_string_lossy().to_string(),
+                            original_path: orig_path.to_string_lossy().to_string(),
+                            line_number: idx + 1,
+                            scene_name: target_name.clone(),
+                        });
+                    }
+                }
+            }
+            None
+        });
+
+        Ok(tl_found)
+    })
+    .await
+    .map_err(|e| format!("Ошибка задачи поиска сцены: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, scan_game_project, parse_file_entries])
+        .invoke_handler(tauri::generate_handler![greet, scan_game_project, parse_file_entries, find_scene_target])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -348,6 +458,12 @@ mod tests {
                     let ui_lines = ui_scene.unwrap().total_lines;
                     println!("Уникальных строк UI в story.rpy: {}", ui_lines);
                     assert!(ui_lines < 66, "Строки UI должны быть дедуплицированы, а не 66 дубликатов! Найдено: {}", ui_lines);
+                    // Проверяем поиск целевой сцены "house" (должна найтись в script.rpy)
+                    let found_house = find_scene_target(game_dir.to_string(), "house".to_string()).await.unwrap();
+                    assert!(found_house.is_some(), "Целевая сцена 'house' должна быть найдена в проекте");
+                    let house_loc = found_house.unwrap();
+                    println!("Найдена сцена 'house': файл {}, строка {}", house_loc.file_name, house_loc.line_number);
+                    assert_eq!(house_loc.file_name, "script.rpy", "Сцена 'house' должна находиться в script.rpy");
                 }
             }
         });
