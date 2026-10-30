@@ -531,13 +531,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_inspect_init_chars_rpyc() {
-        let path = Path::new(r"F:\Games\Lust and Power\Lust and Power (0.75)\game\archive.rpa");
-        if !path.exists() {
+        let Some(game_dir) = crate::local_test_game(crate::TEST_CHARACTERS_GAME) else {
             return;
-        }
+        };
+        let path = Path::new(&game_dir).join("archive.rpa");
 
-        let archive = crate::rpa::RpaArchive::open(path).unwrap();
+        let archive = crate::rpa::RpaArchive::open(&path).unwrap();
 
         // Тестируем декомпиляцию define_vars.rpyc с извлечением Define
         if let Some(entry) = archive.entries.get("___sys/_vars/define_vars.rpyc") {
@@ -582,15 +583,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_parse_real_celia_rpyc() {
-        let celia_path = Path::new(
-            r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\celia.rpyc",
-        );
-        if !celia_path.exists() {
+        let Some(game_dir) = crate::local_test_game(crate::TEST_TRANSLATED_GAME) else {
             return;
-        }
+        };
+        let celia_path = Path::new(&game_dir).join("celia.rpyc");
 
-        let stmts = RpycParser::parse_rpyc_file(celia_path).expect("Ошибка парсинга celia.rpyc");
+        let stmts = RpycParser::parse_rpyc_file(&celia_path).expect("Ошибка парсинга celia.rpyc");
         println!("Всего извлечено инструкций из celia.rpyc: {}", stmts.len());
         assert!(
             !stmts.is_empty(),

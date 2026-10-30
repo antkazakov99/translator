@@ -913,11 +913,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_read_real_game_of_whores_archive() {
-        let path = Path::new(r"F:\Games\Game of Whores\Game of Whores (0.34)\game\archive.rpa");
-        if !path.exists() {
+        let Some(game_dir) = crate::local_test_game(crate::TEST_RPA_GAME) else {
             return;
-        }
+        };
+        let path = Path::new(&game_dir).join("archive.rpa");
+        let path = path.as_path();
 
         let start = std::time::Instant::now();
         let archive = RpaArchive::open(path).expect("Ошибка открытия archive.rpa в Game of Whores");
