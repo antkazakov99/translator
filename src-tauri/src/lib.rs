@@ -185,14 +185,18 @@ fn has_rpa_archives(dir: &Path) -> bool {
     false
 }
 
+/// Папка данных приложения вне каталогов игр.
+fn app_data_dir() -> PathBuf {
+    std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("TranslatorApp")
+}
+
 /// Возвращает путь к изолированной папке кэша в AppData для конкретной игры,
 /// чтобы оригинальная папка игры никогда не засорялась распакованными файлами.
 /// Использует FNV-1a — стабильный хэш, воспроизводимый между версиями компилятора.
 pub fn get_project_cache_dir(game_dir: &Path) -> PathBuf {
-    let local_app_data = std::env::var("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-
     let hash = format!("{:012x}", stable_hash_str(&game_dir.to_string_lossy().to_lowercase()));
 
     let folder_name = game_dir
@@ -200,8 +204,7 @@ pub fn get_project_cache_dir(game_dir: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "game".to_string());
 
-    local_app_data
-        .join("TranslatorApp")
+    app_data_dir()
         .join("projects_cache")
         .join(format!("{}_{}", folder_name, hash))
 }
@@ -1424,11 +1427,27 @@ async fn extract_glossary_terms_from_game(
     llm::extract_terms_from_game_script(&api_url, &model, &base_path, max_terms.unwrap_or(20)).await
 }
 
+/// Подключает логи: в debug — консоль, в release — файл, потому что у приложения
+/// нет консоли (`windows_subsystem = "windows"`). Файл перезаписывается при запуске.
+fn init_logging() {
+    if cfg!(debug_assertions) {
+        tracing_subscriber::fmt::init();
+        return;
+    }
+    let log_dir = app_data_dir();
+    if std::fs::create_dir_all(&log_dir).is_ok()
+        && let Ok(file) = std::fs::File::create(log_dir.join("translator.log"))
+    {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Инициализируем трассировку логов (info!, warn!, error! будут выводиться в консоль)
-    #[cfg(debug_assertions)]
-    tracing_subscriber::fmt::init();
+    init_logging();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
