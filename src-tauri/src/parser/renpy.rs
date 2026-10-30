@@ -1,11 +1,85 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::{EdgeKind, ScenarioGraph, ScenarioNode, TranslationStatus};
 use crate::parser::GameParser;
+
+// Глобально скомпилированные регулярные выражения для максимальной производительности (LazyLock)
+static RE_CHAR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:define\s+|\$\s*)?([A-Za-z_]\w*)\s*=\s*(?:renpy\.)?(?:Character|DynamicCharacter|adv_character)\s*\(\s*[_(\s]*['"]([^'"]+)['"]"#
+    ).unwrap()
+});
+
+static RE_CUSTOM_CHARS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?:define\s+|\$\s*)?([A-Za-z_]\w*)\s*=\s*Chars\s*\(\s*['"]([^'"]+)['"]"#
+    ).unwrap()
+});
+
+static RE_STRUCT_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*label\s+([A-Za-z_]\w*)\s*:"#).unwrap()
+});
+
+static RE_STRUCT_MENU: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*menu(?:\s*([A-Za-z_]\w*))?\s*:"#).unwrap()
+});
+
+static RE_STRUCT_CHOICE_OPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*"([^"]+)"\s*(?:if\s+[^:]+)?\s*:"#).unwrap()
+});
+
+static RE_STRUCT_JUMP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:if\s+(?P<cond>[^:]+):\s*)?(?P<cmd>jump|call)\s+(?P<target>[A-Za-z_]\w*)"#).unwrap()
+});
+
+static RE_STRUCT_IF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:elif|if)\s+(.+?)\s*:"#).unwrap()
+});
+
+static RE_STRUCT_ELSE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*else\s*:"#).unwrap()
+});
+
+static RE_ORIG_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*label\s+([A-Za-z0-9_.]+)\s*:"#).unwrap()
+});
+
+static RE_ORIG_DIALOGUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
+});
+
+static RE_STRINGS_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^translate\s+\w+\s+strings\s*:"#).unwrap()
+});
+
+static RE_DIALOGUE_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^translate\s+\w+\s+([\w\.]+)\s*:"#).unwrap()
+});
+
+static RE_OLD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*old\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
+});
+
+static RE_NEW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*new\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
+});
+
+static RE_DIALOGUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
+});
+
+static RE_SOURCE_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*#\s*(?:game[/\\])?(?P<file>.+?\.rpy):(?P<line>\d+)"#).unwrap()
+});
+
+static RE_LABEL_HASH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"_[0-9a-fA-F]{6,10}(?:_\d+)*$"#).unwrap()
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChoiceOptionDto {
@@ -68,13 +142,6 @@ impl RenpyParser {
     /// Извлекает определения персонажей вида `define e = Character("Erika")`,
     /// `e = Character('Erika')`, `player = Chars('Jack')`, и т.д.
     pub fn extract_speakers(content: &str) -> HashMap<String, String> {
-        let re_char = Regex::new(
-            r#"(?:define\s+|\$\s*)?([A-Za-z_]\w*)\s*=\s*(?:renpy\.)?(?:Character|DynamicCharacter|adv_character)\s*\(\s*[_(\s]*['"]([^'"]+)['"]"#
-        ).unwrap();
-        let re_custom_chars = Regex::new(
-            r#"(?:define\s+|\$\s*)?([A-Za-z_]\w*)\s*=\s*Chars\s*\(\s*['"]([^'"]+)['"]"#
-        ).unwrap();
-
         let mut map = HashMap::new();
         let mut custom_names: HashMap<String, String> = HashMap::new();
 
@@ -84,13 +151,13 @@ impl RenpyParser {
                 continue;
             }
 
-            if let Some(caps) = re_char.captures(trimmed) {
+            if let Some(caps) = RE_CHAR.captures(trimmed) {
                 let alias = caps.get(1).unwrap().as_str().to_string();
                 let name = caps.get(2).unwrap().as_str().to_string();
                 if name != "none" && !name.is_empty() {
                     map.insert(alias, name);
                 }
-            } else if let Some(caps) = re_custom_chars.captures(trimmed) {
+            } else if let Some(caps) = RE_CUSTOM_CHARS.captures(trimmed) {
                 let alias = caps.get(1).unwrap().as_str().to_string();
                 let name = caps.get(2).unwrap().as_str().to_string();
                 if name != "none" && !name.is_empty() {
@@ -345,12 +412,6 @@ impl RenpyParser {
     /// Парсит оригинальный файл скрипта .rpy для извлечения графа: выборов (menu:), переходов (jump) и условий (if)
     pub fn parse_script_structure(content: &str) -> ScriptStructure {
         let mut structure = ScriptStructure::default();
-        let re_label = Regex::new(r#"^\s*label\s+([A-Za-z_]\w*)\s*:"#).unwrap();
-        let re_menu = Regex::new(r#"^\s*menu(?:\s*([A-Za-z_]\w*))?\s*:"#).unwrap();
-        let re_choice_opt = Regex::new(r#"^\s*"([^"]+)"\s*(?:if\s+[^:]+)?\s*:"#).unwrap();
-        let re_jump = Regex::new(r#"^\s*(?:if\s+(?P<cond>[^:]+):\s*)?(?P<cmd>jump|call)\s+(?P<target>[A-Za-z_]\w*)"#).unwrap();
-        let re_if = Regex::new(r#"^\s*(?:elif|if)\s+(.+?)\s*:"#).unwrap();
-        let re_else = Regex::new(r#"^\s*else\s*:"#).unwrap();
 
         let mut current_label: Option<String> = None;
         let mut in_menu = false;
@@ -369,7 +430,7 @@ impl RenpyParser {
             let indent = line.len() - line.trim_start().len();
 
             // 1. Проверяем объявление сцены (label)
-            if let Some(caps) = re_label.captures(line) {
+            if let Some(caps) = RE_STRUCT_LABEL.captures(line) {
                 if in_menu && !current_menu_options.is_empty() {
                     if let Some(ref lbl) = current_label {
                         structure.scene_choices.entry(lbl.clone()).or_default().push(ChoiceBlockDto {
@@ -397,7 +458,7 @@ impl RenpyParser {
             };
 
             // 2. Проверяем начало блока menu:
-            if re_menu.is_match(line) {
+            if RE_STRUCT_MENU.is_match(line) {
                 if in_menu && !current_menu_options.is_empty() {
                     structure.scene_choices.entry(lbl.clone()).or_default().push(ChoiceBlockDto {
                         prompt: None,
@@ -411,7 +472,7 @@ impl RenpyParser {
             }
 
             // Если были в menu, но отступ уменьшился
-            if in_menu && indent <= menu_indent && !re_choice_opt.is_match(line) {
+            if in_menu && indent <= menu_indent && !RE_STRUCT_CHOICE_OPT.is_match(line) {
                 if !current_menu_options.is_empty() {
                     structure.scene_choices.entry(lbl.clone()).or_default().push(ChoiceBlockDto {
                         prompt: None,
@@ -424,7 +485,7 @@ impl RenpyParser {
 
             // 3. Варианты выбора внутри menu
             if in_menu {
-                if let Some(caps) = re_choice_opt.captures(line) {
+                if let Some(caps) = RE_STRUCT_CHOICE_OPT.captures(line) {
                     let opt_text = caps.get(1).unwrap().as_str().to_string();
                     current_menu_options.push(ChoiceOptionDto {
                         text: opt_text,
@@ -436,14 +497,14 @@ impl RenpyParser {
             }
 
             // 4. Ветвления if/elif/else
-            if let Some(caps) = re_if.captures(line) {
+            if let Some(caps) = RE_STRUCT_IF.captures(line) {
                 current_condition = Some(caps.get(1).unwrap().as_str().trim().to_string());
-            } else if re_else.is_match(line) {
+            } else if RE_STRUCT_ELSE.is_match(line) {
                 current_condition = Some("иначе".to_string());
             }
 
             // 5. Переходы jump / call
-            if let Some(caps) = re_jump.captures(line) {
+            if let Some(caps) = RE_STRUCT_JUMP.captures(line) {
                 let cmd = caps.name("cmd").unwrap().as_str();
                 let target = caps.name("target").unwrap().as_str().to_string();
                 let inline_cond = caps.name("cond").map(|c| c.as_str().trim().to_string());
@@ -502,9 +563,6 @@ impl RenpyParser {
         let mut graph = ScenarioGraph::new();
         let file_path = path.to_string_lossy().to_string();
 
-        let re_label = Regex::new(r#"^\s*label\s+([A-Za-z0-9_.]+)\s*:"#).unwrap();
-        let re_dialogue = Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
-
         let mut current_scene_name = "Общие диалоги".to_string();
         let mut last_node_idx = None;
 
@@ -516,7 +574,7 @@ impl RenpyParser {
                 continue;
             }
 
-            if let Some(caps) = re_label.captures(trimmed) {
+            if let Some(caps) = RE_ORIG_LABEL.captures(trimmed) {
                 let label_name = caps.get(1).unwrap().as_str().to_string();
                 current_scene_name = label_name.clone();
                 let label_node = graph.add_node(ScenarioNode::label(label_name));
@@ -543,7 +601,7 @@ impl RenpyParser {
                 continue;
             }
 
-            if let Some(caps) = re_dialogue.captures(trimmed) {
+            if let Some(caps) = RE_ORIG_DIALOGUE.captures(trimmed) {
                 let speaker_alias = caps.name("speaker").map(|s| s.as_str());
                 let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                 let resolved_speaker = self.resolve_speaker(speaker_alias);
@@ -580,15 +638,6 @@ impl GameParser for RenpyParser {
         let mut graph = ScenarioGraph::new();
         let file_path = path.to_string_lossy().to_string();
 
-        let re_strings_block = Regex::new(r#"^translate\s+\w+\s+strings\s*:"#).unwrap();
-        let re_dialogue_block = Regex::new(r#"^translate\s+\w+\s+([\w\.]+)\s*:"#).unwrap();
-        let re_old = Regex::new(r#"^\s*old\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
-        let re_new = Regex::new(r#"^\s*new\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
-        let re_dialogue = Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap();
-        let re_source_comment = Regex::new(r#"^\s*#\s*(?:game[/\\])?(?P<file>.+?\.rpy):(?P<line>\d+)"#).unwrap();
-        // Регулярка для отрезания хэшей Ren'Py вида _1234abcd и повторов _1234abcd_1
-        let re_label_hash = Regex::new(r#"_[0-9a-fA-F]{6,10}(?:_\d+)*$"#).unwrap();
-
         let mut seen_ui_strings: HashMap<String, petgraph::graph::NodeIndex> = HashMap::new();
         let mut in_strings = false;
         let mut in_block = false;
@@ -604,14 +653,14 @@ impl GameParser for RenpyParser {
             let line = raw_line.trim_end();
 
             // Блок интерфейсных строк (strings) НЕ должен разрывать текущую сюжетную сцену!
-            if re_strings_block.is_match(line) {
+            if RE_STRINGS_BLOCK.is_match(line) {
                 in_strings = true;
                 in_block = false;
                 pending_old = None;
                 continue;
             }
 
-            if let Some(caps) = re_dialogue_block.captures(line) {
+            if let Some(caps) = RE_DIALOGUE_BLOCK.captures(line) {
                 in_strings = false;
                 in_block = true;
                 pending_source = None;
@@ -620,7 +669,7 @@ impl GameParser for RenpyParser {
                 current_block_id = Some(raw_block_id.clone());
 
                 // Отрезаем хэш: например "end_scene_eri_52d5be01" -> "end_scene_eri"
-                let scene_name = re_label_hash.replace(&raw_block_id, "").to_string();
+                let scene_name = RE_LABEL_HASH.replace(&raw_block_id, "").to_string();
 
                 if current_scene_name.as_deref() != Some(&scene_name) {
                     current_scene_name = Some(scene_name.clone());
@@ -640,18 +689,18 @@ impl GameParser for RenpyParser {
             }
 
             if in_strings {
-                if let Some(caps) = re_source_comment.captures(line) {
+                if let Some(caps) = RE_SOURCE_COMMENT.captures(line) {
                     if let Ok(line_val) = caps.name("line").unwrap().as_str().parse::<usize>() {
                         pending_comment_line = Some(line_val);
                     }
                     continue;
                 }
 
-                if let Some(caps) = re_old.captures(line) {
+                if let Some(caps) = RE_OLD.captures(line) {
                     let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                     let src_line = pending_comment_line.take().unwrap_or(line_num);
                     pending_old = Some((text, src_line));
-                } else if let Some(caps) = re_new.captures(line) {
+                } else if let Some(caps) = RE_NEW.captures(line) {
                     if let Some((old_text, old_line)) = pending_old.take() {
                         let new_text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                         let is_translated = Self::has_cyrillic(&new_text);
@@ -694,13 +743,13 @@ impl GameParser for RenpyParser {
                 let trimmed = line.trim();
                 if trimmed.starts_with('#') {
                     let comment = trimmed.trim_start_matches('#').trim();
-                    if let Some(caps) = re_dialogue.captures(comment) {
+                    if let Some(caps) = RE_DIALOGUE.captures(comment) {
                         let speaker = caps.name("speaker").map(|s| s.as_str().to_string());
                         let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                         pending_source = Some((speaker, text, line_num));
                     }
                 } else if !trimmed.is_empty() {
-                    if let Some(caps) = re_dialogue.captures(trimmed) {
+                    if let Some(caps) = RE_DIALOGUE.captures(trimmed) {
                         let speaker_alias = caps.name("speaker").map(|s| s.as_str());
                         let target_text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
 

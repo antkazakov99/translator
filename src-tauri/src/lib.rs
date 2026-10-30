@@ -7,11 +7,74 @@ pub mod rpa;
 pub mod rpyc;
 
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use rayon::prelude::*;
-use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto};
+use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto, ScriptStructure};
 use crate::parser::GameParser;
 use crate::graph::ScenarioNode;
+
+#[derive(Clone)]
+struct ParsedFileCacheEntry {
+    file_mtime: SystemTime,
+    orig_mtime: Option<SystemTime>,
+    result: ParsedFileDto,
+}
+
+static PARSED_FILE_CACHE: LazyLock<Mutex<std::collections::HashMap<String, ParsedFileCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+static SCRIPT_STRUCTURE_CACHE: LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, (SystemTime, ScriptStructure)>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+static PROJECT_SCRIPTS_CACHE: LazyLock<Mutex<std::collections::HashMap<PathBuf, (Instant, Vec<PathBuf>)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+static PROJECT_SPEAKERS_CACHE: LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn get_cached_script_structure(path: &Path) -> Option<ScriptStructure> {
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    {
+        let cache = SCRIPT_STRUCTURE_CACHE.lock().unwrap();
+        if let Some((cached_mtime, cached_struct)) = cache.get(path) {
+            if *cached_mtime == mtime {
+                return Some(cached_struct.clone());
+            }
+        }
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let structure = RenpyParser::parse_script_structure(&content);
+    {
+        let mut cache = SCRIPT_STRUCTURE_CACHE.lock().unwrap();
+        cache.insert(path.to_path_buf(), (mtime, structure.clone()));
+    }
+    Some(structure)
+}
+
+fn get_project_scripts(search_dir: &Path, cache_dir: &Path) -> Vec<PathBuf> {
+    {
+        let cache = PROJECT_SCRIPTS_CACHE.lock().unwrap();
+        if let Some((instant, files)) = cache.get(search_dir) {
+            if instant.elapsed() < std::time::Duration::from_secs(60) {
+                return files.clone();
+            }
+        }
+    }
+    let mut all_scripts = Vec::new();
+    collect_rpy_files(search_dir, &mut all_scripts);
+    if cache_dir.exists() {
+        collect_rpy_files(cache_dir, &mut all_scripts);
+    }
+    {
+        let mut cache = PROJECT_SCRIPTS_CACHE.lock().unwrap();
+        cache.insert(search_dir.to_path_buf(), (Instant::now(), all_scripts.clone()));
+    }
+    all_scripts
+}
 
 /// Рекурсивно собирает все файлы `.rpy`, строго игнорируя:
 /// - скрытые директории и файлы (.codex-backups, .editor-backups, .git)
@@ -230,6 +293,19 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let mut characters: Vec<(String, String)> = characters_map.into_iter().collect();
         characters.sort_by(|a, b| a.1.cmp(&b.1));
 
+        // Сохраняем персонажей и список скриптов в глобальный кэш проекта для мгновенного отклика при клике на файлы
+        {
+            let mut sp_cache = PROJECT_SPEAKERS_CACHE.lock().unwrap();
+            let mut map = std::collections::HashMap::new();
+            for (alias, name) in &characters {
+                map.insert(alias.clone(), name.clone());
+            }
+            sp_cache.insert(base_path.clone(), map);
+
+            let mut sc_cache = PROJECT_SCRIPTS_CACHE.lock().unwrap();
+            sc_cache.insert(base_path.clone(), (Instant::now(), script_files.clone()));
+        }
+
         // 3. Ищем файлы переводов в game/tl/russian в параллельных потоках (сверхбыстрый подсчет строк)
         let tl_dir = base_path.join(r"tl\russian");
         let mut files = Vec::new();
@@ -363,40 +439,67 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
 async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = Path::new(&file_path);
+        let file_mtime = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("Не удалось получить свойства файла: {}", e))?;
+
+        let orig_path_str = file_path
+            .replace(r"tl\russian\", "")
+            .replace("tl/russian/", "");
+        let orig_path = Path::new(&orig_path_str);
+        let orig_mtime = if orig_path.exists() {
+            std::fs::metadata(orig_path).and_then(|m| m.modified()).ok()
+        } else {
+            None
+        };
+
+        // 1. Проверяем кэш готового распарсенного файла (мгновенный отклик при повторном клике)
+        {
+            let cache = PARSED_FILE_CACHE.lock().unwrap();
+            if let Some(entry) = cache.get(&file_path) {
+                if entry.file_mtime == file_mtime && entry.orig_mtime == orig_mtime {
+                    return Ok(entry.result.clone());
+                }
+            }
+        }
+
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
 
-        let mut speakers_map = std::collections::HashMap::new();
         let search_dir = find_game_root(path);
         let cache_dir = get_project_cache_dir(&search_dir);
 
-        let mut check_files = Vec::new();
-        collect_rpy_files(&search_dir, &mut check_files);
-        for f in check_files.into_iter().take(40) {
-            if let Ok(c) = std::fs::read_to_string(&f) {
-                speakers_map.extend(RenpyParser::extract_speakers(&c));
+        // 2. Персонажи / speakers: берем из кэша проекта, если есть
+        let speakers_map = {
+            let cache = PROJECT_SPEAKERS_CACHE.lock().unwrap();
+            cache.get(&search_dir).cloned()
+        };
+        let speakers_map = match speakers_map {
+            Some(map) => map,
+            None => {
+                let mut map = std::collections::HashMap::new();
+                let mut check_files = Vec::new();
+                collect_rpy_files(&search_dir, &mut check_files);
+                for f in check_files.into_iter().take(40) {
+                    if let Ok(c) = std::fs::read_to_string(&f) {
+                        map.extend(RenpyParser::extract_speakers(&c));
+                    }
+                }
+                let mut cache = PROJECT_SPEAKERS_CACHE.lock().unwrap();
+                cache.insert(search_dir.clone(), map.clone());
+                map
             }
-        }
+        };
 
         let parser = RenpyParser::new().with_speakers(speakers_map);
         let graph = parser.parse_file(path, &content)
             .map_err(|e| format!("Ошибка парсинга: {}", e))?;
 
-        // Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры ДО группировки строк
-        let orig_path_str = file_path
-            .replace(r"tl\russian\", "")
-            .replace("tl/russian/", "");
-        let orig_path = Path::new(&orig_path_str);
-
+        // 3. Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры (с кэшированием структуры)
         let script_struct = if orig_path.exists() {
-            if let Ok(orig_content) = std::fs::read_to_string(orig_path) {
-                RenpyParser::parse_script_structure(&orig_content)
-            } else {
-                Default::default()
-            }
-        } else if let Ok(content) = std::fs::read_to_string(&file_path) {
-            // Если сам файл уже является оригинальным скриптом (например из AppData кэша)
-            RenpyParser::parse_script_structure(&content)
+            get_cached_script_structure(orig_path).unwrap_or_default()
+        } else if let Some(st) = get_cached_script_structure(path) {
+            st
         } else {
             Default::default()
         };
@@ -548,34 +651,26 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             .collect();
 
         if !current_scene_names.is_empty() {
-            let mut all_scripts = Vec::new();
-            collect_rpy_files(&search_dir, &mut all_scripts);
-            if cache_dir.exists() {
-                collect_rpy_files(&cache_dir, &mut all_scripts);
-            }
+            let all_scripts = get_project_scripts(&search_dir, &cache_dir);
 
-            let cur_file_canon = path.canonicalize().ok();
-            let cur_orig_canon = orig_path.canonicalize().ok();
+            let cur_file_norm = path.to_string_lossy().to_lowercase().replace('\\', "/");
+            let cur_orig_norm = orig_path.to_string_lossy().to_lowercase().replace('\\', "/");
 
             let external_incoming_edges: Vec<SceneEdgeDto> = all_scripts
                 .into_par_iter()
                 .filter(|p| {
-                    let s = p.to_string_lossy();
-                    if s.contains(r"\tl\") || s.contains("/tl/") {
+                    let s = p.to_string_lossy().replace('\\', "/");
+                    let s_lower = s.to_lowercase();
+                    if s_lower.contains("/tl/") {
                         return false;
                     }
-                    if let Ok(canon) = p.canonicalize() {
-                        if Some(&canon) == cur_file_canon.as_ref() || Some(&canon) == cur_orig_canon.as_ref() {
-                            return false;
-                        }
-                    } else if p.as_path() == path || p.as_path() == orig_path {
+                    if s_lower == cur_file_norm || s_lower == cur_orig_norm {
                         return false;
                     }
                     true
                 })
                 .filter_map(|other_path| {
-                    let content = std::fs::read_to_string(other_path).ok()?;
-                    let other_struct = RenpyParser::parse_script_structure(&content);
+                    let other_struct = get_cached_script_structure(&other_path)?;
                     let mut matched = Vec::new();
                     for edge in other_struct.edges {
                         if current_scene_names.contains(&edge.to) {
@@ -603,14 +698,26 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
             }
         }
 
-        Ok(ParsedFileDto {
+        let parsed_result = ParsedFileDto {
             file_path: file_path.clone(),
             file_name: path.file_name().unwrap_or_default().to_string_lossy().to_string(),
             total_lines: file_total,
             translated_lines: file_translated,
             scenes,
             edges,
-        })
+        };
+
+        // Сохраняем в кэш распарсенных файлов для мгновенного отклика при навигации
+        {
+            let mut cache = PARSED_FILE_CACHE.lock().unwrap();
+            cache.insert(file_path, ParsedFileCacheEntry {
+                file_mtime,
+                orig_mtime,
+                result: parsed_result.clone(),
+            });
+        }
+
+        Ok(parsed_result)
     })
     .await
     .map_err(|e| format!("Ошибка задачи парсинга: {}", e))?
@@ -851,6 +958,167 @@ async fn save_project_glossary(
     .map_err(|e| format!("Ошибка сохранения глоссария: {}", e))?
 }
 
+fn read_text_file_safe(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("Не удалось прочитать файл {:?}: {}", path, e))?;
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Ok(String::from_utf8_lossy(&bytes[3..]).into_owned())
+    } else {
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceFileDetails {
+    pub file_path: String,
+    pub file_name: String,
+    pub original_path: Option<String>,
+    pub translation_path: Option<String>,
+    pub content: String,
+    pub original_content: Option<String>,
+    pub total_lines: usize,
+    pub original_total_lines: Option<usize>,
+}
+
+#[tauri::command]
+async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = Path::new(&file_path);
+        if !path.exists() {
+            return Err(format!("Файл не существует: {}", file_path));
+        }
+
+        let content = read_text_file_safe(path)?;
+        let total_lines = content.lines().count();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "script.rpy".to_string());
+
+        let path_str = path.to_string_lossy();
+        let is_translation = path_str.contains(r"\tl\") || path_str.contains("/tl/");
+
+        let mut original_path = None;
+        let mut original_content = None;
+        let mut original_total_lines = None;
+        let mut translation_path = None;
+
+        if is_translation {
+            translation_path = Some(file_path.clone());
+            // Пробуем найти оригинальный файл скрипта
+            let direct_orig = file_path
+                .replace(r"tl\russian\", "")
+                .replace("tl/russian/", "");
+            let direct_path = PathBuf::from(&direct_orig);
+
+            if direct_path.exists() && direct_path != path {
+                if let Ok(orig_txt) = read_text_file_safe(&direct_path) {
+                    original_total_lines = Some(orig_txt.lines().count());
+                    original_content = Some(orig_txt);
+                    original_path = Some(direct_path.to_string_lossy().to_string());
+                }
+            } else {
+                let game_root = find_game_root(path);
+                let cache_dir = get_project_cache_dir(&game_root);
+                let rel = path.strip_prefix(game_root.join("tl").join("russian")).ok();
+                if let Some(r) = rel {
+                    let in_game = game_root.join(r);
+                    let in_cache = cache_dir.join(r);
+                    let chosen = if in_game.exists() {
+                        Some(in_game)
+                    } else if in_cache.exists() {
+                        Some(in_cache)
+                    } else {
+                        None
+                    };
+
+                    if let Some(cp) = chosen {
+                        if let Ok(orig_txt) = read_text_file_safe(&cp) {
+                            original_total_lines = Some(orig_txt.lines().count());
+                            original_content = Some(orig_txt);
+                            original_path = Some(cp.to_string_lossy().to_string());
+                        }
+                    }
+                }
+            }
+        } else {
+            // Файл сам является оригинальным скриптом
+            original_path = Some(file_path.clone());
+            original_total_lines = Some(total_lines);
+            let game_root = find_game_root(path);
+            if let Ok(rel) = path.strip_prefix(&game_root) {
+                let tl_cand = game_root.join("tl").join("russian").join(rel);
+                if tl_cand.exists() {
+                    translation_path = Some(tl_cand.to_string_lossy().to_string());
+                }
+            }
+        }
+
+        Ok(SourceFileDetails {
+            file_path,
+            file_name,
+            original_path,
+            translation_path,
+            content,
+            original_content,
+            total_lines,
+            original_total_lines,
+        })
+    })
+    .await
+    .map_err(|e| format!("Ошибка чтения файла: {}", e))?
+}
+
+#[tauri::command]
+async fn open_in_system_editor(file_path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = Path::new(&file_path);
+        if !path.exists() {
+            return Err(format!("Файл не существует: {}", file_path));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+            Command::new("cmd")
+                .args(["/C", "start", "", &file_path])
+                .spawn()
+                .map_err(|e| format!("Не удалось открыть файл: {}", e))?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            open::that(&file_path).map_err(|e| format!("Не удалось открыть файл: {}", e))
+        }
+    })
+    .await
+    .map_err(|e| format!("Ошибка задачи открытия: {}", e))?
+}
+
+#[tauri::command]
+async fn reveal_in_system_explorer(file_path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = Path::new(&file_path);
+        if !path.exists() {
+            return Err(format!("Файл не существует: {}", file_path));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use std::process::Command;
+            Command::new("explorer")
+                .arg(format!("/select,{}", file_path))
+                .spawn()
+                .map_err(|e| format!("Не удалось открыть проводник: {}", e))?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let folder = path.parent().unwrap_or(path);
+            open::that(folder).map_err(|e| format!("Не удалось открыть папку: {}", e))
+        }
+    })
+    .await
+    .map_err(|e| format!("Ошибка задачи проводника: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -867,7 +1135,10 @@ pub fn run() {
             clean_rpyc_cache,
             decompile_rpyc_file,
             get_project_glossary,
-            save_project_glossary
+            save_project_glossary,
+            read_source_file,
+            open_in_system_editor,
+            reveal_in_system_explorer
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -876,6 +1147,34 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_file_entries_benchmark() {
+        tauri::async_runtime::block_on(async {
+            let file_path = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\celia.rpy";
+            let file_path2 = r"F:\Playnite\Games\0b588a07-1844-467f-8459-e5629642a1bf\Installed\game\folk arc.rpy";
+            if !Path::new(file_path).exists() || !Path::new(file_path2).exists() {
+                return;
+            }
+            let start = std::time::Instant::now();
+            let parsed1 = parse_file_entries(file_path.to_string()).await.unwrap();
+            let dur1 = start.elapsed();
+            println!("Первый файл (celia.rpy): {:?}", dur1);
+
+            let start_other = std::time::Instant::now();
+            let _parsed_other = parse_file_entries(file_path2.to_string()).await.unwrap();
+            let dur_other = start_other.elapsed();
+            println!("Второй файл (folk arc.rpy, скрипты проекта уже в кэше): {:?}", dur_other);
+
+            let start2 = std::time::Instant::now();
+            let parsed2 = parse_file_entries(file_path.to_string()).await.unwrap();
+            let dur2 = start2.elapsed();
+            println!("Повторный клик на первый файл (из кэша файла): {:?}", dur2);
+
+            assert_eq!(parsed1.total_lines, parsed2.total_lines);
+            assert!(dur2.as_millis() <= 5, "Повторный клик должен быть мгновенным из кэша!");
+        });
+    }
 
     #[test]
     fn test_scan_and_parse_story_rpy() {
@@ -945,6 +1244,12 @@ mod tests {
             let decompiled = decompile_rpyc_file(celia_rpyc, None).await.unwrap();
             assert!(decompiled.contains("label end_scene_nei:"));
             println!("Команда decompile_rpyc_file успешно декомпилировала celia.rpyc!");
+
+            let tl_russian = Path::new(game_dir).join(r"tl\russian");
+            if !tl_russian.exists() {
+                println!("tl/russian не существует в {:?}, пропускаем часть упаковки", game_dir);
+                return;
+            }
 
             // 2. Тест упаковки мода в RPA архив во временный файл
             let temp_rpa = std::env::temp_dir().join("test_command_mod.rpa");
