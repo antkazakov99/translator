@@ -34,16 +34,38 @@
   let drag: { x: number; y: number; left: number; top: number } | null = null;
   let dragging = $state(false);
 
+  // Пагинация и фильтрация для входящих и исходящих узлов (предотвращает лаги на хаб-нодах вроде house)
+  let incomingPage = $state(1);
+  let incomingFilter = $state('');
+  let outgoingPage = $state(1);
+  let outgoingFilter = $state('');
+  let pageSize = $state(10);
+
   // Выбранная сцена (если "all" или не найдена — берем первую)
   let selected = $derived(
     (selectedId && selectedId !== 'all' ? scenes.find(s => s.id === selectedId) : null) ||
     scenes[0]
   );
 
+  // Сбрасываем пагинацию и фильтр при переключении сцены
+  $effect(() => {
+    const _ = selected?.name;
+    incomingPage = 1;
+    incomingFilter = '';
+    outgoingPage = 1;
+    outgoingFilter = '';
+  });
+
   let graph = $derived(
     buildSceneGraph(scenes, edges, {
       mode: graphMode,
       focusName: selected?.name ?? null,
+      incomingPage,
+      incomingPageSize: pageSize,
+      incomingFilter,
+      outgoingPage,
+      outgoingPageSize: pageSize,
+      outgoingFilter,
     })
   );
 
@@ -167,9 +189,9 @@
           <span>
             В фокусе: <strong class="text-sky-400">{selected.name}</strong>
             <span class="info-sep">·</span>
-            ← Входящих: <strong>{graph.incomingCount}</strong>
+            ← Входов: <strong>{graph.incomingTotalRaw}</strong>
             <span class="info-sep">·</span>
-            Исходящих: <strong>{graph.outgoingCount}</strong> →
+            Выходов: <strong>{graph.outgoingTotalRaw}</strong> →
           </span>
         {/if}
       {:else}
@@ -178,6 +200,18 @@
     </div>
 
     <div class="zoom-controls">
+      {#if graphMode === 'focused'}
+        <div class="page-size-picker" title="Лимит отображения узлов на страницу">
+          <span class="page-size-label">По:</span>
+          {#each [10, 25, 50] as size}
+            <button
+              class="page-size-btn"
+              class:size-active={pageSize === size}
+              onclick={() => { pageSize = size; incomingPage = 1; outgoingPage = 1; }}
+            >{size}</button>
+          {/each}
+        </div>
+      {/if}
       <button onclick={() => setZoom(zoom / 1.2)} aria-label="Уменьшить масштаб">−</button>
       <button onclick={() => setZoom(1)} title="Масштаб 100%">{Math.round(zoom * 100)}%</button>
       <button onclick={() => setZoom(zoom * 1.2)} aria-label="Увеличить масштаб">+</button>
@@ -243,30 +277,135 @@
       >
         <!-- Заголовки колонок в сфокусированном режиме -->
         {#if graphMode === 'focused'}
+          <!-- Левая колонка: Входящие переходы -->
           <div class="column-header-banner banner-in" style:left="60px" style:width="{NODE_WIDTH}px">
-            <span class="banner-badge">← Входящие переходы ({graph.incomingCount})</span>
+            <div class="banner-top-row">
+              <span class="banner-badge">
+                ← Входящие ({graph.incomingTotalRaw})
+              </span>
+            </div>
+
+            {#if graph.incomingTotalRaw > 5 || incomingFilter}
+              <div class="column-toolbar">
+                <div class="col-search-box">
+                  <input
+                    type="text"
+                    class="col-search-input"
+                    placeholder="Поиск входа..."
+                    bind:value={incomingFilter}
+                    oninput={() => incomingPage = 1}
+                  />
+                  {#if incomingFilter}
+                    <button
+                      type="button"
+                      class="col-clear-btn"
+                      onclick={() => { incomingFilter = ''; incomingPage = 1; }}
+                      title="Очистить"
+                    >✕</button>
+                  {/if}
+                </div>
+
+                {#if graph.incomingTotalPages > 1}
+                  <div class="col-pager">
+                    <button
+                      type="button"
+                      class="col-page-btn"
+                      disabled={incomingPage <= 1}
+                      onclick={() => incomingPage--}
+                      title="Предыдущая страница"
+                    >◀</button>
+                    <span class="col-page-num">{incomingPage}/{graph.incomingTotalPages}</span>
+                    <button
+                      type="button"
+                      class="col-page-btn"
+                      disabled={incomingPage >= graph.incomingTotalPages}
+                      onclick={() => incomingPage++}
+                      title="Следующая страница"
+                    >▶</button>
+                  </div>
+                {/if}
+              </div>
+            {/if}
           </div>
+
+          <!-- Центральная колонка: Фокус -->
           <div class="column-header-banner banner-center" style:left="{60 + NODE_WIDTH + GAP_X}px" style:width="{NODE_WIDTH}px">
-            <span class="banner-badge badge-active">★ Текущая сцена в фокусе</span>
+            <div class="banner-top-row">
+              <span class="banner-badge badge-active">★ Текущая сцена в фокусе</span>
+            </div>
           </div>
+
+          <!-- Правая колонка: Исходящие переходы -->
           <div class="column-header-banner banner-out" style:left="{60 + (NODE_WIDTH + GAP_X) * 2}px" style:width="{NODE_WIDTH}px">
-            <span class="banner-badge">Исходящие развилки ({graph.outgoingCount}) →</span>
+            <div class="banner-top-row">
+              <span class="banner-badge">
+                Исходящие ({graph.outgoingTotalRaw}) →
+              </span>
+            </div>
+
+            {#if graph.outgoingTotalRaw > 5 || outgoingFilter}
+              <div class="column-toolbar">
+                <div class="col-search-box">
+                  <input
+                    type="text"
+                    class="col-search-input"
+                    placeholder="Поиск выхода..."
+                    bind:value={outgoingFilter}
+                    oninput={() => outgoingPage = 1}
+                  />
+                  {#if outgoingFilter}
+                    <button
+                      type="button"
+                      class="col-clear-btn"
+                      onclick={() => { outgoingFilter = ''; outgoingPage = 1; }}
+                      title="Очистить"
+                    >✕</button>
+                  {/if}
+                </div>
+
+                {#if graph.outgoingTotalPages > 1}
+                  <div class="col-pager">
+                    <button
+                      type="button"
+                      class="col-page-btn"
+                      disabled={outgoingPage <= 1}
+                      onclick={() => outgoingPage--}
+                      title="Предыдущая страница"
+                    >◀</button>
+                    <span class="col-page-num">{outgoingPage}/{graph.outgoingTotalPages}</span>
+                    <button
+                      type="button"
+                      class="col-page-btn"
+                      disabled={outgoingPage >= graph.outgoingTotalPages}
+                      onclick={() => outgoingPage++}
+                      title="Следующая страница"
+                    >▶</button>
+                  </div>
+                {/if}
+              </div>
+            {/if}
           </div>
 
           <!-- Пустые состояния колонок при отсутствии входящих или исходящих -->
           {#if graph.incomingCount === 0}
             <div class="empty-state-column" style:left="60px" style:top="{graph.height / 2 - 45}px" style:width="{NODE_WIDTH}px">
-              <span class="empty-emoji">🏁</span>
-              <strong>Начальная сцена</strong>
-              <small>Нет входящих переходов в текущем файле</small>
+              <span class="empty-emoji">{incomingFilter ? '🔍' : '🏁'}</span>
+              <strong>{incomingFilter ? 'Ничего не найдено' : 'Начальная сцена'}</strong>
+              <small>{incomingFilter ? `Нет входов по фильтру "${incomingFilter}"` : 'Нет входящих переходов в текущем файле'}</small>
+              {#if incomingFilter}
+                <button type="button" class="col-reset-btn" onclick={() => { incomingFilter = ''; incomingPage = 1; }}>Сбросить фильтр</button>
+              {/if}
             </div>
           {/if}
 
           {#if graph.outgoingCount === 0}
             <div class="empty-state-column" style:left="{60 + (NODE_WIDTH + GAP_X) * 2}px" style:top="{graph.height / 2 - 45}px" style:width="{NODE_WIDTH}px">
-              <span class="empty-emoji">🏁</span>
-              <strong>Конечная точка</strong>
-              <small>Нет исходящих переходов (конец скрипта/рута)</small>
+              <span class="empty-emoji">{outgoingFilter ? '🔍' : '🏁'}</span>
+              <strong>{outgoingFilter ? 'Ничего не найдено' : 'Конечная точка'}</strong>
+              <small>{outgoingFilter ? `Нет выходов по фильтру "${outgoingFilter}"` : 'Нет исходящих переходов (конец скрипта/рута)'}</small>
+              {#if outgoingFilter}
+                <button type="button" class="col-reset-btn" onclick={() => { outgoingFilter = ''; outgoingPage = 1; }}>Сбросить фильтр</button>
+              {/if}
             </div>
           {/if}
         {/if}
@@ -565,10 +704,18 @@
   /* Заголовки колонок в focused режиме */
   .column-header-banner {
     position: absolute;
-    top: 25px;
-    text-align: center;
-    pointer-events: none;
-    z-index: 5;
+    top: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    z-index: 10;
+  }
+
+  .banner-top-row {
+    display: flex;
+    justify-content: center;
+    width: 100%;
   }
 
   .banner-badge {
@@ -588,6 +735,148 @@
     color: #38bdf8;
   }
 
+  .column-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    width: 100%;
+    padding: 5px 8px;
+    background: #0b1320;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  }
+
+  .col-search-box {
+    position: relative;
+    display: flex;
+    align-items: center;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .col-search-input {
+    width: 100%;
+    padding: 3px 20px 3px 7px;
+    background: #131d2d;
+    border: 1px solid #293548;
+    border-radius: 5px;
+    color: #e2e8f0;
+    font-size: 11px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .col-search-input:focus {
+    border-color: #38bdf8;
+  }
+
+  .col-clear-btn {
+    position: absolute;
+    right: 5px;
+    background: transparent;
+    border: none;
+    color: #94a3b8;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 0;
+  }
+
+  .col-clear-btn:hover {
+    color: #f1f5f9;
+  }
+
+  .col-pager {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    flex-shrink: 0;
+  }
+
+  .col-page-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 4px;
+    color: #cbd5e1;
+    font-size: 10px;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+
+  .col-page-btn:hover:not(:disabled) {
+    background: #334155;
+    color: #38bdf8;
+    border-color: #0284c7;
+  }
+
+  .col-page-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  .col-page-num {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: #94a3b8;
+    min-width: 32px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .page-size-picker {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    margin-right: 6px;
+    padding: 2px 6px;
+    background: #0f172a;
+    border: 1px solid #1e293b;
+    border-radius: 6px;
+  }
+
+  .page-size-label {
+    font-size: 11px;
+    color: #64748b;
+  }
+
+  .page-size-btn {
+    padding: 1px 5px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: #94a3b8;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .page-size-btn.size-active {
+    background: #1e293b;
+    border-color: #0284c7;
+    color: #38bdf8;
+  }
+
+  .col-reset-btn {
+    margin-top: 8px;
+    padding: 4px 10px;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    color: #38bdf8;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .col-reset-btn:hover {
+    background: #334155;
+  }
+
   /* Пустые колонки */
   .empty-state-column {
     position: absolute;
@@ -601,7 +890,6 @@
     background: #0f172a50;
     text-align: center;
     color: #64748b;
-    pointer-events: none;
   }
 
   .empty-emoji {

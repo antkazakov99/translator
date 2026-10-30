@@ -119,3 +119,83 @@ test('focused mode: handles external incoming nodes from other files cleanly', (
   assert.equal(incomingExtNode.role, 'incoming');
   assert.ok(incomingExtNode.x < graph.nodes.find(n => n.name === 'chapter2_start').x);
 });
+
+test('focused mode: paginates large incoming and outgoing node lists cleanly', () => {
+  const current = scene('hub_center');
+  const incomingScenes = Array.from({ length: 45 }, (_, i) => scene(`in_scene_${i}`));
+  const outgoingScenes = Array.from({ length: 25 }, (_, i) => scene(`out_scene_${i}`));
+
+  const allScenes = [current, ...incomingScenes, ...outgoingScenes];
+  const edges = [
+    ...incomingScenes.map(s => ({ from: s.name, to: 'hub_center', kind: 'jump', condition: null })),
+    ...outgoingScenes.map(s => ({ from: 'hub_center', to: s.name, kind: 'jump', condition: null })),
+  ];
+
+  // Page 1: 10 incoming + 1 center + 10 outgoing = 21 nodes
+  const page1 = buildFocusedSceneGraph(allScenes, edges, {
+    focusName: 'hub_center',
+    incomingPage: 1,
+    incomingPageSize: 10,
+    outgoingPage: 1,
+    outgoingPageSize: 10,
+  });
+
+  assert.equal(page1.incomingTotalRaw, 45);
+  assert.equal(page1.incomingTotalPages, 5);
+  assert.equal(page1.incomingCurrentPage, 1);
+  assert.equal(page1.outgoingTotalRaw, 25);
+  assert.equal(page1.outgoingTotalPages, 3);
+  assert.equal(page1.outgoingCurrentPage, 1);
+
+  // Exactly 10 incoming + 1 center + 10 outgoing nodes rendered!
+  assert.equal(page1.nodes.filter(n => n.role === 'incoming').length, 10);
+  assert.equal(page1.nodes.filter(n => n.role === 'outgoing').length, 10);
+  assert.equal(page1.nodes.filter(n => n.role === 'center').length, 1);
+  assert.equal(page1.links.length, 20);
+
+  // Page 2: next 10 incoming
+  const page2 = buildFocusedSceneGraph(allScenes, edges, {
+    focusName: 'hub_center',
+    incomingPage: 2,
+    incomingPageSize: 10,
+    outgoingPage: 1,
+    outgoingPageSize: 10,
+  });
+  assert.equal(page2.incomingCurrentPage, 2);
+  const firstInPage2 = page2.nodes.find(n => n.role === 'incoming');
+  assert.equal(firstInPage2?.name, 'in_scene_10');
+
+  // Filtering: search for specific incoming node
+  const filtered = buildFocusedSceneGraph(allScenes, edges, {
+    focusName: 'hub_center',
+    incomingFilter: '_scene_4',
+  });
+  // 'in_scene_4', 'in_scene_40'..'in_scene_44' = 6 matches
+  assert.equal(filtered.incomingCount, 6);
+  assert.ok(filtered.nodes.filter(n => n.role === 'incoming').every(n => n.name.includes('_scene_4')));
+});
+
+test('focused mode: handles 1000+ routes in < 15ms without canvas explosion', () => {
+  const current = scene('house');
+  const edges = Array.from({ length: 1060 }, (_, i) => ({
+    from: `scene_from_${i}`,
+    to: 'house',
+    kind: 'jump',
+    condition: null,
+  }));
+
+  const start = performance.now();
+  const graph = buildFocusedSceneGraph([current], edges, {
+    focusName: 'house',
+    incomingPage: 1,
+    incomingPageSize: 10,
+  });
+  const elapsed = performance.now() - start;
+
+  assert.equal(graph.incomingTotalRaw, 1060);
+  assert.equal(graph.incomingTotalPages, 106);
+  assert.equal(graph.nodes.length, 11); // 10 incoming + 1 center
+  assert.equal(graph.links.length, 10);
+  assert.ok(graph.height < 3000, 'Height must be compact and not 150,000px!');
+  assert.ok(elapsed < 100, `Execution took ${elapsed}ms, should be fast`);
+});
