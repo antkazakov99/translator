@@ -675,14 +675,15 @@
                 {#if pct === 100}
                   <span class="tree-pct-badge pct-complete">100%</span>
                 {:else if pct > 0}
-                  <div class="tree-progress-capsule" title="{pct}% переведено">
-                    <div class="tree-capsule-track">
-                      <div class="tree-capsule-fill" style="width: {pct}%"></div>
-                    </div>
-                    <span class="tree-capsule-val">{pct}%</span>
-                  </div>
+                  <span class="tree-pct-badge pct-progress">{pct}%</span>
                 {/if}
               </div>
+
+              {#if pct > 0}
+                <div class="tree-micro-track">
+                  <div class="tree-micro-fill" style="width: {pct}%" class:fill-done={pct === 100}></div>
+                </div>
+              {/if}
             </button>
           {/if}
         {/snippet}
@@ -1549,18 +1550,18 @@
     flex-direction: column;
   }
 
-  /* Единый стиль строки дерева (26px, гармоничные отступы, шрифт 12px) */
+  /* Единый стиль строки дерева (28px, гармоничные отступы, шрифт 12px) */
   .tree-row {
     position: relative;
     display: flex;
     align-items: center;
     gap: 6px;
-    height: 26px;
-    min-height: 26px;
+    height: 28px;
+    min-height: 28px;
     padding: 0 8px;
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 4px;
+    border-radius: 5px;
     color: #cbd5e1;
     font-size: 12px;
     font-weight: 400;
@@ -1577,7 +1578,7 @@
   }
 
   .tree-file-row.active {
-    background: #152336 !important;
+    background: #162438 !important;
     border: 1px solid #233e62 !important;
     color: #ffffff !important;
   }
@@ -1664,46 +1665,38 @@
     background: #151b24;
   }
 
-  /* Мини-капсула прогресса в правой колонке метаданных строки */
-  .tree-progress-capsule {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: #131922;
-    padding: 1px 4px;
-    border-radius: 3px;
-    border: 1px solid #1f2735;
-  }
-
-  .tree-capsule-track {
-    width: 20px;
-    height: 3px;
-    background: #252f40;
+  /* Тонкая микрополоска прогресса: зазор снизу 2.5px, чтобы НЕ перекрывать нижнюю рамку */
+  .tree-micro-track {
+    position: absolute;
+    bottom: 2.5px;
+    left: 28px;
+    right: 8px;
+    height: 2px;
+    background: #1a2230;
     border-radius: 999px;
     overflow: hidden;
+    pointer-events: none;
+    z-index: 1;
   }
 
-  .tree-capsule-fill {
+  .tree-row:hover .tree-micro-track {
+    background: #202b3c;
+  }
+
+  .tree-file-row.active .tree-micro-track {
+    bottom: 2.5px;
+    background: #1b2e47;
+  }
+
+  .tree-micro-fill {
     height: 100%;
     background: #0284c7;
     border-radius: 999px;
+    transition: width 0.2s ease;
   }
 
-  .tree-capsule-val {
-    font-size: 10px;
-    color: #94a3b8;
-    font-weight: 500;
-    min-width: 20px;
-    text-align: right;
-  }
-
-  .tree-row.active .tree-progress-capsule {
-    background: #0f1c2d;
-    border-color: #213c5f;
-  }
-
-  .tree-row.active .tree-capsule-val {
-    color: #bae6fd;
+  .tree-micro-fill.fill-done {
+    background: #10b981;
   }
 
   /* Иерархическая ветка: тонкая направляющая линия */
@@ -1728,7 +1721,7 @@
       border-color: #0284c7 !important;
     }
     100% {
-      background-color: #152336;
+      background-color: #162438;
       border-color: #233e62 !important;
       box-shadow: none;
     }
