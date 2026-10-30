@@ -7,24 +7,6 @@ use std::path::Path;
 use std::time::Duration;
 use tracing::{info, warn};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmConfigDto {
-    pub api_url: String,
-    pub model: String,
-    #[serde(default)]
-    pub temperature: Option<f32>,
-}
-
-impl Default for LlmConfigDto {
-    fn default() -> Self {
-        Self {
-            api_url: "http://localhost:1234/v1".to_string(),
-            model: "mistral-small".to_string(),
-            temperature: Some(0.2),
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,

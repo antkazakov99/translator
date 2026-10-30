@@ -2,7 +2,6 @@ pub mod glossary;
 pub mod graph;
 pub mod parser;
 pub mod pickle;
-pub mod project;
 pub mod rpa;
 pub mod rpyc;
 pub mod translation;
