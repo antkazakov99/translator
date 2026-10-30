@@ -1,11 +1,50 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="dark" style="color-scheme: dark;">
   <head>
     <meta charset="utf-8" />
+    <meta name="color-scheme" content="dark" />
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Tauri + SvelteKit + Typescript App</title>
+    <title>Translator — Game Localization Studio</title>
     %sveltekit.head%
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html, body {
+        background-color: #0d0f12;
+        color: #e2e8f0;
+        color-scheme: dark;
+        margin: 0;
+        padding: 0;
+      }
+      /* Sleek Minimalist Cyberpunk Scrollbars for WebView2 / Chromium */
+      * {
+        scrollbar-width: thin;
+        scrollbar-color: #1e2638 transparent;
+      }
+      *::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      *::-webkit-scrollbar-track {
+        background: transparent;
+      }
+      *::-webkit-scrollbar-thumb {
+        background-color: #1e2638;
+        border-radius: 999px;
+        border: 1px solid transparent;
+      }
+      *::-webkit-scrollbar-thumb:hover {
+        background-color: #334155;
+      }
+      *::-webkit-scrollbar-thumb:active {
+        background-color: #0284c7;
+      }
+      *::-webkit-scrollbar-corner {
+        background: transparent;
+      }
+    </style>
   </head>
   <body data-sveltekit-preload-data="hover">
     <div style="display: contents">%sveltekit.body%</div>

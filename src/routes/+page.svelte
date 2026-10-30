@@ -440,7 +440,15 @@
         </div>
 
         <!-- ЛЕНТА ПЕРЕКЛЮЧЕНИЯ СЦЕН (Сверху над таблицей) -->
-        <div class="scenes-nav-bar">
+        <div 
+          class="scenes-nav-bar"
+          onwheel={(e) => {
+            if (e.deltaY !== 0) {
+              e.currentTarget.scrollLeft += e.deltaY;
+              e.preventDefault();
+            }
+          }}
+        >
           <button 
             class="scene-nav-chip" 
             class:active={selectedSceneId === 'all'}
@@ -871,6 +879,48 @@
     overflow: hidden;
   }
 
+  /* КАСТОМНЫЕ МИНИМАЛИСТИЧНЫЕ СКРОЛЛБАРЫ */
+  :global(*),
+  :global(*::before),
+  :global(*::after) {
+    scrollbar-width: thin;
+    scrollbar-color: #1e2638 transparent;
+  }
+
+  :global(*::-webkit-scrollbar),
+  :global(::-webkit-scrollbar) {
+    width: 6px;
+    height: 6px;
+  }
+
+  :global(*::-webkit-scrollbar-track),
+  :global(::-webkit-scrollbar-track) {
+    background: transparent;
+  }
+
+  :global(*::-webkit-scrollbar-thumb),
+  :global(::-webkit-scrollbar-thumb) {
+    background: #1e2638;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    transition: background 0.2s ease;
+  }
+
+  :global(*::-webkit-scrollbar-thumb:hover),
+  :global(::-webkit-scrollbar-thumb:hover) {
+    background: #334155;
+  }
+
+  :global(*::-webkit-scrollbar-thumb:active),
+  :global(::-webkit-scrollbar-thumb:active) {
+    background: #0284c7;
+  }
+
+  :global(*::-webkit-scrollbar-corner),
+  :global(::-webkit-scrollbar-corner) {
+    background: transparent;
+  }
+
   .app-shell {
     display: flex;
     flex-direction: column;
@@ -1246,6 +1296,26 @@
     border-bottom: 1px solid #1a1f28;
     overflow-x: auto;
     white-space: nowrap;
+    scrollbar-width: thin;
+    scrollbar-color: #1e2638 transparent;
+  }
+
+  .scenes-nav-bar::-webkit-scrollbar {
+    height: 4px;
+  }
+
+  .scenes-nav-bar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scenes-nav-bar::-webkit-scrollbar-thumb {
+    background: #1e2638;
+    border-radius: 999px;
+    transition: background 0.15s ease;
+  }
+
+  .scenes-nav-bar::-webkit-scrollbar-thumb:hover {
+    background: #38bdf8;
   }
 
   .scene-nav-chip {
