@@ -59,6 +59,7 @@
     id: string;
     line_number: number;
     speaker: string | null;
+    speaker_alias?: string | null;
     original_text: string;
     translated_text: string | null;
     status: string;
@@ -280,6 +281,63 @@
   let totalEdgesCount = $derived(
     currentFile ? (currentFile.edges ? currentFile.edges.length : 0) : 0
   );
+
+  // Быстрый кэш маппинга персонажей: alias -> name и name -> alias
+  let charAliasToName = $derived.by(() => {
+    const map = new Map<string, string>();
+    if (project?.characters) {
+      for (const [alias, name] of project.characters) {
+        map.set(alias.toLowerCase(), name);
+      }
+    }
+    return map;
+  });
+
+  let charNameToAlias = $derived.by(() => {
+    const map = new Map<string, string>();
+    if (project?.characters) {
+      for (const [alias, name] of project.characters) {
+        map.set(name.toLowerCase(), alias);
+      }
+    }
+    return map;
+  });
+
+  function getSpeakerInfo(speaker: string | null | undefined, speakerAlias?: string | null): { alias: string | null; name: string; isNarrator: boolean; isUi: boolean } {
+    if (!speaker && !speakerAlias) {
+      return { alias: null, name: "Автор", isNarrator: true, isUi: false };
+    }
+
+    if (speaker === "UI / Choice" || speakerAlias === "UI") {
+      return { alias: "UI", name: "Интерфейс", isNarrator: false, isUi: true };
+    }
+
+    // 1. Если бэкенд передал оба поля и они различаются
+    if (speakerAlias && speaker && speakerAlias !== speaker) {
+      return { alias: speakerAlias, name: speaker, isNarrator: false, isUi: false };
+    }
+
+    const raw = (speaker || speakerAlias || "").trim();
+    const lower = raw.toLowerCase();
+
+    // 2. Если raw — это известный алиас (например, "lis" -> alias="lis", name="Lisa")
+    if (charAliasToName.has(lower)) {
+      return { alias: raw, name: charAliasToName.get(lower)!, isNarrator: false, isUi: false };
+    }
+
+    // 3. Если raw — это известное имя (например, "Lisa" -> alias="lis", name="Lisa")
+    if (charNameToAlias.has(lower)) {
+      return { alias: charNameToAlias.get(lower)!, name: raw, isNarrator: false, isUi: false };
+    }
+
+    // 4. Если задан только speakerAlias
+    if (speakerAlias) {
+      return { alias: speakerAlias, name: raw, isNarrator: false, isUi: false };
+    }
+
+    // 5. Запасной вариант: имя без тега или тег равен имени
+    return { alias: raw, name: raw, isNarrator: false, isUi: false };
+  }
 
   // Исходящие связи для сцены
   function getOutgoingEdges(sceneName: string): SceneEdge[] {
@@ -1131,8 +1189,21 @@
 
                       <!-- ПРЕВЬЮ ДИАЛОГА -->
                       {#if scene.entries.length > 0}
+                        {@const spk = getSpeakerInfo(scene.entries[0].speaker, scene.entries[0].speaker_alias)}
                         <div class="node-dialogue-snippet">
-                          <span class="snippet-speaker">{scene.entries[0].speaker ?? "Автор"}:</span>
+                          {#if spk.isNarrator}
+                            <span class="snippet-speaker">Автор:</span>
+                          {:else if spk.isUi}
+                            <span class="char-chip char-chip-ui char-chip-snippet">
+                              <span class="char-alias">[UI]</span>
+                              <span class="char-name">Интерфейс:</span>
+                            </span>
+                          {:else}
+                            <span class="char-chip char-chip-snippet" title="Код: {spk.alias}">
+                              {#if spk.alias}<span class="char-alias">[{spk.alias}]</span>{/if}
+                              <span class="char-name">{spk.name}:</span>
+                            </span>
+                          {/if}
                           <span class="snippet-text">"{scene.entries[0].original_text}"</span>
                         </div>
                       {/if}
@@ -1342,7 +1413,7 @@
                       <thead>
                         <tr>
                           <th style="width: 50px;">#</th>
-                          <th style="width: 140px;">Персонаж</th>
+                          <th style="width: 160px;">Персонаж</th>
                           <th>Оригинал (EN)</th>
                           <th>Перевод (RU)</th>
                           <th style="width: 80px;">Статус</th>
@@ -1350,16 +1421,27 @@
                       </thead>
                       <tbody>
                         {#each sceneEntries as entry}
+                          {@const spk = getSpeakerInfo(entry.speaker, entry.speaker_alias)}
                           <tr 
                             class:selected={selectedEntry?.id === entry.id}
                             onclick={() => selectedEntry = entry}
                           >
                             <td class="col-line">{entry.line_number}</td>
                             <td class="col-speaker">
-                              {#if entry.speaker}
-                                <span class="speaker-badge">{entry.speaker}</span>
-                              {:else}
+                              {#if spk.isNarrator}
                                 <span class="narrator-badge">Автор</span>
+                              {:else if spk.isUi}
+                                <span class="char-chip char-chip-ui" title="Интерфейсные строки">
+                                  <span class="char-alias">[UI]</span>
+                                  <span class="char-name">Интерфейс</span>
+                                </span>
+                              {:else}
+                                <span class="char-chip" title="Код: {spk.alias}">
+                                  {#if spk.alias}
+                                    <span class="char-alias">[{spk.alias}]</span>
+                                  {/if}
+                                  <span class="char-name">{spk.name}</span>
+                                </span>
                               {/if}
                             </td>
                             <td class="col-text en-text">{entry.original_text}</td>
@@ -1390,6 +1472,7 @@
 
         <!-- НИЖНИЙ ИНСПЕКТОР СТРОКИ -->
         {#if selectedEntry}
+          {@const spk = getSpeakerInfo(selectedEntry.speaker, selectedEntry.speaker_alias)}
           <div class="inspector-panel">
             <div class="inspector-header">
               <div class="inspector-breadcrumb">
@@ -1398,7 +1481,19 @@
                 <span class="breadcrumb-sep">/</span>
                 <span class="inspect-line">Строка #{selectedEntry.line_number}</span>
                 <span class="breadcrumb-sep">/</span>
-                <strong class="inspect-speaker">{selectedEntry.speaker ?? "Авторский текст"}</strong>
+                {#if spk.isNarrator}
+                  <span class="inspect-narrator">Авторский текст</span>
+                {:else if spk.isUi}
+                  <span class="char-chip char-chip-ui char-chip-inspect">
+                    <span class="char-alias">[UI]</span>
+                    <strong class="char-name">Интерфейс</strong>
+                  </span>
+                {:else}
+                  <span class="char-chip char-chip-inspect" title="Код: {spk.alias}">
+                    {#if spk.alias}<span class="char-alias">[{spk.alias}]</span>{/if}
+                    <strong class="char-name">{spk.name}</strong>
+                  </span>
+                {/if}
               </div>
               <button class="btn-ai">
                 <Sparkles size={14} />
@@ -2694,21 +2789,61 @@
   .char-chip {
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
     background: #141822;
     border: 1px solid #202838;
-    padding: 2px 6px;
+    padding: 2px 7px;
     border-radius: 4px;
     font-size: 11px;
+    white-space: nowrap;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+
+  .char-chip.char-chip-ui {
+    background: rgba(168, 85, 247, 0.08);
+    border-color: rgba(168, 85, 247, 0.28);
+  }
+
+  .char-chip.char-chip-ui .char-alias {
+    color: #c084fc;
+  }
+
+  .char-chip.char-chip-ui .char-name {
+    color: #e9d5ff;
+  }
+
+  .char-chip-snippet {
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin-right: 4px;
+  }
+
+  .char-chip-inspect {
+    background: #162030;
+    border-color: #243550;
+    padding: 2px 8px;
+    font-size: 12px;
+  }
+
+  .inspect-narrator {
+    color: #64748b;
+    font-style: italic;
+    font-size: 12px;
   }
 
   .char-alias {
     color: #38bdf8;
     font-weight: 600;
+    letter-spacing: 0.3px;
+    flex-shrink: 0;
   }
 
   .char-name {
     color: #cbd5e1;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   /* WORKSPACE */

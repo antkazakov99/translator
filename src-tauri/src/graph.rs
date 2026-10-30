@@ -20,6 +20,7 @@ pub struct DialogueData {
     /// Исходный ID блока в движке (например, "end_scene_eri_52d5be01" в Ren'Py)
     pub block_id: Option<String>,
     pub speaker: Option<String>,
+    pub speaker_alias: Option<String>,
     pub original_text: String,
     pub translated_text: Option<String>,
     pub file_path: String,
@@ -62,6 +63,7 @@ impl ScenarioNode {
             id: Uuid::new_v4().to_string(),
             block_id: None,
             speaker: speaker.map(|s| s.into()),
+            speaker_alias: None,
             original_text: original.into(),
             translated_text: None,
             file_path: file.into(),

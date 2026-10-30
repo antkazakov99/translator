@@ -539,6 +539,7 @@ impl RenpyParser {
                 let mut dialogue = ScenarioNode::dialogue(resolved_speaker, text, &file_path, line_num);
                 if let Some(d) = dialogue.as_dialogue_mut() {
                     d.block_id = Some(current_scene_name.clone());
+                    d.speaker_alias = speaker_alias.map(|s| s.to_string());
                 }
 
                 let node_idx = graph.add_node(dialogue);
@@ -648,6 +649,7 @@ impl GameParser for RenpyParser {
                         } else {
                             let mut dialogue = ScenarioNode::dialogue(Some("UI / Choice"), old_text.clone(), &file_path, old_line);
                             if let Some(d) = dialogue.as_dialogue_mut() {
+                                d.speaker_alias = Some("UI".to_string());
                                 if is_translated {
                                     d.translated_text = Some(new_text);
                                     d.status = TranslationStatus::Translated;
@@ -681,12 +683,14 @@ impl GameParser for RenpyParser {
                         let target_text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
 
                         if let Some((src_speaker, src_text, src_line)) = pending_source.take() {
+                            let raw_alias = src_speaker.clone().or_else(|| speaker_alias.map(|s| s.to_string()));
                             let resolved_speaker = self.resolve_speaker(src_speaker.as_deref().or(speaker_alias));
                             let is_translated = Self::has_cyrillic(&target_text);
 
                             let mut dialogue = ScenarioNode::dialogue(resolved_speaker, src_text, &file_path, src_line);
                             if let Some(d) = dialogue.as_dialogue_mut() {
                                 d.block_id = current_block_id.clone();
+                                d.speaker_alias = raw_alias;
                                 if is_translated {
                                     d.translated_text = Some(target_text);
                                     d.status = TranslationStatus::Translated;
