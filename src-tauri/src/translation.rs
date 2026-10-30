@@ -1,3 +1,4 @@
+use crate::graph::{DialogueData, ScenarioGraph};
 use crate::parser::renpy::RenpyParser;
 use crate::{
     TL_LANG, collect_rpy_files, find_game_root, get_project_cache_dir, parse_project_file,
@@ -11,6 +12,70 @@ use uuid::Uuid;
 
 /// Файл мода со строками для правок скриптов, у которых нет файла в `tl/<язык>`.
 const SAVED_STRINGS_FILE: &str = "translator_saved_strings.rpy";
+
+/// Идентификатор строки в хранилище правок. Не зависит от положения строки в файле
+/// и от сцены, поэтому правки переживают обновление игры и перегенерацию перевода.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LineKey {
+    /// Реплика блока `translate`: Ren'Py вычисляет `id` из текста оригинала.
+    Block { id: String, repeat: usize },
+    /// Строка блока `translate strings`.
+    Strings { old: String },
+    /// Реплика скрипта без блоков `translate`.
+    Script {
+        label: String,
+        text: String,
+        repeat: usize,
+    },
+}
+
+impl LineKey {
+    /// Строит ключ реплики. Реплики передаются в порядке файла: `repeats`
+    /// различает одинаковые строки одного блока или метки.
+    pub fn for_line(line: &DialogueData, repeats: &mut HashMap<LineKey, usize>) -> Self {
+        let Some(block) = line.block_id.clone() else {
+            return Self::Strings {
+                old: line.original_text.clone(),
+            };
+        };
+        let first = if line.target_lines.is_empty() {
+            Self::Script {
+                label: block,
+                text: line.original_text.clone(),
+                repeat: 0,
+            }
+        } else {
+            Self::Block { id: block, repeat: 0 }
+        };
+        let seen = repeats.entry(first.clone()).or_default();
+        let repeat = *seen;
+        *seen += 1;
+        match first {
+            Self::Block { id, .. } => Self::Block { id, repeat },
+            Self::Script { label, text, .. } => Self::Script { label, text, repeat },
+            strings => strings,
+        }
+    }
+
+    pub fn encode(&self) -> Result<String, String> {
+        serde_json::to_string(self).map_err(|e| format!("Не удалось создать ключ строки: {}", e))
+    }
+}
+
+/// Ключ старого формата `[строка, сцена, текст, повтор]`.
+struct LegacyKey {
+    line: usize,
+    text: String,
+    repeat: usize,
+}
+
+impl LegacyKey {
+    fn parse(key: &str) -> Option<Self> {
+        let (line, _, text, repeat) =
+            serde_json::from_str::<(usize, String, String, usize)>(key).ok()?;
+        Some(Self { line, text, repeat })
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TranslationEdit {
@@ -54,8 +119,79 @@ fn read_store(source: &Path, path: &Path) -> Result<TranslationOverrides, String
     Ok(store)
 }
 
-pub fn load(source: &Path) -> Result<HashMap<String, String>, String> {
-    Ok(read_store(source, &store_path(source))?.entries)
+/// Загружает правки файла. Записи старого формата переводятся на новые ключи,
+/// а те, что нельзя сопоставить с репликами, остаются в хранилище без изменений.
+pub fn load_for_graph(
+    source: &Path,
+    graph: &ScenarioGraph,
+) -> Result<HashMap<String, String>, String> {
+    let path = store_path(source);
+    let store = read_store(source, &path)?;
+    if !store.entries.keys().any(|key| LegacyKey::parse(key).is_some()) {
+        return Ok(store.entries);
+    }
+
+    let file_lock = path_lock(&path);
+    let _guard = file_lock.lock();
+    let mut store = read_store(source, &path)?;
+    if migrate_legacy_keys(&mut store, graph)? {
+        write_store(&path, &store)?;
+    }
+    Ok(store.entries)
+}
+
+fn migrate_legacy_keys(
+    store: &mut TranslationOverrides,
+    graph: &ScenarioGraph,
+) -> Result<bool, String> {
+    let mut repeats = HashMap::new();
+    let mut lines_by_text: HashMap<&str, Vec<(usize, String)>> = HashMap::new();
+    for line in graph.dialogues() {
+        let key = LineKey::for_line(line, &mut repeats).encode()?;
+        lines_by_text
+            .entry(line.original_text.as_str())
+            .or_default()
+            .push((line.line_number, key));
+    }
+
+    let mut legacy: Vec<(String, LegacyKey)> = store
+        .entries
+        .keys()
+        .filter_map(|key| Some((key.clone(), LegacyKey::parse(key)?)))
+        .collect();
+    legacy.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Сначала точные совпадения, иначе устаревшая запись заняла бы чужую реплику.
+    // Без совпадения по строке подходит только текст, который встречается один раз.
+    let mut migrated = false;
+    for exact in [true, false] {
+        for (old_key, key) in &legacy {
+            if !store.entries.contains_key(old_key) {
+                continue;
+            }
+            let Some(lines) = lines_by_text.get(key.text.as_str()) else {
+                continue;
+            };
+            let target = if exact {
+                lines
+                    .iter()
+                    .filter(|(line, _)| *line == key.line)
+                    .nth(key.repeat)
+            } else if lines.len() == 1 {
+                lines.first()
+            } else {
+                None
+            };
+            if let Some((_, new_key)) = target
+                && !store.entries.contains_key(new_key)
+                && let Some(text) = store.entries.remove(old_key)
+            {
+                store.entries.insert(new_key.clone(), text);
+                migrated = true;
+            }
+        }
+    }
+    Ok(migrated)
 }
 
 /// Файлы мода, собранные из сохранённых правок.
@@ -106,6 +242,15 @@ fn saved_sources(game_dir: &Path) -> Result<Vec<SavedSource>, String> {
 /// остальных скриптов становятся строковыми переводами, потому что идентификаторы
 /// блоков `translate` вычисляет сам Ren'Py. Строковый перевод действует и на диалоги.
 pub fn prepare_mod_export(game_dir: &Path, tl_dir: &Path) -> Result<ModExport, String> {
+    // Файлы, которые ещё не открывались, тоже могут хранить ключи старого формата
+    for saved in saved_sources(game_dir)? {
+        if saved.source.is_file()
+            && saved.entries.keys().any(|key| LegacyKey::parse(key).is_some())
+        {
+            parse_project_file(saved.source.to_string_lossy().into_owned())?;
+        }
+    }
+
     let mut export = ModExport::default();
     let mut strings = BTreeMap::new();
     for saved in saved_sources(game_dir)? {
@@ -163,10 +308,14 @@ fn patch_translation_file(
     Ok(())
 }
 
-/// Исходный текст строки из ключа `[строка, сцена, текст, повтор]`.
+/// Исходный текст строки, если он есть в ключе.
 fn original_text(key: &str) -> Option<String> {
-    let (_, _, text, _) = serde_json::from_str::<(usize, String, String, usize)>(key).ok()?;
-    Some(text)
+    match serde_json::from_str::<LineKey>(key) {
+        Ok(LineKey::Script { text, .. }) => Some(text),
+        Ok(LineKey::Strings { old }) => Some(old),
+        Ok(LineKey::Block { .. }) => None,
+        Err(_) => LegacyKey::parse(key).map(|key| key.text),
+    }
 }
 
 fn collect_string_edits(
@@ -232,14 +381,17 @@ fn save_at(source: &Path, path: &Path, changes: &[TranslationEdit]) -> Result<()
             .entries
             .insert(change.key.clone(), change.text.clone());
     }
+    write_store(path, &store)
+}
 
+fn write_store(path: &Path, store: &TranslationOverrides) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or("Не удалось определить папку перевода")?;
     fs::create_dir_all(parent)
         .map_err(|e| format!("Не удалось создать папку перевода {:?}: {}", parent, e))?;
     let temp_path = parent.join(format!(".{}.tmp", Uuid::new_v4()));
-    let bytes = serde_json::to_vec_pretty(&store)
+    let bytes = serde_json::to_vec_pretty(store)
         .map_err(|e| format!("Не удалось сериализовать перевод: {}", e))?;
     fs::write(&temp_path, bytes)
         .map_err(|e| format!("Не удалось записать перевод {:?}: {}", temp_path, e))?;

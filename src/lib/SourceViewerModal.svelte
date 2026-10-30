@@ -18,6 +18,7 @@
     Code,
     Hash
   } from "lucide-svelte";
+  import { highlightRenpyLine } from "./renpy-highlight";
 
   interface SourceFileDetails {
     file_path: string;
@@ -259,73 +260,6 @@
         nextMatch();
       }
     }
-  }
-
-  // Базовое форматирование строки Ren'Py
-  function highlightRenpyLine(text: string): string {
-    const trimmed = text.trim();
-    if (!trimmed) return "&nbsp;";
-
-    // Комментарий
-    if (trimmed.startsWith("#")) {
-      return `<span class="tok-comment">${escapeHtml(text)}</span>`;
-    }
-
-    // Метки сцены
-    if (trimmed.startsWith("label ") && trimmed.endsWith(":")) {
-      return `<span class="tok-label-line">${escapeHtml(text)}</span>`;
-    }
-
-    // Блоки перевода
-    if (trimmed.startsWith("translate ") && trimmed.endsWith(":")) {
-      return `<span class="tok-translate-line">${escapeHtml(text)}</span>`;
-    }
-
-    let out = escapeHtml(text);
-
-    // Подсветка ключевых слов
-    const keywords = [
-      "\\bjump\\b",
-      "\\bcall\\b",
-      "\\bmenu:",
-      "\\bscene\\b",
-      "\\bshow\\b",
-      "\\bhide\\b",
-      "\\bwith\\b",
-      "\\bplay\\b",
-      "\\bstop\\b",
-      "\\bqueue\\b",
-      "\\bvoice\\b",
-      "\\bpause\\b",
-      "\\bif\\b",
-      "\\belif\\b",
-      "\\belse:",
-      "\\bpass\\b",
-      "\\breturn\\b",
-      "\\bpython:",
-      "\\binit\\b",
-      "\\bdefine\\b",
-      "\\bdefault\\b",
-      "\\bold\\b",
-      "\\bnew\\b"
-    ];
-
-    keywords.forEach(kw => {
-      out = out.replace(new RegExp(kw, "g"), '<span class="tok-keyword">$&</span>');
-    });
-
-    // Подсветка строк в кавычках
-    out = out.replace(/"([^"]*)"/g, '<span class="tok-string">"$1"</span>');
-    out = out.replace(/'([^']*)'/g, '<span class="tok-string">\'$1\'</span>');
-
-    return out;
-  }
-
-  function escapeHtml(str: string): string {
-    return str
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
   }
 
   function isLineTarget(idx: number, lineText: string): boolean {

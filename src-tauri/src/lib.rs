@@ -627,7 +627,6 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
 
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
-    let saved_translations = translation::load(path)?;
 
     let search_dir = find_game_root(path);
     let cache_dir = get_project_scripts_cache_dir(&search_dir);
@@ -663,6 +662,7 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
     let graph = parser
         .parse_file(path, &content)
         .map_err(|e| format!("Ошибка парсинга: {}", e))?;
+    let saved_translations = translation::load_for_graph(path, &graph)?;
 
     // 3. Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры (с кэшированием структуры)
     let script_struct = if orig_path.exists() {
@@ -678,8 +678,7 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
     let mut file_total = 0;
     let mut file_translated = 0;
     let mut current_scene_name = "Общие диалоги".to_string();
-    let mut repeated_lines: std::collections::HashMap<(usize, String, String), usize> =
-        std::collections::HashMap::new();
+    let mut line_repeats = HashMap::new();
 
     for idx in graph.node_indices() {
         if let Some(node) = graph.get_node(idx) {
@@ -700,20 +699,8 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
                             (current_scene_name.clone(), false)
                         };
 
-                    let identity = (
-                        d.line_number,
-                        target_scene_name.clone(),
-                        d.original_text.clone(),
-                    );
-                    let occurrence = repeated_lines.entry(identity.clone()).or_default();
-                    let translation_key = serde_json::to_string(&(
-                        identity.0,
-                        &identity.1,
-                        &identity.2,
-                        *occurrence,
-                    ))
-                    .map_err(|e| format!("Не удалось создать ключ строки: {}", e))?;
-                    *occurrence += 1;
+                    let translation_key =
+                        translation::LineKey::for_line(d, &mut line_repeats).encode()?;
                     let translated_text = saved_translations
                         .get(&translation_key)
                         .map(|text| Some(text.clone()))
@@ -1598,6 +1585,127 @@ mod tests {
             })
             .collect();
         translation::save(file, &changes).unwrap();
+        PARSED_FILE_CACHE.lock().remove(file.to_string_lossy().as_ref());
+    }
+
+    fn translated_text(file: &Path, original: &str) -> Option<String> {
+        PARSED_FILE_CACHE.lock().remove(file.to_string_lossy().as_ref());
+        let parsed = parse_project_file(file.to_string_lossy().to_string()).unwrap();
+        parsed
+            .scenes
+            .iter()
+            .flat_map(|scene| &scene.entries)
+            .find(|entry| entry.original_text == original)
+            .unwrap()
+            .translated_text
+            .clone()
+    }
+
+    #[test]
+    fn test_saved_edits_survive_line_shifts() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_stable_key_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let tl_dir = tl_lang_dir(&game_dir);
+        std::fs::create_dir_all(&tl_dir).unwrap();
+
+        let translation = concat!(
+            "translate russian start_abcd1234:\n\n",
+            "    # e \"Hello\"\n",
+            "    e \"\"\n\n",
+            "translate russian strings:\n\n",
+            "    old \"Yes\"\n",
+            "    new \"\"\n",
+        );
+        let tl_file = tl_dir.join("story.rpy");
+        std::fs::write(&tl_file, translation).unwrap();
+        save_edits(&tl_file, &[("Hello", "Привет"), ("Yes", "Да")]);
+        std::fs::write(&tl_file, format!("# Обновлено\n\n\n{translation}")).unwrap();
+        assert_eq!(translated_text(&tl_file, "Hello").as_deref(), Some("Привет"));
+        assert_eq!(translated_text(&tl_file, "Yes").as_deref(), Some("Да"));
+
+        let script = "label start:\n    e \"Same\"\n    e \"Same\"\n";
+        let original = game_dir.join("story.rpy");
+        std::fs::write(&original, script).unwrap();
+        let parsed = parse_project_file(original.to_string_lossy().to_string()).unwrap();
+        let second = parsed.scenes[0].entries[1].translation_key.clone();
+        translation::save(
+            &original,
+            &[translation::TranslationEdit { key: second, text: "Второй".into() }],
+        )
+        .unwrap();
+        std::fs::write(&original, format!("define a = 1\n\n{script}")).unwrap();
+        PARSED_FILE_CACHE.lock().remove(original.to_string_lossy().as_ref());
+        let parsed = parse_project_file(original.to_string_lossy().to_string()).unwrap();
+        assert_eq!(parsed.scenes[0].entries[0].translated_text, None);
+        assert_eq!(parsed.scenes[0].entries[1].translated_text.as_deref(), Some("Второй"));
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_legacy_keys_are_migrated_on_load() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_legacy_key_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let tl_dir = tl_lang_dir(&game_dir);
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        let story = tl_dir.join("story.rpy");
+        std::fs::write(
+            &story,
+            concat!(
+                "# Строки сдвинулись после сохранения правок\n",
+                "translate russian start_abcd1234:\n",
+                "    # e \"Unique\"\n",
+                "    e \"\"\n",
+                "translate russian start_abcd1235:\n",
+                "    # e \"Twice\"\n",
+                "    e \"\"\n",
+                "translate russian start_abcd1236:\n",
+                "    # e \"Twice\"\n",
+                "    e \"\"\n",
+                "translate russian start_abcd1237:\n",
+                "    # e \"Exact\"\n",
+                "    e \"\"\n",
+            ),
+        )
+        .unwrap();
+
+        let legacy = |line: usize, scene: &str, text: &str| {
+            serde_json::to_string(&(line, scene, text, 0)).unwrap()
+        };
+        let unmatched = legacy(2, "start", "Twice");
+        let edits = [
+            (legacy(1, "start", "Unique"), "Единственная"),
+            (legacy(12, "другая сцена", "Exact"), "Точная"),
+            (unmatched.clone(), "Неоднозначная"),
+        ]
+        .map(|(key, text)| translation::TranslationEdit { key, text: text.into() });
+        translation::save(&story, &edits).unwrap();
+
+        assert_eq!(translated_text(&story, "Unique").as_deref(), Some("Единственная"));
+        assert_eq!(translated_text(&story, "Exact").as_deref(), Some("Точная"));
+        assert_eq!(translated_text(&story, "Twice"), None);
+
+        // Перенос записан на диск, а неоднозначная правка не потеряна
+        let out_dir = temp_dir.join("unpacked");
+        let message = pack_and_unpack(&game_dir, &out_dir);
+        assert!(message.contains("Не перенесено правок: 1"), "{message}");
+        let packed =
+            std::fs::read_to_string(out_dir.join("tl").join(TL_LANG).join("story.rpy")).unwrap();
+        assert!(packed.contains("e \"Единственная\""));
+        assert!(packed.contains("e \"Точная\""));
+        let stored = std::fs::read_dir(get_project_cache_dir(&game_dir).join("translations"))
+            .unwrap()
+            .flatten()
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .collect::<String>();
+        assert!(stored.contains("Неоднозначная"));
+        assert!(stored.contains("Block"));
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     /// Собирает мод в папку данных приложения и распаковывает его рядом с тестом.
