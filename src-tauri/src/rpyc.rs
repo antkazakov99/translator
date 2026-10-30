@@ -27,6 +27,9 @@ pub struct RpycStatement {
 
 pub struct RpycParser;
 
+const MAX_RPYC_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_AST_BYTES: usize = 256 * 1024 * 1024;
+
 impl RpycParser {
     /// Считывает таблицу слотов из .rpyc файла
     pub fn read_slots(data: &[u8]) -> Result<Vec<RpycSlot>, String> {
@@ -76,7 +79,9 @@ impl RpycParser {
     /// Распаковывает данные Slot 1 (AST байткод) из .rpyc
     pub fn decompress_slot(data: &[u8], slot_info: &RpycSlot) -> Result<Vec<u8>, String> {
         let start = slot_info.offset as usize;
-        let end = start + slot_info.length as usize;
+        let end = start
+            .checked_add(slot_info.length as usize)
+            .ok_or("Смещение слота RPYC переполнено")?;
 
         if end > data.len() {
             return Err(format!(
@@ -88,19 +93,33 @@ impl RpycParser {
         }
 
         let slot_bytes = &data[start..end];
-        let mut decoder = ZlibDecoder::new(slot_bytes);
+        let decoder = ZlibDecoder::new(slot_bytes);
         let mut decompressed = Vec::new();
         decoder
+            .take(MAX_AST_BYTES as u64 + 1)
             .read_to_end(&mut decompressed)
             .map_err(|e| format!("Ошибка распаковки zlib слота {}: {}", slot_info.slot, e))?;
+        if decompressed.len() > MAX_AST_BYTES {
+            return Err(format!(
+                "Распакованный слот {} RPYC слишком велик",
+                slot_info.slot
+            ));
+        }
 
         Ok(decompressed)
     }
 
     /// Декомпилирует/парсит .rpyc файл и извлекает все диалоговые инструкции
     pub fn parse_rpyc_file(path: &Path) -> Result<Vec<RpycStatement>, String> {
-        let data =
-            fs::read(path).map_err(|e| format!("Не удалось прочитать .rpyc {:?}: {}", path, e))?;
+        let file = fs::File::open(path)
+            .map_err(|e| format!("Не удалось открыть .rpyc {:?}: {}", path, e))?;
+        let mut data = Vec::new();
+        file.take(MAX_RPYC_BYTES + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| format!("Не удалось прочитать .rpyc {:?}: {}", path, e))?;
+        if data.len() as u64 > MAX_RPYC_BYTES {
+            return Err(format!("Файл .rpyc {:?} слишком велик", path));
+        }
         Self::parse_rpyc_bytes(&data)
     }
 

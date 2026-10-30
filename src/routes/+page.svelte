@@ -3,7 +3,8 @@
   import SceneGraph from "../lib/SceneGraph.svelte";
   import SceneNodeIcon from "../lib/SceneNodeIcon.svelte";
   import SourceViewerModal from "../lib/SourceViewerModal.svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { invoke, isTauri } from "@tauri-apps/api/core";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { 
@@ -138,6 +139,25 @@
     }
 
     if (recentProjects.length > 0) gameDir = recentProjects[0];
+  });
+
+  onMount(() => {
+    if (!isTauri()) return;
+    const window = getCurrentWindow();
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void window.onCloseRequested(async (event) => {
+      if (!glossaryDirty) return;
+      event.preventDefault();
+      if (await saveGlossary()) await window.destroy();
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   });
 
   function rememberProject(path: string) {
@@ -585,6 +605,7 @@
   let loadingGlossary = $state(false);
   let savingGlossary = $state(false);
   let glossaryDirty = $state(false);
+  let glossaryProjectPath = $state<string | null>(null);
   let selectedGlossaryChar = $state<CharacterGlossaryEntry | null>(null);
   let selectedGlossaryTerm = $state<TermGlossaryEntry | null>(null);
 
@@ -894,6 +915,10 @@
   // Сканировать проект
   async function scanProject() {
     if (!gameDir.trim()) return;
+    if (glossaryDirty && !(await saveGlossary())) {
+      if (glossaryProjectPath) gameDir = glossaryProjectPath;
+      return;
+    }
     const selectedPath = gameDir.trim();
     const seq = ++projectScanSeq;
     ++fileSelectSeq;
@@ -910,6 +935,8 @@
     selectedEntry = null;
     selectedSceneId = "all";
     glossary = { characters: [], terms: [] };
+    glossaryProjectPath = null;
+    glossaryDirty = false;
     selectedGlossaryChar = null;
     selectedGlossaryTerm = null;
     try {
@@ -1059,8 +1086,7 @@
       return;
     }
     if (glossaryDirty) {
-      await saveGlossary();
-      if (glossaryDirty) return;
+      if (!(await saveGlossary())) return;
     }
     cleaningCache = true;
     try {
@@ -1199,6 +1225,10 @@
   async function loadGlossary(silent = false) {
     if (!gameDir.trim()) return;
     const path = gameDir.trim();
+    if (glossaryDirty) {
+      if (glossaryProjectPath === path) return;
+      if (!(await saveGlossary())) return;
+    }
     const seq = ++glossaryLoadSeq;
     const characters = project?.characters ?? null;
     if (!silent) loadingGlossary = true;
@@ -1210,6 +1240,7 @@
       if (seq !== glossaryLoadSeq || gameDir.trim() !== path) return;
       glossary = res;
       glossaryDirty = false;
+      glossaryProjectPath = path;
       selectedGlossaryChar = glossary.characters[0] ?? null;
       selectedGlossaryTerm = glossary.terms[0] ?? null;
     } catch (e) {
@@ -1240,24 +1271,35 @@
     }
   }
 
-  async function saveGlossary() {
-    if (!gameDir.trim()) {
+  async function saveGlossary(): Promise<boolean> {
+    const path = glossaryProjectPath || gameDir.trim();
+    if (!path) {
       showToast("Укажите путь к папке игры", "warning");
-      return;
+      return false;
     }
+    if (savingGlossary) return false;
+    const snapshot = JSON.stringify(glossary);
     savingGlossary = true;
     try {
       const msg = await invoke<string>("save_project_glossary", {
-        gameDir: gameDir.trim(),
-        glossary
+        gameDir: path,
+        glossary: JSON.parse(snapshot) as ProjectGlossary
       });
-      glossaryDirty = false;
+      glossaryProjectPath = path;
+      if (JSON.stringify(glossary) === snapshot) glossaryDirty = false;
       showToast(msg, "success");
+      return !glossaryDirty;
     } catch (e) {
       showToast(`Ошибка сохранения глоссария: ${e}`, "error");
+      return false;
     } finally {
       savingGlossary = false;
     }
+  }
+
+  async function closeGlossary() {
+    if (glossaryDirty && !(await saveGlossary())) return;
+    showGlossaryModal = false;
   }
 
   function updateCharacterGender(char: CharacterGlossaryEntry, gender: "male" | "female" | "neuter" | "unknown") {
@@ -1337,7 +1379,7 @@
   }
   if ((e.ctrlKey || e.metaKey) && e.key === 's' && showGlossaryModal) {
     e.preventDefault();
-    saveGlossary();
+    void saveGlossary();
   }
 }} onpointerdown={closeRecentProjects} />
 
@@ -2633,8 +2675,8 @@
   {#if showGlossaryModal}
     <div 
       class="modal-backdrop" 
-      onclick={(e) => { if (e.target === e.currentTarget) showGlossaryModal = false; }}
-      onkeydown={(e) => { if (e.key === 'Escape') showGlossaryModal = false; }}
+      onclick={(e) => { if (e.target === e.currentTarget) void closeGlossary(); }}
+      onkeydown={(e) => { if (e.key === 'Escape') void closeGlossary(); }}
       role="dialog"
       aria-modal="true"
       aria-label="Глоссарий проекта"
@@ -2665,7 +2707,7 @@
                 <span>{glossaryDirty ? 'Сохранить изменения *' : 'Сохранено'}</span>
               {/if}
             </button>
-            <button class="btn-close-modal" onclick={() => showGlossaryModal = false} aria-label="Закрыть">
+            <button class="btn-close-modal" onclick={closeGlossary} aria-label="Закрыть">
               <X size={16} />
             </button>
           </div>
@@ -3241,7 +3283,7 @@
             {/if}
           </div>
           <div class="footer-actions">
-            <button class="btn-secondary" onclick={() => showGlossaryModal = false}>Закрыть</button>
+            <button class="btn-secondary" onclick={closeGlossary}>Закрыть</button>
             <button class="btn-primary-save" onclick={saveGlossary} disabled={savingGlossary}>
               {#if savingGlossary}
                 <Loader2 size={14} class="spin" />

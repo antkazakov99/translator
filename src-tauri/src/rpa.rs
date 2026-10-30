@@ -10,6 +10,24 @@ use std::path::{Component, Path, PathBuf};
 use crate::pickle::{PickleDecoder, PickleEncoder, PickleValue};
 
 const CACHE_VERSION: &str = "v3_safe_scripts";
+const MAX_COMPRESSED_INDEX: u64 = 64 * 1024 * 1024;
+const MAX_DECOMPRESSED_INDEX: usize = 256 * 1024 * 1024;
+const MAX_COMPILED_SCRIPT: u64 = 128 * 1024 * 1024;
+
+fn read_limited(reader: impl Read, limit: usize, label: &str) -> Result<Vec<u8>, String> {
+    let mut data = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| format!("Не удалось прочитать {}: {}", label, e))?;
+    if data.len() > limit {
+        return Err(format!(
+            "{} превышает допустимый размер {} байт",
+            label, limit
+        ));
+    }
+    Ok(data)
+}
 
 fn safe_output_path(root: &Path, name: &str) -> Result<PathBuf, String> {
     let normalized = name.replace('\\', "/");
@@ -115,6 +133,17 @@ impl RpaArchive {
         let key = u64::from_str_radix(parts[2], 16)
             .map_err(|e| format!("Ошибка парсинга ключа RPA: {}", e))?;
 
+        let archive_size = file
+            .metadata()
+            .map_err(|e| format!("Не удалось определить размер RPA: {}", e))?
+            .len();
+        let index_size = archive_size
+            .checked_sub(index_offset)
+            .ok_or("Индекс RPA выходит за пределы архива")?;
+        if index_size > MAX_COMPRESSED_INDEX {
+            return Err("Сжатый индекс RPA слишком велик".to_string());
+        }
+
         // 2. Переходим к оглавлению архива
         file.seek(SeekFrom::Start(index_offset)).map_err(|e| {
             format!(
@@ -124,16 +153,16 @@ impl RpaArchive {
         })?;
 
         // 3. Читаем сжатые zlib данные индекса до конца файла
-        let mut compressed_index = Vec::new();
-        file.read_to_end(&mut compressed_index)
-            .map_err(|e| format!("Ошибка чтения оглавления RPA: {}", e))?;
+        let compressed_index =
+            read_limited(&mut file, MAX_COMPRESSED_INDEX as usize, "индекс RPA")?;
 
         // 4. Распаковываем zlib
         let mut decoder = ZlibDecoder::new(&compressed_index[..]);
-        let mut decompressed_index = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed_index)
-            .map_err(|e| format!("Ошибка распаковки zlib оглавления RPA: {}", e))?;
+        let decompressed_index = read_limited(
+            &mut decoder,
+            MAX_DECOMPRESSED_INDEX,
+            "распакованный индекс RPA",
+        )?;
 
         // 5. Декодируем Python Pickle
         let mut pickle_dec = PickleDecoder::new(&decompressed_index);
@@ -201,12 +230,20 @@ impl RpaArchive {
         let mut file =
             File::open(rpa_path).map_err(|e| format!("Не удалось открыть RPA: {}", e))?;
 
+        let archive_size = file
+            .metadata()
+            .map_err(|e| format!("Не удалось определить размер RPA: {}", e))?
+            .len();
+        if entry
+            .offset
+            .checked_add(entry.length)
+            .is_none_or(|end| end > archive_size)
+        {
+            return Err(format!("Файл {} выходит за пределы архива", entry.name));
+        }
+
         file.seek(SeekFrom::Start(entry.offset))
             .map_err(|e| format!("Ошибка перехода к смещению {}: {}", entry.offset, e))?;
-
-        let mut payload = vec![0u8; entry.length as usize];
-        file.read_exact(&mut payload)
-            .map_err(|e| format!("Ошибка чтения тела файла {}: {}", entry.name, e))?;
 
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)
@@ -221,8 +258,11 @@ impl RpaArchive {
                 .map_err(|e| format!("Ошибка записи префикса: {}", e))?;
         }
 
-        out.write_all(&payload)
-            .map_err(|e| format!("Ошибка записи файла: {}", e))?;
+        let copied = std::io::copy(&mut file.take(entry.length), &mut out)
+            .map_err(|e| format!("Ошибка распаковки файла {}: {}", entry.name, e))?;
+        if copied != entry.length {
+            return Err(format!("Неполные данные файла {} в архиве", entry.name));
+        }
 
         Ok(())
     }
@@ -308,6 +348,53 @@ impl RpaArchive {
         Ok(())
     }
 
+    fn create_archive_from_paths(
+        out_path: &Path,
+        files: &[(String, PathBuf)],
+    ) -> Result<(), String> {
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Не удалось создать директорию {:?}: {}", parent, e))?;
+        }
+        let mut out = File::create(out_path)
+            .map_err(|e| format!("Не удалось создать файл RPA {:?}: {}", out_path, e))?;
+        out.write_all(b"RPA-3.0 0000000000000000 00000000\n")
+            .map_err(|e| format!("Ошибка записи заголовка RPA: {}", e))?;
+
+        let mut index_entries: Vec<(&str, u64, u64, &[u8])> = Vec::new();
+        for (name, path) in files {
+            let offset = out
+                .stream_position()
+                .map_err(|e| format!("Ошибка определения позиции: {}", e))?;
+            let mut input = File::open(path)
+                .map_err(|e| format!("Не удалось открыть файл мода {:?}: {}", path, e))?;
+            let length = std::io::copy(&mut input, &mut out)
+                .map_err(|e| format!("Не удалось упаковать {:?}: {}", path, e))?;
+            index_entries.push((name.as_str(), offset, length, &[]));
+        }
+
+        let index_offset = out
+            .stream_position()
+            .map_err(|e| format!("Ошибка позиции оглавления: {}", e))?;
+        let mut encoder = PickleEncoder::new();
+        let pickle_bytes = encoder.encode_rpa_index(&index_entries);
+        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+        zlib.write_all(&pickle_bytes)
+            .map_err(|e| format!("Ошибка zlib сжатия оглавления: {}", e))?;
+        let compressed_index = zlib
+            .finish()
+            .map_err(|e| format!("Ошибка завершения сжатия zlib: {}", e))?;
+        out.write_all(&compressed_index)
+            .map_err(|e| format!("Ошибка записи оглавления в RPA: {}", e))?;
+        out.seek(SeekFrom::Start(0))
+            .map_err(|e| format!("Ошибка перемотки в начало RPA: {}", e))?;
+        out.write_all(format!("RPA-3.0 {:016x} 00000000\n", index_offset).as_bytes())
+            .map_err(|e| format!("Ошибка записи финального заголовка: {}", e))?;
+        out.flush()
+            .map_err(|e| format!("Ошибка сброса буфера на диск: {}", e))?;
+        Ok(())
+    }
+
     /// Собирает директорию мода/перевода (например tl/russian) в единый RPA-3.0 мод-архив
     pub fn pack_mod_from_folder(
         source_folder: &Path,
@@ -320,7 +407,7 @@ impl RpaArchive {
             ));
         }
 
-        let mut collected_files: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut collected_files: Vec<(String, PathBuf)> = Vec::new();
         collect_folder_files_for_mod(source_folder, source_folder, &mut collected_files)?;
 
         if collected_files.is_empty() {
@@ -331,7 +418,7 @@ impl RpaArchive {
         for (name, _) in &mut collected_files {
             *name = format!("tl/russian/{}", name);
         }
-        Self::create_archive(out_rpa_path, &collected_files)?;
+        Self::create_archive_from_paths(out_rpa_path, &collected_files)?;
         Ok(count)
     }
 
@@ -387,6 +474,10 @@ impl RpaArchive {
 
         let mut file = File::open(rpa_path)
             .map_err(|e| format!("Не удалось открыть RPA архив {:?}: {}", rpa_path, e))?;
+        let archive_size = file
+            .metadata()
+            .map_err(|e| format!("Не удалось определить размер RPA: {}", e))?
+            .len();
 
         let mut processed = 0;
         for entry in script_entries {
@@ -404,13 +495,29 @@ impl RpaArchive {
                 continue;
             }
 
+            if entry
+                .offset
+                .checked_add(entry.length)
+                .is_none_or(|end| end > archive_size)
+            {
+                return Err(format!("Файл {} выходит за пределы архива", entry.name));
+            }
+
             file.seek(SeekFrom::Start(entry.offset))
                 .map_err(|e| format!("Ошибка перемещения в RPA: {}", e))?;
-            let mut payload = vec![0u8; entry.length as usize];
-            file.read_exact(&mut payload)
-                .map_err(|e| format!("Ошибка чтения файла {}: {}", entry.name, e))?;
 
             if is_rpyc {
+                if entry.length > MAX_COMPILED_SCRIPT {
+                    return Err(format!("RPYC файл {} слишком велик", entry.name));
+                }
+                let payload = read_limited(
+                    (&mut file).take(entry.length),
+                    MAX_COMPILED_SCRIPT as usize,
+                    &entry.name,
+                )?;
+                if payload.len() as u64 != entry.length {
+                    return Err(format!("Неполные данные файла {} в архиве", entry.name));
+                }
                 let stmts = match crate::rpyc::RpycParser::parse_rpyc_bytes(&payload) {
                     Ok(stmts) => stmts,
                     Err(error) => {
@@ -422,8 +529,13 @@ impl RpaArchive {
                 fs::write(&out_file, rpy_code)
                     .map_err(|e| format!("Не удалось записать {:?}: {}", out_file, e))?;
             } else {
-                fs::write(&out_file, &payload)
-                    .map_err(|e| format!("Не удалось записать {:?}: {}", out_file, e))?;
+                let mut out = File::create(&out_file)
+                    .map_err(|e| format!("Не удалось создать {:?}: {}", out_file, e))?;
+                let copied = std::io::copy(&mut (&mut file).take(entry.length), &mut out)
+                    .map_err(|e| format!("Не удалось распаковать {}: {}", entry.name, e))?;
+                if copied != entry.length {
+                    return Err(format!("Неполные данные файла {} в архиве", entry.name));
+                }
             }
             processed += 1;
         }
@@ -504,34 +616,29 @@ impl RpaArchive {
 fn collect_folder_files_for_mod(
     root: &Path,
     current: &Path,
-    acc: &mut Vec<(String, Vec<u8>)>,
+    acc: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), String> {
-    if let Ok(entries) = fs::read_dir(current) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let entries = fs::read_dir(current)
+        .map_err(|e| format!("Не удалось прочитать папку мода {:?}: {}", current, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Ошибка чтения папки мода: {}", e))?;
+        let path = entry.path();
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
 
-            // Пропускаем бэкапы и скрытые файлы
-            if file_name.starts_with('.')
-                || file_name.contains("backup")
-                || file_name.ends_with(".bak")
-            {
-                continue;
-            }
+        // Пропускаем бэкапы и скрытые файлы
+        if file_name.starts_with('.') || file_name.contains("backup") || file_name.ends_with(".bak")
+        {
+            continue;
+        }
 
-            if path.is_dir() {
-                collect_folder_files_for_mod(root, &path, acc)?;
-            } else if path.is_file() {
-                let data = fs::read(&path)
-                    .map_err(|e| format!("Не удалось прочитать файл мода {:?}: {}", path, e))?;
-                let rel_path = path
-                    .strip_prefix(root)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .map_err(|e| {
-                        format!("Не удалось определить путь файла мода {:?}: {}", path, e)
-                    })?;
-                acc.push((rel_path, data));
-            }
+        if path.is_dir() {
+            collect_folder_files_for_mod(root, &path, acc)?;
+        } else if path.is_file() {
+            let rel_path = path
+                .strip_prefix(root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .map_err(|e| format!("Не удалось определить путь файла мода {:?}: {}", path, e))?;
+            acc.push((rel_path, path));
         }
     }
     Ok(())
@@ -540,6 +647,26 @@ fn collect_folder_files_for_mod(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_reject_oversized_archive_data() {
+        assert!(read_limited(&b"too long"[..], 4, "test").is_err());
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_rpa_limit_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let archive = temp_dir.join("short.rpa");
+        fs::write(&archive, b"short").unwrap();
+        let output = temp_dir.join("output.txt");
+        let entry = RpaEntry {
+            name: "output.txt".into(),
+            offset: 0,
+            length: u64::MAX,
+            prefix: Vec::new(),
+        };
+        assert!(RpaArchive::extract_file(&archive, &entry, &output).is_err());
+        assert!(!output.exists());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 
     #[test]
     fn test_create_and_read_rpa3() {
