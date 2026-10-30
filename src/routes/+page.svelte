@@ -194,12 +194,14 @@
     errorMsg = "";
     try {
       project = await invoke<ProjectSummary>("scan_game_project", { gameDir });
+      loadingProject = false;
       if (project.files.length > 0) {
+        // Микропауза для отрисовки сайдбара и статов перед загрузкой первого файла
+        await new Promise(r => setTimeout(r, 20));
         selectFile(project.files[0]);
       }
     } catch (e) {
       errorMsg = String(e);
-    } finally {
       loadingProject = false;
     }
   }
@@ -209,9 +211,18 @@
     selectedFile = file;
     loadingFile = true;
     errorMsg = "";
-    selectedSceneId = "all";
     try {
       currentFile = await invoke<ParsedFile>("parse_file_entries", { filePath: file.path });
+      // По умолчанию выбираем первую реальную сюжетную сцену (или все, если сцена одна)
+      if (currentFile.scenes.length > 1) {
+        const firstStory = currentFile.scenes.find(s => s.name !== "Интерфейс и меню (strings)");
+        selectedSceneId = firstStory ? firstStory.id : currentFile.scenes[0].id;
+      } else if (currentFile.scenes.length > 0) {
+        selectedSceneId = currentFile.scenes[0].id;
+      } else {
+        selectedSceneId = "all";
+      }
+
       if (currentFile.scenes.length > 0 && currentFile.scenes[0].entries.length > 0) {
         selectedEntry = currentFile.scenes[0].entries[0];
       }
@@ -252,7 +263,12 @@
     </div>
 
     <!-- Глобальная статистика перевода -->
-    {#if project}
+    {#if loadingProject}
+      <div class="global-stats skeleton-stats-box">
+        <div class="skeleton-shimmer skeleton-pill-head"></div>
+        <div class="progress-track skeleton-shimmer"></div>
+      </div>
+    {:else if project}
       <div class="global-stats">
         <div class="stat-text">
           <span class="stat-num">{project.total_translated} / {project.total_lines}</span>
@@ -275,7 +291,34 @@
   <div class="main-layout">
     <!-- ЛЕВАЯ КОЛОНКА (Сайдбар файлов и персонажей) -->
     <aside class="sidebar">
-      {#if project}
+      {#if loadingProject}
+        <!-- Скелетоны при сканировании файлов -->
+        <div class="sidebar-section">
+          <div class="sidebar-header">
+            <Loader2 size={14} class="spin text-sky-400" />
+            <span>СКАНИРОВАНИЕ ПРОЕКТА...</span>
+          </div>
+          <div class="skeleton-list">
+            {#each Array(9) as _}
+              <div class="skeleton-file-item">
+                <div class="skeleton-shimmer skeleton-line w-75"></div>
+                <div class="skeleton-shimmer skeleton-line w-45"></div>
+              </div>
+            {/each}
+          </div>
+        </div>
+        <div class="sidebar-section characters-section">
+          <div class="sidebar-header">
+            <Users size={14} />
+            <span>ПЕРСОНАЖИ...</span>
+          </div>
+          <div class="skeleton-chips">
+            {#each Array(6) as _}
+              <div class="skeleton-shimmer skeleton-chip-item"></div>
+            {/each}
+          </div>
+        </div>
+      {:else if project}
         <div class="sidebar-section">
           <div class="sidebar-header">
             <FileText size={14} />
@@ -330,7 +373,16 @@
 
     <!-- ОСНОВНАЯ ОБЛАСТЬ (Сцены, Таблица реплик и Инспектор) -->
     <main class="content-area">
-      {#if currentFile}
+      {#if loadingProject}
+        <div class="loading-project-workspace">
+          <div class="workspace-shimmer-card">
+            <Loader2 size={36} class="spin text-sky-400" />
+            <h3>Сканирование и анализ сценариев...</h3>
+            <p>Параллельная обработка скриптов через Rust Rayon</p>
+            <div class="skeleton-shimmer skeleton-bar-wide"></div>
+          </div>
+        </div>
+      {:else if currentFile}
         <!-- ТУЛБАР ФАЙЛА И ПЕРЕКЛЮЧАТЕЛЬ РЕЖИМОВ -->
         <div class="file-toolbar">
           <div class="file-info-badge">
@@ -674,9 +726,22 @@
           <!-- РЕЖИМ ТАБЛИЦЫ ДИАЛОГОВ -->
           <div class="table-container">
             {#if loadingFile}
-              <div class="loading-state">
-                <Loader2 size={32} class="spin" />
-                <p>Парсинг файла сценария через Rust...</p>
+              <div class="skeleton-table-wrapper">
+                <div class="skeleton-scene-divider">
+                  <div class="skeleton-shimmer skeleton-line w-30"></div>
+                  <div class="skeleton-shimmer skeleton-line w-15"></div>
+                </div>
+                <div class="skeleton-rows-list">
+                  {#each Array(10) as _, idx}
+                    <div class="skeleton-table-row">
+                      <div class="skeleton-shimmer skeleton-cell w-5"></div>
+                      <div class="skeleton-shimmer skeleton-cell w-15 skeleton-badge"></div>
+                      <div class="skeleton-shimmer skeleton-cell" style="width: {40 + (idx % 4) * 10}%;"></div>
+                      <div class="skeleton-shimmer skeleton-cell" style="width: {30 + (idx % 3) * 10}%;"></div>
+                      <div class="skeleton-shimmer skeleton-cell w-10 skeleton-badge"></div>
+                    </div>
+                  {/each}
+                </div>
               </div>
             {:else}
               <div class="scenes-grouped-view">
@@ -2090,12 +2155,180 @@
     text-align: center;
   }
 
-  .spin {
-    animation: spin 1s linear infinite;
+  /* GLOBAL SPIN ANIMATION */
+  :global(.spin) {
+    animation: spin 0.8s linear infinite !important;
+    display: inline-block;
   }
 
   @keyframes spin {
     from { transform: rotate(0deg); }
     to { transform: rotate(360deg); }
+  }
+
+  /* SKELETON SHIMMER PLACEHOLDERS */
+  @keyframes shimmer {
+    0% {
+      background-position: -200% 0;
+    }
+    100% {
+      background-position: 200% 0;
+    }
+  }
+
+  .skeleton-shimmer {
+    background: linear-gradient(
+      90deg,
+      #131822 0%,
+      #1e2636 30%,
+      #2c394e 50%,
+      #1e2636 70%,
+      #131822 100%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s ease-in-out infinite;
+    border-radius: 4px;
+  }
+
+  .skeleton-line {
+    height: 12px;
+  }
+
+  .skeleton-stats-box {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 130px;
+  }
+
+  .skeleton-pill-head {
+    height: 14px;
+    width: 90px;
+  }
+
+  .w-5 { width: 5%; }
+  .w-10 { width: 10%; }
+  .w-15 { width: 15%; }
+  .w-20 { width: 20%; }
+  .w-30 { width: 30%; }
+  .w-40 { width: 40%; }
+  .w-45 { width: 45%; }
+  .w-50 { width: 50%; }
+  .w-60 { width: 60%; }
+  .w-75 { width: 75%; }
+  .w-80 { width: 80%; }
+  .w-100 { width: 100%; }
+
+  .skeleton-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px;
+  }
+
+  .skeleton-file-item {
+    padding: 10px;
+    background: #11141c;
+    border: 1px solid #1a202c;
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .skeleton-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 8px;
+  }
+
+  .skeleton-chip-item {
+    height: 22px;
+    width: 65px;
+    border-radius: 4px;
+  }
+
+  .skeleton-table-wrapper {
+    display: flex;
+    flex-direction: column;
+    padding: 14px;
+    gap: 12px;
+  }
+
+  .skeleton-scene-divider {
+    display: flex;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: #131722;
+    border-radius: 6px;
+    border: 1px solid #1e2638;
+  }
+
+  .skeleton-rows-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .skeleton-table-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 14px;
+    background: #0f121a;
+    border: 1px solid #181f2c;
+    border-radius: 6px;
+  }
+
+  .skeleton-cell {
+    height: 14px;
+  }
+
+  .skeleton-badge {
+    height: 20px;
+    border-radius: 4px;
+  }
+
+  .loading-project-workspace {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0b0e14;
+  }
+
+  .workspace-shimmer-card {
+    background: #121622;
+    border: 1px solid #1e2638;
+    border-radius: 12px;
+    padding: 36px 48px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    text-align: center;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+    max-width: 420px;
+    width: 100%;
+  }
+
+  .workspace-shimmer-card h3 {
+    margin: 0;
+    font-size: 16px;
+    color: #f1f5f9;
+  }
+
+  .workspace-shimmer-card p {
+    margin: 0;
+    font-size: 13px;
+    color: #64748b;
+  }
+
+  .skeleton-bar-wide {
+    height: 6px;
+    width: 100%;
+    margin-top: 8px;
+    border-radius: 999px;
   }
 </style>
