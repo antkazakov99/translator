@@ -2,7 +2,7 @@ use flate2::read::ZlibDecoder;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::pickle::{PickleDecoder, PickleValue};
 
@@ -505,44 +505,6 @@ impl RpycParser {
         }
 
         out
-    }
-
-    /// Очищает устаревший кэш скомпилированных файлов .rpyc
-    /// Если tl_only = true, очищает только папку tl/russian (безопасный режим),
-    /// иначе очищает всю директорию игры.
-    pub fn clean_cache(dir: &Path, tl_only: bool) -> Result<usize, String> {
-        let target_dir = if tl_only {
-            dir.join(r"tl\russian")
-        } else {
-            dir.to_path_buf()
-        };
-
-        if !target_dir.exists() {
-            return Ok(0);
-        }
-
-        let mut rpyc_files = Vec::new();
-        collect_rpyc_files(&target_dir, &mut rpyc_files);
-
-        let count = rpyc_files.len();
-        for file in rpyc_files {
-            let _ = fs::remove_file(&file);
-        }
-
-        Ok(count)
-    }
-}
-
-fn collect_rpyc_files(dir: &Path, files: &mut Vec<PathBuf>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_rpyc_files(&path, files);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rpyc") {
-                files.push(path);
-            }
-        }
     }
 }
 

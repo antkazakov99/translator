@@ -11,7 +11,7 @@ use crate::parser::GameParser;
 use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto, ScriptStructure};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Instant, SystemTime};
 
@@ -231,6 +231,61 @@ fn effective_game_directory(selected_path: &Path) -> PathBuf {
     } else {
         selected_path.to_path_buf()
     }
+}
+
+fn known_game_directory(file_path: &Path) -> Option<PathBuf> {
+    file_path
+        .ancestors()
+        .find(|dir| {
+            dir.is_dir()
+                && (dir
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("game"))
+                    || dir.join("tl").is_dir()
+                    || dir.join("options.rpy").is_file()
+                    || dir.join("screens.rpy").is_file()
+                    || dir.join("gui.rpy").is_file())
+        })
+        .map(Path::to_path_buf)
+}
+
+fn ensure_output_outside_game(output: &Path, game_dirs: &[PathBuf]) -> Result<(), String> {
+    if !output.is_absolute()
+        || output
+            .components()
+            .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
+    {
+        return Err("Укажите абсолютный путь без . или .. для вывода файлов".to_string());
+    }
+
+    let mut existing = output;
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or("Не удалось проверить целевой путь")?;
+    }
+    let existing_real = existing
+        .canonicalize()
+        .map_err(|e| format!("Не удалось проверить целевой путь {:?}: {}", existing, e))?;
+    let resolved_output = existing_real.join(
+        output
+            .strip_prefix(existing)
+            .map_err(|e| format!("Не удалось проверить целевой путь: {}", e))?,
+    );
+
+    let mut protected_dirs = game_dirs.to_vec();
+    if let Some(game_dir) = known_game_directory(output) {
+        protected_dirs.push(game_dir);
+    }
+    for game_dir in &protected_dirs {
+        let game_real = game_dir
+            .canonicalize()
+            .map_err(|e| format!("Не удалось проверить папку игры {:?}: {}", game_dir, e))?;
+        if resolved_output.starts_with(&game_real) || game_real.starts_with(&resolved_output) {
+            return Err("Вывод в папку игры запрещён. Выберите папку данных приложения или другое место вне игры".to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Находит базовую директорию игры (`game`), поднимаясь по дереву каталогов от файла перевода или скрипта.
@@ -977,8 +1032,11 @@ async fn pack_mod_rpa(game_dir: String, output_rpa_path: Option<String>) -> Resu
         let out_path = if let Some(ref p) = output_rpa_path {
             PathBuf::from(p)
         } else {
-            base_path.join("russian_mod.rpa")
+            get_project_cache_dir(&base_path)
+                .join("exports")
+                .join("russian_mod.rpa")
         };
+        ensure_output_outside_game(&out_path, std::slice::from_ref(&base_path))?;
 
         let count = rpa::RpaArchive::pack_mod_from_folder(&tl_dir, &out_path)?;
         Ok(format!(
@@ -991,41 +1049,106 @@ async fn pack_mod_rpa(game_dir: String, output_rpa_path: Option<String>) -> Resu
     .map_err(|e| format!("Ошибка сборки RPA мода: {}", e))?
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct UnpackResult {
+    count: usize,
+    target_dir: String,
+}
+
 #[tauri::command]
-async fn unpack_rpa(rpa_path: String, target_dir: String) -> Result<usize, String> {
+async fn unpack_rpa(
+    rpa_path: String,
+    target_dir: String,
+    game_dir: Option<String>,
+) -> Result<UnpackResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let src = Path::new(&rpa_path);
-        let dst = Path::new(&target_dir);
-        rpa::RpaArchive::extract_all(src, dst)
+        let mut protected = Vec::new();
+        if let Some(game_dir) = game_dir {
+            protected.push(effective_game_directory(Path::new(&game_dir)));
+        }
+        if let Some(game_dir) = known_game_directory(src) {
+            protected.push(game_dir);
+        }
+        let default_target = get_project_cache_dir(
+            protected
+                .first()
+                .map(PathBuf::as_path)
+                .unwrap_or_else(|| src.parent().unwrap_or(src)),
+        )
+        .join("unpacked")
+        .join(src.file_stem().unwrap_or_default());
+        let dst = if target_dir.trim().is_empty() {
+            default_target.as_path()
+        } else {
+            Path::new(&target_dir)
+        };
+        ensure_output_outside_game(dst, &protected)?;
+        let count = rpa::RpaArchive::extract_all(src, dst)?;
+        Ok(UnpackResult {
+            count,
+            target_dir: dst.to_string_lossy().to_string(),
+        })
     })
     .await
     .map_err(|e| format!("Ошибка распаковки RPA: {}", e))?
 }
 
 #[tauri::command]
-async fn clean_rpyc_cache(game_dir: String, tl_only: bool) -> Result<usize, String> {
+async fn clear_project_script_cache(game_dir: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
-        rpyc::RpycParser::clean_cache(&base_path, tl_only)
+        if !base_path.is_dir() {
+            return Err(format!("Папка игры не найдена: {}", game_dir));
+        }
+        let cache_dir = get_project_scripts_cache_dir(&base_path);
+        if cache_dir.exists() {
+            std::fs::remove_dir_all(&cache_dir)
+                .map_err(|e| format!("Не удалось очистить кэш скриптов {:?}: {}", cache_dir, e))?;
+        }
+        CACHED_SCRIPT_PROJECTS.lock().unwrap().remove(&cache_dir);
+        PROJECT_SCRIPTS_CACHE.lock().unwrap().remove(&base_path);
+        PROJECT_SPEAKERS_CACHE.lock().unwrap().remove(&base_path);
+        SCRIPT_STRUCTURE_CACHE
+            .lock()
+            .unwrap()
+            .retain(|path, _| !path.starts_with(&cache_dir));
+        PARSED_FILE_CACHE
+            .lock()
+            .unwrap()
+            .retain(|path, _| !Path::new(path).starts_with(&cache_dir));
+        Ok(())
     })
     .await
-    .map_err(|e| format!("Ошибка очистки кэша .rpyc: {}", e))?
+    .map_err(|e| format!("Ошибка очистки временного кэша: {}", e))?
 }
 
 #[tauri::command]
 async fn decompile_rpyc_file(
     rpyc_path: String,
     output_rpy_path: Option<String>,
+    game_dir: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = Path::new(&rpyc_path);
+        if let Some(ref out_p) = output_rpy_path {
+            let mut protected = Vec::new();
+            if let Some(game_dir) = game_dir {
+                protected.push(effective_game_directory(Path::new(&game_dir)));
+            }
+            if let Some(game_dir) = known_game_directory(path) {
+                protected.push(game_dir);
+            }
+            ensure_output_outside_game(Path::new(out_p), &protected)?;
+        }
         let stmts = rpyc::RpycParser::parse_rpyc_file(path)?;
         let rpy_text = rpyc::RpycParser::decompile_to_rpy_text(&stmts);
 
         if let Some(ref out_p) = output_rpy_path {
             let out_path = Path::new(out_p);
             if let Some(parent) = out_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Не удалось создать папку вывода {:?}: {}", parent, e))?;
             }
             std::fs::write(out_path, &rpy_text)
                 .map_err(|e| format!("Не удалось сохранить декомпилированный .rpy: {}", e))?;
@@ -1235,7 +1358,7 @@ pub fn run() {
             find_scene_target,
             pack_mod_rpa,
             unpack_rpa,
-            clean_rpyc_cache,
+            clear_project_script_cache,
             decompile_rpyc_file,
             get_project_glossary,
             save_project_glossary,
@@ -1397,7 +1520,7 @@ mod tests {
 
             // 1. Тест декомпиляции celia.rpyc через команду decompile_rpyc_file
             let celia_rpyc = format!(r"{}\celia.rpyc", game_dir);
-            let decompiled = decompile_rpyc_file(celia_rpyc, None).await.unwrap();
+            let decompiled = decompile_rpyc_file(celia_rpyc, None, None).await.unwrap();
             assert!(decompiled.contains("label end_scene_nei:"));
             println!("Команда decompile_rpyc_file успешно декомпилировала celia.rpyc!");
 
@@ -1423,14 +1546,15 @@ mod tests {
 
             // 3. Тест распаковки созданного мода через unpack_rpa
             let temp_unpack_dir = std::env::temp_dir().join("test_command_unpacked");
-            let unpacked_count = unpack_rpa(
+            let unpacked = unpack_rpa(
                 temp_rpa.to_string_lossy().to_string(),
                 temp_unpack_dir.to_string_lossy().to_string(),
+                None,
             )
             .await
             .unwrap();
-            println!("Распаковано файлов мода: {}", unpacked_count);
-            assert!(unpacked_count > 0);
+            println!("Распаковано файлов мода: {}", unpacked.count);
+            assert!(unpacked.count > 0);
 
             // Очищаем временные файлы
             let _ = std::fs::remove_file(&temp_rpa);
@@ -1586,6 +1710,7 @@ mod tests {
                 .await
                 .unwrap();
             println!("{}", save_msg);
+            assert!(!temp_game_dir.join("translator_glossary.json").exists());
 
             // Загружаем повторно и сверяем сохраненные данные
             let reloaded = get_project_glossary(temp_game_dir.to_string_lossy().to_string(), None)
@@ -1596,8 +1721,117 @@ mod tests {
             assert_eq!(reloaded.terms.len(), 1);
             assert_eq!(reloaded.terms[0].translated_term, "Клинок демона");
 
+            // Старый файл в игре не должен перекрывать данные приложения.
+            std::fs::write(
+                temp_game_dir.join("translator_glossary.json"),
+                r#"{"characters":[],"terms":[]}"#,
+            )
+            .unwrap();
+            let reloaded = get_project_glossary(temp_game_dir.to_string_lossy().to_string(), None)
+                .await
+                .unwrap();
+            assert_eq!(reloaded.terms[0].translated_term, "Клинок демона");
+
             let _ = std::fs::remove_dir_all(&temp_game_dir);
             let _ = std::fs::remove_dir_all(get_project_cache_dir(&temp_game_dir));
+        });
+    }
+
+    #[test]
+    fn test_game_files_remain_untouched_by_cache_and_export_commands() {
+        tauri::async_runtime::block_on(async {
+            let temp_dir = std::env::temp_dir()
+                .join(format!("translator_readonly_game_{}", uuid::Uuid::new_v4()));
+            let game_dir = temp_dir.join("game");
+            let tl_dir = game_dir.join("tl").join("russian");
+            std::fs::create_dir_all(&tl_dir).unwrap();
+            std::fs::write(tl_dir.join("story.rpy"), "translate russian strings:\n").unwrap();
+            let compiled = game_dir.join("story.rpyc");
+            std::fs::write(&compiled, b"original bytecode").unwrap();
+            let game_path = game_dir.to_string_lossy().to_string();
+            let script_cache = get_project_scripts_cache_dir(&game_dir);
+            std::fs::create_dir_all(&script_cache).unwrap();
+            std::fs::write(script_cache.join("cached.rpy"), b"cached").unwrap();
+
+            clear_project_script_cache(game_path.clone()).await.unwrap();
+            assert!(!script_cache.exists());
+            assert_eq!(std::fs::read(&compiled).unwrap(), b"original bytecode");
+
+            let in_game_archive = game_dir.join("russian_mod.rpa");
+            assert!(
+                pack_mod_rpa(
+                    game_path.clone(),
+                    Some(in_game_archive.to_string_lossy().to_string()),
+                )
+                .await
+                .is_err()
+            );
+            assert!(!in_game_archive.exists());
+            pack_mod_rpa(game_path.clone(), None).await.unwrap();
+            assert!(
+                get_project_cache_dir(&game_dir)
+                    .join("exports")
+                    .join("russian_mod.rpa")
+                    .exists()
+            );
+
+            assert!(
+                unpack_rpa(
+                    game_dir.join("archive.rpa").to_string_lossy().to_string(),
+                    game_dir.join("extracted").to_string_lossy().to_string(),
+                    Some(game_path.clone()),
+                )
+                .await
+                .is_err()
+            );
+            let outside_archive = temp_dir.join("outside.rpa");
+            rpa::RpaArchive::create_archive(
+                &outside_archive,
+                &[("text.txt".to_string(), b"test".to_vec())],
+            )
+            .unwrap();
+            assert!(
+                unpack_rpa(
+                    outside_archive.to_string_lossy().to_string(),
+                    game_dir.join("extracted").to_string_lossy().to_string(),
+                    None,
+                )
+                .await
+                .is_err()
+            );
+            assert!(!game_dir.join("extracted").exists());
+            let unpacked = unpack_rpa(
+                outside_archive.to_string_lossy().to_string(),
+                String::new(),
+                Some(game_path.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(unpacked.count, 1);
+            assert!(unpacked.target_dir.contains("unpacked"));
+            assert_eq!(
+                std::fs::read(
+                    get_project_cache_dir(&game_dir)
+                        .join("unpacked")
+                        .join("outside")
+                        .join("text.txt")
+                )
+                .unwrap(),
+                b"test"
+            );
+            assert!(
+                decompile_rpyc_file(
+                    compiled.to_string_lossy().to_string(),
+                    Some(game_dir.join("story.rpy").to_string_lossy().to_string()),
+                    Some(game_path),
+                )
+                .await
+                .is_err()
+            );
+            assert!(!game_dir.join("story.rpy").exists());
+
+            let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+            let _ = std::fs::remove_dir_all(&temp_dir);
         });
     }
 

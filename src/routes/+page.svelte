@@ -1031,7 +1031,6 @@
   let decompileRpycPath = $state("");
   let decompileOutputRpyPath = $state("");
   let decompiledCodePreview = $state("");
-  let cleanTlOnly = $state(true);
 
   // 1. Быстрая сборка RPA мода в один клик
   async function quickPackMod() {
@@ -1053,21 +1052,24 @@
     }
   }
 
-  // 2. Быстрая очистка кэша .rpyc
-  async function quickCleanCache() {
+  // Обновить распакованные скрипты в кэше приложения, не меняя файлы игры.
+  async function refreshScriptCache() {
     if (!gameDir.trim()) {
       showToast("Укажите путь к папке игры", "warning");
       return;
     }
+    if (glossaryDirty) {
+      await saveGlossary();
+      if (glossaryDirty) return;
+    }
     cleaningCache = true;
     try {
-      const count = await invoke<number>("clean_rpyc_cache", {
-        gameDir: gameDir.trim(),
-        tlOnly: true
-      });
-      showToast(`Кэш .rpyc очищен (${count} файлов). Ren'Py соберет свежий байткод!`, "success");
+      await invoke<void>("clear_project_script_cache", { gameDir: gameDir.trim() });
+      await scanProject();
+      if (!project) throw new Error(errorMsg || "Повторное сканирование не удалось");
+      showToast("Временный кэш скриптов обновлён. Файлы игры не изменены.", "success");
     } catch (e) {
-      showToast(`Ошибка очистки кэша: ${e}`, "error");
+      showToast(`Ошибка обновления кэша: ${e}`, "error");
     } finally {
       cleaningCache = false;
     }
@@ -1075,18 +1077,19 @@
 
   // 3. Распаковка произвольного RPA архива
   async function executeUnpackRpa() {
-    if (!unpackSourceRpa.trim() || !unpackTargetDir.trim()) {
-      showToast("Укажите путь к .rpa архиву и целевую папку", "warning");
+    if (!unpackSourceRpa.trim()) {
+      showToast("Укажите путь к .rpa архиву", "warning");
       return;
     }
     unpackingRpa = true;
     unpackResultMsg = "";
     try {
-      const count = await invoke<number>("unpack_rpa", {
+      const result = await invoke<{ count: number; target_dir: string }>("unpack_rpa", {
         rpaPath: unpackSourceRpa.trim(),
-        targetDir: unpackTargetDir.trim()
+        targetDir: unpackTargetDir.trim(),
+        gameDir: gameDir.trim() || null
       });
-      unpackResultMsg = `Успешно распаковано ${count} файлов в "${unpackTargetDir.trim()}"`;
+      unpackResultMsg = `Распаковано ${result.count} файлов в "${result.target_dir}"`;
       showToast(unpackResultMsg, "success");
     } catch (e) {
       unpackResultMsg = `Ошибка: ${e}`;
@@ -1126,7 +1129,8 @@
     try {
       const code = await invoke<string>("decompile_rpyc_file", {
         rpycPath: decompileRpycPath.trim(),
-        outputRpyPath: decompileOutputRpyPath.trim() || null
+        outputRpyPath: decompileOutputRpyPath.trim() || null,
+        gameDir: gameDir.trim() || null
       });
       decompiledCodePreview = code;
       const lines = code.split("\n").length;
@@ -1146,23 +1150,6 @@
       showToast("Код скопирован в буфер обмена!", "success");
     } catch {
       showToast("Не удалось скопировать код", "error");
-    }
-  }
-
-  // 7. Очистка кэша из модального окна
-  async function executeCleanCacheModal() {
-    if (!gameDir.trim()) return;
-    cleaningCache = true;
-    try {
-      const count = await invoke<number>("clean_rpyc_cache", {
-        gameDir: gameDir.trim(),
-        tlOnly: cleanTlOnly
-      });
-      showToast(`Удалено ${count} кэш-файлов .rpyc (${cleanTlOnly ? 'только tl/russian' : 'вся папка game'})`, "success");
-    } catch (e) {
-      showToast(`Ошибка очистки: ${e}`, "error");
-    } finally {
-      cleaningCache = false;
     }
   }
 
@@ -1493,11 +1480,11 @@
               disabled={cleaningCache || !gameDir}
               onclick={() => {
                 showToolsMenu = false;
-                quickCleanCache();
+                refreshScriptCache();
               }}
             >
               {#if cleaningCache}<Loader2 size={16} class="spin text-rose-400" />{:else}<Trash2 size={16} class="text-rose-400" />{/if}
-              <span><strong>Очистить .rpyc</strong><small>Удалить скомпилированные файлы</small></span>
+              <span><strong>Обновить кэш</strong><small>Перечитать архивы игры</small></span>
             </button>
             <button
               class="tools-menu-item"
@@ -2463,11 +2450,11 @@
                 </div>
 
                 <div class="tool-form-group">
-                  <span class="tool-field-label">Путь к итоговому файлу RPA (по умолчанию в game/)</span>
+                  <span class="tool-field-label">Путь к итоговому файлу RPA (по умолчанию в данных приложения; вне папки игры)</span>
                   <input 
                     type="text" 
                     bind:value={packModCustomPath} 
-                    placeholder={gameDir ? `${gameDir}\\russian_mod.rpa` : "Куда сохранить .rpa..."} 
+                    placeholder="Оставьте пустым для сохранения в кэш приложения"
                     class="tool-input"
                   />
                 </div>
@@ -2511,11 +2498,11 @@
                 </div>
 
                 <div class="tool-form-group">
-                  <span class="tool-field-label">Куда распаковать (целевая папка)</span>
+                  <span class="tool-field-label">Куда распаковать (по умолчанию в кэш приложения; вне папки игры)</span>
                   <input 
                     type="text" 
                     bind:value={unpackTargetDir} 
-                    placeholder="Например: C:\\Game\\game\\extracted" 
+                    placeholder="Оставьте пустым для кэша приложения"
                     class="tool-input"
                   />
                 </div>
@@ -2568,7 +2555,7 @@
                   </div>
 
                   <div class="tool-form-group flex-1">
-                    <span class="tool-field-label">Сохранить как .rpy (опционально)</span>
+                    <span class="tool-field-label">Сохранить как .rpy вне папки игры (опционально)</span>
                     <input 
                       type="text" 
                       bind:value={decompileOutputRpyPath} 
@@ -2608,41 +2595,30 @@
                 {/if}
               </div>
 
-              <!-- Карточка 2: Очистка кэша .rpyc -->
+              <!-- Карточка 2: Обновление кэша приложения -->
               <div class="tool-card full-width-card">
                 <div class="tool-card-head">
                   <div class="tool-head-title">
                     <Trash2 size={16} class="text-rose-400" />
-                    <h4>Очистка устаревшего кэша скомпилированных скриптов .rpyc</h4>
+                    <h4>Обновление временного кэша скриптов</h4>
                   </div>
                   <span class="tool-badge tool-badge-rose">Cache Flush</span>
                 </div>
                 <p class="tool-desc">
-                  Устраняет частую проблему Ren'Py, когда движок запускает старый скомпилированный байткод вместо свежепереведенных файлов .rpy.
+                  Удаляет только распакованные скрипты в данных Translator и заново считывает архивы. Папка игры остаётся без изменений.
                 </p>
-
-                <div class="cache-options-row">
-                  <label class="radio-label">
-                    <input type="radio" bind:group={cleanTlOnly} value={true} />
-                    <span>Только файлы перевода в <code>tl/russian</code> (Рекомендуется, безопасно)</span>
-                  </label>
-                  <label class="radio-label">
-                    <input type="radio" bind:group={cleanTlOnly} value={false} />
-                    <span>Все файлы .rpyc во всей папке <code>game/</code></span>
-                  </label>
-                </div>
 
                 <button 
                   class="btn-tool-action btn-clean-action" 
-                  onclick={executeCleanCacheModal} 
+                  onclick={refreshScriptCache}
                   disabled={cleaningCache || !gameDir}
                 >
                   {#if cleaningCache}
                     <Loader2 size={15} class="spin" />
-                    <span>Удаление кэша...</span>
+                    <span>Обновление кэша...</span>
                   {:else}
                     <Trash2 size={15} />
-                    <span>Очистить кэш .rpyc</span>
+                    <span>Обновить временный кэш</span>
                   {/if}
                 </button>
               </div>
@@ -3261,7 +3237,7 @@
             {#if glossaryDirty}
               <span class="text-amber-400">Есть несохраненные правки в глоссарии</span>
             {:else}
-              <span class="text-slate-400">Все изменения сохранены в кэш проекта и translator_glossary.json</span>
+              <span class="text-slate-400">Все изменения сохранены в данных приложения</span>
             {/if}
           </div>
           <div class="footer-actions">
@@ -4408,32 +4384,6 @@
     resize: vertical;
     outline: none;
     box-sizing: border-box;
-  }
-
-  .cache-options-row {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    background: #0a0d14;
-    padding: 10px 14px;
-    border-radius: 6px;
-    border: 1px solid #1a2232;
-  }
-
-  .radio-label {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    color: #cbd5e1;
-    cursor: pointer;
-  }
-
-  .radio-label code {
-    background: #131824;
-    padding: 1px 4px;
-    border-radius: 3px;
-    color: #f43f5e;
   }
 
   .progress-fill {

@@ -31,17 +31,9 @@ pub struct ProjectGlossary {
 }
 
 impl ProjectGlossary {
-    /// Загружает глоссарий для игры: сначала проверяет папку игры, затем кэш в AppData
+    /// Загружает глоссарий из данных приложения. Файл в игре читается только для
+    /// совместимости с версиями, которые сохраняли его туда.
     pub fn load_for_project(game_dir: &Path) -> Self {
-        let game_file = game_dir.join("translator_glossary.json");
-        if game_file.exists() {
-            if let Ok(content) = fs::read_to_string(&game_file) {
-                if let Ok(glossary) = serde_json::from_str::<ProjectGlossary>(&content) {
-                    return glossary;
-                }
-            }
-        }
-
         let cache_file = get_project_cache_dir(game_dir).join("glossary.json");
         if cache_file.exists() {
             if let Ok(content) = fs::read_to_string(&cache_file) {
@@ -51,17 +43,26 @@ impl ProjectGlossary {
             }
         }
 
+        let game_file = game_dir.join("translator_glossary.json");
+        if game_file.exists() {
+            if let Ok(content) = fs::read_to_string(&game_file) {
+                if let Ok(glossary) = serde_json::from_str::<ProjectGlossary>(&content) {
+                    return glossary;
+                }
+            }
+        }
+
         Self::default()
     }
 
-    /// Сохраняет глоссарий: пытается записать в папку игры и всегда сохраняет в изолированный кэш AppData
+    /// Сохраняет глоссарий только в данные приложения, не изменяя папку игры.
     pub fn save_for_project(&self, game_dir: &Path) -> Result<PathBuf, String> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Ошибка сериализации глоссария: {}", e))?;
 
-        // 1. Всегда гарантированно пишем в изолированный кэш
         let cache_dir = get_project_cache_dir(game_dir);
-        let _ = fs::create_dir_all(&cache_dir);
+        fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("Не удалось создать папку данных {:?}: {}", cache_dir, e))?;
         let cache_file = cache_dir.join("glossary.json");
         fs::write(&cache_file, &json).map_err(|e| {
             format!(
@@ -70,15 +71,7 @@ impl ProjectGlossary {
             )
         })?;
 
-        // 2. Если папка игры доступна для записи — сохраняем и туда (удобно для git и передачи коллегам)
-        let game_file = game_dir.join("translator_glossary.json");
-        let target = if fs::write(&game_file, &json).is_ok() {
-            game_file
-        } else {
-            cache_file
-        };
-
-        Ok(target)
+        Ok(cache_file)
     }
 
     /// Объединяет сохраненный глоссарий с новыми персонажами, найденными при сканировании
