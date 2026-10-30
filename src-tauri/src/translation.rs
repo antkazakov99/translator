@@ -1,12 +1,9 @@
-use crate::{find_game_root, get_project_cache_dir, stable_hash_str};
+use crate::{find_game_root, get_project_cache_dir, path_lock, stable_hash_str};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use uuid::Uuid;
-
-static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TranslationEdit {
@@ -90,7 +87,8 @@ pub fn save(source: &Path, changes: &[TranslationEdit]) -> Result<(), String> {
 }
 
 fn save_at(source: &Path, path: &Path, changes: &[TranslationEdit]) -> Result<(), String> {
-    let _guard = SAVE_LOCK.lock().map_err(|e| e.to_string())?;
+    let file_lock = path_lock(path);
+    let _guard = file_lock.lock();
     let mut store = read_store(source, path)?;
     for change in changes {
         if change.key.is_empty() {

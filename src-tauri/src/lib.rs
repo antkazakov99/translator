@@ -12,9 +12,11 @@ use crate::graph::ScenarioNode;
 use crate::parser::GameParser;
 use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto, ScriptStructure};
 use rayon::prelude::*;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 use std::time::{Instant, SystemTime};
 
 /// Стабильный FNV-1a хэш для воспроизводимых имён кэш-папок между
@@ -33,6 +35,14 @@ fn tl_lang_dir(game_dir: &Path) -> PathBuf {
     game_dir.join("tl").join("russian")
 }
 
+static PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Блокировка на путь: сериализует запись одного файла или папки, не мешая остальным.
+pub(crate) fn path_lock(path: &Path) -> Arc<Mutex<()>> {
+    PATH_LOCKS.lock().entry(path.to_path_buf()).or_default().clone()
+}
+
 #[derive(Clone)]
 struct ParsedFileCacheEntry {
     file_mtime: SystemTime,
@@ -40,31 +50,30 @@ struct ParsedFileCacheEntry {
     result: ParsedFileDto,
 }
 
-static PARSED_FILE_CACHE: LazyLock<Mutex<std::collections::HashMap<String, ParsedFileCacheEntry>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static PARSED_FILE_CACHE: LazyLock<Mutex<HashMap<String, ParsedFileCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static SCRIPT_STRUCTURE_CACHE: LazyLock<
-    Mutex<std::collections::HashMap<PathBuf, (SystemTime, ScriptStructure)>>,
-> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static SCRIPT_STRUCTURE_CACHE: LazyLock<Mutex<HashMap<PathBuf, (SystemTime, ScriptStructure)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-type ProjectScriptsCache = std::collections::HashMap<PathBuf, (Instant, Vec<PathBuf>)>;
+type SpeakerMap = HashMap<String, String>;
 
-static PROJECT_SCRIPTS_CACHE: LazyLock<Mutex<ProjectScriptsCache>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+/// Данные просканированных проектов. Поля обновляются под одной блокировкой,
+/// поэтому сканирование публикует список скриптов и персонажей одновременно.
+#[derive(Default)]
+struct ProjectCache {
+    scripts: HashMap<PathBuf, (Instant, Vec<PathBuf>)>,
+    speakers: HashMap<PathBuf, SpeakerMap>,
+    cached_script_projects: HashMap<PathBuf, PathBuf>,
+}
 
-type SpeakerMap = std::collections::HashMap<String, String>;
-type ProjectSpeakerCache = std::collections::HashMap<PathBuf, SpeakerMap>;
-
-static PROJECT_SPEAKERS_CACHE: LazyLock<Mutex<ProjectSpeakerCache>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
-
-static CACHED_SCRIPT_PROJECTS: LazyLock<Mutex<std::collections::HashMap<PathBuf, PathBuf>>> =
-    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+static PROJECT_CACHE: LazyLock<Mutex<ProjectCache>> =
+    LazyLock::new(|| Mutex::new(ProjectCache::default()));
 
 fn get_cached_script_structure(path: &Path) -> Option<ScriptStructure> {
     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
     {
-        let cache = SCRIPT_STRUCTURE_CACHE.lock().unwrap();
+        let cache = SCRIPT_STRUCTURE_CACHE.lock();
         if let Some((cached_mtime, cached_struct)) = cache.get(path)
             && *cached_mtime == mtime
         {
@@ -74,7 +83,7 @@ fn get_cached_script_structure(path: &Path) -> Option<ScriptStructure> {
     let content = std::fs::read_to_string(path).ok()?;
     let structure = RenpyParser::parse_script_structure(&content);
     {
-        let mut cache = SCRIPT_STRUCTURE_CACHE.lock().unwrap();
+        let mut cache = SCRIPT_STRUCTURE_CACHE.lock();
         cache.insert(path.to_path_buf(), (mtime, structure.clone()));
     }
     Some(structure)
@@ -82,8 +91,8 @@ fn get_cached_script_structure(path: &Path) -> Option<ScriptStructure> {
 
 fn get_project_scripts(search_dir: &Path, cache_dir: &Path) -> Vec<PathBuf> {
     {
-        let cache = PROJECT_SCRIPTS_CACHE.lock().unwrap();
-        if let Some((instant, files)) = cache.get(search_dir)
+        let cache = PROJECT_CACHE.lock();
+        if let Some((instant, files)) = cache.scripts.get(search_dir)
             && instant.elapsed() < std::time::Duration::from_secs(60)
         {
             return files.clone();
@@ -95,8 +104,8 @@ fn get_project_scripts(search_dir: &Path, cache_dir: &Path) -> Vec<PathBuf> {
         collect_rpy_files(cache_dir, &mut all_scripts);
     }
     {
-        let mut cache = PROJECT_SCRIPTS_CACHE.lock().unwrap();
-        cache.insert(
+        let mut cache = PROJECT_CACHE.lock();
+        cache.scripts.insert(
             search_dir.to_path_buf(),
             (Instant::now(), all_scripts.clone()),
         );
@@ -351,15 +360,15 @@ fn ensure_output_outside_game(output: &Path, game_dirs: &[PathBuf]) -> Result<()
 
 /// Находит базовую директорию игры (`game`), поднимаясь по дереву каталогов от файла перевода или скрипта.
 fn find_game_root(file_path: &Path) -> PathBuf {
-    if let Some(game_dir) =
-        CACHED_SCRIPT_PROJECTS
-            .lock()
-            .unwrap()
+    if let Some(game_dir) = {
+        let cache = PROJECT_CACHE.lock();
+        cache
+            .cached_script_projects
             .iter()
             .find_map(|(cache_dir, game_dir)| {
                 file_path.starts_with(cache_dir).then(|| game_dir.clone())
             })
-    {
+    } {
         return game_dir;
     }
 
@@ -417,18 +426,22 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let cache_dir = get_project_scripts_cache_dir(&base_path);
         if has_rpa_archives(&base_path) {
             rpa::RpaArchive::extract_scripts_from_game_archives(&base_path, &cache_dir)?;
-            CACHED_SCRIPT_PROJECTS
+            PROJECT_CACHE
                 .lock()
-                .unwrap()
+                .cached_script_projects
                 .insert(cache_dir.clone(), base_path.clone());
             collect_rpy_files(&cache_dir, &mut script_files);
-        } else if cache_dir.exists() {
-            std::fs::remove_dir_all(&cache_dir).map_err(|e| {
-                format!(
-                    "Не удалось удалить устаревший кэш скриптов {:?}: {}",
-                    cache_dir, e
-                )
-            })?;
+        } else {
+            let cache_lock = path_lock(&cache_dir);
+            let _guard = cache_lock.lock();
+            if cache_dir.exists() {
+                std::fs::remove_dir_all(&cache_dir).map_err(|e| {
+                    format!(
+                        "Не удалось удалить устаревший кэш скриптов {:?}: {}",
+                        cache_dir, e
+                    )
+                })?;
+            }
         }
 
         let mut characters_map: std::collections::HashMap<String, String> = script_files
@@ -460,17 +473,15 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let mut characters: Vec<(String, String)> = characters_map.into_iter().collect();
         characters.sort_by(|a, b| a.1.cmp(&b.1));
 
-        // Сохраняем персонажей и список скриптов в глобальный кэш проекта для мгновенного отклика при клике на файлы
+        // Сохраняем персонажей и список скриптов в глобальный кэш проекта атомарно под одной блокировкой
         {
-            let mut sp_cache = PROJECT_SPEAKERS_CACHE.lock().unwrap();
-            let mut map = std::collections::HashMap::new();
+            let mut cache = PROJECT_CACHE.lock();
+            let mut map = HashMap::new();
             for (alias, name) in &characters {
                 map.insert(alias.clone(), name.clone());
             }
-            sp_cache.insert(base_path.clone(), map);
-
-            let mut sc_cache = PROJECT_SCRIPTS_CACHE.lock().unwrap();
-            sc_cache.insert(base_path.clone(), (Instant::now(), script_files.clone()));
+            cache.speakers.insert(base_path.clone(), map);
+            cache.scripts.insert(base_path.clone(), (Instant::now(), script_files.clone()));
         }
 
         // 3. Ищем файлы переводов в game/tl/russian в параллельных потоках (сверхбыстрый подсчет строк)
@@ -575,7 +586,7 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
 
         // 1. Проверяем кэш готового распарсенного файла (мгновенный отклик при повторном клике)
         {
-            let cache = PARSED_FILE_CACHE.lock().unwrap();
+            let cache = PARSED_FILE_CACHE.lock();
             if let Some(entry) = cache.get(&file_path)
                 && entry.file_mtime == file_mtime
                 && entry.orig_mtime == orig_mtime
@@ -593,23 +604,28 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
 
         // 2. Персонажи / speakers: берем из кэша проекта, если есть
         let speakers_map = {
-            let cache = PROJECT_SPEAKERS_CACHE.lock().unwrap();
-            cache.get(&search_dir).cloned()
+            let cache = PROJECT_CACHE.lock();
+            cache.speakers.get(&search_dir).cloned()
         };
         let speakers_map = match speakers_map {
             Some(map) => map,
             None => {
-                let mut map = std::collections::HashMap::new();
+                let mut map = HashMap::new();
                 let mut check_files = Vec::new();
                 collect_rpy_files(&search_dir, &mut check_files);
-                for f in check_files.into_iter().take(40) {
+                collect_rpy_files(&cache_dir, &mut check_files);
+                for f in check_files.into_iter().take(MAX_SPEAKER_SCAN_FILES) {
                     if let Ok(c) = std::fs::read_to_string(&f) {
                         map.extend(RenpyParser::extract_speakers(&c));
                     }
                 }
-                let mut cache = PROJECT_SPEAKERS_CACHE.lock().unwrap();
-                cache.insert(search_dir.clone(), map.clone());
-                map
+                // Полная карта от параллельного сканирования важнее этой быстрой выборки
+                let mut cache = PROJECT_CACHE.lock();
+                cache
+                    .speakers
+                    .entry(search_dir.clone())
+                    .or_insert(map)
+                    .clone()
             }
         };
 
@@ -870,7 +886,7 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
 
         // Сохраняем в кэш распарсенных файлов для мгновенного отклика при навигации
         {
-            let mut cache = PARSED_FILE_CACHE.lock().unwrap();
+            let mut cache = PARSED_FILE_CACHE.lock();
             cache.insert(
                 file_path,
                 ParsedFileCacheEntry {
@@ -894,7 +910,7 @@ async fn save_file_translations(
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         translation::save(Path::new(&file_path), &changes)?;
-        PARSED_FILE_CACHE.lock().unwrap().remove(&file_path);
+        PARSED_FILE_CACHE.lock().remove(&file_path);
         Ok(())
     })
     .await
@@ -1125,20 +1141,26 @@ async fn clear_project_script_cache(game_dir: String) -> Result<(), String> {
             return Err(format!("Папка игры не найдена: {}", game_dir));
         }
         let cache_dir = get_project_scripts_cache_dir(&base_path);
-        if cache_dir.exists() {
-            std::fs::remove_dir_all(&cache_dir)
-                .map_err(|e| format!("Не удалось очистить кэш скриптов {:?}: {}", cache_dir, e))?;
+        {
+            let cache_lock = path_lock(&cache_dir);
+            let _guard = cache_lock.lock();
+            if cache_dir.exists() {
+                std::fs::remove_dir_all(&cache_dir).map_err(|e| {
+                    format!("Не удалось очистить кэш скриптов {:?}: {}", cache_dir, e)
+                })?;
+            }
         }
-        CACHED_SCRIPT_PROJECTS.lock().unwrap().remove(&cache_dir);
-        PROJECT_SCRIPTS_CACHE.lock().unwrap().remove(&base_path);
-        PROJECT_SPEAKERS_CACHE.lock().unwrap().remove(&base_path);
+        {
+            let mut cache = PROJECT_CACHE.lock();
+            cache.cached_script_projects.remove(&cache_dir);
+            cache.scripts.remove(&base_path);
+            cache.speakers.remove(&base_path);
+        }
         SCRIPT_STRUCTURE_CACHE
             .lock()
-            .unwrap()
             .retain(|path, _| !path.starts_with(&cache_dir));
         PARSED_FILE_CACHE
             .lock()
-            .unwrap()
             .retain(|path, _| !Path::new(path).starts_with(&cache_dir));
         Ok(())
     })
