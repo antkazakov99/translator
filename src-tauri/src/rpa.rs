@@ -188,32 +188,41 @@ impl RpaArchive {
                 None => continue,
             };
 
-            if let Some(first_seg) = segments.first() {
-                match first_seg {
-                    PickleValue::Tuple(items) if items.len() >= 2 => {
+            // Объединяем все сегменты: offset — из первого, length — сумма всех, prefix — из первого
+            let mut total_offset: Option<u64> = None;
+            let mut total_length: u64 = 0;
+            let mut prefix = Vec::new();
+
+            for seg in segments {
+                if let PickleValue::Tuple(items) = seg {
+                    if items.len() >= 2 {
                         let raw_offset = items[0].as_u64().unwrap_or(0);
                         let raw_len = items[1].as_u64().unwrap_or(0);
-                        let offset = raw_offset ^ key;
-                        let length = raw_len ^ key;
+                        let seg_offset = raw_offset ^ key;
+                        let seg_len = raw_len ^ key;
 
-                        let prefix = if items.len() >= 3 {
-                            items[2].as_bytes().unwrap_or_default().to_vec()
-                        } else {
-                            Vec::new()
-                        };
-
-                        entries.insert(
-                            filename.clone(),
-                            RpaEntry {
-                                name: filename,
-                                offset,
-                                length,
-                                prefix,
-                            },
-                        );
+                        if total_offset.is_none() {
+                            // Первый сегмент: запоминаем offset и prefix
+                            total_offset = Some(seg_offset);
+                            if items.len() >= 3 {
+                                prefix = items[2].as_bytes().unwrap_or_default().to_vec();
+                            }
+                        }
+                        total_length += seg_len;
                     }
-                    _ => {}
                 }
+            }
+
+            if let Some(offset) = total_offset {
+                entries.insert(
+                    filename.clone(),
+                    RpaEntry {
+                        name: filename,
+                        offset,
+                        length: total_length,
+                        prefix,
+                    },
+                );
             }
         }
 
@@ -506,19 +515,34 @@ impl RpaArchive {
             file.seek(SeekFrom::Start(entry.offset))
                 .map_err(|e| format!("Ошибка перемещения в RPA: {}", e))?;
 
+            // Создаём родительскую директорию заранее (нужна для tmp-файла рядом)
+            if let Some(parent) = out_file.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("Ошибка создания папки {:?}: {}", parent, e))?;
+            }
+
+            // Используем tmp-файл, чтобы при сбое не остался частичный кэш
+            let tmp_file = out_file.with_extension("tmp");
+
             if is_rpyc {
                 if entry.length > MAX_COMPILED_SCRIPT {
                     return Err(format!("RPYC файл {} слишком велик", entry.name));
                 }
-                let payload = read_limited(
+                let mut payload_buf = Vec::new();
+                if !entry.prefix.is_empty() {
+                    payload_buf.extend_from_slice(&entry.prefix);
+                }
+                let raw = read_limited(
                     (&mut file).take(entry.length),
                     MAX_COMPILED_SCRIPT as usize,
                     &entry.name,
                 )?;
-                if payload.len() as u64 != entry.length {
+                if raw.len() as u64 != entry.length {
                     return Err(format!("Неполные данные файла {} в архиве", entry.name));
                 }
-                let stmts = match crate::rpyc::RpycParser::parse_rpyc_bytes(&payload) {
+                payload_buf.extend_from_slice(&raw);
+
+                let stmts = match crate::rpyc::RpycParser::parse_rpyc_bytes(&payload_buf) {
                     Ok(stmts) => stmts,
                     Err(error) => {
                         tracing::warn!(file = %entry.name, %error, "RPYC не декомпилирован");
@@ -526,17 +550,28 @@ impl RpaArchive {
                     }
                 };
                 let rpy_code = crate::rpyc::RpycParser::decompile_to_rpy_text(&stmts);
-                fs::write(&out_file, rpy_code)
-                    .map_err(|e| format!("Не удалось записать {:?}: {}", out_file, e))?;
+                fs::write(&tmp_file, rpy_code)
+                    .map_err(|e| format!("Не удалось записать {:?}: {}", tmp_file, e))?;
             } else {
-                let mut out = File::create(&out_file)
-                    .map_err(|e| format!("Не удалось создать {:?}: {}", out_file, e))?;
+                let mut out = File::create(&tmp_file)
+                    .map_err(|e| format!("Не удалось создать {:?}: {}", tmp_file, e))?;
+                if !entry.prefix.is_empty() {
+                    out.write_all(&entry.prefix)
+                        .map_err(|e| format!("Ошибка записи префикса для {}: {}", entry.name, e))?;
+                }
                 let copied = std::io::copy(&mut (&mut file).take(entry.length), &mut out)
                     .map_err(|e| format!("Не удалось распаковать {}: {}", entry.name, e))?;
                 if copied != entry.length {
+                    let _ = fs::remove_file(&tmp_file);
                     return Err(format!("Неполные данные файла {} в архиве", entry.name));
                 }
             }
+
+            // Атомарное переименование: только после успешной записи
+            fs::rename(&tmp_file, &out_file).map_err(|e| {
+                let _ = fs::remove_file(&tmp_file);
+                format!("Не удалось переименовать {:?} -> {:?}: {}", tmp_file, out_file, e)
+            })?;
             processed += 1;
         }
 
