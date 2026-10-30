@@ -541,11 +541,9 @@ mod tests {
 
         // Тестируем декомпиляцию define_vars.rpyc с извлечением Define
         if let Some(entry) = archive.entries.get("___sys/_vars/define_vars.rpyc") {
-            let mut file = fs::File::open(path).unwrap();
-            use std::io::Seek;
-            file.seek(std::io::SeekFrom::Start(entry.offset)).unwrap();
-            let mut payload = vec![0u8; entry.length as usize];
-            file.read_exact(&mut payload).unwrap();
+            let mut file = fs::File::open(&path).unwrap();
+            let archive_size = file.metadata().unwrap().len();
+            let payload = entry.read_compiled(&mut file, archive_size).unwrap();
 
             let stmts = RpycParser::parse_rpyc_bytes(&payload).unwrap();
             let defines = stmts.iter().filter(|s| s.kind == "define").count();
@@ -564,11 +562,9 @@ mod tests {
 
         // Тестируем декомпиляцию init_Chars.rpyc с извлечением Python
         if let Some(entry) = archive.entries.get("___sys/_vars/init_Chars.rpyc") {
-            let mut file = fs::File::open(path).unwrap();
-            use std::io::Seek;
-            file.seek(std::io::SeekFrom::Start(entry.offset)).unwrap();
-            let mut payload = vec![0u8; entry.length as usize];
-            file.read_exact(&mut payload).unwrap();
+            let mut file = fs::File::open(&path).unwrap();
+            let archive_size = file.metadata().unwrap().len();
+            let payload = entry.read_compiled(&mut file, archive_size).unwrap();
 
             let stmts = RpycParser::parse_rpyc_bytes(&payload).unwrap();
             let py_stmts = stmts.iter().filter(|s| s.kind == "python").count();
