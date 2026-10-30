@@ -132,21 +132,40 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
+fn resolve_game_directory(path: String) -> Result<String, String> {
+    let selected_path = PathBuf::from(&path);
+    if !selected_path.is_dir() {
+        return Err(format!("Папка игры не найдена: {}", path));
+    }
+
+    Ok(effective_game_directory(&selected_path).to_string_lossy().to_string())
+}
+
+fn effective_game_directory(selected_path: &Path) -> PathBuf {
+    let nested_game_path = selected_path.join("game");
+    if nested_game_path.is_dir() {
+        nested_game_path
+    } else {
+        selected_path.to_path_buf()
+    }
+}
+
+#[tauri::command]
 async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let base_path = Path::new(&game_dir);
+        let base_path = effective_game_directory(Path::new(&game_dir));
         if !base_path.exists() {
             return Err(format!("Папка игры не найдена: {}", game_dir));
         }
 
         // 1. Ищем персонажей в оригинальных скриптах игры в параллельных потоках (Rayon)
         let mut script_files = Vec::new();
-        collect_rpy_files(base_path, &mut script_files);
+        collect_rpy_files(&base_path, &mut script_files);
 
         // 2. Если в папке игры есть архивы .rpa — распаковываем ТОЛЬКО скрипты в изолированный AppData кэш
-        let cache_dir = get_project_cache_dir(base_path);
-        if has_rpa_archives(base_path) {
-            let _ = rpa::RpaArchive::extract_scripts_from_game_archives(base_path, &cache_dir);
+        let cache_dir = get_project_cache_dir(&base_path);
+        if has_rpa_archives(&base_path) {
+            let _ = rpa::RpaArchive::extract_scripts_from_game_archives(&base_path, &cache_dir);
             collect_rpy_files(&cache_dir, &mut script_files);
         }
 
@@ -271,7 +290,7 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
                         return None; // Фильтруем скрипты без диалогов
                     }
                     let relative_name = path
-                        .strip_prefix(base_path)
+                        .strip_prefix(&base_path)
                         .map(|p| p.to_string_lossy().replace('\\', "/"))
                         .unwrap_or_else(|_| path.file_name().unwrap_or_default().to_string_lossy().to_string());
 
@@ -469,16 +488,16 @@ async fn find_scene_target(
     target_name: String,
 ) -> Result<Option<SceneTargetResult>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let base_path = Path::new(&game_dir);
+        let base_path = effective_game_directory(Path::new(&game_dir));
         if !base_path.exists() {
             return Err(format!("Путь к игре не существует: {}", game_dir));
         }
 
         let tl_dir = base_path.join(r"tl\russian");
-        let cache_dir = get_project_cache_dir(base_path);
+        let cache_dir = get_project_cache_dir(&base_path);
 
         let mut script_files = Vec::new();
-        collect_rpy_files(base_path, &mut script_files);
+        collect_rpy_files(&base_path, &mut script_files);
         if cache_dir.exists() {
             collect_rpy_files(&cache_dir, &mut script_files);
         }
@@ -510,7 +529,7 @@ async fn find_scene_target(
                         let rel_path = if orig_path.starts_with(&cache_dir) {
                             orig_path.strip_prefix(&cache_dir).unwrap_or(&orig_path)
                         } else {
-                            orig_path.strip_prefix(base_path).unwrap_or(&orig_path)
+                            orig_path.strip_prefix(&base_path).unwrap_or(&orig_path)
                         };
                         let tl_path = tl_dir.join(rel_path);
                         let resolved_tl_path = if tl_path.exists() {
@@ -588,7 +607,7 @@ async fn pack_mod_rpa(
     output_rpa_path: Option<String>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let base_path = Path::new(&game_dir);
+        let base_path = effective_game_directory(Path::new(&game_dir));
         let tl_dir = base_path.join(r"tl\russian");
         if !tl_dir.exists() {
             return Err("Папка перевода tl/russian не найдена в директории игры".to_string());
@@ -625,8 +644,8 @@ async fn unpack_rpa(rpa_path: String, target_dir: String) -> Result<usize, Strin
 #[tauri::command]
 async fn clean_rpyc_cache(game_dir: String, tl_only: bool) -> Result<usize, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let base_path = Path::new(&game_dir);
-        rpyc::RpycParser::clean_cache(base_path, tl_only)
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        rpyc::RpycParser::clean_cache(&base_path, tl_only)
     })
     .await
     .map_err(|e| format!("Ошибка очистки кэша .rpyc: {}", e))?
@@ -663,8 +682,8 @@ async fn get_project_glossary(
     scanned_characters: Option<Vec<(String, String)>>,
 ) -> Result<glossary::ProjectGlossary, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let base_path = Path::new(&game_dir);
-        let mut gl = glossary::ProjectGlossary::load_for_project(base_path);
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let mut gl = glossary::ProjectGlossary::load_for_project(&base_path);
         if let Some(ref chars) = scanned_characters {
             gl.merge_with_scanned_characters(chars);
         }
@@ -680,8 +699,8 @@ async fn save_project_glossary(
     glossary: glossary::ProjectGlossary,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let base_path = Path::new(&game_dir);
-        let saved_path = glossary.save_for_project(base_path)?;
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let saved_path = glossary.save_for_project(&base_path)?;
         Ok(format!("Глоссарий сохранен ({:?})", saved_path.file_name().unwrap_or_default()))
     })
     .await
@@ -691,9 +710,11 @@ async fn save_project_glossary(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             greet,
+            resolve_game_directory,
             scan_game_project,
             parse_file_entries,
             find_scene_target,

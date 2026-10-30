@@ -1,5 +1,8 @@
 <script lang="ts">
+  import { onMount, tick } from "svelte";
+  import SceneGraph from "../lib/SceneGraph.svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { 
     Folder,
     FolderOpen, 
@@ -20,8 +23,10 @@
     Zap,
     Layers,
     ArrowUpRight,
+    ChevronLeft,
     ChevronRight,
     ChevronDown,
+    Menu as MenuIcon,
     Network,
     Package,
     Archive,
@@ -30,6 +35,7 @@
     Download,
     Upload,
     X,
+    Pencil,
     Copy,
     BookOpen,
     Plus,
@@ -39,9 +45,156 @@
 
   // Стейт проекта на Svelte 5 (Runes)
   let gameDir = $state("F:\\Playnite\\Games\\0b588a07-1844-467f-8459-e5629642a1bf\\Installed\\game");
+  let recentProjects = $state<string[]>([]);
+  let projectNames = $state<Record<string, string>>({});
+  let editingProjectPath = $state<string | null>(null);
+  let editingProjectName = $state("");
+  let showRecentProjects = $state(false);
+  let showToolsMenu = $state(false);
+  let showProjectManager = $state(false);
+  let projectManagerSearch = $state("");
   let loadingProject = $state(false);
   let loadingFile = $state(false);
   let errorMsg = $state("");
+  let filteredRecentProjects = $derived.by(() => {
+    const query = projectManagerSearch.trim().toLocaleLowerCase();
+    if (!query) return recentProjects;
+    return recentProjects.filter(path =>
+      path.toLocaleLowerCase().includes(query) || projectDisplayName(path).toLocaleLowerCase().includes(query)
+    );
+  });
+
+  const RECENT_PROJECTS_KEY = "translator.recent-projects";
+  const PROJECT_NAMES_KEY = "translator.project-names";
+
+  onMount(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(RECENT_PROJECTS_KEY) || "[]");
+      if (Array.isArray(saved)) recentProjects = saved.filter((path): path is string => typeof path === "string");
+    } catch {
+      recentProjects = [];
+    }
+
+    try {
+      const savedNames = JSON.parse(localStorage.getItem(PROJECT_NAMES_KEY) || "{}");
+      if (savedNames && typeof savedNames === "object" && !Array.isArray(savedNames)) {
+        projectNames = Object.fromEntries(Object.entries(savedNames).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+      }
+    } catch {
+      projectNames = {};
+    }
+
+    if (recentProjects.length > 0) gameDir = recentProjects[0];
+  });
+
+  function rememberProject(path: string) {
+    const normalized = path.replace(/\\/g, "/").replace(/\/$/, "").toLowerCase();
+    recentProjects = [path, ...recentProjects.filter(item =>
+      item.replace(/\\/g, "/").replace(/\/$/, "").toLowerCase() !== normalized
+    )];
+    persistRecentProjects();
+  }
+
+  function persistRecentProjects() {
+    try {
+      localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(recentProjects));
+    } catch {
+      // Список останется доступен до закрытия приложения, даже если хранилище недоступно.
+    }
+  }
+
+  function projectKey(path: string) {
+    return path.replace(/\\/g, "/").replace(/\/$/, "").toLocaleLowerCase();
+  }
+
+  function projectDisplayName(path: string) {
+    const customName = projectNames[projectKey(path)]?.trim();
+    if (customName) return customName;
+    const parts = path.replace(/\\/g, "/").replace(/\/$/, "").split("/");
+    const lastPart = parts.at(-1) || path;
+    return lastPart.toLowerCase() === "game" ? parts.at(-2) || lastPart : lastPart;
+  }
+
+  function beginProjectRename(path: string) {
+    editingProjectPath = path;
+    editingProjectName = projectDisplayName(path);
+  }
+
+  function saveProjectName(path: string) {
+    const key = projectKey(path);
+    const name = editingProjectName.trim();
+    if (name) {
+      projectNames = { ...projectNames, [key]: name };
+    } else {
+      const { [key]: _removed, ...remainingNames } = projectNames;
+      projectNames = remainingNames;
+    }
+    try {
+      localStorage.setItem(PROJECT_NAMES_KEY, JSON.stringify(projectNames));
+    } catch {
+      // Новое имя сохранится в памяти до закрытия приложения.
+    }
+    editingProjectPath = null;
+  }
+
+  function cancelProjectRename() {
+    editingProjectPath = null;
+    editingProjectName = "";
+  }
+
+  function removeRecentProject(path: string) {
+    const normalized = projectKey(path);
+    recentProjects = recentProjects.filter(item => projectKey(item) !== normalized);
+    const { [normalized]: _removed, ...remainingNames } = projectNames;
+    projectNames = remainingNames;
+    try {
+      localStorage.setItem(PROJECT_NAMES_KEY, JSON.stringify(projectNames));
+    } catch {
+      // Удаление из списка всё равно действует в текущем запуске.
+    }
+    persistRecentProjects();
+  }
+
+  function openProjectManager() {
+    showRecentProjects = false;
+    projectManagerSearch = "";
+    showProjectManager = true;
+  }
+
+  async function pickProjectFolder() {
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Выберите папку игры или проекта",
+        defaultPath: gameDir.trim() || undefined
+      });
+      if (typeof selected === "string") {
+        gameDir = selected;
+        await scanProject();
+      }
+    } catch (e) {
+      errorMsg = `Не удалось открыть выбор папки: ${String(e)}`;
+    }
+  }
+
+  function chooseRecentProject(path: string) {
+    gameDir = path;
+    showRecentProjects = false;
+    scanProject();
+  }
+
+  function closeRecentProjects(event: PointerEvent) {
+    if (!(event.target instanceof Element) || !event.target.closest(".recent-project-picker")) {
+      showRecentProjects = false;
+    }
+    if (!(event.target instanceof Element) || !event.target.closest(".tools-menu-wrap")) {
+      showToolsMenu = false;
+    }
+    if (!(event.target instanceof Element) || !event.target.closest(".table-scene-picker-wrap")) {
+      showScenePicker = false;
+    }
+  }
 
   interface TranslationFile {
     name: string;
@@ -299,6 +452,92 @@
   let graphSubMode = $state<"flow" | "grid">("flow");
   let focusedSceneName = $state<string | null>(null);
 
+  // Состояние навигации по сценам (сайдбар и тулбар)
+  let showGraphSidebar = $state(true);
+  let showScenePicker = $state(false);
+  let scenePickerSearch = $state("");
+  let graphSceneSearch = $state("");
+
+  // Текущая выбранная сцена для селектора
+  let currentSceneIndex = $derived.by(() => {
+    if (!currentFile || selectedSceneId === "all") return -1;
+    return currentFile.scenes.findIndex(s => s.id === selectedSceneId);
+  });
+
+  let currentScene = $derived.by(() => {
+    if (!currentFile || selectedSceneId === "all") return null;
+    return currentFile.scenes.find(s => s.id === selectedSceneId) ?? null;
+  });
+
+  let isPrevSceneDisabled = $derived.by(() => {
+    if (!currentFile || currentFile.scenes.length === 0) return true;
+    if (selectedSceneId === "all") return true;
+    return currentSceneIndex <= 0;
+  });
+
+  let isNextSceneDisabled = $derived.by(() => {
+    if (!currentFile || currentFile.scenes.length === 0) return true;
+    if (selectedSceneId === "all") return currentFile.scenes.length === 0;
+    return currentSceneIndex >= currentFile.scenes.length - 1;
+  });
+
+  function goToPrevScene() {
+    if (!currentFile || currentFile.scenes.length === 0) return;
+    if (selectedSceneId === "all") return;
+    const idx = currentSceneIndex;
+    if (idx > 0) {
+      selectedSceneId = currentFile.scenes[idx - 1].id;
+    } else if (idx === 0) {
+      selectedSceneId = "all";
+    }
+  }
+
+  function goToNextScene() {
+    if (!currentFile || currentFile.scenes.length === 0) return;
+    if (selectedSceneId === "all") {
+      selectedSceneId = currentFile.scenes[0].id;
+      return;
+    }
+    const idx = currentSceneIndex;
+    if (idx >= 0 && idx < currentFile.scenes.length - 1) {
+      selectedSceneId = currentFile.scenes[idx + 1].id;
+    }
+  }
+
+  function selectScene(sceneId: string) {
+    selectedSceneId = sceneId;
+    showScenePicker = false;
+  }
+
+  // Фильтрация сцен для селектора в таблице
+  let filteredScenesForPicker = $derived.by(() => {
+    if (!currentFile) return [];
+    const q = scenePickerSearch.trim().toLowerCase();
+    if (!q) return currentFile.scenes;
+    return currentFile.scenes.filter(s => s.name.toLowerCase().includes(q));
+  });
+
+  // Фильтрация сцен для аутлайнера графа в сайдбаре
+  let filteredScenesForGraph = $derived.by(() => {
+    if (!currentFile) return [];
+    const q = graphSceneSearch.trim().toLowerCase();
+    if (!q) return currentFile.scenes;
+    return currentFile.scenes.filter(s => s.name.toLowerCase().includes(q));
+  });
+
+  // Фокус и плавный скролл к узлу в графе (для обоих режимов: flow и grid)
+  function focusAndScrollSceneInGraph(scene: Scene) {
+    selectedSceneId = scene.id;
+    focusedSceneName = scene.name;
+    const targetId = graphSubMode === "flow" 
+      ? `scene-node-${scene.id}` 
+      : `scene-grid-card-${scene.id}`;
+    const el = document.getElementById(targetId);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }
+
   // Статистика графа
   let totalChoicesCount = $derived(
     currentFile ? currentFile.scenes.reduce((acc, s) => acc + (s.choices ? s.choices.length : 0), 0) : 0
@@ -458,20 +697,20 @@
   // Проверяет, ведет ли переход на сцену в текущем файле
   function isInternalScene(targetName: string): boolean {
     if (!currentFile) return false;
-    return currentFile.scenes.some(s => s.name === targetName || s.name.startsWith(targetName));
+    return currentFile.scenes.some(s => s.name === targetName);
   }
 
   // Сфокусироваться на сцене или перейти в неё
   function focusScene(sceneName: string) {
     if (!currentFile) return;
     let targetScene = currentFile.scenes.find(s => s.name === sceneName);
-    if (!targetScene) {
-      targetScene = currentFile.scenes.find(s => s.name.startsWith(sceneName) || sceneName.startsWith(s.name));
-    }
     if (targetScene) {
       selectedSceneId = targetScene.id;
       focusedSceneName = targetScene.name;
-      const el = document.getElementById(`scene-node-${targetScene.id}`);
+      const targetId = graphSubMode === 'flow' 
+        ? `scene-node-${targetScene.id}` 
+        : `scene-grid-card-${targetScene.id}`;
+      const el = document.getElementById(targetId);
       if (el) {
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
@@ -492,7 +731,7 @@
 
   // Интерактивный переход к сцене: внутри текущего файла или между файлами проекта
   async function navigateOrFocusScene(targetName: string) {
-    if (!targetName) return;
+    if (!targetName || graphNavigating) return;
 
     // 1. Если сцена есть в текущем файле — моментальный фокус
     if (isInternalScene(targetName)) {
@@ -501,6 +740,8 @@
       return;
     }
 
+    graphNavigating = true;
+    const origin = selectedFile ? { file: selectedFile, sceneId: selectedSceneId } : null;
     // 2. Иначе ищем в проекте через Rust бэкенд
     showToast(`Поиск перехода к "${targetName}" по файлам проекта...`, "info");
     try {
@@ -517,24 +758,17 @@
       });
 
       if (!found) {
-        showToast(`Метка "${targetName}" — внешняя локация / системный вызов Ren'Py`, "warning");
+        showToast(`Метка "${targetName}" не найдена в доступных файлах проекта`, "warning");
         return;
       }
 
       // Нормализуем пути для надежного сравнения (слэши, подпапки, имя файла)
       const norm = (s: string) => s.replace(/\\/g, '/').toLowerCase();
       const targetPath = norm(found.file_path);
-      const targetNameNormalized = norm(found.file_name);
-      const targetShort = norm(found.short_name);
 
       let targetFile = project?.files.find(f => {
         const fp = norm(f.path);
-        const fn = norm(f.name);
-        return fp === targetPath ||
-               fn === targetNameNormalized ||
-               fn === targetShort ||
-               fn.endsWith('/' + targetShort) ||
-               fp.endsWith('/' + targetShort);
+        return fp === targetPath;
       });
 
       // Если файл есть на диске, но не был в списке tl/, добавляем его динамически
@@ -550,18 +784,37 @@
       }
 
       if (targetFile) {
-        showToast(`Переход в ${found.short_name} ➔ сцена "${targetName}" (строка ${found.line_number})`, "success");
-        await selectFile(targetFile);
-        // Небольшая задержка на отрисовку DOM после парсинга файла
-        setTimeout(() => {
-          focusScene(targetName);
-        }, 150);
+        if (!await selectFile(targetFile)) return;
+        if (origin) graphHistory = [...graphHistory, origin];
+        await tick();
+        focusScene(found.scene_name);
+        showToast(isInternalScene(found.scene_name)
+          ? 'Открыт граф ' + found.short_name + ' → ' + found.scene_name
+          : 'Файл открыт, но метка отсутствует среди разобранных сцен: ' + targetName,
+          isInternalScene(found.scene_name) ? 'success' : 'warning');
       } else {
         showToast(`Сцена найдена в ${found.short_name}:${found.line_number}, но файл не найден`, "warning");
       }
     } catch (e) {
       showToast(`Ошибка поиска: ${e}`, "error");
+    } finally {
+      graphNavigating = false;
     }
+  }
+
+  let graphNavigating = $state(false);
+  let graphHistory = $state<{ file: TranslationFile; sceneId: string }[]>([]);
+
+  async function backToGraph() {
+    const previous = graphHistory.at(-1);
+    if (!previous || graphNavigating) return;
+    graphNavigating = true;
+    try {
+      if (await selectFile(previous.file)) {
+        graphHistory = graphHistory.slice(0, -1);
+        selectedSceneId = previous.sceneId;
+      }
+    } finally { graphNavigating = false; }
   }
 
   // Открыть сцену в режиме таблицы диалогов
@@ -612,7 +865,11 @@
     loadingProject = true;
     errorMsg = "";
     try {
-      project = await invoke<ProjectSummary>("scan_game_project", { gameDir });
+      const selectedPath = gameDir.trim();
+      const scanPath = await invoke<string>("resolve_game_directory", { path: selectedPath });
+      project = await invoke<ProjectSummary>("scan_game_project", { gameDir: scanPath });
+      graphHistory = [];
+      rememberProject(selectedPath);
       loadingProject = false;
       loadGlossary(true);
       if (project.files.length > 0) {
@@ -635,6 +892,7 @@
     errorMsg = "";
     try {
       currentFile = await invoke<ParsedFile>("parse_file_entries", { filePath: file.path });
+      focusedSceneName = null;
       // По умолчанию выбираем первую реальную сюжетную сцену (или все, если сцена одна)
       if (currentFile.scenes.length > 1) {
         const firstStory = currentFile.scenes.find(s => s.name !== "Интерфейс и меню (strings)");
@@ -648,8 +906,10 @@
       if (currentFile.scenes.length > 0 && currentFile.scenes[0].entries.length > 0) {
         selectedEntry = currentFile.scenes[0].entries[0];
       }
+      return true;
     } catch (e) {
       errorMsg = String(e);
+      return false;
     } finally {
       loadingFile = false;
     }
@@ -876,6 +1136,10 @@
   }
 
   async function openGlossary(filterAlias?: string) {
+    if (!gameDir.trim()) {
+      showToast("Сначала выберите или откройте проект для работы с глоссарием", "warning");
+      return;
+    }
     if (filterAlias) {
       glossarySearch = filterAlias;
     }
@@ -982,111 +1246,190 @@
 
 <!-- Горячая клавиша Ctrl+S для быстрого сохранения глоссария -->
 <svelte:window onkeydown={(e) => {
+  if (e.key === "Escape") {
+    showProjectManager = false;
+    showRecentProjects = false;
+    showToolsMenu = false;
+  }
   if ((e.ctrlKey || e.metaKey) && e.key === 's' && showGlossaryModal) {
     e.preventDefault();
     saveGlossary();
   }
-}} />
+}} onpointerdown={closeRecentProjects} />
 
 <div class="app-shell">
   <!-- ВЕРХНИЙ ТУЛБАР -->
   <header class="topbar">
-    <div class="brand">
-      <Languages class="icon-brand" size={24} />
-      <span class="brand-title">Translator</span>
-      <span class="badge-tag">Graph / Scene Edition</span>
+    <div class="topbar-left">
+      <div class="brand">
+        <Languages class="icon-brand" size={24} />
+        <span class="brand-title">Translator</span>
+        <span class="badge-tag">Graph / Scene Edition</span>
+      </div>
+
+      <!-- Выбор текущего и ранее открытых проектов -->
+      <div class="dir-bar">
+        <FolderOpen size={16} class="text-zinc-400" />
+        <div class="recent-project-picker">
+          <button
+            class="current-project-label"
+            class:menu-open={showRecentProjects}
+            aria-label="Выбрать проект"
+            aria-expanded={showRecentProjects}
+            onclick={() => showRecentProjects = !showRecentProjects}
+          >
+            <span>{gameDir.trim() ? projectDisplayName(gameDir) : "Проект не выбран"}</span>
+            <ChevronDown size={14} />
+          </button>
+          {#if showRecentProjects}
+            <div class="recent-project-menu">
+              <div class="recent-project-menu-title">ПРОЕКТЫ</div>
+              {#if recentProjects.length > 0}
+                {#each recentProjects as path (path)}
+                  <button
+                    class="recent-project-option"
+                    class:recent-project-current={gameDir === path}
+                    title={path}
+                    onclick={() => chooseRecentProject(path)}
+                  >
+                    <FolderOpen size={15} />
+                    <span class="recent-project-option-text">
+                      <span class="recent-project-name">{projectDisplayName(path)}</span>
+                      <span class="recent-project-path">{path}</span>
+                    </span>
+                  </button>
+                {/each}
+              {:else}
+                <div class="recent-project-empty">Недавно открытые проекты появятся здесь</div>
+              {/if}
+              <div class="recent-project-menu-footer">
+                <button onclick={openProjectManager}>
+                  <Folder size={14} />
+                  <span>Менеджер проектов</span>
+                  <span class="recent-project-menu-count">{recentProjects.length}</span>
+                </button>
+              </div>
+            </div>
+          {/if}
+        </div>
+        <button onclick={pickProjectFolder} disabled={loadingProject} class="btn-browse" title="Выбрать папку проекта">
+          <FolderOpen size={15} />
+          <span>Обзор</span>
+        </button>
+        <button onclick={scanProject} disabled={loadingProject} class="btn-primary" title="Сканировать проект">
+          {#if loadingProject}
+            <Loader2 size={16} class="spin" />
+          {:else}
+            <Play size={15} />
+          {/if}
+          <span>Сканировать</span>
+        </button>
+      </div>
     </div>
 
-    <!-- Поле ввода папки игры -->
-    <div class="dir-bar">
-      <FolderOpen size={16} class="text-zinc-400" />
-      <input 
-        type="text" 
-        bind:value={gameDir} 
-        placeholder="Путь к папке игры (game)..." 
-        class="input-dir" 
-      />
-      <button onclick={scanProject} disabled={loadingProject} class="btn-primary">
+    <div class="topbar-right">
+      <!-- Проектные элементы: шкала перевода и глоссарий -->
+      <div class="project-actions">
+        <!-- Глобальная статистика перевода (шкала) -->
         {#if loadingProject}
-          <Loader2 size={16} class="spin" />
-        {:else}
-          <Play size={15} />
+          <div class="global-stats skeleton-stats-box" title="Сканирование проекта...">
+            <div class="skeleton-shimmer skeleton-pill-head"></div>
+            <div class="progress-track skeleton-shimmer"></div>
+          </div>
+        {:else if project}
+          <div class="global-stats" title="Прогресс перевода: {project.total_translated} / {project.total_lines} ({totalPercent}%)">
+            <div class="stat-text">
+              <span class="stat-num">{project.total_translated} / {project.total_lines}</span>
+              <span class="stat-pct">({totalPercent}%)</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" style="width: {totalPercent}%"></div>
+            </div>
+          </div>
         {/if}
-        <span>Сканировать</span>
-      </button>
-    </div>
 
-    <!-- Быстрые действия с RPA и RPYC -->
-    <div class="topbar-actions">
-      <button 
-        onclick={quickPackMod} 
-        disabled={packingMod || !gameDir} 
-        class="btn-top-tool btn-pack" 
-        title="Собрать tl/russian в автономный russian_mod.rpa (RPA-3.0)"
-      >
-        {#if packingMod}
-          <Loader2 size={13} class="spin text-amber-400" />
-          <span>Сборка...</span>
-        {:else}
-          <Package size={14} class="text-amber-400" />
-          <span>Собрать RPA</span>
-        {/if}
-      </button>
-
-      <button 
-        onclick={quickCleanCache} 
-        disabled={cleaningCache || !gameDir} 
-        class="btn-top-tool btn-clean" 
-        title="Удалить скомпилированные .rpyc файлы из tl/russian"
-      >
-        {#if cleaningCache}
-          <Loader2 size={13} class="spin text-rose-400" />
-          <span>Очистка...</span>
-        {:else}
-          <Trash2 size={14} class="text-rose-400" />
-          <span>Очистить .rpyc</span>
-        {/if}
-      </button>
-
-      <button 
-        onclick={() => showToolsModal = true} 
-        class="btn-top-tool btn-studio" 
-        title="Студия: упаковка/распаковка RPA и декомпилятор RPYC"
-      >
-        <Archive size={14} class="text-sky-400" />
-        <span>RPA / RPYC Студия</span>
-      </button>
-
-      <button 
-        onclick={openGlossary} 
-        class="btn-top-tool btn-glossary" 
-        title="Глоссарий проекта: имена персонажей, пол (М/Ж) и словарь терминов"
-      >
-        <BookOpen size={14} class="text-emerald-400" />
-        <span>Глоссарий</span>
-        {#if glossary.characters.length > 0 || glossary.terms.length > 0}
-          <span class="topbar-badge">{glossary.characters.length + glossary.terms.length}</span>
-        {/if}
-      </button>
-    </div>
-
-    <!-- Глобальная статистика перевода -->
-    {#if loadingProject}
-      <div class="global-stats skeleton-stats-box">
-        <div class="skeleton-shimmer skeleton-pill-head"></div>
-        <div class="progress-track skeleton-shimmer"></div>
+        <!-- Кнопка глоссария -->
+        <button
+          class="glossary-header-button"
+          class:disabled={!gameDir.trim()}
+          title={gameDir.trim() ? "Глоссарий проекта: персонажи, термины и пол (М/Ж)" : "Сначала выберите проект для работы с глоссарием"}
+          onclick={() => openGlossary()}
+        >
+          <BookOpen size={15} />
+          <span class="glossary-header-label">Глоссарий</span>
+          {#if glossary.characters.length > 0 || glossary.terms.length > 0}
+            <span class="topbar-badge">{glossary.characters.length + glossary.terms.length}</span>
+          {/if}
+        </button>
       </div>
-    {:else if project}
-      <div class="global-stats">
-        <div class="stat-text">
-          <span class="stat-num">{project.total_translated} / {project.total_lines}</span>
-          <span class="stat-pct">({totalPercent}%)</span>
-        </div>
-        <div class="progress-track">
-          <div class="progress-fill" style="width: {totalPercent}%"></div>
-        </div>
+
+      <div class="topbar-divider"></div>
+
+      <!-- Бургер-меню для редко используемых инструментов проекта и управления -->
+      <div class="tools-menu-wrap">
+        <button
+          class="tools-menu-trigger"
+          class:menu-open={showToolsMenu}
+          aria-label="Инструменты проекта и утилиты"
+          aria-expanded={showToolsMenu}
+          title="Инструменты проекта"
+          onclick={() => showToolsMenu = !showToolsMenu}
+        >
+          <MenuIcon size={18} />
+        </button>
+        {#if showToolsMenu}
+          <div class="tools-menu">
+            <div class="tools-menu-heading">ИНСТРУМЕНТЫ ПРОЕКТА</div>
+            <button
+              class="tools-menu-item"
+              disabled={packingMod || !gameDir}
+              onclick={() => {
+                showToolsMenu = false;
+                quickPackMod();
+              }}
+            >
+              {#if packingMod}<Loader2 size={16} class="spin text-amber-400" />{:else}<Package size={16} class="text-amber-400" />{/if}
+              <span><strong>Собрать RPA</strong><small>Упаковать перевод в архив</small></span>
+            </button>
+            <button
+              class="tools-menu-item"
+              disabled={cleaningCache || !gameDir}
+              onclick={() => {
+                showToolsMenu = false;
+                quickCleanCache();
+              }}
+            >
+              {#if cleaningCache}<Loader2 size={16} class="spin text-rose-400" />{:else}<Trash2 size={16} class="text-rose-400" />{/if}
+              <span><strong>Очистить .rpyc</strong><small>Удалить скомпилированные файлы</small></span>
+            </button>
+            <button
+              class="tools-menu-item"
+              onclick={() => {
+                showToolsMenu = false;
+                showToolsModal = true;
+              }}
+            >
+              <Archive size={16} class="text-sky-400" />
+              <span><strong>Студия RPA / RPYC</strong><small>Архивы и декомпиляция</small></span>
+            </button>
+
+            <div class="tools-menu-divider"></div>
+            <div class="tools-menu-heading">УПРАВЛЕНИЕ</div>
+
+            <button
+              class="tools-menu-item"
+              onclick={() => {
+                showToolsMenu = false;
+                openProjectManager();
+              }}
+            >
+              <Folder size={16} class="text-emerald-400" />
+              <span><strong>Менеджер проектов</strong><small>Список, переименование ({recentProjects.length})</small></span>
+            </button>
+          </div>
+        {/if}
       </div>
-    {/if}
+    </div>
   </header>
 
   {#if errorMsg}
@@ -1267,7 +1610,7 @@
             </button>
             <button 
               class="btn-sidebar-glossary" 
-              onclick={openGlossary} 
+              onclick={() => openGlossary()} 
               title="Открыть глоссарий персонажей и терминов"
             >
               <BookOpen size={11} class="text-emerald-400" />
@@ -1346,6 +1689,104 @@
             </button>
           </div>
 
+          <!-- Компактный навигатор по сценам (для режима таблицы) -->
+          {#if viewMode === 'table'}
+            <div class="table-scene-nav">
+              <button 
+                class="btn-scene-step" 
+                onclick={goToPrevScene} 
+                disabled={isPrevSceneDisabled}
+                title="Предыдущая сцена"
+                aria-label="Предыдущая сцена"
+              >
+                <ChevronLeft size={14} />
+              </button>
+
+              <div class="table-scene-picker-wrap">
+                <button 
+                  class="btn-scene-picker" 
+                  class:menu-open={showScenePicker}
+                  onclick={() => showScenePicker = !showScenePicker}
+                  title="Выбрать сцену"
+                >
+                  <Clapperboard size={13} class="text-sky-400" />
+                  <span class="scene-picker-label">
+                    {#if selectedSceneId === 'all'}
+                      Все сцены ({currentFile.scenes.length})
+                    {:else if currentScene}
+                      {currentScene.name}
+                    {:else}
+                      Все сцены
+                    {/if}
+                  </span>
+                  {#if currentScene}
+                    {@const pct = currentScene.total_lines > 0 ? Math.round((currentScene.translated_lines / currentScene.total_lines) * 100) : 0}
+                    <span class="scene-picker-badge" class:badge-complete={pct === 100}>
+                      {currentScene.translated_lines}/{currentScene.total_lines} ({pct}%)
+                    </span>
+                  {/if}
+                  <ChevronDown size={13} class="picker-caret" />
+                </button>
+
+                {#if showScenePicker}
+                  <div class="scene-picker-dropdown">
+                    <div class="scene-picker-search">
+                      <Search size={12} class="text-slate-400" />
+                      <input 
+                        type="text" 
+                        bind:value={scenePickerSearch} 
+                        placeholder="Поиск сцены..." 
+                        class="scene-search-input"
+                      />
+                      {#if scenePickerSearch}
+                        <button class="clear-search-btn" onclick={() => scenePickerSearch = ""}>✕</button>
+                      {/if}
+                    </div>
+
+                    <div class="scene-picker-list">
+                      <button 
+                        class="scene-picker-item" 
+                        class:selected={selectedSceneId === 'all'}
+                        onclick={() => selectScene('all')}
+                      >
+                        <Clapperboard size={13} class="text-slate-400" />
+                        <span class="scene-item-title">Все сцены ({currentFile.scenes.length})</span>
+                      </button>
+
+                      {#each filteredScenesForPicker as scene, idx}
+                        {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
+                        <button 
+                          class="scene-picker-item" 
+                          class:selected={selectedSceneId === scene.id}
+                          onclick={() => selectScene(scene.id)}
+                        >
+                          <span class="scene-item-seq">#{idx + 1}</span>
+                          <span class="scene-item-title">{scene.name}</span>
+                          <span class="scene-item-badge" class:badge-complete={pct === 100}>
+                            {scene.translated_lines}/{scene.total_lines} ({pct}%)
+                          </span>
+                        </button>
+                      {/each}
+                      {#if filteredScenesForPicker.length === 0}
+                        <div class="scene-picker-empty">Сцена не найдена</div>
+                      {/if}
+                    </div>
+                  </div>
+                {/if}
+              </div>
+
+              <button 
+                class="btn-scene-step" 
+                onclick={goToNextScene} 
+                disabled={isNextSceneDisabled}
+                title="Следующая сцена"
+                aria-label="Следующая сцена"
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
+          {/if}
+
           <!-- Поиск -->
           <div class="search-box">
             <Search size={14} />
@@ -1373,40 +1814,6 @@
           </div>
         </div>
 
-        <!-- ЛЕНТА ПЕРЕКЛЮЧЕНИЯ СЦЕН (Сверху над таблицей) -->
-        <div 
-          class="scenes-nav-bar"
-          onwheel={(e) => {
-            if (e.deltaY !== 0) {
-              e.currentTarget.scrollLeft += e.deltaY;
-              e.preventDefault();
-            }
-          }}
-        >
-          <button 
-            class="scene-nav-chip" 
-            class:active={selectedSceneId === 'all'}
-            onclick={() => selectedSceneId = 'all'}
-          >
-            <span>Все сцены ({currentFile.scenes.length})</span>
-          </button>
-
-          {#each currentFile.scenes as scene}
-            {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
-            <button 
-              class="scene-nav-chip" 
-              class:active={selectedSceneId === scene.id}
-              onclick={() => selectedSceneId = scene.id}
-            >
-              <Clapperboard size={12} class="scene-chip-icon" />
-              <span class="scene-chip-title">{scene.name}</span>
-              <span class="scene-chip-badge" class:badge-complete={pct === 100}>
-                {scene.translated_lines}/{scene.total_lines} ({pct}%)
-              </span>
-            </button>
-          {/each}
-        </div>
-
         <!-- ОСНОВНОЙ ВИД -->
         {#if viewMode === 'scenes'}
           <!-- СЮЖЕТНЫЙ ГРАФ И СХЕМА ВЕТВЛЕНИЙ -->
@@ -1421,220 +1828,137 @@
                 <span class="graph-pill pill-amber">{totalEdgesCount} переходов (jump/branch)</span>
               </div>
 
-              <div class="graph-submode-toggles">
+              <div class="graph-topbar-controls">
+                {#if graphHistory.length > 0}
+                  <button class="graph-mode-btn" disabled={graphNavigating} onclick={backToGraph}>← Назад к графу</button>
+                {/if}
                 <button 
-                  class="graph-mode-btn" 
-                  class:active={graphSubMode === 'flow'}
-                  onclick={() => graphSubMode = 'flow'}
-                  title="Потоковая диаграмма с ветвлениями"
+                  class="graph-sidebar-toggle-btn" 
+                  class:active={showGraphSidebar}
+                  onclick={() => showGraphSidebar = !showGraphSidebar}
+                  title={showGraphSidebar ? "Скрыть панель списка сцен" : "Показать панель списка сцен"}
                 >
-                  <GitBranch size={14} />
-                  <span>Поток сюжета</span>
+                  <Clapperboard size={13} />
+                  <span>Список сцен</span>
+                  {#if showGraphSidebar}
+                    <span class="btn-state-pill">Вкл</span>
+                  {/if}
                 </button>
-                <button 
-                  class="graph-mode-btn" 
-                  class:active={graphSubMode === 'grid'}
-                  onclick={() => graphSubMode = 'grid'}
-                  title="Компактная матрица сцен"
-                >
-                  <Layers size={14} />
-                  <span>Матрица</span>
-                </button>
+
+                <div class="graph-submode-toggles">
+                  <button 
+                    class="graph-mode-btn" 
+                    class:active={graphSubMode === 'flow'}
+                    onclick={() => graphSubMode = 'flow'}
+                    title="Потоковая диаграмма с ветвлениями"
+                  >
+                    <GitBranch size={14} />
+                    <span>Поток сюжета</span>
+                  </button>
+                  <button 
+                    class="graph-mode-btn" 
+                    class:active={graphSubMode === 'grid'}
+                    onclick={() => graphSubMode = 'grid'}
+                    title="Компактная матрица сцен"
+                  >
+                    <Layers size={14} />
+                    <span>Матрица</span>
+                  </button>
+                </div>
               </div>
             </div>
 
-            {#if graphSubMode === 'flow'}
-              <!-- РЕЖИМ 1: ИНТЕРАКТИВНЫЙ ПОТОК СЮЖЕТА (DAG FLOW WITH BRANCHES) -->
-              <div class="story-flow-canvas">
-                <div class="story-nodes-track">
-                  {#each currentFile.scenes as scene, index}
-                    {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
-                    {@const incoming = getIncomingEdges(scene.name)}
-                    {@const outgoing = getOutgoingEdges(scene.name)}
-                    {@const isFocused = focusedSceneName === scene.name}
-
-                    <div 
-                      id={`scene-node-${scene.id}`}
-                      class="flow-scene-node"
-                      class:node-focused={isFocused}
-                      class:node-selected={selectedSceneId === scene.id}
-                    >
-                      <!-- ЗАГОЛОВОК СЦЕНЫ -->
-                      <div class="node-header">
-                        <div class="node-title-group">
-                          <span class="node-seq">#{index + 1}</span>
-                          <Clapperboard size={16} class="node-icon text-sky-400" />
-                          <h4 class="node-name">{scene.name}</h4>
-                          {#if scene.name === "Интерфейс и меню (strings)"}
-                            <span class="node-tag tag-ui">Интерфейс</span>
-                          {:else if scene.choices && scene.choices.length > 0}
-                            <span class="node-tag tag-choice">Развилка</span>
-                          {/if}
-                        </div>
-
-                        <div class="node-progress-badge" class:badge-complete={pct === 100}>
-                          <span>{scene.translated_lines}/{scene.total_lines} строк</span>
-                          <strong>{pct}%</strong>
-                        </div>
-                      </div>
-
-                      <div class="node-progress-line">
-                        <div class="node-fill" style="width: {pct}%"></div>
-                      </div>
-
-                      <!-- ВХОДЯЩИЕ ПЕРЕХОДЫ (ОТКУДА СЮДА ПРИШЛИ) -->
-                      {#if incoming.length > 0}
-                        <div class="node-incoming-box">
-                          <span class="box-label">⬅ Вход из сцен:</span>
-                          <div class="edge-chips">
-                            {#each incoming as edge}
-                              <button 
-                                class="edge-chip chip-incoming" 
-                                onclick={() => navigateOrFocusScene(edge.from)}
-                                title="Перейти к сцене {edge.from}"
-                              >
-                                <span>{edge.from}</span>
-                                {#if edge.condition}
-                                  <span class="edge-condition-sub">({edge.condition})</span>
-                                {/if}
-                              </button>
-                            {/each}
-                          </div>
-                        </div>
-                      {/if}
-
-                      <!-- ПРЕВЬЮ ДИАЛОГА -->
-                      {#if scene.entries.length > 0}
-                        {@const spk = getSpeakerInfo(scene.entries[0].speaker, scene.entries[0].speaker_alias)}
-                        <div class="node-dialogue-snippet">
-                          {#if spk.isNarrator}
-                            <span class="snippet-speaker">Автор:</span>
-                          {:else if spk.isUi}
-                            <span class="char-chip char-chip-ui char-chip-snippet">
-                              <span class="char-alias">[UI]</span>
-                              <span class="char-name">Интерфейс:</span>
-                            </span>
-                          {:else}
-                            <span class="char-chip char-chip-snippet" title="Код: {spk.alias || '—'}">
-                              {#if spk.alias}<span class="char-alias">[{spk.alias}]</span>{/if}
-                              <span class="char-name">{spk.translatedName ? spk.translatedName : spk.name}:</span>
-                              {#if spk.gender === 'male'}
-                                <span class="gender-pill gender-male" title="Мужской род">М</span>
-                              {:else if spk.gender === 'female'}
-                                <span class="gender-pill gender-female" title="Женский род">Ж</span>
-                              {:else if spk.gender === 'neuter'}
-                                <span class="gender-pill gender-neuter" title="Средний род (существо)">Ср</span>
-                              {/if}
-                            </span>
-                          {/if}
-                          <span class="snippet-text">"{scene.entries[0].original_text}"</span>
-                        </div>
-                      {/if}
-
-                      <!-- СЕКЦИЯ 1: ВЫБОРЫ В СЦЕНЕ (MENU:) -->
-                      {#if scene.choices && scene.choices.length > 0}
-                        <div class="node-choices-section">
-                          <div class="choices-section-header">
-                            <Zap size={14} class="text-purple-400" />
-                            <strong>Выбор игрока (Меню развилки):</strong>
-                          </div>
-                          {#each scene.choices as choiceBlock}
-                            <div class="choice-options-list">
-                              {#each choiceBlock.options as opt}
-                                <div class="choice-option-pill">
-                                  <span class="opt-bullet">◆</span>
-                                  <span class="opt-title">"{opt.text}"</span>
-                                  {#if opt.target_jump}
-                                    <span class="opt-arrow">➔</span>
-                                    {@const isInt = isInternalScene(opt.target_jump)}
-                                    <button 
-                                      class="target-link"
-                                      class:link-internal={isInt}
-                                      class:link-external={!isInt}
-                                      onclick={() => navigateOrFocusScene(opt.target_jump!)}
-                                      title={isInt ? `Перейти к сцене ${opt.target_jump} в этом файле` : `Перейти к ${opt.target_jump} (межфайловый переход)`}
-                                    >
-                                      <span>{opt.target_jump}</span>
-                                      {#if isInt}
-                                        <ChevronRight size={11} />
-                                      {:else}
-                                        <ArrowUpRight size={11} />
-                                      {/if}
-                                    </button>
-                                  {/if}
-                                </div>
-                              {/each}
-                            </div>
-                          {/each}
-                        </div>
-                      {/if}
-
-                      <!-- СЕКЦИЯ 2: ИСХОДЯЩИЕ ВЕТВЛЕНИЯ И ПЕРЕХОДЫ (JUMP/IF) -->
-                      {#if outgoing.length > 0}
-                        <div class="node-jumps-section">
-                          <div class="jumps-section-header">
-                            <CornerDownRight size={14} class="text-amber-400" />
-                            <strong>Переходы и ветвления:</strong>
-                          </div>
-                          <div class="outgoing-chips-grid">
-                            {#each outgoing as edge}
-                              {@const isInternal = isInternalScene(edge.to)}
-                              <div class="outgoing-edge-card" class:edge-choice={edge.kind === 'choice'} class:edge-branch={edge.kind === 'branch'}>
-                                {#if edge.condition}
-                                  <div class="edge-cond-badge">
-                                    <span class="cond-icon">🔀</span>
-                                    <span class="cond-text">{edge.condition}</span>
-                                  </div>
-                                {/if}
-                                <div class="edge-dest-row">
-                                  <span class="edge-arrow">➔</span>
-                                  <button 
-                                    class="dest-btn"
-                                    class:internal={isInternal}
-                                    class:external={!isInternal}
-                                    onclick={() => navigateOrFocusScene(edge.to)}
-                                    title={isInternal ? `Фокус на сцене ${edge.to} (в текущем файле)` : `Перейти к сцене ${edge.to} в проекте (межфайловый переход)`}
-                                  >
-                                    <span>{edge.to}</span>
-                                    {#if isInternal}
-                                      <ChevronRight size={13} />
-                                    {:else}
-                                      <ArrowUpRight size={12} />
-                                    {/if}
-                                  </button>
-                                </div>
-                              </div>
-                            {/each}
-                          </div>
-                        </div>
-                      {/if}
-
-                      <!-- КНОПКА ДЕЙСТВИЯ: ПЕРЕЙТИ В ТАБЛИЦУ -->
-                      <div class="node-footer-bar">
-                        <button 
-                          class="btn-open-scene-table"
-                          onclick={() => openSceneInTable(scene.id)}
-                        >
-                          <Table size={13} />
-                          <span>Открыть диалоги ({scene.total_lines} строк)</span>
-                          <ArrowRight size={13} />
-                        </button>
-                      </div>
+            <!-- РАБОЧАЯ ОБЛАСТЬ ГРАФА С ВНУТРЕННИМ САЙДБАРОМ -->
+            <div class="graph-workspace">
+              <!-- ВНУТРЕННИЙ САЙДБАР ГРАФА ДЛЯ БЫСТРОЙ НАВИГАЦИИ -->
+              {#if showGraphSidebar}
+                <aside class="graph-inner-sidebar">
+                  <div class="graph-sidebar-header">
+                    <div class="graph-sidebar-title">
+                      <Clapperboard size={13} class="text-sky-400" />
+                      <span>Сцены ({currentFile.scenes.length})</span>
                     </div>
+                    <div class="graph-sidebar-actions">
+                      <button 
+                        class="icon-btn-subtle" 
+                        class:active={selectedSceneId === 'all'}
+                        onclick={() => {
+                          selectedSceneId = 'all';
+                          focusedSceneName = null;
+                        }}
+                        title="Показать все сцены (сбросить фокус)"
+                      >
+                        Все
+                      </button>
+                      <button 
+                        class="icon-btn-subtle"
+                        onclick={() => showGraphSidebar = false}
+                        title="Скрыть панель сцен"
+                      >
+                        <X size={13} />
+                      </button>
+                    </div>
+                  </div>
 
-                    <!-- ВИЗУАЛЬНЫЙ КОННЕКТОР МЕЖДУ СЦЕНАМИ -->
-                    {#if index < currentFile.scenes.length - 1}
-                      <div class="flow-step-connector">
-                        <div class="connector-line"></div>
-                        <div class="connector-dot">
-                          <ArrowRight size={12} class="rotate-90 text-sky-400" />
-                        </div>
-                        <div class="connector-line"></div>
-                      </div>
+                  <!-- Поиск сцен внутри графа -->
+                  <div class="graph-sidebar-search">
+                    <Search size={13} class="text-slate-500" />
+                    <input 
+                      type="text" 
+                      placeholder="Поиск сцены..." 
+                      bind:value={graphSceneSearch}
+                      class="graph-sidebar-input"
+                    />
+                    {#if graphSceneSearch}
+                      <button class="clear-search-pill" onclick={() => graphSceneSearch = ""}>✕</button>
                     {/if}
-                  {/each}
-                </div>
-              </div>
+                  </div>
+
+                  <!-- Список сцен с быстрым скроллом и фокусом -->
+                  <div class="graph-sidebar-list">
+                    {#if filteredScenesForGraph.length === 0}
+                      <div class="graph-sidebar-empty">
+                        <span>Сцены не найдены</span>
+                      </div>
+                    {:else}
+                      {#each filteredScenesForGraph as scene, idx}
+                        {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
+                        {@const isSelected = selectedSceneId === scene.id || focusedSceneName === scene.name}
+                        <button 
+                          class="graph-scene-item" 
+                          class:active={isSelected}
+                          onclick={() => focusAndScrollSceneInGraph(scene)}
+                          title="{scene.name} • {scene.translated_lines}/{scene.total_lines} строк ({pct}%)"
+                        >
+                          <div class="graph-scene-item-left">
+                            <span class="graph-scene-seq">#{idx + 1}</span>
+                            <span class="graph-scene-name">{scene.name}</span>
+                          </div>
+                          <div class="graph-scene-item-right">
+                            {#if scene.choices && scene.choices.length > 0}
+                              <span class="mini-tag tag-purple" title="Развилок: {scene.choices.length}">
+                                <Zap size={10} />
+                              </span>
+                            {/if}
+                            <span class="graph-scene-pct" class:pct-done={pct === 100}>{pct}%</span>
+                          </div>
+                        </button>
+                      {/each}
+                    {/if}
+                  </div>
+                </aside>
+              {/if}
+
+              <!-- ОСНОВНАЯ ОБЛАСТЬ ГРАФА / МАТРИЦЫ -->
+              <div class="graph-canvas-container">
+
+            {#if graphSubMode === 'flow'}
+              {#key currentFile.file_path}
+                <SceneGraph scenes={currentFile.scenes} edges={currentFile.edges ?? []}
+                  selectedId={selectedSceneId} busy={graphNavigating}
+                  onselect={(scene) => { selectedSceneId = scene.id; focusedSceneName = scene.name; }}
+                  onnavigate={navigateOrFocusScene} onopen={openSceneInTable} />
+              {/key}
             {:else}
               <!-- РЕЖИМ 2: СЕТКА КАРТОЧЕК -->
               <div class="scenes-flow-grid">
@@ -1642,8 +1966,9 @@
                   {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
                   {@const outgoing = getOutgoingEdges(scene.name)}
                   <div 
+                    id={`scene-grid-card-${scene.id}`}
                     class="scene-card" 
-                    class:card-selected={selectedSceneId === scene.id}
+                    class:card-selected={selectedSceneId === scene.id || focusedSceneName === scene.name}
                     onclick={() => openSceneInTable(scene.id)}
                   >
                     <div class="scene-card-header">
@@ -1687,6 +2012,8 @@
                 {/each}
               </div>
             {/if}
+              </div>
+            </div>
           </div>
         {:else}
           <!-- РЕЖИМ ТАБЛИЦЫ ДИАЛОГОВ -->
@@ -2566,7 +2893,7 @@
                         type="button" 
                         class="gender-card gender-card-male"
                         class:active={selectedGlossaryChar.gender === 'male'}
-                        onclick={() => updateCharacterGender(selectedGlossaryChar, 'male')}
+                        onclick={() => { if (selectedGlossaryChar) updateCharacterGender(selectedGlossaryChar, 'male'); }}
                       >
                         <div class="gender-card-top">
                           <span class="gender-letter">М</span>
@@ -2579,7 +2906,7 @@
                         type="button" 
                         class="gender-card gender-card-female"
                         class:active={selectedGlossaryChar.gender === 'female'}
-                        onclick={() => updateCharacterGender(selectedGlossaryChar, 'female')}
+                        onclick={() => { if (selectedGlossaryChar) updateCharacterGender(selectedGlossaryChar, 'female'); }}
                       >
                         <div class="gender-card-top">
                           <span class="gender-letter">Ж</span>
@@ -2592,7 +2919,7 @@
                         type="button" 
                         class="gender-card gender-card-neuter"
                         class:active={selectedGlossaryChar.gender === 'neuter'}
-                        onclick={() => updateCharacterGender(selectedGlossaryChar, 'neuter')}
+                        onclick={() => { if (selectedGlossaryChar) updateCharacterGender(selectedGlossaryChar, 'neuter'); }}
                       >
                         <div class="gender-card-top">
                           <span class="gender-letter">Ср</span>
@@ -2605,7 +2932,7 @@
                         type="button" 
                         class="gender-card gender-card-unknown"
                         class:active={selectedGlossaryChar.gender === 'unknown' || !selectedGlossaryChar.gender}
-                        onclick={() => updateCharacterGender(selectedGlossaryChar, 'unknown')}
+                        onclick={() => { if (selectedGlossaryChar) updateCharacterGender(selectedGlossaryChar, 'unknown'); }}
                       >
                         <div class="gender-card-top">
                           <span class="gender-letter">—</span>
@@ -2707,7 +3034,7 @@
                   <div class="edit-sidebar-footer-actions">
                     <button 
                       class="btn-delete-term" 
-                      onclick={() => removeGlossaryTerm(selectedGlossaryTerm.id)}
+                      onclick={() => { if (selectedGlossaryTerm) removeGlossaryTerm(selectedGlossaryTerm.id); }}
                     >
                       <Trash2 size={13} />
                       <span>Удалить термин</span>
@@ -2748,6 +3075,141 @@
           </div>
         </div>
       </div>
+    </div>
+  {/if}
+
+  {#if showProjectManager}
+    <div
+      class="project-manager-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="project-manager-title"
+      tabindex="-1"
+      onclick={(event) => {
+        if (event.target === event.currentTarget) showProjectManager = false;
+      }}
+      onkeydown={(event) => {
+        if (event.key === "Escape") showProjectManager = false;
+      }}
+    >
+      <section class="project-manager-modal">
+        <header class="project-manager-header">
+          <div class="project-manager-heading">
+            <div class="project-manager-icon"><Folder size={19} /></div>
+            <div>
+              <h2 id="project-manager-title">Менеджер проектов</h2>
+              <p>Недавно открытые проекты · {recentProjects.length}</p>
+            </div>
+          </div>
+          <button class="project-manager-close" aria-label="Закрыть" onclick={() => showProjectManager = false}>
+            <X size={17} />
+          </button>
+        </header>
+
+        <div class="project-manager-toolbar">
+          <div class="project-manager-search">
+            <Search size={15} />
+            <input
+              bind:value={projectManagerSearch}
+              placeholder="Найти проект по имени или пути..."
+              aria-label="Поиск проектов"
+            />
+            {#if projectManagerSearch}
+              <button aria-label="Очистить поиск" onclick={() => projectManagerSearch = ""}>
+                <X size={14} />
+              </button>
+            {/if}
+          </div>
+          <button
+            class="project-manager-browse"
+            disabled={loadingProject}
+            onclick={() => {
+              showProjectManager = false;
+              pickProjectFolder();
+            }}
+          >
+            <FolderOpen size={15} />
+            <span>Открыть папку...</span>
+          </button>
+        </div>
+
+        <div class="project-manager-list">
+          {#if filteredRecentProjects.length === 0}
+            <div class="project-manager-empty">
+              <FolderOpen size={30} />
+              <strong>{recentProjects.length === 0 ? "Пока нет открытых проектов" : "Ничего не найдено"}</strong>
+              <span>{recentProjects.length === 0 ? "Выберите папку игры, чтобы добавить первый проект." : "Измените запрос и попробуйте ещё раз."}</span>
+            </div>
+          {:else}
+            {#each filteredRecentProjects as path (path)}
+              <div class="project-manager-row" class:project-current={gameDir === path}>
+                {#if editingProjectPath === path}
+                  <div class="project-manager-rename">
+                    <span class="project-manager-row-icon"><FolderOpen size={17} /></span>
+                    <input
+                      class="project-manager-name-input"
+                      bind:value={editingProjectName}
+                      aria-label="Новое название проекта"
+                      onkeydown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          saveProjectName(path);
+                        } else if (event.key === "Escape") {
+                          event.stopPropagation();
+                          cancelProjectRename();
+                        }
+                      }}
+                    />
+                    <button class="project-manager-save-name" title="Сохранить название" onclick={() => saveProjectName(path)}>
+                      <Save size={14} />
+                    </button>
+                    <button class="project-manager-remove" title="Отменить переименование" onclick={cancelProjectRename}>
+                      <X size={14} />
+                    </button>
+                  </div>
+                {:else}
+                  <button
+                    class="project-manager-open"
+                    title={`Открыть ${path}`}
+                    onclick={() => {
+                      showProjectManager = false;
+                      chooseRecentProject(path);
+                    }}
+                  >
+                    <span class="project-manager-row-icon"><FolderOpen size={17} /></span>
+                    <span class="project-manager-row-info">
+                      <span class="project-manager-name">{projectDisplayName(path)}</span>
+                      <span class="project-manager-path">{path}</span>
+                    </span>
+                    <span class="project-manager-open-label">Открыть</span>
+                  </button>
+                  <button
+                    class="project-manager-rename-trigger"
+                    title="Переименовать проект"
+                    aria-label={`Переименовать ${projectDisplayName(path)}`}
+                    onclick={() => beginProjectRename(path)}
+                  >
+                    <Pencil size={14} />
+                  </button>
+                  <button
+                    class="project-manager-remove"
+                    title="Убрать из списка проектов"
+                    aria-label={`Убрать ${projectDisplayName(path)} из списка`}
+                    onclick={() => removeRecentProject(path)}
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                {/if}
+              </div>
+            {/each}
+          {/if}
+        </div>
+
+        <footer class="project-manager-footer">
+          <span>Удаление убирает проект только из этого списка.</span>
+          <button onclick={() => showProjectManager = false}>Готово</button>
+        </footer>
+      </section>
     </div>
   {/if}
 
@@ -2825,24 +3287,38 @@
     display: flex;
     flex-direction: column;
     height: 100vh;
-    width: 100vw;
+    width: 100%;
+    min-width: 0;
   }
 
   /* TOPBAR */
   .topbar {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 16px;
-    padding: 10px 18px;
+    padding: 8px 18px;
     background: #14171d;
     border-bottom: 1px solid #232832;
-    min-height: 48px;
+    min-height: 52px;
+    box-sizing: border-box;
+  }
+
+  .topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-width: 0;
+    flex: 1;
+    max-width: 780px;
   }
 
   .brand {
     display: flex;
     align-items: center;
     gap: 8px;
+    flex: 0 0 auto;
+    min-width: 0;
   }
 
   .brand-title {
@@ -2850,6 +3326,8 @@
     font-size: 16px;
     color: #f8fafc;
     letter-spacing: -0.3px;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .badge-tag {
@@ -2859,6 +3337,8 @@
     padding: 2px 7px;
     border-radius: 999px;
     border: 1px solid #0284c733;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .dir-bar {
@@ -2869,18 +3349,355 @@
     border: 1px solid #262c38;
     border-radius: 8px;
     padding: 4px 10px;
-    flex: 1;
-    max-width: 720px;
+    width: 100%;
+    box-sizing: border-box;
+    min-width: 0;
   }
 
-  .input-dir {
+  .topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex: 0 0 auto;
+    margin-left: auto;
+  }
+
+  .project-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .topbar-divider {
+    width: 1px;
+    height: 22px;
+    background: #252c38;
+    flex-shrink: 0;
+  }
+
+  .tools-menu-wrap {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .glossary-header-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    min-height: 34px;
+    padding: 6px 11px;
+    border: 1px solid #1e5c4a;
+    border-radius: 7px;
+    background: #10271f;
+    color: #a7f3d0;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: all 0.15s ease;
+  }
+
+  .glossary-header-button:hover:not(.disabled) {
+    border-color: #34d399;
+    background: #17372c;
+    color: #ecfdf5;
+  }
+
+  .glossary-header-button.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    border-color: #23352f;
+    background: #121915;
+    color: #637f75;
+  }
+
+  .tools-menu-trigger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    min-height: 34px;
+    padding: 6px;
+    border: 1px solid #30394a;
+    border-radius: 7px;
+    background: #151922;
+    color: #c7d0df;
+    font: inherit;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .tools-menu-trigger:hover,
+  .tools-menu-trigger.menu-open {
+    border-color: #3b82f6;
+    background: #202738;
+    color: #f1f5f9;
+  }
+
+  .tools-menu {
+    position: absolute;
+    z-index: 200;
+    top: calc(100% + 8px);
+    right: 0;
+    width: min(300px, calc(100vw - 20px));
+    padding: 7px;
+    border: 1px solid #30394a;
+    border-radius: 10px;
+    background: #11151d;
+    box-shadow: 0 16px 38px #0009, 0 2px 8px #0006;
+  }
+
+  .tools-menu-heading {
+    padding: 7px 9px 9px;
+    color: #74829a;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+  }
+
+  .tools-menu-divider {
+    height: 1px;
+    background: #212937;
+    margin: 6px 0;
+  }
+
+  .tools-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 11px;
+    width: 100%;
+    padding: 9px;
+    border: 0;
+    border-radius: 7px;
     background: transparent;
-    border: none;
+    color: #9aa8bd;
+    text-align: left;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .tools-menu-item:hover:not(:disabled) {
+    background: #1d2a40;
     color: #e2e8f0;
-    font-size: 13px;
-    font-family: inherit;
+  }
+
+  .tools-menu-item:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .tools-menu-item > span:first-of-type {
+    display: flex;
     flex: 1;
-    outline: none;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .tools-menu-item strong {
+    color: #dbe4f0;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .tools-menu-item small {
+    color: #77849a;
+    font-size: 10px;
+  }
+
+  .btn-browse,
+  .btn-primary {
+    flex: 0 0 auto;
+  }
+
+  .btn-browse {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #151922;
+    border: 1px solid #30394a;
+    border-radius: 6px;
+    color: #c7d0df;
+    padding: 6px 9px;
+    font: inherit;
+    font-size: 12px;
+    white-space: nowrap;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+
+  .btn-browse {
+    cursor: pointer;
+  }
+
+  .btn-browse:hover:not(:disabled) {
+    background: #222834;
+    color: #fff;
+  }
+
+  .btn-browse:disabled {
+    opacity: 0.55;
+    cursor: wait;
+  }
+
+  .recent-project-picker {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 100px;
+  }
+
+  .current-project-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    min-width: 0;
+    padding: 6px 4px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: #e2e8f0;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+
+  .current-project-label > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .current-project-label > :global(svg) {
+    flex: 0 0 auto;
+    color: #8b9ab2;
+    transition: transform 0.15s;
+  }
+
+  .current-project-label:hover,
+  .current-project-label.menu-open {
+    background: #202738;
+    border-color: #3b82f6;
+    color: #f1f5f9;
+  }
+
+  .current-project-label.menu-open > :global(svg) {
+    transform: rotate(180deg);
+  }
+
+  .recent-project-menu {
+    position: absolute;
+    z-index: 100;
+    top: calc(100% + 8px);
+    right: 0;
+    width: min(360px, calc(100vw - 32px));
+    max-height: 340px;
+    overflow-y: auto;
+    padding: 6px;
+    background: #11151d;
+    border: 1px solid #30394a;
+    border-radius: 10px;
+    box-shadow: 0 16px 38px #0009, 0 2px 8px #0006;
+  }
+
+  .recent-project-menu-title {
+    padding: 7px 9px 8px;
+    color: #74829a;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+  }
+
+  .recent-project-empty {
+    padding: 12px 10px;
+    color: #8290a5;
+    font-size: 11px;
+  }
+
+  .recent-project-menu-footer {
+    margin-top: 5px;
+    padding-top: 5px;
+    border-top: 1px solid #252e3d;
+  }
+
+  .recent-project-menu-footer button {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 9px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: #aebbd0;
+    text-align: left;
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .recent-project-menu-footer button:hover {
+    background: #1d2a40;
+    color: #93c5fd;
+  }
+
+  .recent-project-menu-count {
+    margin-left: auto;
+    color: #7888a1;
+    font-size: 10px;
+  }
+
+  .recent-project-option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 9px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: #9aa8bd;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .recent-project-option:hover,
+  .recent-project-option.recent-project-current {
+    background: #1d2a40;
+    color: #60a5fa;
+  }
+
+  .recent-project-option-text {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .recent-project-name,
+  .recent-project-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .recent-project-name {
+    color: #e2e8f0;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .recent-project-path {
+    max-width: 300px;
+    color: #77849a;
+    font-size: 10px;
   }
 
   .btn-primary {
@@ -2906,7 +3723,8 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    min-width: 150px;
+    width: 160px;
+    flex-shrink: 0;
   }
 
   .stat-text {
@@ -2932,62 +3750,75 @@
     overflow: hidden;
   }
 
-  /* TOPBAR ACTIONS FOR RPA & RPYC */
-  .topbar-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
+  @media (max-width: 1280px) {
+    .topbar {
+      gap: 12px;
+      padding: 8px 14px;
+    }
+
+    .badge-tag {
+      display: none;
+    }
+
+    .global-stats {
+      width: 130px;
+    }
   }
 
-  .btn-top-tool {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 12px;
-    background: #11141c;
-    border: 1px solid #252c3c;
-    border-radius: 6px;
-    font-size: 12px;
-    font-weight: 500;
-    color: #cbd5e1;
-    cursor: pointer;
-    transition: all 0.15s ease;
-    white-space: nowrap;
+  @media (max-width: 1024px) {
+    .dir-bar .btn-browse span,
+    .dir-bar .btn-primary span {
+      display: none;
+    }
+
+    .btn-browse,
+    .dir-bar .btn-primary {
+      justify-content: center;
+      min-width: 34px;
+      padding: 7px;
+    }
   }
 
-  .btn-top-tool:hover:not(:disabled) {
-    background: #182030;
-    border-color: #3b82f6;
-    color: #f8fafc;
-    box-shadow: 0 0 10px rgba(59, 130, 246, 0.2);
+  @media (max-width: 768px) {
+    .topbar {
+      gap: 8px;
+      padding: 6px 10px;
+    }
+
+    .topbar-left {
+      gap: 8px;
+    }
+
+    .global-stats {
+      display: none;
+    }
+
+    .glossary-header-label {
+      display: none;
+    }
+
+    .glossary-header-button {
+      min-width: 34px;
+      padding: 6px 8px;
+    }
   }
 
-  .btn-top-tool:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
+  @media (max-width: 520px) {
+    .brand-title {
+      display: none;
+    }
 
-  .btn-top-tool.btn-pack:hover:not(:disabled) {
-    border-color: #f59e0b;
-    box-shadow: 0 0 10px rgba(245, 158, 11, 0.25);
-  }
+    .topbar-divider {
+      display: none;
+    }
 
-  .btn-top-tool.btn-clean:hover:not(:disabled) {
-    border-color: #f43f5e;
-    box-shadow: 0 0 10px rgba(244, 63, 94, 0.25);
-  }
+    .recent-project-picker {
+      min-width: 60px;
+    }
 
-  .btn-top-tool.btn-studio {
-    background: #0f1c2e;
-    border-color: #1e3a5f;
-    color: #38bdf8;
-  }
-
-  .btn-top-tool.btn-studio:hover {
-    background: #132a48;
-    border-color: #38bdf8;
-    color: #e0f2fe;
-    box-shadow: 0 0 12px rgba(56, 189, 248, 0.3);
+    .dir-bar > :global(svg:first-child) {
+      display: none;
+    }
   }
 
   /* MODAL WINDOW FOR RPA & RPYC STUDIO */
@@ -3927,78 +4758,427 @@
     border-color: #0284c7;
   }
 
-  /* SCENES NAV BAR */
-  .scenes-nav-bar {
+  /* GRAPH WORKSPACE & INNER SIDEBAR */
+  .graph-workspace {
+    flex: 1;
+    display: flex;
+    flex-direction: row;
+    min-height: 0;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .graph-topbar-controls {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 7px 16px;
-    background: #0f1217;
-    border-bottom: 1px solid #1a1f28;
-    overflow-x: auto;
-    white-space: nowrap;
-    scrollbar-width: thin;
-    scrollbar-color: #1e2638 transparent;
+    gap: 10px;
   }
 
-  .scenes-nav-bar::-webkit-scrollbar {
-    height: 4px;
-  }
-
-  .scenes-nav-bar::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  .scenes-nav-bar::-webkit-scrollbar-thumb {
-    background: #1e2638;
-    border-radius: 999px;
-    transition: background 0.15s ease;
-  }
-
-  .scenes-nav-bar::-webkit-scrollbar-thumb:hover {
-    background: #38bdf8;
-  }
-
-  .scene-nav-chip {
+  .graph-sidebar-toggle-btn {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    background: #141820;
-    border: 1px solid #202734;
+    padding: 4px 10px;
+    background: #141923;
+    border: 1px solid #1e2636;
     border-radius: 6px;
-    padding: 4px 9px;
+    font: inherit;
     font-size: 12px;
+    font-weight: 500;
     color: #94a3b8;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: all 0.15s ease;
   }
 
-  .scene-nav-chip:hover {
-    background: #19202c;
-    color: #cbd5e1;
+  .graph-sidebar-toggle-btn:hover {
+    background: #1a2232;
+    border-color: #2b394e;
+    color: #e2e8f0;
   }
 
-  .scene-nav-chip.active {
-    background: #1d2535;
+  .graph-sidebar-toggle-btn.active {
+    background: #152236;
     border-color: #0284c7;
     color: #38bdf8;
   }
 
-  .scene-chip-title {
+  .btn-state-pill {
+    font-size: 10px;
+    font-weight: 600;
+    background: rgba(2, 132, 199, 0.2);
+    color: #38bdf8;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+
+  .graph-inner-sidebar {
+    width: 250px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    background: #0d1017;
+    border-right: 1px solid #1a202c;
+    min-height: 0;
+    overflow: hidden;
+    z-index: 10;
+  }
+
+  .graph-sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid #171d28;
+    background: #0f131c;
+  }
+
+  .graph-sidebar-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: #94a3b8;
+    text-transform: uppercase;
+  }
+
+  .graph-sidebar-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .graph-sidebar-search {
+    position: relative;
+    display: flex;
+    align-items: center;
+    padding: 8px 10px;
+    border-bottom: 1px solid #171d28;
+    background: #0b0e14;
+    gap: 6px;
+  }
+
+  .graph-sidebar-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #f1f5f9;
+    font: inherit;
+    font-size: 12px;
+  }
+
+  .graph-sidebar-input::placeholder {
+    color: #4b5563;
+  }
+
+  .graph-sidebar-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .graph-sidebar-empty {
+    padding: 24px 12px;
+    text-align: center;
+    color: #4b5563;
+    font-size: 12px;
+  }
+
+  .graph-scene-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 9px;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: #94a3b8;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }
+
+  .graph-scene-item:hover {
+    background: #141a26;
+    border-color: #202b3d;
+    color: #f1f5f9;
+  }
+
+  .graph-scene-item.active {
+    background: #14243b;
+    border-color: #0284c7;
+    color: #38bdf8;
+  }
+
+  .graph-scene-item-left {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .graph-scene-seq {
+    color: #55657e;
+    font-size: 10px;
+    font-family: monospace;
+    flex-shrink: 0;
+  }
+
+  .graph-scene-name {
+    font-size: 12px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .graph-scene-item-right {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+  }
+
+  .graph-scene-pct {
+    font-size: 10px;
+    font-weight: 600;
+    color: #64748b;
+    padding: 1px 4px;
+    background: #090c12;
+    border-radius: 4px;
+  }
+
+  .graph-scene-pct.pct-done {
+    background: rgba(16, 185, 129, 0.15);
+    color: #34d399;
+  }
+
+  .graph-canvas-container {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* TABLE SCENE NAV (DROPDOWN + STEPPERS IN TOOLBAR) */
+  .table-scene-nav {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    position: relative;
+  }
+
+  .btn-scene-step {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    background: #141820;
+    border: 1px solid #242c3b;
+    border-radius: 6px;
+    color: #94a3b8;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .btn-scene-step:hover:not(:disabled) {
+    background: #202838;
+    color: #f8fafc;
+    border-color: #38bdf8;
+  }
+
+  .btn-scene-step:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  .table-scene-picker-wrap {
+    position: relative;
+  }
+
+  .btn-scene-picker {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 28px;
+    padding: 4px 9px;
+    background: #141820;
+    border: 1px solid #242c3b;
+    border-radius: 6px;
+    color: #e2e8f0;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    max-width: 260px;
+  }
+
+  .btn-scene-picker:hover,
+  .btn-scene-picker.menu-open {
+    border-color: #38bdf8;
+    background: #1a2230;
+    color: #fff;
+  }
+
+  .scene-picker-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-weight: 500;
   }
 
-  .scene-chip-badge {
+  .scene-picker-badge {
     font-size: 10px;
-    background: #0d0f12;
     padding: 1px 5px;
     border-radius: 4px;
-    color: #64748b;
+    background: #1e2636;
+    color: #7dd3fc;
+    font-weight: 600;
+    flex-shrink: 0;
   }
 
-  .scene-chip-badge.badge-complete {
-    background: #064e3b;
+  .scene-picker-badge.badge-complete {
+    background: rgba(16, 185, 129, 0.15);
     color: #34d399;
+  }
+
+  .picker-caret {
+    color: #64748b;
+    flex-shrink: 0;
+  }
+
+  .scene-picker-dropdown {
+    position: absolute;
+    z-index: 300;
+    top: calc(100% + 5px);
+    left: 0;
+    width: min(320px, calc(100vw - 24px));
+    max-height: 380px;
+    display: flex;
+    flex-direction: column;
+    background: #11151d;
+    border: 1px solid #2c3647;
+    border-radius: 9px;
+    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.65), 0 2px 8px rgba(0, 0, 0, 0.4);
+    overflow: hidden;
+  }
+
+  .scene-picker-search {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 9px;
+    background: #0d1017;
+    border-bottom: 1px solid #1e2634;
+  }
+
+  .scene-search-input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #f1f5f9;
+    font: inherit;
+    font-size: 11px;
+  }
+
+  .clear-search-btn {
+    border: none;
+    background: transparent;
+    color: #64748b;
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 4px;
+  }
+
+  .clear-search-btn:hover {
+    color: #e2e8f0;
+  }
+
+  .scene-picker-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 5px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .scene-picker-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    background: transparent;
+    color: #cbd5e1;
+    font: inherit;
+    font-size: 11px;
+    text-align: left;
+    cursor: pointer;
+    transition: all 0.1s ease;
+  }
+
+  .scene-picker-item:hover {
+    background: #1a2332;
+    color: #fff;
+  }
+
+  .scene-picker-item.selected {
+    background: #192a40;
+    border-color: #0284c7;
+    color: #38bdf8;
+    font-weight: 600;
+  }
+
+  .scene-item-seq {
+    color: #55657e;
+    font-size: 10px;
+    font-family: monospace;
+    flex-shrink: 0;
+  }
+
+  .scene-item-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .scene-item-badge {
+    font-size: 10px;
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: #0d1219;
+    color: #64748b;
+    flex-shrink: 0;
+  }
+
+  .scene-item-badge.badge-complete {
+    background: rgba(16, 185, 129, 0.15);
+    color: #34d399;
+  }
+
+  .scene-picker-empty {
+    padding: 16px;
+    text-align: center;
+    color: #64748b;
+    font-size: 11px;
   }
 
   /* STORY GRAPH & FLOW VIEW */
@@ -4082,372 +5262,6 @@
     color: #ffffff;
   }
 
-  /* FLOW CANVAS */
-  .story-flow-canvas {
-    flex: 1;
-    overflow-y: auto;
-    padding: 28px 20px;
-  }
-
-  .story-nodes-track {
-    max-width: 820px;
-    margin: 0 auto;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-  }
-
-  .flow-scene-node {
-    width: 100%;
-    background: #121620;
-    border: 1px solid #202838;
-    border-radius: 10px;
-    padding: 16px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
-    transition: all 0.2s;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-
-  .flow-scene-node:hover {
-    border-color: #2e3a52;
-    background: #151a26;
-  }
-
-  .flow-scene-node.node-focused {
-    border-color: #38bdf8;
-    box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.3);
-  }
-
-  .flow-scene-node.node-selected {
-    border-color: #0284c7;
-  }
-
-  .node-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-
-  .node-title-group {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .node-seq {
-    font-size: 11px;
-    font-weight: 700;
-    color: #64748b;
-    font-family: monospace;
-    background: #0b0e14;
-    padding: 2px 6px;
-    border-radius: 4px;
-  }
-
-  .node-name {
-    margin: 0;
-    font-size: 15px;
-    font-weight: 700;
-    color: #f8fafc;
-  }
-
-  .node-tag {
-    font-size: 10px;
-    font-weight: 600;
-    padding: 2px 6px;
-    border-radius: 4px;
-    text-transform: uppercase;
-  }
-
-  .node-tag.tag-ui {
-    background: #1e293b;
-    color: #94a3b8;
-  }
-
-  .node-tag.tag-choice {
-    background: rgba(168, 85, 247, 0.2);
-    color: #c084fc;
-    border: 1px solid rgba(168, 85, 247, 0.4);
-  }
-
-  .node-progress-badge {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    background: #18202d;
-    padding: 3px 8px;
-    border-radius: 6px;
-    color: #94a3b8;
-  }
-
-  .node-progress-badge.badge-complete {
-    background: rgba(16, 185, 129, 0.15);
-    color: #34d399;
-  }
-
-  .node-progress-line {
-    height: 3px;
-    background: #1b2230;
-    border-radius: 999px;
-    overflow: hidden;
-  }
-
-  .node-fill {
-    height: 100%;
-    background: #38bdf8;
-    transition: width 0.3s;
-  }
-
-  /* Входящие связи */
-  .node-incoming-box {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: #0f131a;
-    padding: 6px 10px;
-    border-radius: 6px;
-    border-left: 3px solid #38bdf8;
-  }
-
-  .box-label {
-    font-size: 11px;
-    color: #64748b;
-    white-space: nowrap;
-  }
-
-  .edge-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-
-  .edge-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: #192130;
-    border: 1px solid #27344a;
-    color: #cbd5e1;
-    font-size: 11px;
-    padding: 2px 7px;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-
-  .edge-chip:hover {
-    background: #232e42;
-    border-color: #38bdf8;
-    color: #38bdf8;
-  }
-
-  .edge-condition-sub {
-    color: #fbbf24;
-    font-size: 10px;
-  }
-
-  /* Превью диалога */
-  .node-dialogue-snippet {
-    background: #0d1016;
-    border: 1px solid #1a202c;
-    border-radius: 6px;
-    padding: 8px 12px;
-    font-size: 12px;
-    line-height: 1.4;
-    color: #94a3b8;
-  }
-
-  .snippet-speaker {
-    font-weight: 600;
-    color: #38bdf8;
-    margin-right: 4px;
-  }
-
-  .snippet-text {
-    font-style: italic;
-  }
-
-  /* ВЫБОРЫ В СЦЕНЕ (MENU:) */
-  .node-choices-section {
-    background: rgba(168, 85, 247, 0.06);
-    border: 1px solid rgba(168, 85, 247, 0.25);
-    border-radius: 8px;
-    padding: 10px 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .choices-section-header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: #c084fc;
-  }
-
-  .choice-options-list {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding-left: 8px;
-  }
-
-  .choice-option-pill {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: #141724;
-    border: 1px solid rgba(168, 85, 247, 0.3);
-    border-radius: 6px;
-    padding: 5px 10px;
-    font-size: 12px;
-  }
-
-  .opt-bullet {
-    color: #c084fc;
-    font-size: 10px;
-  }
-
-  .opt-title {
-    color: #f1f5f9;
-    font-weight: 500;
-  }
-
-  .opt-arrow {
-    color: #64748b;
-    font-size: 11px;
-  }
-
-  .target-link {
-    font-size: 11px;
-    font-weight: 600;
-    padding: 2px 7px;
-    border-radius: 4px;
-  }
-
-  .target-link.link-internal {
-    background: #0284c7;
-    color: #ffffff;
-    border: none;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-
-  .target-link.link-internal:hover {
-    background: #0369a1;
-  }
-
-  .target-link.link-external {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: #182232;
-    border: 1px solid #273750;
-    color: #93c5fd;
-    cursor: pointer;
-    transition: all 0.15s ease;
-  }
-
-  .target-link.link-external:hover {
-    background: #202d44;
-    border-color: #38bdf8;
-    color: #ffffff;
-  }
-
-  /* ИСХОДЯЩИЕ ПЕРЕХОДЫ И ВЕТВЛЕНИЯ */
-  .node-jumps-section {
-    background: rgba(245, 158, 11, 0.05);
-    border: 1px solid rgba(245, 158, 11, 0.22);
-    border-radius: 8px;
-    padding: 10px 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .jumps-section-header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: #fbbf24;
-  }
-
-  .outgoing-chips-grid {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-
-  .outgoing-edge-card {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    background: #141920;
-    border: 1px solid #232c3d;
-    border-radius: 6px;
-    padding: 6px 10px;
-  }
-
-  .edge-cond-badge {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 11px;
-    color: #fbbf24;
-    font-weight: 500;
-  }
-
-  .edge-dest-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .edge-arrow {
-    color: #64748b;
-    font-size: 11px;
-  }
-
-  .dest-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 3px 8px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.15s ease;
-  }
-
-  .dest-btn.internal {
-    background: #0369a1;
-    color: #ffffff;
-    border: 1px solid #0284c7;
-  }
-
-  .dest-btn.internal:hover {
-    background: #0284c7;
-    box-shadow: 0 0 10px rgba(56, 189, 248, 0.3);
-  }
-
-  .dest-btn.external {
-    background: #182232;
-    border: 1px solid #273750;
-    color: #93c5fd;
-  }
-
-  .dest-btn.external:hover {
-    background: #202d44;
-    border-color: #38bdf8;
-    color: #ffffff;
-    box-shadow: 0 0 12px rgba(56, 189, 248, 0.25);
-  }
-
   /* ВСПЛЫВАЮЩИЙ ТОАСТ НАВИГАЦИИ */
   .toast-notification {
     position: fixed;
@@ -4494,60 +5308,6 @@
       opacity: 1;
       transform: translateY(0) scale(1);
     }
-  }
-
-  /* ФУТЕР УЗЛА */
-  .node-footer-bar {
-    display: flex;
-    justify-content: flex-end;
-    padding-top: 4px;
-    border-top: 1px solid #1a2230;
-  }
-
-  .btn-open-scene-table {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: #182234;
-    border: 1px solid #263550;
-    color: #38bdf8;
-    padding: 6px 12px;
-    border-radius: 6px;
-    font-size: 12px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-
-  .btn-open-scene-table:hover {
-    background: #0284c7;
-    color: #ffffff;
-    border-color: #0284c7;
-  }
-
-  /* КОННЕКТОР МЕЖДУ УЗЛАМИ */
-  .flow-step-connector {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    height: 36px;
-  }
-
-  .connector-line {
-    width: 2px;
-    flex: 1;
-    background: #232d3f;
-  }
-
-  .connector-dot {
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    background: #141a24;
-    border: 2px solid #28354c;
-    display: flex;
-    align-items: center;
-    justify-content: center;
   }
 
   /* СЕТКА КАРТОЧЕК */
@@ -5219,18 +5979,6 @@
 
   .btn-sidebar-glossary:hover {
     background: rgba(16, 185, 129, 0.25);
-    border-color: #34d399;
-    color: #ffffff;
-  }
-
-  .btn-top-tool.btn-glossary {
-    border-color: rgba(16, 185, 129, 0.35);
-    background: rgba(16, 185, 129, 0.08);
-    color: #a7f3d0;
-  }
-
-  .btn-top-tool.btn-glossary:hover {
-    background: rgba(16, 185, 129, 0.18);
     border-color: #34d399;
     color: #ffffff;
   }
@@ -6004,5 +6752,420 @@
   .btn-primary-save:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+  }
+
+  @media (max-width: 700px) {
+    .sidebar {
+      width: 230px;
+      flex: 0 0 230px;
+    }
+  }
+
+  @media (max-width: 480px) {
+    .sidebar {
+      width: 190px;
+      flex-basis: 190px;
+    }
+  }
+
+  .project-manager-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 22px;
+    background: rgba(5, 8, 13, 0.76);
+    backdrop-filter: blur(7px);
+  }
+
+  .project-manager-modal {
+    display: flex;
+    flex-direction: column;
+    width: min(760px, 100%);
+    max-height: min(780px, 90vh);
+    overflow: hidden;
+    border: 1px solid #2a3548;
+    border-radius: 14px;
+    background: #11151d;
+    box-shadow: 0 28px 80px #000b, 0 0 0 1px #60a5fa12;
+  }
+
+  .project-manager-header,
+  .project-manager-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 17px 20px;
+  }
+
+  .project-manager-header {
+    border-bottom: 1px solid #252e3d;
+  }
+
+  .project-manager-heading {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .project-manager-icon,
+  .project-manager-row-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    color: #60a5fa;
+  }
+
+  .project-manager-icon {
+    width: 38px;
+    height: 38px;
+    border: 1px solid #2d4770;
+    border-radius: 10px;
+    background: #1a2a43;
+  }
+
+  .project-manager-heading h2 {
+    margin: 0;
+    color: #f1f5f9;
+    font-size: 17px;
+    font-weight: 650;
+  }
+
+  .project-manager-heading p {
+    margin: 4px 0 0;
+    color: #8492a8;
+    font-size: 11px;
+  }
+
+  .project-manager-close,
+  .project-manager-search button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: #8290a5;
+    cursor: pointer;
+  }
+
+  .project-manager-close {
+    width: 32px;
+    height: 32px;
+  }
+
+  .project-manager-close:hover,
+  .project-manager-search button:hover {
+    background: #252e3d;
+    color: #f1f5f9;
+  }
+
+  .project-manager-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 20px;
+    border-bottom: 1px solid #202937;
+  }
+
+  .project-manager-search {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
+    flex: 1;
+    padding: 8px 10px;
+    border: 1px solid #2a3547;
+    border-radius: 8px;
+    background: #0c1017;
+    color: #74839b;
+  }
+
+  .project-manager-search:focus-within {
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 2px #3b82f622;
+  }
+
+  .project-manager-search input {
+    min-width: 0;
+    flex: 1;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: #e2e8f0;
+    font: inherit;
+    font-size: 12px;
+  }
+
+  .project-manager-search input::placeholder {
+    color: #617087;
+  }
+
+  .project-manager-search button {
+    width: 22px;
+    height: 22px;
+  }
+
+  .project-manager-browse,
+  .project-manager-footer button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    flex: 0 0 auto;
+    border: 1px solid #34445d;
+    border-radius: 8px;
+    background: #1a2433;
+    color: #d4deeb;
+    padding: 8px 11px;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .project-manager-browse:hover:not(:disabled),
+  .project-manager-footer button:hover {
+    border-color: #3b82f6;
+    background: #20334f;
+    color: #f8fafc;
+  }
+
+  .project-manager-browse:disabled {
+    opacity: 0.55;
+    cursor: wait;
+  }
+
+  .project-manager-list {
+    min-height: 120px;
+    overflow-y: auto;
+    padding: 8px 12px;
+  }
+
+  .project-manager-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    margin: 2px 0;
+    padding-right: 5px;
+    border: 1px solid transparent;
+    border-radius: 9px;
+  }
+
+  .project-manager-row:hover,
+  .project-manager-row.project-current {
+    border-color: #273b58;
+    background: #182131;
+  }
+
+  .project-manager-open {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    flex: 1;
+    padding: 10px 9px;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .project-manager-row-info {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .project-manager-name,
+  .project-manager-path {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .project-manager-name {
+    color: #e2e8f0;
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .project-manager-path {
+    color: #7f8da3;
+    font-size: 10px;
+  }
+
+  .project-manager-open-label {
+    flex: 0 0 auto;
+    color: #7f9bc1;
+    font-size: 10px;
+    opacity: 0;
+    transition: opacity 0.12s;
+  }
+
+  .project-manager-row:hover .project-manager-open-label {
+    opacity: 1;
+  }
+
+  .project-manager-rename {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    padding: 7px 5px 7px 9px;
+  }
+
+  .project-manager-name-input {
+    min-width: 0;
+    flex: 1;
+    padding: 7px 9px;
+    border: 1px solid #3b82f6;
+    border-radius: 6px;
+    outline: none;
+    background: #0c111a;
+    color: #f1f5f9;
+    font: inherit;
+    font-size: 12px;
+  }
+
+  .project-manager-rename-trigger,
+  .project-manager-remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 32px;
+    height: 32px;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    background: transparent;
+    color: #738198;
+    cursor: pointer;
+  }
+
+  .project-manager-rename-trigger {
+    opacity: 0;
+    transition: color 0.12s, background 0.12s, opacity 0.12s;
+  }
+
+  .project-manager-row:hover .project-manager-rename-trigger,
+  .project-manager-row:focus-within .project-manager-rename-trigger {
+    opacity: 1;
+  }
+
+  .project-manager-rename-trigger:hover {
+    border-color: #355078;
+    background: #1c2b42;
+    color: #93c5fd;
+  }
+
+  .project-manager-remove:hover {
+    border-color: #713340;
+    background: #3a1d27;
+    color: #fb7185;
+  }
+
+  .project-manager-save-name {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 32px;
+    height: 32px;
+    border: 1px solid #16634c;
+    border-radius: 7px;
+    background: #123327;
+    color: #6ee7b7;
+    cursor: pointer;
+  }
+
+  .project-manager-save-name:hover {
+    background: #174734;
+    color: #a7f3d0;
+  }
+
+  .project-manager-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 9px;
+    min-height: 220px;
+    color: #617087;
+    text-align: center;
+  }
+
+  .project-manager-empty strong {
+    color: #cbd5e1;
+    font-size: 13px;
+  }
+
+  .project-manager-empty span {
+    font-size: 11px;
+  }
+
+  .project-manager-footer {
+    border-top: 1px solid #252e3d;
+    color: #75839a;
+    font-size: 10px;
+  }
+
+  .project-manager-footer button {
+    min-width: 84px;
+  }
+
+  @media (max-width: 560px) {
+    .project-manager-backdrop {
+      padding: 10px;
+    }
+
+    .project-manager-modal {
+      max-height: 94vh;
+      border-radius: 11px;
+    }
+
+    .project-manager-header,
+    .project-manager-footer {
+      padding: 13px;
+    }
+
+    .project-manager-toolbar {
+      align-items: stretch;
+      flex-direction: column;
+      padding: 11px 13px;
+    }
+
+    .project-manager-browse {
+      min-height: 34px;
+    }
+
+    .project-manager-list {
+      padding: 6px 8px;
+    }
+
+    .project-manager-open {
+      gap: 8px;
+      padding: 9px 6px;
+    }
+
+    .project-manager-open-label {
+      display: none;
+    }
+
+    .project-manager-rename-trigger {
+      opacity: 1;
+    }
+
+    .project-manager-footer span {
+      max-width: 200px;
+      line-height: 1.4;
+    }
   }
 </style>
