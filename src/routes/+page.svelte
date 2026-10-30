@@ -147,9 +147,11 @@
     let unlisten: (() => void) | undefined;
     let disposed = false;
     void window.onCloseRequested(async (event) => {
-      if (!glossaryDirty) return;
+      if (!glossaryDirty && !translationDirty) return;
       event.preventDefault();
-      if (await saveGlossary()) await window.destroy();
+      const translationsSaved = await saveTranslations();
+      const glossarySaved = !glossaryDirty || await saveGlossary();
+      if (translationsSaved && glossarySaved) await window.destroy();
     }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;
@@ -284,6 +286,7 @@
 
   interface DialogueEntry {
     id: string;
+    translation_key: string;
     line_number: number;
     speaker: string | null;
     speaker_alias?: string | null;
@@ -354,6 +357,11 @@
   let project = $state<ProjectSummary | null>(null);
   let selectedFile = $state<TranslationFile | null>(null);
   let currentFile = $state<ParsedFile | null>(null);
+  let translationEdits = $state<Record<string, string>>({});
+  let savingTranslations = $state(false);
+  let translationSavePromise: Promise<boolean> | null = null;
+  let translationDirty = $derived(Object.keys(translationEdits).length > 0);
+  let activeProjectPath = $state("");
 
   // Структура узла дерева файлов
   interface FileTreeNode {
@@ -912,9 +920,65 @@
       : 0
   );
 
+  function updateTranslationStats() {
+    if (!currentFile) return;
+    let translated = 0;
+    for (const scene of currentFile.scenes) {
+      scene.translated_lines = scene.entries.filter(entry => entry.translated_text?.trim()).length;
+      translated += scene.translated_lines;
+    }
+    currentFile.translated_lines = translated;
+    const summaryFile = project?.files.find(file => file.path === currentFile?.file_path);
+    if (project && summaryFile) {
+      project.total_translated += translated - summaryFile.translated_lines;
+      summaryFile.translated_lines = translated;
+    }
+  }
+
+  function recordTranslationEdit(entry: DialogueEntry, text: string) {
+    entry.translated_text = text;
+    translationEdits[entry.translation_key] = text;
+    updateTranslationStats();
+  }
+
+  async function saveTranslations(): Promise<boolean> {
+    if (!currentFile || !translationDirty) return true;
+    if (translationSavePromise) {
+      if (!(await translationSavePromise)) return false;
+      return translationDirty ? saveTranslations() : true;
+    }
+    const filePath = currentFile.file_path;
+    const snapshot = { ...translationEdits };
+    savingTranslations = true;
+    const task = invoke<void>("save_file_translations", {
+      filePath,
+      changes: Object.entries(snapshot).map(([key, text]) => ({ key, text }))
+    }).then(() => {
+      if (currentFile?.file_path === filePath) {
+        for (const [key, text] of Object.entries(snapshot)) {
+          if (translationEdits[key] === text) delete translationEdits[key];
+        }
+      }
+      showToast("Перевод сохранён в данных приложения", "success");
+      return !translationDirty;
+    }).catch((e) => {
+      showToast(`Ошибка сохранения перевода: ${e}`, "error");
+      return false;
+    }).finally(() => {
+      savingTranslations = false;
+      translationSavePromise = null;
+    });
+    translationSavePromise = task;
+    return task;
+  }
+
   // Сканировать проект
   async function scanProject() {
     if (!gameDir.trim()) return;
+    if (!(await saveTranslations())) {
+      if (activeProjectPath) gameDir = activeProjectPath;
+      return;
+    }
     if (glossaryDirty && !(await saveGlossary())) {
       if (glossaryProjectPath) gameDir = glossaryProjectPath;
       return;
@@ -932,6 +996,7 @@
     project = null;
     selectedFile = null;
     currentFile = null;
+    translationEdits = {};
     selectedEntry = null;
     selectedSceneId = "all";
     glossary = { characters: [], terms: [] };
@@ -945,6 +1010,7 @@
       const summary = await invoke<ProjectSummary>("scan_game_project", { gameDir: scanPath });
       if (seq !== projectScanSeq || gameDir.trim() !== selectedPath) return;
       project = summary;
+      activeProjectPath = selectedPath;
       graphHistory = [];
       rememberProject(selectedPath);
       void loadGlossary(true);
@@ -963,6 +1029,7 @@
 
   // Загрузить выбранный файл
   async function selectFile(file: TranslationFile) {
+    if (!(await saveTranslations())) return false;
     const seq = ++fileSelectSeq;
     selectedFile = file;
     expandParentsForFile(file.name);
@@ -1002,6 +1069,8 @@
       if (seq !== fileSelectSeq) return false;
 
       currentFile = parsed;
+      translationEdits = {};
+      updateTranslationStats();
       focusedSceneName = null;
       // По умолчанию выбираем первую реальную сюжетную сцену с диалогами
       if (currentFile.scenes.length > 1) {
@@ -1085,6 +1154,7 @@
       showToast("Укажите путь к папке игры", "warning");
       return;
     }
+    if (!(await saveTranslations())) return;
     if (glossaryDirty) {
       if (!(await saveGlossary())) return;
     }
@@ -1370,7 +1440,7 @@
   }
 </script>
 
-<!-- Горячая клавиша Ctrl+S для быстрого сохранения глоссария -->
+<!-- Горячая клавиша Ctrl+S для сохранения текущих правок -->
 <svelte:window onkeydown={(e) => {
   if (e.key === "Escape") {
     showProjectManager = false;
@@ -1380,6 +1450,9 @@
   if ((e.ctrlKey || e.metaKey) && e.key === 's' && showGlossaryModal) {
     e.preventDefault();
     void saveGlossary();
+  } else if ((e.ctrlKey || e.metaKey) && e.key === 's' && currentFile) {
+    e.preventDefault();
+    void saveTranslations();
   }
 }} onpointerdown={closeRecentProjects} />
 
@@ -2024,6 +2097,16 @@
                 </div>
 
                 <div class="table-subtoolbar-right">
+                  <button
+                    type="button"
+                    class="btn-toolbar-code"
+                    onclick={() => void saveTranslations()}
+                    disabled={!translationDirty || savingTranslations}
+                    title="Сохранить правки перевода в данных приложения (Ctrl+S)"
+                  >
+                    {#if savingTranslations}<Loader2 size={12} class="spin" />{:else}<Save size={12} />{/if}
+                    <span>{translationDirty ? 'Сохранить перевод *' : 'Перевод сохранён'}</span>
+                  </button>
                   <div class="search-box">
                     <Search size={13} class="text-slate-400" />
                     <input 
@@ -2181,6 +2264,8 @@
                                 <textarea
                                   class="table-trans-textarea"
                                   bind:value={entry.translated_text}
+                                  oninput={(event) => recordTranslationEdit(entry, event.currentTarget.value)}
+                                  disabled={loadingFile || loadingProject || savingTranslations}
                                   placeholder="Введите перевод..."
                                   rows="2"
                                   onfocus={() => selectedEntry = entry}

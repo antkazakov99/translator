@@ -5,6 +5,7 @@ pub mod pickle;
 pub mod project;
 pub mod rpa;
 pub mod rpyc;
+pub mod translation;
 
 use crate::graph::ScenarioNode;
 use crate::parser::GameParser;
@@ -177,6 +178,7 @@ pub struct ProjectSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DialogueEntryDto {
     pub id: String,
+    pub translation_key: String,
     pub line_number: usize,
     pub speaker: Option<String>,
     pub speaker_alias: Option<String>,
@@ -606,6 +608,7 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
 
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
+        let saved_translations = translation::load(path)?;
 
         let search_dir = find_game_root(path);
         let cache_dir = get_project_scripts_cache_dir(&search_dir);
@@ -659,6 +662,8 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
         let mut file_total = 0;
         let mut file_translated = 0;
         let mut current_scene_name = "Общие диалоги".to_string();
+        let mut repeated_lines: std::collections::HashMap<(usize, String, String), usize> =
+            std::collections::HashMap::new();
 
         for idx in graph.node_indices() {
             if let Some(node) = graph.get_node(idx) {
@@ -667,13 +672,6 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
                         current_scene_name = label_name.clone();
                     }
                     ScenarioNode::Dialogue(d) => {
-                        let is_trans = d.translated_text.is_some()
-                            && !d.translated_text.as_ref().unwrap().trim().is_empty();
-                        file_total += 1;
-                        if is_trans {
-                            file_translated += 1;
-                        }
-
                         let (target_scene_name, is_menu_choice) =
                             if d.speaker.as_deref() == Some("UI / Choice") {
                                 let trimmed_orig = d.original_text.trim();
@@ -685,6 +683,32 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
                             } else {
                                 (current_scene_name.clone(), false)
                             };
+
+                        let identity = (
+                            d.line_number,
+                            target_scene_name.clone(),
+                            d.original_text.clone(),
+                        );
+                        let occurrence = repeated_lines.entry(identity.clone()).or_default();
+                        let translation_key = serde_json::to_string(&(
+                            identity.0,
+                            &identity.1,
+                            &identity.2,
+                            *occurrence,
+                        ))
+                        .map_err(|e| format!("Не удалось создать ключ строки: {}", e))?;
+                        *occurrence += 1;
+                        let translated_text = saved_translations
+                            .get(&translation_key)
+                            .map(|text| Some(text.clone()))
+                            .unwrap_or_else(|| d.translated_text.clone());
+                        let is_trans = translated_text
+                            .as_deref()
+                            .is_some_and(|text| !text.trim().is_empty());
+                        file_total += 1;
+                        if is_trans {
+                            file_translated += 1;
+                        }
 
                         // Находим существующую сцену с таким именем (чтобы реплики склеивались в одну сцену)
                         let scene_idx = if let Some(pos) =
@@ -720,11 +744,12 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
 
                         scene.entries.push(DialogueEntryDto {
                             id: d.id.clone(),
+                            translation_key,
                             line_number: d.line_number,
                             speaker,
                             speaker_alias,
                             original_text: d.original_text.clone(),
-                            translated_text: d.translated_text.clone(),
+                            translated_text,
                             status: format!("{:?}", d.status),
                             scene_name: target_scene_name,
                         });
@@ -882,6 +907,20 @@ async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> 
     })
     .await
     .map_err(|e| format!("Ошибка задачи парсинга: {}", e))?
+}
+
+#[tauri::command]
+async fn save_file_translations(
+    file_path: String,
+    changes: Vec<translation::TranslationEdit>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        translation::save(Path::new(&file_path), &changes)?;
+        PARSED_FILE_CACHE.lock().unwrap().remove(&file_path);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Ошибка задачи сохранения перевода: {}", e))?
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1364,6 +1403,7 @@ pub fn run() {
             decompile_rpyc_file,
             get_project_glossary,
             save_project_glossary,
+            save_file_translations,
             read_source_file,
             open_in_system_editor,
             reveal_in_system_explorer
