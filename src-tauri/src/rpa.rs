@@ -237,14 +237,19 @@ impl RpaArchive {
             return Err(format!("Неподдерживаемая версия RPA архива: {}", version));
         }
 
-        if parts.len() < 3 {
+        if parts.len() < 2 {
             return Err(format!("Некорректный заголовок RPA: '{}'", header_str));
         }
 
         let index_offset = u64::from_str_radix(parts[1], 16)
             .map_err(|e| format!("Ошибка парсинга смещения индекса RPA: {}", e))?;
-        let key = u64::from_str_radix(parts[2], 16)
-            .map_err(|e| format!("Ошибка парсинга ключа RPA: {}", e))?;
+        // В RPA-2.0 ключа нет: смещения в индексе хранятся без XOR
+        let key = match (version.as_str(), parts.get(2)) {
+            ("RPA-2.0", _) => 0,
+            (_, Some(key)) => u64::from_str_radix(key, 16)
+                .map_err(|e| format!("Ошибка парсинга ключа RPA: {}", e))?,
+            (_, None) => return Err(format!("Некорректный заголовок RPA: '{}'", header_str)),
+        };
 
         let archive_size = file
             .metadata()
@@ -848,6 +853,37 @@ mod tests {
     }
 
     #[test]
+    fn test_read_rpa2_header_without_key() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_rpa2_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let rpa_path = temp_dir.join("old.rpa");
+        RpaArchive::create_archive(&rpa_path, &[("script.rpy".into(), b"label start:".to_vec())])
+            .unwrap();
+
+        // Заголовок RPA-2.0 короче: дополняем его так, чтобы смещения не сдвинулись
+        let index_offset = RpaArchive::open(&rpa_path).unwrap().index_offset;
+        let mut bytes = fs::read(&rpa_path).unwrap();
+        let header = format!("RPA-2.0 {:016x}\n", index_offset);
+        bytes[..header.len()].copy_from_slice(header.as_bytes());
+        fs::write(&rpa_path, &bytes).unwrap();
+
+        let archive = RpaArchive::open(&rpa_path).unwrap();
+        assert_eq!(archive.version, "RPA-2.0");
+        assert_eq!(archive.key, 0);
+        let extract_dir = temp_dir.join("extracted");
+        assert_eq!(RpaArchive::extract_all(&rpa_path, &extract_dir).unwrap(), 1);
+        assert_eq!(fs::read(extract_dir.join("script.rpy")).unwrap(), b"label start:");
+
+        // В RPA-3.0 ключ обязателен
+        let header = format!("RPA-3.0 {:016x}\n", index_offset);
+        bytes[..header.len()].copy_from_slice(header.as_bytes());
+        fs::write(&rpa_path, &bytes).unwrap();
+        assert!(RpaArchive::open(&rpa_path).is_err());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn test_reject_archive_path_traversal() {
         let temp_dir =
             std::env::temp_dir().join(format!("translator_rpa_path_{}", uuid::Uuid::new_v4()));
@@ -910,6 +946,25 @@ mod tests {
             "saved"
         );
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
+    fn test_read_real_rpa2_archive() {
+        let Some(path) = crate::local_test_game(crate::TEST_RPA2_ARCHIVE) else {
+            return;
+        };
+        let archive = RpaArchive::open(Path::new(&path)).unwrap();
+        assert_eq!(archive.version, "RPA-2.0");
+        assert!(!archive.entries.is_empty());
+
+        let mut file = File::open(&path).unwrap();
+        let archive_size = file.metadata().unwrap().len();
+        for entry in archive.entries.values() {
+            let mut sink = std::io::sink();
+            entry.copy_to(&mut file, archive_size, &mut sink).unwrap();
+        }
+        println!("{}: файлов {}", path, archive.entries.len());
     }
 
     #[test]

@@ -1484,6 +1484,9 @@ pub(crate) const TEST_RPA_GAME: &str = "TRANSLATOR_TEST_RPA_GAME";
 /// Игра с персонажами в `___sys/_vars/*.rpyc` внутри `archive.rpa` (папка `game`).
 #[cfg(test)]
 pub(crate) const TEST_CHARACTERS_GAME: &str = "TRANSLATOR_TEST_CHARACTERS_GAME";
+/// Путь к файлу архива формата RPA-2.0.
+#[cfg(test)]
+pub(crate) const TEST_RPA2_ARCHIVE: &str = "TRANSLATOR_TEST_RPA2_ARCHIVE";
 
 /// Папка игры для тестов на реальных данных: `cargo test -- --ignored`
 /// с заданной переменной окружения. Без неё такие тесты ничего не проверяют.
