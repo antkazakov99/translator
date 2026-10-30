@@ -41,10 +41,6 @@ static RE_STRUCT_ELSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s*else
 static RE_ORIG_LABEL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*label\s+([A-Za-z0-9_.]+)\s*:"#).unwrap());
 
-static RE_ORIG_DIALOGUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
-});
-
 static RE_STRINGS_BLOCK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^translate\s+\w+\s+strings\s*:"#).unwrap());
 
@@ -57,9 +53,22 @@ static RE_OLD: LazyLock<Regex> =
 static RE_NEW: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*new\s+"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap());
 
+// Говорящий: имя в кавычках или псевдоним с атрибутами спрайта (`e happy "..."`, `e @ sad "..."`)
 static RE_DIALOGUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*(?:(?P<speaker>[A-Za-z_][\w.]*)\s+)?"(?P<text>(?:[^"\\]|\\.)*)""#).unwrap()
+    Regex::new(concat!(
+        r#"^\s*(?:(?:"(?P<name>(?:[^"\\]|\\.)*)""#,
+        r#"|(?P<speaker>[A-Za-z_][\w.]*)(?:\s+(?:@|-?[A-Za-z_]\w*))*)\s+)?"#,
+        r#"(?:"(?P<text>(?:[^"\\]|\\.)*)"|'(?P<text_sq>(?:[^'\\]|\\.)*)')"#,
+    ))
+    .unwrap()
 });
+
+/// Операторы Ren'Py со строкой в аргументах: по виду они не отличаются от реплик.
+const NON_DIALOGUE_STATEMENTS: &[&str] = &[
+    "voice", "play", "queue", "stop", "show", "hide", "scene", "with", "image", "define",
+    "default", "transform", "style", "screen", "init", "python", "label", "menu", "jump", "call",
+    "return", "pause", "window", "if", "elif", "while", "for",
+];
 
 static RE_SOURCE_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*#\s*(?:game[/\\])?(?P<file>.+?\.rpy):(?P<line>\d+)"#).unwrap()
@@ -100,6 +109,42 @@ pub struct ScriptStructure {
     pub scene_choices: HashMap<String, Vec<ChoiceBlockDto>>,
     pub scene_jumps: HashMap<String, Vec<(String, Option<String>)>>,
     pub edges: Vec<SceneEdgeDto>,
+}
+
+/// Реплика, найденная в строке скрипта.
+struct SayLine<'a> {
+    speaker: Option<&'a str>,
+    /// Текст без кавычек, экранирование не снято.
+    text: &'a str,
+    /// Границы текста вместе с кавычками.
+    quoted: std::ops::Range<usize>,
+}
+
+fn parse_say_line(line: &str) -> Option<SayLine<'_>> {
+    let caps = RE_DIALOGUE.captures(line)?;
+    if let Some(keyword) = caps.name("speaker")
+        && NON_DIALOGUE_STATEMENTS.contains(&keyword.as_str())
+    {
+        return None;
+    }
+    let text = caps.name("text").or_else(|| caps.name("text_sq"))?;
+    Some(SayLine {
+        speaker: caps
+            .name("speaker")
+            .or_else(|| caps.name("name"))
+            .map(|speaker| speaker.as_str()),
+        text: text.as_str(),
+        quoted: text.start() - 1..text.end() + 1,
+    })
+}
+
+/// Файл перевода объявляет блоки `translate` в начале строки. Слово внутри
+/// реплики или комментария оригинального скрипта признаком не считается.
+fn has_translate_blocks(content: &str) -> bool {
+    content.lines().any(|line| {
+        let line = line.trim_start_matches('\u{feff}').trim_end();
+        line.starts_with("translate ") && line.ends_with(':')
+    })
 }
 
 /// Парсер и генератор файлов сценариев и локализаций Ren'Py (.rpy)
@@ -236,24 +281,36 @@ impl RenpyParser {
         text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
     }
 
-    /// Сверхбыстрый подсчет статистики файла перевода (всего строк, переведено)
-    /// без построения графа petgraph, без регулярных выражений и без генерации UUID.
-    /// Работает в 100+ раз быстрее полного парсинга.
+    /// Заменяет текст реплики или строки `new` в строке файла перевода.
+    pub fn replace_dialogue_text(line: &str, text: &str) -> Option<String> {
+        let say = parse_say_line(line)?;
+        Some(format!(
+            "{}\"{}\"{}",
+            &line[..say.quoted.start],
+            Self::escape_renpy_string(text),
+            &line[say.quoted.end..]
+        ))
+    }
+
+    /// Исходные тексты строк `old` из файла перевода.
+    pub fn string_translation_sources(content: &str) -> std::collections::HashSet<String> {
+        content
+            .lines()
+            .filter_map(|line| RE_OLD.captures(line))
+            .map(|caps| Self::unescape_renpy_string(caps.name("text").unwrap().as_str()))
+            .collect()
+    }
+
+    /// Быстрый подсчет статистики файла перевода (всего строк, переведено)
+    /// без построения графа petgraph и без генерации UUID. Реплики определяются
+    /// так же, как в полном разборе, поэтому счётчики не расходятся.
     pub fn quick_translation_stats(content: &str) -> (usize, usize) {
-        if !content.contains("translate ") {
-            let mut total = 0;
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if !trimmed.starts_with('#')
-                    && trimmed.contains('"')
-                    && !trimmed.starts_with("define ")
-                    && !trimmed.starts_with("image ")
-                    && !trimmed.starts_with("default ")
-                    && !trimmed.starts_with('$')
-                {
-                    total += 1;
-                }
-            }
+        if !has_translate_blocks(content) {
+            let total = content
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with('#') && parse_say_line(line).is_some())
+                .count();
             return (total, 0);
         }
 
@@ -315,12 +372,12 @@ impl RenpyParser {
             if in_block {
                 if trimmed.starts_with('#') {
                     // Игнорируем комментарии путей вроде `# game/story.rpy:10`
-                    if trimmed.contains('"') {
+                    if parse_say_line(trimmed.trim_start_matches('#').trim()).is_some() {
                         pending_dialogue = true;
                     }
-                } else if pending_dialogue && trimmed.contains('"') {
+                } else if pending_dialogue && let Some(say) = parse_say_line(trimmed) {
                     total += 1;
-                    if Self::has_cyrillic(trimmed) {
+                    if Self::has_cyrillic(say.text) {
                         translated += 1;
                     }
                     pending_dialogue = false;
@@ -613,28 +670,9 @@ impl RenpyParser {
                 continue;
             }
 
-            // Исключаем ключевые команды движка
-            if trimmed.starts_with('$')
-                || trimmed.starts_with("jump ")
-                || trimmed.starts_with("call ")
-                || trimmed.starts_with("scene ")
-                || trimmed.starts_with("show ")
-                || trimmed.starts_with("hide ")
-                || trimmed.starts_with("with ")
-                || trimmed.starts_with("play ")
-                || trimmed.starts_with("stop ")
-                || trimmed.starts_with("define ")
-                || trimmed.starts_with("default ")
-                || trimmed.starts_with("python")
-                || trimmed.starts_with("init ")
-                || trimmed.starts_with("return")
-            {
-                continue;
-            }
-
-            if let Some(caps) = RE_ORIG_DIALOGUE.captures(trimmed) {
-                let speaker_alias = caps.name("speaker").map(|s| s.as_str());
-                let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
+            if let Some(say) = parse_say_line(trimmed) {
+                let speaker_alias = say.speaker;
+                let text = Self::unescape_renpy_string(say.text);
                 let resolved_speaker = self.resolve_speaker(speaker_alias);
 
                 let mut dialogue =
@@ -663,7 +701,7 @@ impl GameParser for RenpyParser {
 
     /// Парсит `.rpy` файл и группирует реплики по реальным смысловым сценам
     fn parse_file(&self, path: &Path, content: &str) -> Result<ScenarioGraph> {
-        if !content.contains("translate ") {
+        if !has_translate_blocks(content) {
             return self.parse_original_script(path, content);
         }
 
@@ -740,13 +778,14 @@ impl GameParser for RenpyParser {
 
                     // Дедупликация строк UI: если точно такой же old_text уже встречался
                     if let Some(&existing_idx) = seen_ui_strings.get(&old_text) {
-                        if is_translated
-                            && let Some(existing_node) = graph.get_node_mut(existing_idx)
+                        if let Some(existing_node) = graph.get_node_mut(existing_idx)
                             && let Some(d) = existing_node.as_dialogue_mut()
-                            && d.translated_text.is_none()
                         {
-                            d.translated_text = Some(new_text);
-                            d.status = TranslationStatus::Translated;
+                            d.target_lines.push(line_num);
+                            if is_translated && d.translated_text.is_none() {
+                                d.translated_text = Some(new_text);
+                                d.status = TranslationStatus::Translated;
+                            }
                         }
                     } else {
                         let mut dialogue = ScenarioNode::dialogue(
@@ -757,6 +796,7 @@ impl GameParser for RenpyParser {
                         );
                         if let Some(d) = dialogue.as_dialogue_mut() {
                             d.speaker_alias = Some("UI".to_string());
+                            d.target_lines.push(line_num);
                             if is_translated {
                                 d.translated_text = Some(new_text);
                                 d.status = TranslationStatus::Translated;
@@ -778,17 +818,14 @@ impl GameParser for RenpyParser {
                 let trimmed = line.trim();
                 if trimmed.starts_with('#') {
                     let comment = trimmed.trim_start_matches('#').trim();
-                    if let Some(caps) = RE_DIALOGUE.captures(comment) {
-                        let speaker = caps.name("speaker").map(|s| s.as_str().to_string());
-                        let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
+                    if let Some(say) = parse_say_line(comment) {
+                        let speaker = say.speaker.map(str::to_string);
+                        let text = Self::unescape_renpy_string(say.text);
                         pending_source = Some((speaker, text, line_num));
                     }
-                } else if !trimmed.is_empty()
-                    && let Some(caps) = RE_DIALOGUE.captures(trimmed)
-                {
-                    let speaker_alias = caps.name("speaker").map(|s| s.as_str());
-                    let target_text =
-                        Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
+                } else if let Some(say) = parse_say_line(trimmed) {
+                    let speaker_alias = say.speaker;
+                    let target_text = Self::unescape_renpy_string(say.text);
 
                     if let Some((src_speaker, src_text, src_line)) = pending_source.take() {
                         let raw_alias = src_speaker
@@ -807,6 +844,7 @@ impl GameParser for RenpyParser {
                         if let Some(d) = dialogue.as_dialogue_mut() {
                             d.block_id = current_block_id.clone();
                             d.speaker_alias = raw_alias;
+                            d.target_lines.push(line_num);
                             if is_translated {
                                 d.translated_text = Some(target_text);
                                 d.status = TranslationStatus::Translated;
@@ -841,6 +879,81 @@ mod tests {
         let speakers = RenpyParser::extract_speakers(script);
         assert_eq!(speakers.get("mc").unwrap(), "Главный Герой");
         assert_eq!(speakers.get("e").unwrap(), "Erika");
+    }
+
+    fn dialogue_texts(rpy: &str) -> Vec<(Option<String>, String, Option<String>)> {
+        let graph = RenpyParser::new().parse_file(Path::new("t.rpy"), rpy).unwrap();
+        graph
+            .node_indices()
+            .filter_map(|idx| graph.get_node(idx)?.as_dialogue().cloned())
+            .map(|d| (d.speaker, d.original_text, d.translated_text))
+            .collect()
+    }
+
+    #[test]
+    fn test_word_translate_in_dialogue_keeps_original_script_mode() {
+        let rpy = "label start:\n    e \"I can translate this.\"\n    # translate later\n";
+        assert_eq!(RenpyParser::quick_translation_stats(rpy), (1, 0));
+        assert_eq!(dialogue_texts(rpy).len(), 1);
+
+        let with_bom = "\u{feff}translate russian start_abcd1234:\n    # e \"Hi\"\n    e \"Привет\"\n";
+        assert!(has_translate_blocks(with_bom));
+    }
+
+    #[test]
+    fn test_dialogue_forms() {
+        let rpy = r#"label start:
+    e happy "With attributes"
+    e @ sad -angry "Say with"
+    "Stranger" "Named by string"
+    e 'Single quotes'
+    "Narration" with dissolve
+    voice "audio/line.ogg"
+    play music "theme.ogg"
+    show text "Title"
+    define x = "value"
+"#;
+        let texts: Vec<_> = dialogue_texts(rpy).into_iter().map(|d| (d.0, d.1)).collect();
+        assert_eq!(
+            texts,
+            vec![
+                (Some("e".to_string()), "With attributes".to_string()),
+                (Some("e".to_string()), "Say with".to_string()),
+                (Some("Stranger".to_string()), "Named by string".to_string()),
+                (Some("e".to_string()), "Single quotes".to_string()),
+                (None, "Narration".to_string()),
+            ]
+        );
+        assert_eq!(RenpyParser::quick_translation_stats(rpy), (5, 0));
+    }
+
+    #[test]
+    fn test_voice_line_keeps_dialogue_translation() {
+        let rpy = r#"translate russian start_abcd1234:
+
+    # voice "audio/line.ogg"
+    # e happy "Hello"
+    voice "audio/line.ogg"
+    e happy "Привет"
+"#;
+        assert_eq!(
+            dialogue_texts(rpy),
+            vec![(Some("e".to_string()), "Hello".to_string(), Some("Привет".to_string()))]
+        );
+        assert_eq!(RenpyParser::quick_translation_stats(rpy), (1, 1));
+    }
+
+    #[test]
+    fn test_replace_dialogue_text_keeps_line_shape() {
+        assert_eq!(
+            RenpyParser::replace_dialogue_text("    e happy \"Старый\" with dissolve\r", "Новый \"текст\""),
+            Some("    e happy \"Новый \\\"текст\\\"\" with dissolve\r".to_string())
+        );
+        assert_eq!(
+            RenpyParser::replace_dialogue_text("    new 'old'", "new"),
+            Some("    new \"new\"".to_string())
+        );
+        assert_eq!(RenpyParser::replace_dialogue_text("    voice \"a.ogg\"", "x"), None);
     }
 
     #[test]

@@ -37,17 +37,28 @@ fn tl_lang_dir(game_dir: &Path) -> PathBuf {
     game_dir.join("tl").join(TL_LANG)
 }
 
+fn tl_segment_position(parts: &[Component]) -> Option<usize> {
+    parts.windows(2).position(|pair| {
+        pair[0].as_os_str().eq_ignore_ascii_case("tl")
+            && pair[1].as_os_str().eq_ignore_ascii_case(TL_LANG)
+    })
+}
+
 /// Путь к исходному скрипту: убирает сегмент `tl/<язык>` из пути файла перевода.
 fn original_script_path(path: &Path) -> PathBuf {
     let parts: Vec<Component> = path.components().collect();
-    let tl_pos = parts.windows(2).position(|pair| {
-        pair[0].as_os_str().eq_ignore_ascii_case("tl")
-            && pair[1].as_os_str().eq_ignore_ascii_case(TL_LANG)
-    });
-    match tl_pos {
+    match tl_segment_position(&parts) {
         Some(pos) => parts[..pos].iter().chain(&parts[pos + 2..]).collect(),
         None => path.to_path_buf(),
     }
+}
+
+/// Путь файла перевода относительно `tl/<язык>`; `None` для остальных файлов.
+pub(crate) fn tl_relative_name(path: &Path) -> Option<String> {
+    let parts: Vec<Component> = path.components().collect();
+    let pos = tl_segment_position(&parts)?;
+    let relative: PathBuf = parts[pos + 2..].iter().collect();
+    Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
 static PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
@@ -271,6 +282,7 @@ pub struct DialogueEntryDto {
     pub id: String,
     pub translation_key: String,
     pub line_number: usize,
+    pub target_lines: Vec<usize>,
     pub speaker: Option<String>,
     pub speaker_alias: Option<String>,
     pub original_text: String,
@@ -564,337 +576,351 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
 
 #[tauri::command]
 async fn parse_file_entries(file_path: String) -> Result<ParsedFileDto, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let path = Path::new(&file_path);
-        let file_mtime = std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .map_err(|e| format!("Не удалось получить свойства файла: {}", e))?;
+    tauri::async_runtime::spawn_blocking(move || parse_project_file(file_path))
+        .await
+        .map_err(|e| format!("Ошибка задачи парсинга: {}", e))?
+}
 
-        let orig_path = original_script_path(path);
-        let orig_path = orig_path.as_path();
-        let orig_mtime = if orig_path.exists() {
-            std::fs::metadata(orig_path).and_then(|m| m.modified()).ok()
-        } else {
-            None
+/// Какой сцене принадлежит текст выбора. Один текст может встречаться в разных
+/// сценах, а порядок обхода `scene_choices` случаен, поэтому берётся первая сцена
+/// по порядку объявления. Иначе ключ строки менялся бы между запусками.
+fn choice_scenes(structure: &ScriptStructure) -> HashMap<String, String> {
+    let mut scenes = HashMap::new();
+    for label in &structure.labels {
+        let Some(choices) = structure.scene_choices.get(&label.name) else {
+            continue;
         };
+        for option in choices.iter().flat_map(|choice| &choice.options) {
+            scenes
+                .entry(option.text.trim().to_string())
+                .or_insert_with(|| label.name.clone());
+        }
+    }
+    scenes
+}
 
-        // 1. Проверяем кэш готового распарсенного файла (мгновенный отклик при повторном клике)
+/// Разбирает файл проекта на сцены и подставляет сохранённые правки перевода.
+pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, String> {
+    let path = Path::new(&file_path);
+    let file_mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("Не удалось получить свойства файла: {}", e))?;
+
+    let orig_path = original_script_path(path);
+    let orig_path = orig_path.as_path();
+    let orig_mtime = if orig_path.exists() {
+        std::fs::metadata(orig_path).and_then(|m| m.modified()).ok()
+    } else {
+        None
+    };
+
+    // 1. Проверяем кэш готового распарсенного файла (мгновенный отклик при повторном клике)
+    {
+        let cache = PARSED_FILE_CACHE.lock();
+        if let Some(entry) = cache.get(&file_path)
+            && entry.file_mtime == file_mtime
+            && entry.orig_mtime == orig_mtime
         {
-            let cache = PARSED_FILE_CACHE.lock();
-            if let Some(entry) = cache.get(&file_path)
-                && entry.file_mtime == file_mtime
-                && entry.orig_mtime == orig_mtime
-            {
-                return Ok(entry.result.clone());
-            }
+            return Ok(entry.result.clone());
         }
+    }
 
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
-        let saved_translations = translation::load(path)?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
+    let saved_translations = translation::load(path)?;
 
-        let search_dir = find_game_root(path);
-        let cache_dir = get_project_scripts_cache_dir(&search_dir);
+    let search_dir = find_game_root(path);
+    let cache_dir = get_project_scripts_cache_dir(&search_dir);
 
-        // 2. Персонажи / speakers: берем из кэша проекта, если есть
-        let speakers_map = {
-            let cache = PROJECT_CACHE.lock();
-            cache.speakers.get(&search_dir).cloned()
-        };
-        let speakers_map = match speakers_map {
-            Some(map) => map,
-            None => {
-                let mut map = HashMap::new();
-                let mut check_files = Vec::new();
-                collect_rpy_files(&search_dir, &mut check_files);
-                collect_rpy_files(&cache_dir, &mut check_files);
-                for f in check_files.into_iter().take(MAX_SPEAKER_SCAN_FILES) {
-                    if let Ok(c) = std::fs::read_to_string(&f) {
-                        map.extend(RenpyParser::extract_speakers(&c));
-                    }
-                }
-                // Полная карта от параллельного сканирования важнее этой быстрой выборки
-                let mut cache = PROJECT_CACHE.lock();
-                cache
-                    .speakers
-                    .entry(search_dir.clone())
-                    .or_insert(map)
-                    .clone()
-            }
-        };
-
-        let parser = RenpyParser::new().with_speakers(speakers_map);
-        let graph = parser
-            .parse_file(path, &content)
-            .map_err(|e| format!("Ошибка парсинга: {}", e))?;
-
-        // 3. Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры (с кэшированием структуры)
-        let script_struct = if orig_path.exists() {
-            get_cached_script_structure(orig_path).unwrap_or_default()
-        } else {
-            get_cached_script_structure(path).unwrap_or_default()
-        };
-
-        // Быстрый поиск: текст выбора -> имя сцены
-        let mut choice_text_to_scene: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for (scene_name, choices) in &script_struct.scene_choices {
-            for choice in choices {
-                for opt in &choice.options {
-                    choice_text_to_scene.insert(opt.text.trim().to_string(), scene_name.clone());
+    // 2. Персонажи / speakers: берем из кэша проекта, если есть
+    let speakers_map = {
+        let cache = PROJECT_CACHE.lock();
+        cache.speakers.get(&search_dir).cloned()
+    };
+    let speakers_map = match speakers_map {
+        Some(map) => map,
+        None => {
+            let mut map = HashMap::new();
+            let mut check_files = Vec::new();
+            collect_rpy_files(&search_dir, &mut check_files);
+            collect_rpy_files(&cache_dir, &mut check_files);
+            for f in check_files.into_iter().take(MAX_SPEAKER_SCAN_FILES) {
+                if let Ok(c) = std::fs::read_to_string(&f) {
+                    map.extend(RenpyParser::extract_speakers(&c));
                 }
             }
+            // Полная карта от параллельного сканирования важнее этой быстрой выборки
+            let mut cache = PROJECT_CACHE.lock();
+            cache
+                .speakers
+                .entry(search_dir.clone())
+                .or_insert(map)
+                .clone()
         }
+    };
 
-        let mut scenes: Vec<SceneDto> = Vec::new();
-        let mut file_total = 0;
-        let mut file_translated = 0;
-        let mut current_scene_name = "Общие диалоги".to_string();
-        let mut repeated_lines: std::collections::HashMap<(usize, String, String), usize> =
-            std::collections::HashMap::new();
+    let parser = RenpyParser::new().with_speakers(speakers_map);
+    let graph = parser
+        .parse_file(path, &content)
+        .map_err(|e| format!("Ошибка парсинга: {}", e))?;
 
-        for idx in graph.node_indices() {
-            if let Some(node) = graph.get_node(idx) {
-                match node {
-                    ScenarioNode::Label(label_name) => {
-                        current_scene_name = label_name.clone();
-                    }
-                    ScenarioNode::Dialogue(d) => {
-                        let (target_scene_name, is_menu_choice) =
-                            if d.speaker.as_deref() == Some("UI / Choice") {
-                                let trimmed_orig = d.original_text.trim();
-                                if let Some(scene) = choice_text_to_scene.get(trimmed_orig) {
-                                    (scene.clone(), true)
-                                } else {
-                                    ("Интерфейс и меню (strings)".to_string(), false)
-                                }
+    // 3. Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры (с кэшированием структуры)
+    let script_struct = if orig_path.exists() {
+        get_cached_script_structure(orig_path).unwrap_or_default()
+    } else {
+        get_cached_script_structure(path).unwrap_or_default()
+    };
+
+    // Быстрый поиск: текст выбора -> имя сцены
+    let choice_text_to_scene = choice_scenes(&script_struct);
+
+    let mut scenes: Vec<SceneDto> = Vec::new();
+    let mut file_total = 0;
+    let mut file_translated = 0;
+    let mut current_scene_name = "Общие диалоги".to_string();
+    let mut repeated_lines: std::collections::HashMap<(usize, String, String), usize> =
+        std::collections::HashMap::new();
+
+    for idx in graph.node_indices() {
+        if let Some(node) = graph.get_node(idx) {
+            match node {
+                ScenarioNode::Label(label_name) => {
+                    current_scene_name = label_name.clone();
+                }
+                ScenarioNode::Dialogue(d) => {
+                    let (target_scene_name, is_menu_choice) =
+                        if d.speaker.as_deref() == Some("UI / Choice") {
+                            let trimmed_orig = d.original_text.trim();
+                            if let Some(scene) = choice_text_to_scene.get(trimmed_orig) {
+                                (scene.clone(), true)
                             } else {
-                                (current_scene_name.clone(), false)
-                            };
-
-                        let identity = (
-                            d.line_number,
-                            target_scene_name.clone(),
-                            d.original_text.clone(),
-                        );
-                        let occurrence = repeated_lines.entry(identity.clone()).or_default();
-                        let translation_key = serde_json::to_string(&(
-                            identity.0,
-                            &identity.1,
-                            &identity.2,
-                            *occurrence,
-                        ))
-                        .map_err(|e| format!("Не удалось создать ключ строки: {}", e))?;
-                        *occurrence += 1;
-                        let translated_text = saved_translations
-                            .get(&translation_key)
-                            .map(|text| Some(text.clone()))
-                            .unwrap_or_else(|| d.translated_text.clone());
-                        let is_trans = translated_text
-                            .as_deref()
-                            .is_some_and(|text| !text.trim().is_empty());
-                        file_total += 1;
-                        if is_trans {
-                            file_translated += 1;
-                        }
-
-                        // Находим существующую сцену с таким именем (чтобы реплики склеивались в одну сцену)
-                        let scene_idx = if let Some(pos) =
-                            scenes.iter().position(|s| s.name == target_scene_name)
-                        {
-                            pos
+                                ("Интерфейс и меню (strings)".to_string(), false)
+                            }
                         } else {
-                            let new_id = format!("scene_{}", scenes.len());
-                            scenes.push(SceneDto {
-                                id: new_id,
-                                name: target_scene_name.clone(),
-                                total_lines: 0,
-                                translated_lines: 0,
-                                choices: Vec::new(),
-                                jumps: Vec::new(),
-                                entries: Vec::new(),
-                            });
-                            scenes.len() - 1
+                            (current_scene_name.clone(), false)
                         };
 
-                        let scene = &mut scenes[scene_idx];
-                        scene.total_lines += 1;
-                        if is_trans {
-                            scene.translated_lines += 1;
-                        }
-
-                        let mut speaker = d.speaker.clone();
-                        let mut speaker_alias = d.speaker_alias.clone();
-                        if is_menu_choice {
-                            speaker = Some("Выбор в меню".to_string());
-                            speaker_alias = Some("Choice".to_string());
-                        }
-
-                        scene.entries.push(DialogueEntryDto {
-                            id: d.id.clone(),
-                            translation_key,
-                            line_number: d.line_number,
-                            speaker,
-                            speaker_alias,
-                            original_text: d.original_text.clone(),
-                            translated_text,
-                            status: format!("{:?}", d.status),
-                            scene_name: target_scene_name,
-                        });
+                    let identity = (
+                        d.line_number,
+                        target_scene_name.clone(),
+                        d.original_text.clone(),
+                    );
+                    let occurrence = repeated_lines.entry(identity.clone()).or_default();
+                    let translation_key = serde_json::to_string(&(
+                        identity.0,
+                        &identity.1,
+                        &identity.2,
+                        *occurrence,
+                    ))
+                    .map_err(|e| format!("Не удалось создать ключ строки: {}", e))?;
+                    *occurrence += 1;
+                    let translated_text = saved_translations
+                        .get(&translation_key)
+                        .map(|text| Some(text.clone()))
+                        .unwrap_or_else(|| d.translated_text.clone());
+                    let is_trans = translated_text
+                        .as_deref()
+                        .is_some_and(|text| !text.trim().is_empty());
+                    file_total += 1;
+                    if is_trans {
+                        file_translated += 1;
                     }
-                    _ => {}
+
+                    // Находим существующую сцену с таким именем (чтобы реплики склеивались в одну сцену)
+                    let scene_idx = if let Some(pos) =
+                        scenes.iter().position(|s| s.name == target_scene_name)
+                    {
+                        pos
+                    } else {
+                        let new_id = format!("scene_{}", scenes.len());
+                        scenes.push(SceneDto {
+                            id: new_id,
+                            name: target_scene_name.clone(),
+                            total_lines: 0,
+                            translated_lines: 0,
+                            choices: Vec::new(),
+                            jumps: Vec::new(),
+                            entries: Vec::new(),
+                        });
+                        scenes.len() - 1
+                    };
+
+                    let scene = &mut scenes[scene_idx];
+                    scene.total_lines += 1;
+                    if is_trans {
+                        scene.translated_lines += 1;
+                    }
+
+                    let mut speaker = d.speaker.clone();
+                    let mut speaker_alias = d.speaker_alias.clone();
+                    if is_menu_choice {
+                        speaker = Some("Выбор в меню".to_string());
+                        speaker_alias = Some("Choice".to_string());
+                    }
+
+                    scene.entries.push(DialogueEntryDto {
+                        id: d.id.clone(),
+                        translation_key,
+                        line_number: d.line_number,
+                        target_lines: d.target_lines.clone(),
+                        speaker,
+                        speaker_alias,
+                        original_text: d.original_text.clone(),
+                        translated_text,
+                        status: format!("{:?}", d.status),
+                        scene_name: target_scene_name,
+                    });
                 }
+                _ => {}
             }
         }
+    }
 
-        // Гарантируем, что ВСЕ сюжетные сцены/метки из оригинального файла присутствуют в списке сцен
-        for label_info in &script_struct.labels {
-            if !scenes.iter().any(|s| s.name == label_info.name) {
-                scenes.push(SceneDto {
-                    id: format!("scene_{}", scenes.len()),
-                    name: label_info.name.clone(),
-                    total_lines: 0,
-                    translated_lines: 0,
-                    choices: Vec::new(),
-                    jumps: Vec::new(),
-                    entries: Vec::new(),
+    // Гарантируем, что ВСЕ сюжетные сцены/метки из оригинального файла присутствуют в списке сцен
+    for label_info in &script_struct.labels {
+        if !scenes.iter().any(|s| s.name == label_info.name) {
+            scenes.push(SceneDto {
+                id: format!("scene_{}", scenes.len()),
+                name: label_info.name.clone(),
+                total_lines: 0,
+                translated_lines: 0,
+                choices: Vec::new(),
+                jumps: Vec::new(),
+                entries: Vec::new(),
+            });
+        }
+    }
+
+    // Упорядочиваем сцены в порядке объявления в оригинальном скрипте
+    scenes.sort_by_key(|s| {
+        if s.name == "Интерфейс и меню (strings)" {
+            usize::MAX
+        } else {
+            script_struct
+                .labels
+                .iter()
+                .position(|l| l.name == s.name)
+                .unwrap_or(usize::MAX - 1)
+        }
+    });
+
+    // Переиндексируем ID сцен
+    for (idx, scene) in scenes.iter_mut().enumerate() {
+        scene.id = format!("scene_{}", idx);
+    }
+
+    // Привязываем найденные выборы (меню) и переходы к каждой сцене
+    for scene in &mut scenes {
+        if let Some(choices) = script_struct.scene_choices.get(&scene.name) {
+            scene.choices = choices.clone();
+        }
+        if let Some(jumps) = script_struct.scene_jumps.get(&scene.name) {
+            scene.jumps = jumps.iter().map(|(target, _)| target.clone()).collect();
+        }
+    }
+
+    let mut edges = script_struct.edges;
+    // Если переходов в файле не обнаружено, связываем сцены последовательно
+    if edges.is_empty() && scenes.len() > 1 {
+        for i in 0..scenes.len() - 1 {
+            if scenes[i].name != "Интерфейс и меню (strings)"
+                && scenes[i + 1].name != "Интерфейс и меню (strings)"
+            {
+                edges.push(SceneEdgeDto {
+                    from: scenes[i].name.clone(),
+                    to: scenes[i + 1].name.clone(),
+                    kind: "linear".to_string(),
+                    condition: None,
                 });
             }
         }
+    }
 
-        // Упорядочиваем сцены в порядке объявления в оригинальном скрипте
-        scenes.sort_by_key(|s| {
-            if s.name == "Интерфейс и меню (strings)" {
-                usize::MAX
-            } else {
-                script_struct
-                    .labels
-                    .iter()
-                    .position(|l| l.name == s.name)
-                    .unwrap_or(usize::MAX - 1)
-            }
-        });
+    // Поиск входящих переходов из ДРУГИХ скриптов проекта в сцены текущего файла
+    let current_scene_names: std::collections::HashSet<String> = scenes
+        .iter()
+        .map(|s| s.name.clone())
+        .filter(|name| name != "Интерфейс и меню (strings)")
+        .collect();
 
-        // Переиндексируем ID сцен
-        for (idx, scene) in scenes.iter_mut().enumerate() {
-            scene.id = format!("scene_{}", idx);
-        }
+    if !current_scene_names.is_empty() {
+        let all_scripts = get_project_scripts(&search_dir, &cache_dir);
 
-        // Привязываем найденные выборы (меню) и переходы к каждой сцене
-        for scene in &mut scenes {
-            if let Some(choices) = script_struct.scene_choices.get(&scene.name) {
-                scene.choices = choices.clone();
-            }
-            if let Some(jumps) = script_struct.scene_jumps.get(&scene.name) {
-                scene.jumps = jumps.iter().map(|(target, _)| target.clone()).collect();
-            }
-        }
+        let cur_file_norm = path.to_string_lossy().to_lowercase().replace('\\', "/");
+        let cur_orig_norm = orig_path
+            .to_string_lossy()
+            .to_lowercase()
+            .replace('\\', "/");
 
-        let mut edges = script_struct.edges;
-        // Если переходов в файле не обнаружено, связываем сцены последовательно
-        if edges.is_empty() && scenes.len() > 1 {
-            for i in 0..scenes.len() - 1 {
-                if scenes[i].name != "Интерфейс и меню (strings)"
-                    && scenes[i + 1].name != "Интерфейс и меню (strings)"
-                {
-                    edges.push(SceneEdgeDto {
-                        from: scenes[i].name.clone(),
-                        to: scenes[i + 1].name.clone(),
-                        kind: "linear".to_string(),
-                        condition: None,
-                    });
+        let external_incoming_edges: Vec<SceneEdgeDto> = all_scripts
+            .into_par_iter()
+            .filter(|p| {
+                let s = p.to_string_lossy().replace('\\', "/");
+                let s_lower = s.to_lowercase();
+                if s_lower.contains("/tl/") {
+                    return false;
                 }
-            }
-        }
-
-        // Поиск входящих переходов из ДРУГИХ скриптов проекта в сцены текущего файла
-        let current_scene_names: std::collections::HashSet<String> = scenes
-            .iter()
-            .map(|s| s.name.clone())
-            .filter(|name| name != "Интерфейс и меню (strings)")
+                if s_lower == cur_file_norm || s_lower == cur_orig_norm {
+                    return false;
+                }
+                true
+            })
+            .filter_map(|other_path| {
+                let other_struct = get_cached_script_structure(&other_path)?;
+                let mut matched = Vec::new();
+                for edge in other_struct.edges {
+                    if current_scene_names.contains(&edge.to) {
+                        matched.push(edge);
+                    }
+                }
+                if matched.is_empty() {
+                    None
+                } else {
+                    Some(matched)
+                }
+            })
+            .flatten()
             .collect();
 
-        if !current_scene_names.is_empty() {
-            let all_scripts = get_project_scripts(&search_dir, &cache_dir);
-
-            let cur_file_norm = path.to_string_lossy().to_lowercase().replace('\\', "/");
-            let cur_orig_norm = orig_path
-                .to_string_lossy()
-                .to_lowercase()
-                .replace('\\', "/");
-
-            let external_incoming_edges: Vec<SceneEdgeDto> = all_scripts
-                .into_par_iter()
-                .filter(|p| {
-                    let s = p.to_string_lossy().replace('\\', "/");
-                    let s_lower = s.to_lowercase();
-                    if s_lower.contains("/tl/") {
-                        return false;
-                    }
-                    if s_lower == cur_file_norm || s_lower == cur_orig_norm {
-                        return false;
-                    }
-                    true
-                })
-                .filter_map(|other_path| {
-                    let other_struct = get_cached_script_structure(&other_path)?;
-                    let mut matched = Vec::new();
-                    for edge in other_struct.edges {
-                        if current_scene_names.contains(&edge.to) {
-                            matched.push(edge);
-                        }
-                    }
-                    if matched.is_empty() {
-                        None
-                    } else {
-                        Some(matched)
-                    }
-                })
-                .flatten()
-                .collect();
-
-            for ext_edge in external_incoming_edges {
-                if !edges.iter().any(|e| {
-                    e.from == ext_edge.from
-                        && e.to == ext_edge.to
-                        && e.kind == ext_edge.kind
-                        && e.condition == ext_edge.condition
-                }) {
-                    edges.push(ext_edge);
-                }
+        for ext_edge in external_incoming_edges {
+            if !edges.iter().any(|e| {
+                e.from == ext_edge.from
+                    && e.to == ext_edge.to
+                    && e.kind == ext_edge.kind
+                    && e.condition == ext_edge.condition
+            }) {
+                edges.push(ext_edge);
             }
         }
+    }
 
-        let parsed_result = ParsedFileDto {
-            file_path: file_path.clone(),
-            file_name: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-            total_lines: file_total,
-            translated_lines: file_translated,
-            scenes,
-            edges,
-        };
+    let parsed_result = ParsedFileDto {
+        file_path: file_path.clone(),
+        file_name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        total_lines: file_total,
+        translated_lines: file_translated,
+        scenes,
+        edges,
+    };
 
-        // Сохраняем в кэш распарсенных файлов для мгновенного отклика при навигации
-        {
-            let mut cache = PARSED_FILE_CACHE.lock();
-            cache.insert(
-                file_path,
-                ParsedFileCacheEntry {
-                    file_mtime,
-                    orig_mtime,
-                    result: parsed_result.clone(),
-                },
-            );
-        }
+    // Сохраняем в кэш распарсенных файлов для мгновенного отклика при навигации
+    {
+        let mut cache = PARSED_FILE_CACHE.lock();
+        cache.insert(
+            file_path,
+            ParsedFileCacheEntry {
+                file_mtime,
+                orig_mtime,
+                result: parsed_result.clone(),
+            },
+        );
+    }
 
-        Ok(parsed_result)
-    })
-    .await
-    .map_err(|e| format!("Ошибка задачи парсинга: {}", e))?
+    Ok(parsed_result)
 }
 
 #[tauri::command]
@@ -1054,9 +1080,6 @@ async fn pack_mod_rpa(game_dir: String, output_rpa_path: Option<String>) -> Resu
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
         let tl_dir = tl_lang_dir(&base_path);
-        if !tl_dir.exists() {
-            return Err("Папка перевода tl/russian не найдена в директории игры".to_string());
-        }
 
         let out_path = if let Some(ref p) = output_rpa_path {
             PathBuf::from(p)
@@ -1067,16 +1090,24 @@ async fn pack_mod_rpa(game_dir: String, output_rpa_path: Option<String>) -> Resu
         };
         ensure_output_outside_game(&out_path, std::slice::from_ref(&base_path))?;
 
-        if translation::has_saved_edits(&base_path)? {
-            return Err("RPA не собран: сохранённые в приложении правки перевода ещё не включаются в архив. Сборка остановлена, чтобы не создать устаревший мод".to_string());
+        let export = translation::prepare_mod_export(&base_path, &tl_dir)?;
+        if !tl_dir.exists() && export.files.is_empty() {
+            return Err("Папка перевода tl/russian не найдена в директории игры".to_string());
         }
 
-        let count = rpa::RpaArchive::pack_mod_from_folder(&tl_dir, &out_path)?;
-        Ok(format!(
+        let count = rpa::RpaArchive::pack_mod_from_folder(&tl_dir, export.files, &out_path)?;
+        let mut message = format!(
             "Мод успешно собран! Упаковано {} файлов в {}",
             count,
             out_path.to_string_lossy()
-        ))
+        );
+        if export.skipped > 0 {
+            message.push_str(&format!(
+                ". Не перенесено правок: {} (их строки изменились или конфликтуют с tl/russian)",
+                export.skipped
+            ));
+        }
+        Ok(message)
     })
     .await
     .map_err(|e| format!("Ошибка сборки RPA мода: {}", e))?
@@ -1541,34 +1572,134 @@ mod tests {
     }
 
     #[test]
-    fn test_saved_edit_of_translation_file_blocks_stale_export() {
+    fn test_repeated_choice_text_belongs_to_first_declared_scene() {
+        let script = (0..32)
+            .map(|i| format!("label scene_{i}:\n    menu:\n        \"Yes\":\n            pass\n\n"))
+            .collect::<String>();
+        let structure = RenpyParser::parse_script_structure(&script);
+        assert_eq!(choice_scenes(&structure).get("Yes").unwrap(), "scene_0");
+    }
+
+    /// Сохраняет перевод для реплик файла так же, как это делает интерфейс.
+    fn save_edits(file: &Path, edits: &[(&str, &str)]) {
+        let parsed = parse_project_file(file.to_string_lossy().to_string()).unwrap();
+        let changes: Vec<_> = edits
+            .iter()
+            .map(|(original, text)| translation::TranslationEdit {
+                key: parsed
+                    .scenes
+                    .iter()
+                    .flat_map(|scene| &scene.entries)
+                    .find(|entry| entry.original_text == *original)
+                    .unwrap()
+                    .translation_key
+                    .clone(),
+                text: text.to_string(),
+            })
+            .collect();
+        translation::save(file, &changes).unwrap();
+    }
+
+    /// Собирает мод в папку данных приложения и распаковывает его рядом с тестом.
+    fn pack_and_unpack(game_dir: &Path, out_dir: &Path) -> String {
         tauri::async_runtime::block_on(async {
-            let temp_dir = std::env::temp_dir()
-                .join(format!("translator_saved_edit_{}", uuid::Uuid::new_v4()));
-            let game_dir = temp_dir.join("game");
-            let tl_dir = tl_lang_dir(&game_dir);
-            std::fs::create_dir_all(&tl_dir).unwrap();
-            std::fs::write(tl_dir.join("options.rpy"), "translate russian strings:\n").unwrap();
-            let story = tl_dir.join("story.rpy");
-            std::fs::write(&story, "translate russian strings:\n").unwrap();
+            let message = pack_mod_rpa(game_dir.to_string_lossy().to_string(), None)
+                .await
+                .unwrap();
+            let archive = get_project_cache_dir(game_dir).join("exports").join("russian_mod.rpa");
+            rpa::RpaArchive::extract_all(&archive, out_dir).unwrap();
+            message
+        })
+    }
 
-            let edit = translation::TranslationEdit {
-                key: "line-1".into(),
-                text: "Привет".into(),
-            };
-            translation::save(&story, &[edit]).unwrap();
+    #[test]
+    fn test_saved_edits_of_translation_file_reach_mod() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_saved_edit_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let tl_dir = tl_lang_dir(&game_dir);
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        let source = concat!(
+            "translate russian start_abcd1234:\r\n",
+            "\r\n",
+            "    # voice \"line.ogg\"\r\n",
+            "    # e happy \"Hello\"\r\n",
+            "    voice \"line.ogg\"\r\n",
+            "    e happy \"\"\r\n",
+            "\r\n",
+            "translate russian strings:\r\n",
+            "\r\n",
+            "    old \"Yes\"\r\n",
+            "    new \"\"\r\n",
+            "\r\n",
+            "translate russian strings:\r\n",
+            "\r\n",
+            "    old \"Yes\"\r\n",
+            "    new \"\"\r\n",
+        );
+        let story = tl_dir.join("story.rpy");
+        std::fs::write(&story, source).unwrap();
+        std::fs::write(tl_dir.join("story.rpyc"), b"stale").unwrap();
+        std::fs::write(tl_dir.join("other.rpyc"), b"kept").unwrap();
 
-            assert!(translation::has_saved_edits(&game_dir).unwrap());
-            assert_eq!(translation::load(&story).unwrap().get("line-1").unwrap(), "Привет");
-            assert!(
-                pack_mod_rpa(game_dir.to_string_lossy().to_string(), None)
-                    .await
-                    .is_err()
-            );
+        save_edits(&story, &[("Hello", "Привет \"всем\""), ("Yes", "Да")]);
+        let out_dir = temp_dir.join("unpacked");
+        let message = pack_and_unpack(&game_dir, &out_dir);
+        assert!(!message.contains("Не перенесено"), "{message}");
 
-            let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
-            let _ = std::fs::remove_dir_all(&temp_dir);
-        });
+        let packed = out_dir.join("tl").join(TL_LANG);
+        let patched = std::fs::read_to_string(packed.join("story.rpy")).unwrap();
+        assert!(patched.contains("    voice \"line.ogg\"\r\n"));
+        assert!(patched.contains("    e happy \"Привет \\\"всем\\\"\"\r\n"));
+        assert_eq!(patched.matches("    new \"Да\"\r\n").count(), 2);
+        assert!(!packed.join("story.rpyc").exists());
+        assert!(packed.join("other.rpyc").exists());
+        assert_eq!(std::fs::read_to_string(&story).unwrap(), source);
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_saved_edits_of_original_script_become_string_translations() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_saved_strings_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let story = game_dir.join("story.rpy");
+        std::fs::write(&story, "label start:\n    e \"Say \\\"hi\\\"\"\n    e \"Taken\"\n").unwrap();
+
+        // Без папки tl/russian мод собирается только из правок
+        save_edits(&story, &[("Say \"hi\"", "Скажи \"привет\""), ("Taken", "Занято")]);
+        let out_dir = temp_dir.join("first");
+        pack_and_unpack(&game_dir, &out_dir);
+        let strings = std::fs::read_to_string(
+            out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpy"),
+        )
+        .unwrap();
+        assert!(strings.starts_with("# "));
+        assert!(strings.contains(&format!("translate {} strings:\n", TL_LANG)));
+        assert!(strings.contains("    old \"Say \\\"hi\\\"\"\n    new \"Скажи \\\"привет\\\"\"\n"));
+
+        // Повтор `old` в одном языке Ren'Py считает ошибкой загрузки
+        let tl_dir = tl_lang_dir(&game_dir);
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        std::fs::write(
+            tl_dir.join("menu.rpy"),
+            "translate russian strings:\n    old \"Taken\"\n    new \"Уже есть\"\n",
+        )
+        .unwrap();
+        let out_dir = temp_dir.join("second");
+        let message = pack_and_unpack(&game_dir, &out_dir);
+        assert!(message.contains("Не перенесено правок: 1"), "{message}");
+        let strings = std::fs::read_to_string(
+            out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpy"),
+        )
+        .unwrap();
+        assert!(!strings.contains("Taken"));
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

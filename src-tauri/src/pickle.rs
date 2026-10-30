@@ -664,31 +664,30 @@ impl PickleEncoder {
         }
     }
 
-    /// Сериализует словарь RPA-3.0 индекса: { filename: [ (offset, length, prefix) ] }
-    pub fn encode_rpa_index(&mut self, entries: &[(&str, u64, u64, &[u8])]) -> Vec<u8> {
+    /// Сериализует словарь RPA-3.0 индекса: { filename: [ (offset, length) ] }.
+    /// Третьего элемента `prefix` нет: его тип `bytes` появился в протоколе 3,
+    /// и unpickler Python 2 в Ren'Py 6/7 не смог бы прочитать индекс.
+    pub fn encode_rpa_index(&mut self, entries: &[(&str, u64, u64)]) -> Vec<u8> {
         // EMPTY_DICT
         self.buf.push(b'}');
         // BINPUT 0
         self.buf.push(b'q');
         self.buf.push(0);
 
-        for (name, offset, length, prefix) in entries {
+        for (name, offset, length) in entries {
             // Ключ: BINUNICODE
             self.write_binunicode(name);
 
-            // Значение: List с одним Tuple3
+            // Значение: List с одним Tuple2
             self.buf.push(b']'); // EMPTY_LIST
             self.buf.push(b'('); // MARK
-            self.buf.push(b'('); // MARK for Tuple
 
             // offset
             self.write_int(*offset as i64);
             // length
             self.write_int(*length as i64);
-            // prefix
-            self.write_binbytes(prefix);
 
-            self.buf.push(b't'); // TUPLE
+            self.buf.push(0x86); // TUPLE2
             self.buf.push(b'e'); // APPENDS to List
             self.buf.push(b's'); // SETITEM in Dict
         }
@@ -704,19 +703,6 @@ impl PickleEncoder {
         self.buf
             .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         self.buf.extend_from_slice(bytes);
-    }
-
-    fn write_binbytes(&mut self, bytes: &[u8]) {
-        if bytes.len() <= 255 {
-            self.buf.push(b'C');
-            self.buf.push(bytes.len() as u8);
-            self.buf.extend_from_slice(bytes);
-        } else {
-            self.buf.push(b'B');
-            self.buf
-                .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            self.buf.extend_from_slice(bytes);
-        }
     }
 
     fn write_int(&mut self, val: i64) {
@@ -741,5 +727,27 @@ impl PickleEncoder {
 impl Default for PickleEncoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpa_index_uses_only_protocol_2_opcodes() {
+        let bytes = PickleEncoder::new().encode_rpa_index(&[("a.rpy", 34, 300)]);
+        let expected: &[u8] = &[
+            0x80, 2, b'}', b'q', 0, b'X', 5, 0, 0, 0, b'a', b'.', b'r', b'p', b'y', b']', b'(',
+            b'K', 34, b'M', 0x2c, 0x01, 0x86, b'e', b's', b'.',
+        ];
+        assert_eq!(bytes, expected);
+
+        let index = PickleDecoder::new(&bytes).decode().unwrap();
+        let segments = index.get_dict_value("a.rpy").unwrap().as_list().unwrap();
+        assert_eq!(
+            segments[0],
+            PickleValue::Tuple(vec![PickleValue::Int(34), PickleValue::Int(300)])
+        );
     }
 }
