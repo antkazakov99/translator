@@ -45,6 +45,7 @@ walkdir = "2.5"
 # Сеть и LLM
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+md5 = "0.7"
 
 [profile.release]
 codegen-units = 1

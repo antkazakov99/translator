@@ -516,8 +516,15 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
             cache.scripts.insert(base_path.clone(), (Instant::now(), script_files.clone()));
         }
 
-        // 3. Ищем файлы переводов в game/tl/russian в параллельных потоках (сверхбыстрый подсчет строк)
-        let tl_dir = tl_lang_dir(&base_path);
+        // 3. Ищем файлы переводов в game/tl/russian в параллельных потоках (сверхбыстрый подсчет строк).
+        // Запакованный перевод к этому моменту восстановлен в кэше
+        let disk_tl_dir = tl_lang_dir(&base_path);
+        let packed_tl_dir = cache_dir.join("tl").join(TL_LANG);
+        let tl_dir = if disk_tl_dir.exists() || !packed_tl_dir.exists() {
+            disk_tl_dir
+        } else {
+            packed_tl_dir
+        };
         let mut files = Vec::new();
         let mut grand_total = 0;
         let mut grand_translated = 0;
@@ -1099,8 +1106,9 @@ fn build_mod_archive(
     format: rpyc_writer::ScriptFormat,
 ) -> Result<String, String> {
     let tl_dir = tl_lang_dir(base_path);
-    let export = translation::prepare_mod_export(base_path, &tl_dir)?;
-    if !tl_dir.exists() && export.files.is_empty() {
+    let packed = rpa::RpaArchive::packed_translation_files(base_path)?;
+    let export = translation::prepare_mod_export(base_path, &tl_dir, !packed.is_empty())?;
+    if !tl_dir.exists() && packed.is_empty() && export.files.is_empty() {
         return Err(if export.skipped > 0 {
             format!(
                 "Мод не собран: не удалось перенести сохранённые правки (правок: {})",
@@ -1111,7 +1119,7 @@ fn build_mod_archive(
         });
     }
 
-    let files = translation::mod_archive_files(&tl_dir, export.files, format)?;
+    let files = translation::mod_archive_files(&tl_dir, packed, export.files, format)?;
     rpa::RpaArchive::create_archive(out_path, &files)?;
 
     let mut message = format!(
@@ -1545,6 +1553,9 @@ pub(crate) const TEST_FRAMED_ARCHIVE: &str = "TRANSLATOR_TEST_FRAMED_ARCHIVE";
 /// Папка `tl/<язык>` реальной игры для проверки компилятора.
 #[cfg(test)]
 pub(crate) const TEST_TL_DIR: &str = "TRANSLATOR_TEST_TL_DIR";
+/// Папка `game` игры с переводом внутри архивов RPA.
+#[cfg(test)]
+pub(crate) const TEST_PACKED_TL_GAME: &str = "TRANSLATOR_TEST_PACKED_TL_GAME";
 
 /// Папка игры для тестов на реальных данных: `cargo test -- --ignored`
 /// с заданной переменной окружения. Без неё такие тесты ничего не проверяют.
@@ -1895,6 +1906,69 @@ mod tests {
         );
         assert!(strings.contains("One two") && !strings.contains("One  two"), "{strings}");
         assert_eq!(translated_text(&story, "One two").as_deref(), Some("Раз два"));
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_packed_translation_becomes_standalone_mod() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_packed_tl_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let story = concat!(
+            "translate russian start_abcd1234:\n",
+            "    e \"Старый текст\" (\"base\")\n",
+            "translate russian strings:\n",
+            "    old \"Start\"\n",
+            "    new \"Начать\"\n",
+        );
+        let compile = |name: &str, source: &str| {
+            rpyc_writer::compile_script(TEST_FORMAT, TL_LANG, name, source).unwrap()
+        };
+        let other = compile("other.rpy", "translate russian strings:\n    old \"a\"\n    new \"б\"\n");
+        let prefix = format!("tl/{TL_LANG}");
+        rpa::RpaArchive::create_archive(
+            &game_dir.join("translation.rpa"),
+            &[
+                (format!("{prefix}/story.rpyc"), compile("story.rpy", story)),
+                (format!("{prefix}/other.rpyc"), other.clone()),
+                (format!("{prefix}/fonts/ui.ttf"), b"font".to_vec()),
+            ],
+        )
+        .unwrap();
+
+        let summary = tauri::async_runtime::block_on(scan_game_project(
+            game_dir.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        let file = summary.files.iter().find(|file| file.name == "story.rpy").unwrap();
+        assert!(Path::new(&file.path).starts_with(get_project_scripts_cache_dir(&game_dir)));
+        let restored = std::fs::read_to_string(&file.path).unwrap();
+        assert!(restored.contains("old \"Start\""), "{restored}");
+
+        let parsed = parse_project_file(file.path.clone()).unwrap();
+        let entry = parsed
+            .scenes
+            .iter()
+            .flat_map(|scene| &scene.entries)
+            .find(|entry| entry.translated_text.as_deref() == Some("Старый текст"))
+            .unwrap();
+        let edit = translation::TranslationEdit {
+            key: entry.translation_key.clone(),
+            text: "Новый текст".to_string(),
+        };
+        translation::save(Path::new(&file.path), &[edit]).unwrap();
+
+        let out_dir = temp_dir.join("mod");
+        pack_and_unpack(&game_dir, &out_dir);
+        let packed = out_dir.join("tl").join(TL_LANG);
+        let story = compiled_text(&packed.join("story.rpyc"));
+        assert!(story.contains("Новый текст") && !story.contains("Старый"), "{story}");
+        assert!(story.contains("ArgumentInfo"), "{story}");
+        assert_eq!(std::fs::read(packed.join("other.rpyc")).unwrap(), other);
+        assert_eq!(std::fs::read(packed.join("fonts").join("ui.ttf")).unwrap(), b"font");
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
         let _ = std::fs::remove_dir_all(&temp_dir);

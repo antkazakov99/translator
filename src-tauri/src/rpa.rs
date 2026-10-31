@@ -13,7 +13,7 @@ use crate::pickle::{PickleDecoder, PickleEncoder, PickleValue};
 /// Имя архива, в который упаковывается мод перевода.
 pub(crate) const MOD_ARCHIVE_NAME: &str = "ru_lang.rpa";
 
-const CACHE_VERSION: &str = "v5_lexer_strings";
+const CACHE_VERSION: &str = "v6_translation_blocks";
 const MAX_COMPRESSED_INDEX: u64 = 64 * 1024 * 1024;
 const MAX_DECOMPRESSED_INDEX: usize = 256 * 1024 * 1024;
 const MAX_COMPILED_SCRIPT: u64 = 128 * 1024 * 1024;
@@ -456,8 +456,9 @@ impl RpaArchive {
             }
         }
 
+        // Файлы перевода разбираются отдельно, когда известны реплики оригинала
         for (name, entry) in &archive.entries {
-            if name.ends_with(".rpyc") {
+            if name.ends_with(".rpyc") && translation_file_name(name).is_none() {
                 let base = name.trim_end_matches(".rpyc").to_string();
                 if !existing_rpy_basenames.contains(&base) {
                     script_entries.push(entry.clone());
@@ -521,6 +522,115 @@ impl RpaArchive {
         Ok(processed)
     }
 
+    /// Восстанавливает запакованные файлы перевода в кэше. Реплики оригинала читаются
+    /// только при необходимости: это второй проход по всем скриптам игры.
+    fn decompile_packed_translation(
+        game_dir: &Path,
+        archives: &[PathBuf],
+        target_cache_dir: &Path,
+    ) -> Result<usize, String> {
+        // Движок перебирает архивы с конца алфавита и берёт первую найденную копию
+        let mut pending: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut opened = Vec::new();
+        for path in archives.iter().rev() {
+            let archive = Self::open(path)?;
+            let mut file = File::open(path)
+                .map_err(|e| format!("Не удалось открыть RPA архив {:?}: {}", path, e))?;
+            let archive_size = file
+                .metadata()
+                .map_err(|e| format!("Не удалось определить размер RPA: {}", e))?
+                .len();
+            for (name, entry) in &archive.entries {
+                if name.ends_with(".rpyc")
+                    && translation_file_name(name).is_some()
+                    && !pending.contains_key(name)
+                    && !target_cache_dir.join(format!("{}.rpy", name.trim_end_matches(".rpyc"))).exists()
+                {
+                    pending.insert(name.clone(), entry.read_compiled(&mut file, archive_size)?);
+                }
+            }
+            opened.push((archive, file, archive_size));
+        }
+        if pending.is_empty() {
+            return Ok(0);
+        }
+
+        let mut originals = HashMap::new();
+        let mut collect = |name: &str, data: &[u8]| {
+            if let Err(error) = crate::rpyc::RpycParser::collect_original_dialogue(data, &mut originals) {
+                tracing::warn!(file = %name, %error, "Реплики оригинала не прочитаны");
+            }
+        };
+        for (archive, file, archive_size) in &mut opened {
+            // Повторы идентификаторов нумеруются в порядке загрузки файлов
+            let mut entries: Vec<_> = archive.entries.iter().collect();
+            entries.sort_by_key(|(name, _)| name.as_str());
+            for (name, entry) in entries {
+                if name.ends_with(".rpyc") && !name.starts_with("tl/") {
+                    collect(name, &entry.read_compiled(file, *archive_size)?);
+                }
+            }
+        }
+        let mut loose = Vec::new();
+        if let Err(error) = collect_folder_files_for_mod(game_dir, game_dir, 0, &mut loose) {
+            tracing::warn!(%error, "Скрипты рядом с игрой прочитаны не полностью");
+        }
+        loose.sort();
+        for (name, path) in loose {
+            if name.ends_with(".rpyc") && !name.starts_with("tl/") {
+                match fs::read(&path) {
+                    Ok(data) => collect(&name, &data),
+                    Err(error) => tracing::warn!(file = %name, %error, "Скрипт не прочитан"),
+                }
+            }
+        }
+
+        let mut processed = 0;
+        for (name, data) in &pending {
+            let target = format!("{}.rpy", name.trim_end_matches(".rpyc"));
+            let text = match crate::rpyc::RpycParser::decompile_translation(data, &originals) {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::warn!(file = %name, %error, "Файл перевода не декомпилирован");
+                    continue;
+                }
+            };
+            let out_file = safe_output_path(target_cache_dir, &target)?;
+            write_atomic(&out_file, |out| {
+                out.write_all(text.as_bytes())
+                    .map_err(|e| format!("Не удалось записать {:?}: {}", out_file, e))
+            })?;
+            processed += 1;
+        }
+        Ok(processed)
+    }
+
+    /// Файлы перевода из архивов игры по пути относительно `tl/<язык>`, без исходников:
+    /// из архивов движок их не читает. Свой архив мода источником не считается.
+    pub fn packed_translation_files(game_dir: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
+        let mut files = HashMap::new();
+        for path in game_archives(game_dir)?.iter().rev() {
+            let archive = Self::open(path)?;
+            let mut file = File::open(path)
+                .map_err(|e| format!("Не удалось открыть RPA архив {:?}: {}", path, e))?;
+            let archive_size = file
+                .metadata()
+                .map_err(|e| format!("Не удалось определить размер RPA: {}", e))?
+                .len();
+            for (name, entry) in &archive.entries {
+                let Some(relative) = translation_file_name(name) else {
+                    continue;
+                };
+                if !name.ends_with(".rpy") && !files.contains_key(relative) {
+                    let mut data = Vec::new();
+                    entry.copy_to(&mut file, archive_size, &mut data)?;
+                    files.insert(relative.to_string(), data);
+                }
+            }
+        }
+        Ok(files)
+    }
+
     /// Проверяет наличие архивов .rpa в папке игры и извлекает/декомпилирует все скрипты в папку кэша
     pub fn extract_scripts_from_game_archives(
         game_dir: &Path,
@@ -530,21 +640,7 @@ impl RpaArchive {
         let cache_lock = crate::path_lock(target_cache_dir);
         let _guard = cache_lock.lock();
 
-        let mut archives = Vec::new();
-        for entry in fs::read_dir(game_dir)
-            .map_err(|e| format!("Не удалось прочитать папку игры {:?}: {}", game_dir, e))?
-        {
-            let path = entry
-                .map_err(|e| format!("Ошибка чтения папки игры: {}", e))?
-                .path();
-            // Собственный архив мода не содержит исходных скриптов игры
-            if path.extension().and_then(|e| e.to_str()) == Some("rpa")
-                && path.file_name().is_none_or(|name| name != MOD_ARCHIVE_NAME)
-            {
-                archives.push(path);
-            }
-        }
-        archives.sort();
+        let archives = game_archives(game_dir)?;
 
         let mut fingerprint = format!("{}\n", CACHE_VERSION);
         for path in &archives {
@@ -570,9 +666,10 @@ impl RpaArchive {
         }
 
         let mut total_extracted = 0;
-        for path in archives {
-            total_extracted += Self::extract_and_decompile_scripts(&path, target_cache_dir)?;
+        for path in &archives {
+            total_extracted += Self::extract_and_decompile_scripts(path, target_cache_dir)?;
         }
+        total_extracted += Self::decompile_packed_translation(game_dir, &archives, target_cache_dir)?;
         if !target_cache_dir.exists() {
             fs::create_dir_all(target_cache_dir).map_err(|e| {
                 format!(
@@ -589,6 +686,32 @@ impl RpaArchive {
         })?;
         Ok(total_extracted)
     }
+}
+
+/// Путь относительно `tl/<язык>`; `None` для файлов вне папки перевода.
+fn translation_file_name(name: &str) -> Option<&str> {
+    name.strip_prefix("tl/")?
+        .strip_prefix(crate::TL_LANG)?
+        .strip_prefix('/')
+}
+
+/// Архивы игры в алфавитном порядке. Собственный архив мода не содержит её скриптов.
+fn game_archives(game_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut archives = Vec::new();
+    for entry in fs::read_dir(game_dir)
+        .map_err(|e| format!("Не удалось прочитать папку игры {:?}: {}", game_dir, e))?
+    {
+        let path = entry
+            .map_err(|e| format!("Ошибка чтения папки игры: {}", e))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) == Some("rpa")
+            && path.file_name().is_none_or(|name| name != MOD_ARCHIVE_NAME)
+        {
+            archives.push(path);
+        }
+    }
+    archives.sort();
+    Ok(archives)
 }
 
 /// Рекурсивно собирает файлы для создания мода
