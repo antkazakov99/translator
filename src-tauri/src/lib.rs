@@ -7,6 +7,7 @@ pub mod rpyc;
 pub mod rpyc_writer;
 pub mod translation;
 pub mod llm;
+pub mod scenes;
 pub mod terms;
 
 use crate::graph::{DialogueData, ScenarioNode};
@@ -118,6 +119,8 @@ type SpeakerMap = HashMap<String, String>;
 struct ProjectCache {
     scripts: HashMap<PathBuf, (Instant, Vec<PathBuf>)>,
     speakers: HashMap<PathBuf, SpeakerMap>,
+    /// Разобранные реплики открытых проектов: разбор всех скриптов занимает секунды.
+    lines: HashMap<PathBuf, Arc<scenes::GameLines>>,
     /// Корни открытых проектов по их папкам скриптов в кэше.
     project_roots: HashMap<PathBuf, PathBuf>,
 }
@@ -521,6 +524,7 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
             return Err(format!("Папка игры не найдена: {}", game_dir));
         }
         register_project(&base_path);
+        PROJECT_CACHE.lock().lines.remove(&base_path);
 
         // 1. Ищем персонажей в оригинальных скриптах игры в параллельных потоках (Rayon)
         let mut script_files = Vec::new();
@@ -594,6 +598,12 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         });
         let grand_total = files.iter().map(|f| f.total_lines).sum();
         let grand_translated = files.iter().map(|f| f.translated_lines).sum();
+
+        // Сцены персонажей понадобятся при открытии глоссария: их разбор занимает секунды
+        let lines_root = base_path.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            game_lines(&lines_root);
+        });
 
         Ok(ProjectSummary {
             game_name: base_path
@@ -1286,6 +1296,7 @@ async fn clear_project_script_cache(game_dir: String) -> Result<(), String> {
         {
             let mut cache = PROJECT_CACHE.lock();
             cache.scripts.remove(&base_path);
+            cache.lines.remove(&base_path);
             cache.speakers.remove(&base_path);
         }
         SCRIPT_STRUCTURE_CACHE
@@ -1566,6 +1577,44 @@ async fn check_llm_models(api_url: String) -> Result<Vec<String>, String> {
     llm::check_models(&api_url).await
 }
 
+/// Имя скрипта относительно игры: одинаковое для файла на диске и в кэше.
+fn script_display_name(path: &Path, game_root: &Path) -> String {
+    path_in_game(path, game_root)
+        .unwrap_or_else(|| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Реплики игры: разбираются один раз, новый скан начинает заново.
+fn game_lines(base_path: &Path) -> Arc<scenes::GameLines> {
+    if let Some(lines) = PROJECT_CACHE.lock().lines.get(base_path) {
+        return lines.clone();
+    }
+    let lines = scenes::load_lines(&original_scripts(base_path), |path| {
+        script_display_name(path, base_path)
+    });
+    let game = Arc::new(scenes::GameLines::new(lines));
+    PROJECT_CACHE.lock().lines.insert(base_path.to_path_buf(), game.clone());
+    game
+}
+
+/// Сцены, где персонаж говорит или о нём говорят, с этими строками.
+#[tauri::command]
+async fn get_character_scenes(
+    game_dir: String,
+    aliases: Vec<String>,
+    names: Vec<String>,
+) -> Result<Vec<scenes::CharacterScene>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let aliases: Vec<&str> = aliases.iter().map(String::as_str).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        scenes::character_scenes(&game_lines(&base_path), &aliases, &names)
+    })
+    .await
+    .map_err(|e| format!("Ошибка поиска сцен персонажа: {}", e))
+}
+
 /// Просьба остановить пакетную обработку. Запуски в окне идут по одному.
 static LLM_CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -1581,20 +1630,41 @@ fn send_progress<T: Serialize + Clone>(channel: &Channel<llm::BatchProgress<T>>,
     }
 }
 
+/// Что и как передать модели при обновлении персонажей.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CharacterRunOptions {
+    only_empty: bool,
+    sample_count: Option<usize>,
+    #[serde(default)]
+    whole_scenes: bool,
+}
+
 #[tauri::command]
 async fn autofill_glossary_characters(
     game_dir: String,
     api_url: String,
     model: String,
     characters: Vec<glossary::CharacterGlossaryEntry>,
-    only_empty: bool,
+    options: CharacterRunOptions,
     on_batch: Channel<llm::BatchProgress<llm::CharacterResult>>,
 ) -> Result<llm::AutofillResult<glossary::CharacterGlossaryEntry>, String> {
     LLM_CANCEL.store(false, Ordering::Relaxed);
     let base_path = effective_game_directory(Path::new(&game_dir));
-    let aliases: Vec<String> = characters.iter().map(|c| c.alias.clone()).collect();
+    let only_empty = options.only_empty;
+    let sample_count = options
+        .sample_count
+        .unwrap_or(llm::DEFAULT_CHARACTER_SAMPLES)
+        .clamp(1, llm::MAX_CHARACTER_SAMPLES);
+    let selected = characters.clone();
     let samples = tauri::async_runtime::spawn_blocking(move || {
-        llm::collect_character_dialogue_samples(&original_scripts(&base_path), &aliases)
+        let variables = llm::string_variables(&original_scripts(&base_path));
+        let game = game_lines(&base_path);
+        if options.whole_scenes {
+            llm::collect_scene_samples(&game, &variables, &selected)
+        } else {
+            llm::collect_character_dialogue_samples(&game.lines, &variables, &selected, sample_count)
+        }
     })
     .await
     .map_err(|e| format!("Ошибка сбора контекста персонажей: {}", e))?;
@@ -1727,7 +1797,8 @@ pub fn run() {
             autofill_glossary_characters,
             autofill_glossary_terms,
             extract_glossary_terms_from_game,
-            cancel_llm_run
+            cancel_llm_run,
+            get_character_scenes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

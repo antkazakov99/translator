@@ -25,6 +25,9 @@
     translated_name: string;
     gender: string;
     notes: string;
+    speech: string;
+    excluded_scenes: string[];
+    merged: { alias: string; original_name: string }[];
   }
 
   export interface TermGlossaryEntry {
@@ -89,6 +92,7 @@
 
   const LLM_API_KEY = "translator.llm_api_url";
   const LLM_MODEL_KEY = "translator.llm_model";
+  const SAMPLE_COUNT_KEY = "translator.llm_sample_count";
 
   let activeTab = $state<"characters" | "terms">("characters");
   let apiUrl = $state("http://127.0.0.1:1234/v1");
@@ -102,6 +106,10 @@
   let onlyEmpty = $state(true);
   let extractTermsFromGame = $state(false);
   let maxCandidates = $state(60);
+  let sampleCount = $state(64);
+  let wholeScenes = $state(false);
+  // Персонажи, снятые с обработки: по умолчанию выбраны все
+  let unselectedAliases = $state<string[]>([]);
 
   // Состояние выполнения
   let isProcessing = $state(false);
@@ -141,6 +149,8 @@
       }
       const savedModel = localStorage.getItem(LLM_MODEL_KEY);
       if (savedModel) selectedModel = savedModel;
+      const savedCount = Number(localStorage.getItem(SAMPLE_COUNT_KEY));
+      if (savedCount > 0) sampleCount = savedCount;
     } catch {
       // Игнорируем недоступность storage
     }
@@ -155,16 +165,25 @@
       reviewNote = "";
       characterRows = [];
       termRows = [];
+      unselectedAliases = [];
       previewChars = JSON.parse(JSON.stringify(characters));
       previewTerms = JSON.parse(JSON.stringify(terms));
     }
   });
 
+  function setCharacterSelected(alias: string, selected: boolean) {
+    unselectedAliases = selected
+      ? unselectedAliases.filter((a) => a !== alias)
+      : [...unselectedAliases, alias];
+  }
+
+  function needsCharacterWork(c: CharacterGlossaryEntry) {
+    return !c.translated_name.trim() || c.gender === "unknown" || !c.gender.trim() || !c.notes.trim() || !c.speech.trim();
+  }
+
   // Вычисляемые счетчики
   let emptyCharsCount = $derived.by(() => {
-    return characters.filter(
-      (c) => !c.translated_name.trim() || c.gender === "unknown" || !c.gender.trim()
-    ).length;
+    return characters.filter(needsCharacterWork).length;
   });
 
   let emptyTermsCount = $derived.by(() => {
@@ -175,6 +194,7 @@
     try {
       localStorage.setItem(LLM_API_KEY, apiUrl.trim());
       localStorage.setItem(LLM_MODEL_KEY, selectedModel.trim());
+      localStorage.setItem(SAMPLE_COUNT_KEY, String(sampleCount));
     } catch {}
   }
 
@@ -240,19 +260,24 @@
   async function startCharactersAutofill() {
     beginRun("Сбор реплик персонажей из сценария...");
     const rows = previewChars.flatMap((c, index) =>
-      !onlyEmpty || !c.translated_name.trim() || c.gender === "unknown" || !c.gender.trim()
+      !unselectedAliases.includes(c.alias) && (!onlyEmpty || needsCharacterWork(c))
         ? [{ index, samples: [], done: false }]
         : []
     );
     characterRows = rows;
+    if (rows.length === 0) {
+      isProcessing = false;
+      errorMessage = "Нет персонажей для обработки: все выбранные уже заполнены.";
+      return;
+    }
 
     try {
       const result = await invoke<AutofillResult<CharacterGlossaryEntry>>("autofill_glossary_characters", {
         gameDir,
         apiUrl: apiUrl.trim(),
         model: selectedModel.trim(),
-        characters: previewChars,
-        onlyEmpty,
+        characters: rows.map((row) => previewChars[row.index]),
+        options: { onlyEmpty, sampleCount, wholeScenes },
         onBatch: batchChannel<CharacterResult>((items) => {
           for (const { samples, ...character } of items) {
             const row = characterRows.find((r) => !r.done && previewChars[r.index].alias === character.alias);
@@ -548,8 +573,45 @@
             <div class="options-group">
               <label class="checkbox-label">
                 <input type="checkbox" bind:checked={onlyEmpty} disabled={isProcessing} />
-                <span>Заполнять только непереведенные имена и пустой род (рекомендуется)</span>
+                <span>Заполнять только незаполненные записи (рекомендуется)</span>
               </label>
+              <div class="ml-6 flex items-center gap-2 text-xs text-slate-300">
+                <label for="ai-sample-count">Реплик на персонажа:</label>
+                <input
+                  id="ai-sample-count"
+                  type="number"
+                  min="1"
+                  max="256"
+                  bind:value={sampleCount}
+                  class="input-compact w-20 text-center text-xs"
+                  disabled={isProcessing}
+                />
+                <span class="review-note">больше реплик даёт точнее результат, но работает дольше</span>
+              </div>
+              <label class="checkbox-label">
+                <input type="checkbox" bind:checked={wholeScenes} disabled={isProcessing} />
+                <span>Передавать сцены целиком, со всеми участниками (точнее, но каждый персонаж это отдельный запрос)</span>
+              </label>
+              <details class="result-lines">
+                <summary>Персонажи: выбрано {previewChars.length - unselectedAliases.length} из {previewChars.length}</summary>
+                <div class="review-toggles select-toggles">
+                  <button class="btn-link" onclick={() => unselectedAliases = []}>Выбрать всех</button>
+                  <button class="btn-link" onclick={() => unselectedAliases = previewChars.map((c) => c.alias)}>Снять всех</button>
+                </div>
+                <div class="character-picker">
+                  {#each previewChars as character (character.alias)}
+                    <label class="checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={!unselectedAliases.includes(character.alias)}
+                        onchange={(e) => setCharacterSelected(character.alias, e.currentTarget.checked)}
+                        disabled={isProcessing}
+                      />
+                      <span>{character.original_name || character.alias}</span>
+                    </label>
+                  {/each}
+                </div>
+              </details>
             </div>
 
             {#if characterRows.length === 0}
@@ -614,20 +676,30 @@
                           <option value="neuter">Средний</option>
                           <option value="unknown">Не указан</option>
                         </select>
-                        <input
-                          type="text"
-                          class="input-compact text-xs"
+                        <textarea
+                          class="input-compact text-xs result-span result-notes"
+                          rows="4"
                           bind:value={character.notes}
-                          placeholder="Заметка"
-                          aria-label={`Заметка о персонаже ${character.alias}`}
-                        />
+                          placeholder="Описание"
+                          aria-label={`Описание персонажа ${character.alias}`}
+                        ></textarea>
+                        <textarea
+                          class="input-compact text-xs result-span result-notes"
+                          rows="2"
+                          bind:value={character.speech}
+                          placeholder="Манера речи"
+                          aria-label={`Манера речи персонажа ${character.alias}`}
+                        ></textarea>
                       </div>
                       {#if row.samples.length > 0}
-                        <ul class="result-samples">
-                          {#each row.samples as sample}
-                            <li>{sample}</li>
-                          {/each}
-                        </ul>
+                        <details class="result-lines">
+                          <summary>Реплики: {row.samples.length}</summary>
+                          <ul class="result-samples">
+                            {#each row.samples as sample}
+                              <li>{sample}</li>
+                            {/each}
+                          </ul>
+                        </details>
                       {:else}
                         <p class="review-note">Реплик не нашлось: модель судила только по имени.</p>
                       {/if}
@@ -1381,8 +1453,34 @@
     gap: 0.4rem;
   }
 
+  .result-span {
+    grid-column: 1 / -1;
+  }
+
+  .result-notes {
+    resize: vertical;
+    font-family: inherit;
+    line-height: 1.45;
+  }
+
+  .select-toggles {
+    margin: 0.4rem 0;
+  }
+
+  .character-picker {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.25rem 0.75rem;
+  }
+
+  .result-lines summary {
+    font-size: 0.72rem;
+    color: #c084fc;
+    cursor: pointer;
+  }
+
   .result-samples {
-    margin: 0;
+    margin: 0.25rem 0 0;
     padding-left: 1rem;
     font-size: 0.72rem;
     color: #94a3b8;

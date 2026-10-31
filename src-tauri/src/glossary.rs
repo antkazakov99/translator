@@ -5,6 +5,13 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Запись, вошедшая в другого персонажа: автор игры завёл для одного героя несколько кодов.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MergedCharacter {
+    pub alias: String,
+    pub original_name: String,
+}
+
 /// Запись персонажа в глоссарии проекта
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CharacterGlossaryEntry {
@@ -12,7 +19,31 @@ pub struct CharacterGlossaryEntry {
     pub original_name: String,   // Оригинальное имя в игре ("Lisa", "Emma", "Jack")
     pub translated_name: String, // Перевод имени на русский ("Лиза", "Эмма", "Джек")
     pub gender: String,          // "male" (М) | "female" (Ж) | "unknown" (—)
-    pub notes: String,           // Заметки для перевода (напр. "обращение на 'ты', дерзкая")
+    pub notes: String,           // Описание персонажа
+    #[serde(default)]
+    pub speech: String,          // Манера речи (напр. "дерзко, со сленгом, на 'ты'")
+    #[serde(default)]
+    pub excluded_scenes: Vec<String>, // Сцены, которые не передаются модели
+    #[serde(default)]
+    pub merged: Vec<MergedCharacter>, // Другие коды этого же персонажа
+}
+
+impl CharacterGlossaryEntry {
+    pub fn aliases(&self) -> Vec<&str> {
+        std::iter::once(self.alias.as_str())
+            .chain(self.merged.iter().map(|m| m.alias.as_str()))
+            .collect()
+    }
+
+    pub fn names(&self) -> Vec<&str> {
+        std::iter::once(self.original_name.as_str())
+            .chain(self.merged.iter().map(|m| m.original_name.as_str()))
+            .collect()
+    }
+
+    pub fn has_alias(&self, alias: &str) -> bool {
+        self.aliases().iter().any(|own| own.eq_ignore_ascii_case(alias))
+    }
 }
 
 /// Запись термина, локации или звания в глоссарии проекта
@@ -89,11 +120,13 @@ impl ProjectGlossary {
             let own = self
                 .characters
                 .iter_mut()
-                .find(|own| own.alias.eq_ignore_ascii_case(&character.alias));
+                .find(|own| own.has_alias(&character.alias));
             match own {
                 Some(own) if own.translated_name.trim().is_empty() => {
                     if !character.translated_name.trim().is_empty() {
+                        let own_merged = std::mem::take(&mut own.merged);
                         *own = character;
+                        own.merged.extend(own_merged);
                         merged += 1;
                     }
                 }
@@ -132,7 +165,7 @@ impl ProjectGlossary {
             if !self
                 .characters
                 .iter()
-                .any(|c| c.alias.eq_ignore_ascii_case(alias))
+                .any(|c| c.has_alias(alias))
             {
                 let gender = auto_detect_gender(name);
                 self.characters.push(CharacterGlossaryEntry {
@@ -140,7 +173,7 @@ impl ProjectGlossary {
                     original_name: name.clone(),
                     translated_name: String::new(),
                     gender,
-                    notes: String::new(),
+                    ..Default::default()
                 });
             }
         }
@@ -213,6 +246,14 @@ mod tests {
         ];
 
         glossary.merge_with_scanned_characters(&scanned);
+        assert_eq!(glossary.characters.len(), 4);
+
+        // Вошедший в другого персонажа код скан не возвращает отдельной записью
+        glossary.characters[0].merged.push(MergedCharacter {
+            alias: "merged_code".to_string(),
+            original_name: "Twin".to_string(),
+        });
+        glossary.merge_with_scanned_characters(&[("merged_code".to_string(), "Twin".to_string())]);
         assert_eq!(glossary.characters.len(), 4);
 
         let wg = glossary

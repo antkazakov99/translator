@@ -15,7 +15,7 @@ const MAX_EXAMPLE_CHARS: usize = 120;
 const EXAMPLE_CONTEXT_CHARS: usize = 40;
 
 static RE_MARKUP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{[^}]*\}|\[[^\]]*\]").unwrap());
-static RE_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\p{L}+(?:['’]\p{L}+)?").unwrap());
+pub(crate) static RE_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\p{L}+(?:['’]\p{L}+)?").unwrap());
 static RE_PHRASE: LazyLock<Regex> = LazyLock::new(|| {
     let word = r"\p{Lu}\p{Ll}+(?:['’]\p{Ll}+)?(?:-\p{Lu}?\p{Ll}+)?";
     Regex::new(&format!(r"\b{word}(?: (?:(?:of|the|de|la|del|von|der) )*{word})*\b")).unwrap()
@@ -110,7 +110,7 @@ fn starts_sentence(before: &str) -> bool {
 }
 
 /// Междометия вроде «Hhhhh» и «Grrrllk».
-fn is_stuttering(term: &str) -> bool {
+pub(crate) fn is_stuttering(term: &str) -> bool {
     let letters: Vec<char> = term.to_lowercase().chars().collect();
     letters.windows(3).any(|run| run[0] == run[1] && run[1] == run[2] && run[0].is_alphabetic())
 }
