@@ -5,7 +5,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,6 +23,8 @@ const MAX_BATCH_CHARACTERS: usize = 3;
 const CHARACTER_ANSWER_TOKENS: u32 = 3072;
 /// Локальная модель пишет подробный ответ минутами.
 const REQUEST_TIMEOUT_SECS: u64 = 300;
+const SCENE_NOTE_TOKENS: u32 = 768;
+const MAX_CONDENSE_ROUNDS: usize = 3;
 const MAX_SAMPLE_CHARS: usize = 200;
 const MIN_SAMPLE_WORDS: usize = 4;
 const EXPLICIT_WORDS: &[&str] = &[
@@ -445,9 +449,8 @@ pub fn collect_character_dialogue_samples(
         .collect()
 }
 
-/// Собирает сцены персонажа целиком, со всеми участниками: так видно, кто с кем говорит.
-/// Сцены берутся равномерно в пределах объёма.
-pub fn collect_scene_samples(
+/// Тексты сцен в виде «Говорящий: реплика».
+fn scene_transcripts(
     game: &GameLines,
     variables: &HashMap<String, Vec<String>>,
     characters: &[CharacterGlossaryEntry],
@@ -470,7 +473,17 @@ pub fn collect_scene_samples(
             .or_default()
             .push(format!("{}: {}", speaker, sample_text(&line.text, variables)));
     }
+    by_scene
+}
 
+/// Собирает сцены персонажа целиком, со всеми участниками: так видно, кто с кем говорит.
+/// Сцены берутся равномерно в пределах объёма.
+pub fn collect_scene_samples(
+    game: &GameLines,
+    variables: &HashMap<String, Vec<String>>,
+    characters: &[CharacterGlossaryEntry],
+) -> HashMap<String, Vec<String>> {
+    let by_scene = scene_transcripts(game, variables, characters);
     let mut samples = HashMap::new();
     for character in characters {
         let keys: Vec<String> = scenes::character_scenes(game, &character.aliases(), &character.names())
@@ -502,6 +515,181 @@ pub fn collect_scene_samples(
         }
     }
     samples
+}
+
+/// Делит все включённые сцены персонажа на части, каждая из которых помещается в запрос.
+pub fn scene_chunks(
+    game: &GameLines,
+    variables: &HashMap<String, Vec<String>>,
+    character: &CharacterGlossaryEntry,
+) -> Vec<String> {
+    let transcripts = scene_transcripts(game, variables, std::slice::from_ref(character));
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut size = 0;
+    for scene in scenes::character_scenes(game, &character.aliases(), &character.names()) {
+        if character.excluded_scenes.contains(&scene.key) {
+            continue;
+        }
+        for line in transcripts.get(&scene.key).into_iter().flatten() {
+            let length = line.chars().count() + 1;
+            if size > 0 && size + length > MAX_SAMPLE_TEXT {
+                chunks.push(std::mem::take(&mut current));
+                size = 0;
+            }
+            current.push_str(line);
+            current.push('\n');
+            size += length;
+        }
+    }
+    if size > 0 {
+        chunks.push(current);
+    }
+    chunks
+}
+
+/// Оставляет `count` частей, равномерно по игре. Набор частей зависит только от сцен,
+/// поэтому при увеличении `count` готовые заметки подходят снова.
+pub fn pick_chunks(chunks: Vec<String>, count: usize) -> Vec<String> {
+    spread(&chunks.iter().collect::<Vec<_>>(), count.max(1))
+}
+
+/// Ход обработки сцен персонажа.
+#[derive(Debug, Clone, Serialize)]
+pub struct SummaryProgress {
+    /// `scenes`, `note`, `condense` или `final`.
+    pub stage: String,
+    pub done: usize,
+    pub total: usize,
+    /// Заметка готовой части: окно показывает её сразу, не дожидаясь итога.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+fn read_scene_notes(path: &Path) -> HashMap<String, String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+fn write_scene_notes(path: &Path, notes: &HashMap<String, String>) -> Result<(), String> {
+    let json = serde_json::to_string(notes)
+        .map_err(|e| format!("Не удалось подготовить заметки: {}", e))?;
+    crate::rpa::write_atomic(path, |out: &mut File| {
+        out.write_all(json.as_bytes())
+            .map_err(|e| format!("Не удалось сохранить заметки {:?}: {}", path, e))
+    })
+}
+
+/// Сжимает заметки, пока они не поместятся в итоговый запрос.
+async fn condense_notes(
+    api_url: &str,
+    model: &str,
+    mut notes: Vec<String>,
+    on_progress: &(impl Fn(SummaryProgress) + Send + Sync),
+) -> Result<Vec<String>, String> {
+    let size = |notes: &[String]| notes.iter().map(|note| note.chars().count()).sum::<usize>();
+    let system_prompt = "You merge notes about one character of a visual novel. Write in Russian. \
+        Keep concrete facts: occupation, relations, events, manner of speech. Drop repetitions. \
+        Respond with plain text only.";
+
+    for _ in 0..MAX_CONDENSE_ROUNDS {
+        if size(&notes) <= MAX_SAMPLE_TEXT {
+            break;
+        }
+        let mut groups: Vec<Vec<String>> = Vec::new();
+        let mut group_size = 0;
+        for note in notes {
+            let length = note.chars().count();
+            match groups.last_mut() {
+                Some(group) if group_size + length <= MAX_SAMPLE_TEXT => {
+                    group.push(note);
+                    group_size += length;
+                }
+                _ => {
+                    groups.push(vec![note]);
+                    group_size = length;
+                }
+            }
+        }
+        let total = groups.len();
+        let mut condensed = Vec::new();
+        for (done, group) in groups.iter().enumerate() {
+            on_progress(SummaryProgress { stage: "condense".to_string(), done, total, note: None });
+            let prompt = format!("Notes:\n\n{}\n\nMerge them:", group.join("\n\n"));
+            condensed.push(call_chat_completion(api_url, model, system_prompt, &prompt, 0.2, CHARACTER_ANSWER_TOKENS).await?);
+        }
+        notes = condensed;
+    }
+
+    let total = size(&notes);
+    if total > MAX_SAMPLE_TEXT {
+        let keep = (notes.len() * MAX_SAMPLE_TEXT / total).max(1);
+        notes = spread(&notes.iter().collect::<Vec<_>>(), keep);
+    }
+    Ok(notes)
+}
+
+/// Обновляет персонажа по частям его сцен: собирает заметки, а затем пишет описание по ним. Готовые заметки лежат на диске, поэтому остановленный запуск
+/// продолжается с того же места. Возвращает `None`, если запуск остановлен.
+pub async fn summarize_character(
+    api_url: &str,
+    model: &str,
+    character: CharacterGlossaryEntry,
+    chunks: Vec<String>,
+    notes_file: &Path,
+    cancel: &AtomicBool,
+    on_progress: impl Fn(SummaryProgress) + Send + Sync,
+) -> Result<Option<CharacterGlossaryEntry>, String> {
+    let system_prompt = format!(
+        "You read a part of a visual novel script and take notes about the character {}. \
+        The text has the form \"Speaker: text\", and \"you\" usually means the protagonist. \
+        Write in Russian, 2 to 5 short sentences, only what this text shows: what the character does, \
+        occupation, relations with others, and how they speak (tone, slang, \"ты\" or \"вы\"). \
+        If the text says nothing about the character, answer with an empty string. \
+        Text in [square brackets] is an in-game variable: never infer anything from its name. \
+        Respond with plain text only.",
+        character.original_name
+    );
+
+    let mut stored = read_scene_notes(notes_file);
+    let total = chunks.len();
+    let mut notes = Vec::new();
+    for (done, chunk) in chunks.iter().enumerate() {
+        on_progress(SummaryProgress { stage: "scenes".to_string(), done, total, note: None });
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let key = format!(
+            "{:016x}",
+            crate::stable_hash_str(&format!("{model}\n{}\n{chunk}", character.alias))
+        );
+        let note = match stored.get(&key) {
+            Some(note) => note.clone(),
+            None => {
+                let prompt = format!("Script:\n\n{chunk}\n\nNotes about {}:", character.original_name);
+                let note = call_chat_completion(api_url, model, &system_prompt, &prompt, 0.2, SCENE_NOTE_TOKENS).await?;
+                stored.insert(key, note.clone());
+                write_scene_notes(notes_file, &stored)?;
+                note
+            }
+        };
+        if !note.trim().is_empty() {
+            on_progress(SummaryProgress { stage: "note".to_string(), done, total, note: Some(note.clone()) });
+            notes.push(note);
+        }
+    }
+
+    let notes = condense_notes(api_url, model, notes, &on_progress).await?;
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    on_progress(SummaryProgress { stage: "final".to_string(), done: total, total, note: None });
+    let alias = character.alias.to_lowercase();
+    let samples = HashMap::from([(alias, notes)]);
+    let result = autofill_characters(api_url, model, vec![character], false, samples, cancel, |_| {}).await?;
+    Ok(result.items.into_iter().next())
 }
 
 /// Автозаполнение персонажей в глоссарии через LLM
@@ -563,6 +751,7 @@ For each character provided, you must output:
 
 Text in [square brackets] is an in-game variable whose value is unknown. Never infer an occupation, kinship or name from the variable's own name.
 Lines may come as a scene transcript in the form "Speaker: text". Only lines of that speaker show their own manner; lines of others show how they see the character.
+Lines may also be notes collected from every scene of the game: treat them as reliable and use all of them.
 
 Respond ONLY with a valid JSON array of objects without markdown fences or explanations:
 [
@@ -1182,6 +1371,91 @@ mod tests {
         let all = collect_scene_samples(&game, &HashMap::new(), &[kate(&["story.rpy::bar"])]);
         assert_eq!(all["k"], ["Kate: I am staying home tonight.", "m: Then I will cook, Kate."]);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_chunks_cover_all_enabled_scenes_within_limit() {
+        let mut script = String::new();
+        for scene in 0..3 {
+            script.push_str(&format!("label scene_{scene}:\n"));
+            for line in 0..120 {
+                script.push_str(&format!("    k \"Scene {scene} line {line} {}\"\n", "word ".repeat(30)));
+            }
+        }
+        let (dir, scripts) = script_with(&script);
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()));
+
+        let chunks = scene_chunks(&game, &HashMap::new(), &kate(&[]));
+        assert!(chunks.len() > 2);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= MAX_SAMPLE_TEXT));
+        let text = chunks.concat();
+        assert!(text.contains("Scene 0 line 0 ") && text.contains("Scene 2 line 119 "));
+
+        let without = scene_chunks(&game, &HashMap::new(), &kate(&["story.rpy::scene_2"]));
+        assert!(!without.concat().contains("Scene 2 line"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn completion(content: &str) -> String {
+        let body = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
+        http_response("200 OK", &body)
+    }
+
+    #[test]
+    fn test_summary_resumes_from_saved_notes() {
+        let dir = std::env::temp_dir().join(format!("translator_notes_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let notes_file = dir.join("scene_notes.json");
+        let chunks = vec!["Kate: one".to_string(), "Kate: two".to_string()];
+        let answer = r#"[{"alias":"k","notes":"Итог","speech":"На 'ты'"}]"#;
+        let cancel = AtomicBool::new(false);
+        let stages = std::sync::Mutex::new(Vec::new());
+
+        // Первая часть готова, на второй запуск остановлен
+        let url = serve_responses(vec![completion("Заметка 1")]);
+        let stopped = tauri::async_runtime::block_on(summarize_character(
+            &url, "model", kate(&[]), chunks.clone(), &notes_file, &cancel,
+            |p| {
+                if p.done == 1 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        ))
+        .unwrap();
+        assert_eq!(stopped, None);
+
+        // Новый запуск не спрашивает готовую часть заново: у сервера всего два ответа
+        cancel.store(false, Ordering::Relaxed);
+        let url = serve_responses(vec![completion("Заметка 2"), completion(answer)]);
+        let updated = tauri::async_runtime::block_on(summarize_character(
+            &url, "model", kate(&[]), chunks, &notes_file, &cancel,
+            |p| stages.lock().unwrap().push(p.stage),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.notes, "Итог");
+        assert_eq!(updated.speech, "На 'ты'");
+        assert_eq!(stages.into_inner().unwrap(), ["scenes", "note", "scenes", "note", "final"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_chunks_are_picked_evenly() {
+        let chunks: Vec<String> = (0..10).map(|i| i.to_string()).collect();
+        assert_eq!(pick_chunks(chunks.clone(), 1), ["0"]);
+        assert_eq!(pick_chunks(chunks.clone(), 3), ["0", "3", "6"]);
+        assert_eq!(pick_chunks(chunks.clone(), 50), chunks);
+    }
+
+    #[test]
+    fn test_long_notes_are_condensed_for_final_request() {
+        let long = "заметка ".repeat(1200);
+        let url = serve_responses(vec![completion("Сжато 1"), completion("Сжато 2")]);
+        let notes = tauri::async_runtime::block_on(condense_notes(
+            &url, "model", vec![long.clone(), long], &|_| {},
+        ))
+        .unwrap();
+        assert_eq!(notes, ["Сжато 1", "Сжато 2"]);
     }
 
     #[test]
