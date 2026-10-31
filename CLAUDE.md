@@ -28,7 +28,7 @@ cargo test --lib -- --ignored
 cargo clippy
 ```
 
-Тесты с `#[ignore]` работают на реальных играх и берут пути из переменных окружения: `TRANSLATOR_TEST_TRANSLATED_GAME`, `TRANSLATOR_TEST_RPA_GAME`, `TRANSLATOR_TEST_CHARACTERS_GAME`, `TRANSLATOR_TEST_RPA2_ARCHIVE`, `TRANSLATOR_TEST_FRAMED_ARCHIVE`. Без переменной такой тест ничего не проверяет и проходит. `TRANSLATOR_RPYC_PROBE_DIR` включает запись архивов для проверки скомпилированных скриптов настоящим движком.
+Тесты с `#[ignore]` работают на реальных играх и берут пути из переменных окружения: `TRANSLATOR_TEST_TRANSLATED_GAME`, `TRANSLATOR_TEST_RPA_GAME`, `TRANSLATOR_TEST_CHARACTERS_GAME`, `TRANSLATOR_TEST_RPA2_ARCHIVE`, `TRANSLATOR_TEST_FRAMED_ARCHIVE`, `TRANSLATOR_TEST_TL_DIR`. Без переменной такой тест ничего не проверяет и проходит. `TRANSLATOR_RPYC_PROBE_DIR` включает запись архивов для проверки скомпилированных скриптов настоящим движком.
 
 ## Архитектура
 
@@ -56,7 +56,7 @@ cargo clippy
 - `pickle.rs`: декодер и кодировщик Python pickle для индексов RPA и деревьев скриптов.
 - `rpa.rs`: чтение и запись архивов RPA-2.0 и RPA-3.0.
 - `rpyc.rs`: декомпиляция в упрощённый `.rpy` только для разбора, не для повторной компиляции игрой. Если вывод декомпилятора меняется, нужно поднять `CACHE_VERSION` в `rpa.rs`, иначе останется старый кэш.
-- `rpyc_writer.rs`: компилятор `.rpyc` без запуска игры. Формат определяется по файлам движка (`ScriptFormat::detect`), поддерживаются три раскладки `AstLayout`. Компилируются только строковые переводы, блоки `translate` с простыми репликами и `init python`, остальное останавливает сборку.
+- `rpyc_writer.rs`: компилятор `.rpyc` без запуска игры. Формат определяется по файлам движка (`ScriptFormat::detect`), поддерживаются три раскладки `AstLayout`. Компилируются только строковые переводы, блоки `translate` с репликами (включая `nointeract` и `with`) и `init python`, остальное останавливает сборку.
 
 ### Состояние в памяти
 
