@@ -7,6 +7,7 @@ pub mod rpyc;
 pub mod rpyc_writer;
 pub mod translation;
 pub mod llm;
+pub mod terms;
 
 use crate::graph::{DialogueData, ScenarioNode};
 use crate::parser::GameParser;
@@ -14,10 +15,12 @@ use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto, ScreenLink
 use rayon::prelude::*;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
+use tauri::ipc::Channel;
 
 /// Язык перевода: имя папки `tl/<язык>` и блоков `translate <язык>`.
 pub(crate) const TL_LANG: &str = "russian";
@@ -167,6 +170,17 @@ fn get_project_scripts(search_dir: &Path, cache_dir: &Path) -> Vec<PathBuf> {
 
 /// Максимальная глубина рекурсивного обхода каталогов скриптов Ren'Py
 pub(crate) const MAX_SCAN_DEPTH: usize = 20;
+
+/// Оригинальные скрипты проекта с диска и из кэша, без файлов перевода.
+fn original_scripts(game_dir: &Path) -> Vec<PathBuf> {
+    let cache_dir = get_project_scripts_cache_dir(game_dir);
+    let mut scripts: Vec<PathBuf> = get_project_scripts(game_dir, &cache_dir)
+        .into_iter()
+        .filter(|path| !is_translation_path(path, game_dir))
+        .collect();
+    scripts.sort();
+    scripts
+}
 
 /// Ограничение на количество сканируемых скриптов при быстром извлечении спикеров,
 /// чтобы не блокировать первичный скан проекта чтением сотен файлов.
@@ -628,7 +642,7 @@ fn screen_targets<'a>(
     structures: impl Iterator<Item = &'a ScriptStructure>,
 ) -> HashMap<String, Vec<String>> {
     let mut links: HashMap<&str, Vec<&ScreenLinks>> = HashMap::new();
-    let mut labels = std::collections::HashSet::new();
+    let mut labels = HashSet::new();
     for structure in structures {
         labels.extend(structure.labels.iter().map(|label| label.name.as_str()));
         for (name, screen) in &structure.screens {
@@ -640,7 +654,7 @@ fn screen_targets<'a>(
         .keys()
         .map(|name| {
             let mut targets = Vec::new();
-            let mut seen = std::collections::HashSet::from([*name]);
+            let mut seen = HashSet::from([*name]);
             let mut pending = vec![*name];
             while let Some(screen) = pending.pop() {
                 for part in links.get(screen).into_iter().flatten() {
@@ -666,7 +680,7 @@ fn screen_edges(
     structure: &ScriptStructure,
     screens: &HashMap<String, Vec<String>>,
 ) -> Vec<SceneEdgeDto> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut edges = Vec::new();
     for (scene, screen) in &structure.shown_screens {
         for target in screens.get(screen).into_iter().flatten() {
@@ -886,7 +900,7 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
         }
     }
 
-    let current_scene_names: std::collections::HashSet<String> = scenes
+    let current_scene_names: HashSet<String> = scenes
         .iter()
         .map(|s| s.name.clone())
         .filter(|name| name != "Интерфейс и меню (strings)")
@@ -943,7 +957,7 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
                 .filter(|edge| current_scene_names.contains(&edge.to))
         });
 
-        let mut known: std::collections::HashSet<_> = edges
+        let mut known: HashSet<_> = edges
             .iter()
             .map(|e| (e.from.clone(), e.to.clone(), e.kind.clone(), e.condition.clone()))
             .collect();
@@ -1552,6 +1566,21 @@ async fn check_llm_models(api_url: String) -> Result<Vec<String>, String> {
     llm::check_models(&api_url).await
 }
 
+/// Просьба остановить пакетную обработку. Запуски в окне идут по одному.
+static LLM_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Запрос, уже отправленный модели, дожидается ответа: готовые пакеты сохраняются.
+#[tauri::command]
+fn cancel_llm_run() {
+    LLM_CANCEL.store(true, Ordering::Relaxed);
+}
+
+fn send_progress<T: Serialize + Clone>(channel: &Channel<llm::BatchProgress<T>>, progress: llm::BatchProgress<T>) {
+    if let Err(error) = channel.send(progress) {
+        tracing::warn!(%error, "Итог пакета не передан в интерфейс");
+    }
+}
+
 #[tauri::command]
 async fn autofill_glossary_characters(
     game_dir: String,
@@ -1559,16 +1588,21 @@ async fn autofill_glossary_characters(
     model: String,
     characters: Vec<glossary::CharacterGlossaryEntry>,
     only_empty: bool,
+    on_batch: Channel<llm::BatchProgress<llm::CharacterResult>>,
 ) -> Result<llm::AutofillResult<glossary::CharacterGlossaryEntry>, String> {
+    LLM_CANCEL.store(false, Ordering::Relaxed);
     let base_path = effective_game_directory(Path::new(&game_dir));
     let aliases: Vec<String> = characters.iter().map(|c| c.alias.clone()).collect();
     let samples = tauri::async_runtime::spawn_blocking(move || {
-        llm::collect_character_dialogue_samples(&base_path, &aliases)
+        llm::collect_character_dialogue_samples(&original_scripts(&base_path), &aliases)
     })
     .await
     .map_err(|e| format!("Ошибка сбора контекста персонажей: {}", e))?;
 
-    llm::autofill_characters(&api_url, &model, characters, only_empty, samples).await
+    llm::autofill_characters(&api_url, &model, characters, only_empty, samples, &LLM_CANCEL, |progress| {
+        send_progress(&on_batch, progress)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1577,19 +1611,75 @@ async fn autofill_glossary_terms(
     model: String,
     terms: Vec<glossary::TermGlossaryEntry>,
     only_empty: bool,
+    on_batch: Channel<llm::BatchProgress<glossary::TermGlossaryEntry>>,
 ) -> Result<llm::AutofillResult<glossary::TermGlossaryEntry>, String> {
-    llm::autofill_terms(&api_url, &model, terms, only_empty).await
+    LLM_CANCEL.store(false, Ordering::Relaxed);
+    llm::autofill_terms(&api_url, &model, terms, only_empty, &LLM_CANCEL, |progress| {
+        send_progress(&on_batch, progress)
+    })
+    .await
 }
 
+/// Сколько кандидатов в термины проверяет модель. Каждые 20 это один запрос.
+const DEFAULT_TERM_CANDIDATES: usize = 60;
+const MAX_TERM_CANDIDATES: usize = 200;
+
+#[derive(Debug, Serialize)]
+struct ExtractedTerms {
+    items: Vec<llm::ReviewedTerm>,
+    failed_batches: usize,
+    candidates: usize,
+    single_words_skipped: bool,
+}
+
+/// Слова имён персонажей проекта в нижнем регистре.
+fn character_name_words(game_dir: &Path) -> HashSet<String> {
+    PROJECT_CACHE
+        .lock()
+        .speakers
+        .get(game_dir)
+        .into_iter()
+        .flatten()
+        .flat_map(|(alias, name)| std::iter::once(alias.as_str()).chain(name.split_whitespace()))
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Находит названия по всему тексту игры и отдаёт модели на проверку. В глоссарий
+/// термины попадают только после отбора пользователем.
 #[tauri::command]
 async fn extract_glossary_terms_from_game(
     game_dir: String,
     api_url: String,
     model: String,
-    max_terms: Option<usize>,
-) -> Result<Vec<glossary::TermGlossaryEntry>, String> {
+    max_candidates: Option<usize>,
+    known_terms: Vec<String>,
+    on_batch: Channel<llm::BatchProgress<llm::ReviewedTerm>>,
+) -> Result<ExtractedTerms, String> {
+    LLM_CANCEL.store(false, Ordering::Relaxed);
     let base_path = effective_game_directory(Path::new(&game_dir));
-    llm::extract_terms_from_game_script(&api_url, &model, &base_path, max_terms.unwrap_or(20)).await
+    if !base_path.exists() {
+        return Err(format!("Папка игры не найдена: {:?}", base_path));
+    }
+    let limit = max_candidates.unwrap_or(DEFAULT_TERM_CANDIDATES).clamp(1, MAX_TERM_CANDIDATES);
+    let known: HashSet<String> = known_terms.iter().map(|term| term.trim().to_lowercase()).collect();
+    let search = tauri::async_runtime::spawn_blocking(move || {
+        let texts = llm::script_texts(&original_scripts(&base_path));
+        terms::find_candidates(&texts, &character_name_words(&base_path), &known, limit)
+    })
+    .await
+    .map_err(|e| format!("Ошибка поиска терминов: {}", e))?;
+
+    let checked = llm::check_term_candidates(&api_url, &model, &search.candidates, &LLM_CANCEL, |progress| {
+        send_progress(&on_batch, progress)
+    })
+    .await?;
+    Ok(ExtractedTerms {
+        items: checked.items,
+        failed_batches: checked.failed_batches,
+        candidates: search.candidates.len(),
+        single_words_skipped: search.single_words_skipped,
+    })
 }
 
 /// Подключает логи: в debug — консоль, в release — файл, потому что у приложения
@@ -1636,7 +1726,8 @@ pub fn run() {
             check_llm_models,
             autofill_glossary_characters,
             autofill_glossary_terms,
-            extract_glossary_terms_from_game
+            extract_glossary_terms_from_game,
+            cancel_llm_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2526,6 +2617,34 @@ mod tests {
             .unwrap();
         assert!(!cache_dir.join("gallery.rpy").exists());
         assert!(!cache_dir.join("packed.rpy").exists());
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_llm_text_comes_from_packed_originals() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_llm_sources_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let tl_dir = tl_lang_dir(&game_dir);
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        std::fs::write(
+            tl_dir.join("packed.rpy"),
+            "translate russian start_abcd1234:\n    # e \"Hello there\"\n    e \"Привет\"\n",
+        )
+        .unwrap();
+        rpa::RpaArchive::create_archive(
+            &game_dir.join("scripts.rpa"),
+            &[("packed.rpy".into(), b"label start:\n    e \"Hello there\"\n".to_vec())],
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(scan_game_project(game_dir.to_string_lossy().into_owned()))
+            .unwrap();
+
+        let scripts = original_scripts(&game_dir);
+        assert_eq!(scripts, [get_project_scripts_cache_dir(&game_dir).join("packed.rpy")]);
+        assert_eq!(llm::script_texts(&scripts), ["Hello there"]);
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
         let _ = std::fs::remove_dir_all(&temp_dir);

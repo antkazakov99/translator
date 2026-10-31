@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { invoke } from "@tauri-apps/api/core";
+  import { Channel, invoke } from "@tauri-apps/api/core";
   import {
     Sparkles,
     Bot,
@@ -15,7 +15,8 @@
     Sliders,
     ArrowRight,
     Wand2,
-    Search
+    Search,
+    Square
   } from "lucide-svelte";
 
   export interface CharacterGlossaryEntry {
@@ -37,6 +38,35 @@
   interface AutofillResult<T> {
     items: T[];
     failed_batches: number;
+  }
+
+  interface BatchProgress<T> {
+    batch: number;
+    total_batches: number;
+    failed_batches: number;
+    items: T[];
+  }
+
+  interface CharacterResult extends CharacterGlossaryEntry {
+    samples: string[];
+  }
+
+  interface ResultRow {
+    index: number;
+    samples: string[];
+    done: boolean;
+  }
+
+  interface ReviewedTerm extends TermGlossaryEntry {
+    count: number;
+    example: string;
+  }
+
+  interface ExtractedTerms {
+    items: ReviewedTerm[];
+    failed_batches: number;
+    candidates: number;
+    single_words_skipped: boolean;
   }
 
   let {
@@ -71,18 +101,37 @@
   // Настройки генерации
   let onlyEmpty = $state(true);
   let extractTermsFromGame = $state(false);
-  let maxExtractedTerms = $state(20);
+  let maxCandidates = $state(60);
 
   // Состояние выполнения
   let isProcessing = $state(false);
   let progressStep = $state("");
   let errorMessage = $state<string | null>(null);
+  let progress = $state<{ batch: number; total: number } | null>(null);
+  let stopRequested = $state(false);
+  // Итог команды может опередить последний пакет из канала, поэтому подпись считается по строкам
+  let finishedRun = $state<{ noun: string; rows: () => ResultRow[] } | null>(null);
+  let resultLabel = $derived.by(() => {
+    if (!finishedRun) return progressStep;
+    const rows = finishedRun.rows();
+    const done = rows.filter((r) => r.done).length;
+    return `${stopRequested ? "Остановлено." : "Готово!"} ${finishedRun.noun}: ${done} из ${rows.length}`;
+  });
+
+  // Строки результата: значения лежат в previewChars и previewTerms, поэтому их можно править
+  let characterRows = $state<ResultRow[]>([]);
+  let termRows = $state<ResultRow[]>([]);
 
   // Результаты генерации для предпросмотра
   let previewChars = $state<CharacterGlossaryEntry[]>([]);
   let previewTerms = $state<TermGlossaryEntry[]>([]);
   let hasResults = $state(false);
   let statsSummary = $state<{ updatedChars: number; updatedTerms: number }>({ updatedChars: 0, updatedTerms: 0 });
+
+  // Термины, которые прошли проверку моделью и ждут отбора
+  let reviewTerms = $state<(ReviewedTerm & { selected: boolean })[]>([]);
+  let reviewNote = $state("");
+  let selectedReviewCount = $derived(reviewTerms.filter((t) => t.selected).length);
 
   onMount(() => {
     try {
@@ -102,6 +151,10 @@
       activeTab = initialTab;
       errorMessage = null;
       hasResults = false;
+      reviewTerms = [];
+      reviewNote = "";
+      characterRows = [];
+      termRows = [];
       previewChars = JSON.parse(JSON.stringify(characters));
       previewTerms = JSON.parse(JSON.stringify(terms));
     }
@@ -157,40 +210,63 @@
     return `Часть данных модель не обработала (пакетов с ошибкой: ${count}). Эти записи остались без изменений, запустите обработку ещё раз.`;
   }
 
-  async function startCharactersAutofill() {
+  function beginRun(step: string) {
     isProcessing = true;
     errorMessage = null;
-    progressStep = "Анализ контекста реплик и генерация перевода имён...";
+    progress = null;
+    stopRequested = false;
+    hasResults = false;
+    finishedRun = null;
+    progressStep = step;
     saveSettings();
+  }
+
+  /** Канал итогов пакетов: записи появляются в окне сразу, как только их вернула модель. */
+  function batchChannel<T>(onItems: (items: T[]) => void) {
+    const channel = new Channel<BatchProgress<T>>();
+    channel.onmessage = (message) => {
+      progress = { batch: message.batch, total: message.total_batches };
+      onItems(message.items);
+    };
+    return channel;
+  }
+
+  async function stopRun() {
+    stopRequested = true;
+    progressStep = "Останавливаемся: дожидаемся ответа на текущий пакет...";
+    await invoke("cancel_llm_run");
+  }
+
+  async function startCharactersAutofill() {
+    beginRun("Сбор реплик персонажей из сценария...");
+    const rows = previewChars.flatMap((c, index) =>
+      !onlyEmpty || !c.translated_name.trim() || c.gender === "unknown" || !c.gender.trim()
+        ? [{ index, samples: [], done: false }]
+        : []
+    );
+    characterRows = rows;
 
     try {
-      const { items: updated, failed_batches: failedBatches } = await invoke<AutofillResult<CharacterGlossaryEntry>>("autofill_glossary_characters", {
+      const result = await invoke<AutofillResult<CharacterGlossaryEntry>>("autofill_glossary_characters", {
         gameDir,
         apiUrl: apiUrl.trim(),
         model: selectedModel.trim(),
         characters: previewChars,
-        onlyEmpty
+        onlyEmpty,
+        onBatch: batchChannel<CharacterResult>((items) => {
+          for (const { samples, ...character } of items) {
+            const row = characterRows.find((r) => !r.done && previewChars[r.index].alias === character.alias);
+            if (!row) continue;
+            previewChars[row.index] = character;
+            row.samples = samples;
+            row.done = true;
+            hasResults = true;
+          }
+          if (!stopRequested) progressStep = "Модель определяет имена и род персонажей...";
+        })
       });
-
-      let changedCount = 0;
-      for (let i = 0; i < updated.length; i++) {
-        const orig = characters[i];
-        const now = updated[i];
-        if (
-          orig &&
-          (orig.translated_name !== now.translated_name ||
-            orig.gender !== now.gender ||
-            orig.notes !== now.notes)
-        ) {
-          changedCount++;
-        }
-      }
-
-      previewChars = updated;
-      statsSummary.updatedChars = changedCount;
-      hasResults = true;
-      progressStep = `Готово! Обновлено персонажей: ${changedCount}`;
-      if (failedBatches > 0) errorMessage = failedBatchesMessage(failedBatches);
+      finishedRun = { noun: "Обработано персонажей", rows: () => characterRows };
+      if (result.failed_batches > 0) errorMessage = failedBatchesMessage(result.failed_batches);
     } catch (e) {
       errorMessage = `Не удалось заполнить персонажей: ${String(e)}`;
     } finally {
@@ -198,65 +274,83 @@
     }
   }
 
-  async function startTermsAutofill() {
-    isProcessing = true;
-    errorMessage = null;
-    saveSettings();
+  async function startTermsExtraction() {
+    beginRun("Поиск названий по всему тексту игры...");
+    reviewTerms = [];
+    reviewNote = "";
 
     try {
-      let currentTermsList = [...previewTerms];
-      let newExtractedCount = 0;
-
-      if (extractTermsFromGame) {
-        progressStep = "Сканирование сценария и извлечение ключевых сущностей (NER)...";
-        const extracted = await invoke<TermGlossaryEntry[]>("extract_glossary_terms_from_game", {
-          gameDir,
-          apiUrl: apiUrl.trim(),
-          model: selectedModel.trim(),
-          maxTerms: maxExtractedTerms
-        });
-
-        // Добавляем только уникальные
-        for (const ext of extracted) {
-          if (
-            !currentTermsList.some(
-              (t) => t.source_term.trim().toLowerCase() === ext.source_term.trim().toLowerCase()
-            )
-          ) {
-            currentTermsList.push(ext);
-            newExtractedCount++;
-          }
-        }
-
-        // Сбой следующего шага не должен отменять уже извлечённые термины
-        if (newExtractedCount > 0) {
-          previewTerms = currentTermsList;
-          statsSummary.updatedTerms = newExtractedCount;
-          hasResults = true;
-        }
-      }
-
-      progressStep = "Перевод и категоризация терминов через LLM...";
-      const { items: updated, failed_batches: failedBatches } = await invoke<AutofillResult<TermGlossaryEntry>>("autofill_glossary_terms", {
+      const result = await invoke<ExtractedTerms>("extract_glossary_terms_from_game", {
+        gameDir,
         apiUrl: apiUrl.trim(),
         model: selectedModel.trim(),
-        terms: currentTermsList,
-        onlyEmpty
+        maxCandidates,
+        knownTerms: previewTerms.map((t) => t.source_term),
+        onBatch: batchChannel<ReviewedTerm>((items) => {
+          reviewTerms.push(...items.map((item) => ({ ...item, selected: true })));
+          if (!stopRequested) progressStep = "Модель проверяет кандидатов...";
+        })
       });
 
-      let changedCount = 0;
-      for (const t of updated) {
-        const orig = terms.find((o) => o.id === t.id);
-        if (!orig || orig.translated_term !== t.translated_term || orig.category !== t.category) {
-          changedCount++;
-        }
+      reviewNote = result.candidates === 0
+        ? "В тексте игры не нашлось новых названий."
+        : `Модель оставила ${result.items.length} из ${result.candidates} кандидатов.`;
+      if (stopRequested) reviewNote = `Остановлено. Модель оставила ${result.items.length} терминов.`;
+      if (result.single_words_skipped) {
+        reviewNote += " В языке игры заглавные пишутся у всех существительных, поэтому искались только фразы из нескольких слов.";
       }
+      if (result.failed_batches > 0) {
+        errorMessage = `Часть кандидатов модель не обработала (пакетов с ошибкой: ${result.failed_batches}). Запустите поиск ещё раз.`;
+      }
+    } catch (e) {
+      errorMessage = `Не удалось найти термины: ${String(e)}`;
+    } finally {
+      isProcessing = false;
+    }
+  }
 
-      previewTerms = updated;
-      statsSummary.updatedTerms = changedCount + newExtractedCount;
-      hasResults = true;
-      progressStep = `Готово! Терминов обновлено/добавлено: ${statsSummary.updatedTerms}`;
-      if (failedBatches > 0) errorMessage = failedBatchesMessage(failedBatches);
+  function setAllReviewed(selected: boolean) {
+    for (const term of reviewTerms) term.selected = selected;
+  }
+
+  function addReviewedTerms() {
+    const chosen = reviewTerms
+      .filter((t) => t.selected)
+      .map(({ selected, count, example, ...term }) => term);
+    previewTerms = [...previewTerms, ...chosen];
+    statsSummary.updatedTerms = chosen.length;
+    reviewTerms = [];
+    reviewNote = "";
+    hasResults = true;
+    finishedRun = null;
+    progressStep = `Готово! Добавлено терминов: ${chosen.length}`;
+  }
+
+  async function startTermsAutofill() {
+    beginRun("Перевод и категоризация терминов через LLM...");
+    const rows = previewTerms.flatMap((t, index) =>
+      !onlyEmpty || !t.translated_term.trim() ? [{ index, samples: [], done: false }] : []
+    );
+    termRows = rows;
+
+    try {
+      const result = await invoke<AutofillResult<TermGlossaryEntry>>("autofill_glossary_terms", {
+        apiUrl: apiUrl.trim(),
+        model: selectedModel.trim(),
+        terms: previewTerms,
+        onlyEmpty,
+        onBatch: batchChannel<TermGlossaryEntry>((items) => {
+          for (const term of items) {
+            const row = termRows.find((r) => !r.done && previewTerms[r.index].id === term.id);
+            if (!row) continue;
+            previewTerms[row.index] = term;
+            row.done = true;
+            hasResults = true;
+          }
+        })
+      });
+      finishedRun = { noun: "Обработано терминов", rows: () => termRows };
+      if (result.failed_batches > 0) errorMessage = failedBatchesMessage(result.failed_batches);
     } catch (e) {
       errorMessage = `Не удалось обработать термины: ${String(e)}`;
     } finally {
@@ -397,8 +491,51 @@
 
       <!-- Тело активного режима -->
       <div class="ai-body">
+        <!-- Прогресс / Ошибка -->
+        {#if isProcessing}
+          <div class="progress-box">
+            <div class="progress-line">
+              <Loader2 size={18} class="spin text-violet-400" />
+              <span class="progress-text">{progressStep}</span>
+              {#if progress}
+                <span class="progress-count">Пакет {progress.batch} из {progress.total}</span>
+              {/if}
+              <button class="btn-stop" onclick={stopRun} disabled={stopRequested}>
+                <Square size={11} />
+                <span>Остановить</span>
+              </button>
+            </div>
+            {#if progress}
+              <div class="progress-track">
+                <div class="progress-fill" style={`width: ${(progress.batch / progress.total) * 100}%`}></div>
+              </div>
+            {/if}
+          </div>
+        {/if}
+
+        {#if errorMessage}
+          <div class="error-box">
+            <AlertCircle size={16} class="text-rose-400 shrink-0" />
+            <span class="text-xs text-rose-200">{errorMessage}</span>
+          </div>
+        {/if}
+
+        {#if hasResults && !isProcessing}
+          <div class="result-banner">
+            <Check size={18} class="text-emerald-400 shrink-0" />
+            <div class="flex-1 text-xs">
+              <span class="font-semibold text-emerald-300">{resultLabel}</span>
+              <p class="text-slate-400 mt-0.5">Нажмите «Применить к глоссарию», чтобы перенести результаты в таблицу проекта.</p>
+            </div>
+            <button class="btn-apply-results" onclick={applyChanges}>
+              <Check size={14} />
+              <span>Применить к глоссарию</span>
+            </button>
+          </div>
+        {/if}
         {#if activeTab === 'characters'}
           <div class="tab-content">
+            {#if characterRows.length === 0}
             <div class="info-banner">
               <Wand2 size={16} class="text-violet-400 shrink-0 mt-0.5" />
               <div class="text-xs text-slate-300 space-y-1">
@@ -406,6 +543,7 @@
                 <p>Нейросеть транскрибирует имена на русский язык, определяет грамматический род (М/Ж/Ср) для согласования глаголов, а также собирает контекстные фразы персонажей из сценария игры.</p>
               </div>
             </div>
+            {/if}
 
             <div class="options-group">
               <label class="checkbox-label">
@@ -414,6 +552,7 @@
               </label>
             </div>
 
+            {#if characterRows.length === 0}
             <div class="stats-overview">
               <div class="stat-card">
                 <span class="stat-num">{characters.length}</span>
@@ -428,6 +567,7 @@
                 <span class="stat-desc">Уже готово</span>
               </div>
             </div>
+            {/if}
 
             <!-- Кнопка запуска -->
             <button 
@@ -443,47 +583,105 @@
                 <span>Запустить автозаполнение персонажей через ИИ</span>
               {/if}
             </button>
+
+            {#if characterRows.length > 0}
+              <div class="review-panel">
+                {#each characterRows as row (row.index)}
+                  {@const character = previewChars[row.index]}
+                  <div class="result-item" class:result-waiting={!row.done}>
+                    <div class="result-title">
+                      <span class="review-term">{character.original_name || character.alias}</span>
+                      <span class="review-count">{character.alias}</span>
+                      {#if !row.done}
+                        <span class="review-count">{isProcessing ? "в очереди" : "не обработан"}</span>
+                      {/if}
+                    </div>
+                    {#if row.done}
+                      <div class="result-fields">
+                        <input
+                          type="text"
+                          class="input-compact text-xs"
+                          bind:value={character.translated_name}
+                          aria-label={`Перевод имени ${character.alias}`}
+                        />
+                        <select
+                          class="input-compact text-xs cursor-pointer"
+                          bind:value={character.gender}
+                          aria-label={`Род персонажа ${character.alias}`}
+                        >
+                          <option value="female">Женский</option>
+                          <option value="male">Мужской</option>
+                          <option value="neuter">Средний</option>
+                          <option value="unknown">Не указан</option>
+                        </select>
+                        <input
+                          type="text"
+                          class="input-compact text-xs"
+                          bind:value={character.notes}
+                          placeholder="Заметка"
+                          aria-label={`Заметка о персонаже ${character.alias}`}
+                        />
+                      </div>
+                      {#if row.samples.length > 0}
+                        <ul class="result-samples">
+                          {#each row.samples as sample}
+                            <li>{sample}</li>
+                          {/each}
+                        </ul>
+                      {:else}
+                        <p class="review-note">Реплик не нашлось: модель судила только по имени.</p>
+                      {/if}
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
           </div>
         {:else}
           <div class="tab-content">
+            {#if termRows.length === 0 && reviewTerms.length === 0}
             <div class="info-banner">
               <BookMarked size={16} class="text-emerald-400 shrink-0 mt-0.5" />
               <div class="text-xs text-slate-300 space-y-1">
                 <p><strong>Словарь терминов, локаций и предметов:</strong></p>
-                <p>Нейросеть переведёт термины, определит категории (локация, титул, предмет), а также может автоматически просканировать сценарий и извлечь ключевые названия мира (NER).</p>
+                <p>Нейросеть переведёт термины и определит категории (локация, титул, предмет). Новые названия ищутся по всему тексту игры: модель отсеивает лишнее, а вы выбираете, что добавить в глоссарий.</p>
               </div>
             </div>
+            {/if}
 
             <div class="options-group space-y-2">
               <label class="checkbox-label">
-                <input type="checkbox" bind:checked={onlyEmpty} disabled={isProcessing} />
-                <span>Переводить только непереведенные термины</span>
-              </label>
-
-              <label class="checkbox-label">
                 <input type="checkbox" bind:checked={extractTermsFromGame} disabled={isProcessing} />
-                <span>Автоматически извлечь новые ключевые термины из сценария (NER)</span>
+                <span>Найти новые термины в тексте игры</span>
               </label>
 
               {#if extractTermsFromGame}
                 <div class="ml-6 flex items-center gap-2 text-xs text-slate-300">
-                  <span>Максимум новых терминов:</span>
-                  <input 
-                    type="number" 
-                    min="5" 
-                    max="50" 
-                    bind:value={maxExtractedTerms} 
+                  <label for="ai-max-candidates">Кандидатов на проверку:</label>
+                  <input
+                    id="ai-max-candidates"
+                    type="number"
+                    min="20"
+                    max="200"
+                    step="20"
+                    bind:value={maxCandidates}
                     class="input-compact w-20 text-center text-xs"
                     disabled={isProcessing}
                   />
+                  <span class="review-note">каждые 20 это один запрос к модели</span>
                 </div>
+              {:else}
+                <label class="checkbox-label">
+                  <input type="checkbox" bind:checked={onlyEmpty} disabled={isProcessing} />
+                  <span>Переводить только непереведенные термины</span>
+                </label>
               {/if}
             </div>
 
             <!-- Кнопка запуска терминов -->
-            <button 
-              class="btn-run-generation btn-run-terms" 
-              onclick={startTermsAutofill} 
+            <button
+              class="btn-run-generation btn-run-terms"
+              onclick={extractTermsFromGame ? startTermsExtraction : startTermsAutofill}
               disabled={isProcessing}
             >
               {#if isProcessing}
@@ -491,40 +689,107 @@
                 <span>Обработка терминов через LLM...</span>
               {:else}
                 <Wand2 size={16} />
-                <span>{extractTermsFromGame ? 'Извлечь и перевести термины через ИИ' : 'Перевести термины через ИИ'}</span>
+                <span>{extractTermsFromGame ? 'Найти термины в игре через ИИ' : 'Перевести термины через ИИ'}</span>
               {/if}
             </button>
+
+            {#if termRows.length > 0}
+              <div class="review-panel">
+                {#each termRows as row (row.index)}
+                  {@const term = previewTerms[row.index]}
+                  <div class="result-item" class:result-waiting={!row.done}>
+                    <div class="result-title">
+                      <span class="review-term">{term.source_term}</span>
+                      {#if !row.done}
+                        <span class="review-count">{isProcessing ? "в очереди" : "не обработан"}</span>
+                      {/if}
+                    </div>
+                    {#if row.done}
+                      <div class="result-fields">
+                        <input
+                          type="text"
+                          class="input-compact text-xs"
+                          bind:value={term.translated_term}
+                          aria-label={`Перевод термина ${term.source_term}`}
+                        />
+                        <select
+                          class="input-compact text-xs cursor-pointer"
+                          bind:value={term.category}
+                          aria-label={`Категория термина ${term.source_term}`}
+                        >
+                          <option value="general">Общее</option>
+                          <option value="location">Локация</option>
+                          <option value="title">Титул</option>
+                          <option value="item">Предмет</option>
+                        </select>
+                        <input
+                          type="text"
+                          class="input-compact text-xs"
+                          bind:value={term.notes}
+                          placeholder="Заметка"
+                          aria-label={`Заметка о термине ${term.source_term}`}
+                        />
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+
+            {#if reviewNote || reviewTerms.length > 0}
+              <div class="review-panel">
+                <div class="review-header">
+                  <span class="review-note">{reviewNote || "Найденные термины появляются здесь по мере проверки."}</span>
+                  {#if reviewTerms.length > 0}
+                    <div class="review-toggles">
+                      <button class="btn-link" onclick={() => setAllReviewed(true)}>Выбрать все</button>
+                      <button class="btn-link" onclick={() => setAllReviewed(false)}>Снять все</button>
+                    </div>
+                  {/if}
+                </div>
+
+                {#each reviewTerms as term (term.id)}
+                  <div class="review-row" class:review-row-off={!term.selected}>
+                    <input
+                      type="checkbox"
+                      class="review-check"
+                      bind:checked={term.selected}
+                      aria-label={`Добавить термин ${term.source_term}`}
+                    />
+                    <div class="review-source">
+                      <span class="review-term">{term.source_term} <span class="review-count">× {term.count}</span></span>
+                      <span class="review-example" title={term.example}>{term.example}</span>
+                    </div>
+                    <input
+                      type="text"
+                      class="input-compact text-xs"
+                      bind:value={term.translated_term}
+                      aria-label={`Перевод термина ${term.source_term}`}
+                    />
+                    <select
+                      class="input-compact text-xs cursor-pointer"
+                      bind:value={term.category}
+                      aria-label={`Категория термина ${term.source_term}`}
+                    >
+                      <option value="general">Общее</option>
+                      <option value="location">Локация</option>
+                      <option value="title">Титул</option>
+                      <option value="item">Предмет</option>
+                    </select>
+                  </div>
+                {/each}
+
+                {#if reviewTerms.length > 0}
+                  <button class="btn-apply-results review-add" onclick={addReviewedTerms} disabled={selectedReviewCount === 0 || isProcessing}>
+                    <Check size={14} />
+                    <span>Добавить выбранные ({selectedReviewCount})</span>
+                  </button>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/if}
 
-        <!-- Прогресс / Ошибка -->
-        {#if isProcessing}
-          <div class="progress-box">
-            <Loader2 size={18} class="spin text-violet-400" />
-            <span class="text-xs text-slate-200">{progressStep}</span>
-          </div>
-        {/if}
-
-        {#if errorMessage}
-          <div class="error-box">
-            <AlertCircle size={16} class="text-rose-400 shrink-0" />
-            <span class="text-xs text-rose-200">{errorMessage}</span>
-          </div>
-        {/if}
-
-        {#if hasResults}
-          <div class="result-banner">
-            <Check size={18} class="text-emerald-400 shrink-0" />
-            <div class="flex-1 text-xs">
-              <span class="font-semibold text-emerald-300">{progressStep}</span>
-              <p class="text-slate-400 mt-0.5">Нажмите «Применить к глоссарию», чтобы перенести результаты в таблицу проекта.</p>
-            </div>
-            <button class="btn-apply-results" onclick={applyChanges}>
-              <Check size={14} />
-              <span>Применить к глоссарию</span>
-            </button>
-          </div>
-        {/if}
       </div>
 
       <!-- Футер -->
@@ -532,7 +797,7 @@
         <button class="btn-secondary" onclick={onclose} disabled={isProcessing}>
           Закрыть
         </button>
-        {#if hasResults}
+        {#if hasResults && !isProcessing}
           <button class="btn-primary" onclick={applyChanges}>
             <Check size={14} />
             <span>Применить и закрыть</span>
@@ -562,7 +827,7 @@
     border-radius: 14px;
     box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.75), 0 0 35px rgba(139, 92, 246, 0.12);
     width: 100%;
-    max-width: 620px;
+    max-width: 760px;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -889,19 +1154,72 @@
   }
 
   .progress-box {
+    position: sticky;
+    top: 0;
+    z-index: 1;
     display: flex;
-    align-items: center;
-    gap: 0.65rem;
-    background: rgba(139, 92, 246, 0.08);
+    flex-direction: column;
+    gap: 0.5rem;
+    background: #1b1a3a;
     border: 1px solid rgba(139, 92, 246, 0.25);
     padding: 0.75rem 1rem;
     border-radius: 8px;
-    animation: pulse 1.8s infinite ease-in-out;
   }
 
-  @keyframes pulse {
-    0%, 100% { opacity: 0.8; }
-    50% { opacity: 1; }
+  .progress-line {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+  }
+
+  .progress-text {
+    flex: 1;
+    min-width: 0;
+    font-size: 0.75rem;
+    color: #e2e8f0;
+  }
+
+  .progress-count {
+    font-size: 0.72rem;
+    color: #94a3b8;
+    white-space: nowrap;
+  }
+
+  .progress-track {
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(51, 65, 85, 0.7);
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: #a855f7;
+    transition: width 0.3s;
+  }
+
+  .btn-stop {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    background: rgba(51, 65, 85, 0.6);
+    border: 1px solid rgba(71, 85, 105, 0.6);
+    color: #cbd5e1;
+    font-size: 0.72rem;
+    padding: 0.28rem 0.65rem;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .btn-stop:hover:not(:disabled) {
+    color: #f8fafc;
+    border-color: rgba(148, 163, 184, 0.5);
+  }
+
+  .btn-stop:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .error-box {
@@ -940,8 +1258,139 @@
     transition: all 0.15s;
   }
 
-  .btn-apply-results:hover {
+  .btn-apply-results:hover:not(:disabled) {
     background: #047857;
+  }
+
+  .btn-apply-results:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .review-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(51, 65, 85, 0.5);
+    border-radius: 8px;
+    padding: 0.75rem;
+  }
+
+  .review-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.25rem;
+  }
+
+  .review-note {
+    font-size: 0.72rem;
+    color: #94a3b8;
+  }
+
+  .review-toggles {
+    display: flex;
+    gap: 0.6rem;
+    flex-shrink: 0;
+  }
+
+  .btn-link {
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: #c084fc;
+    font-size: 0.72rem;
+    cursor: pointer;
+  }
+
+  .btn-link:hover {
+    color: #e9d5ff;
+  }
+
+  .review-row {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1.2fr) minmax(0, 1fr) 6.2rem;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .review-row-off {
+    opacity: 0.5;
+  }
+
+  .review-check {
+    accent-color: #a855f7;
+    width: 15px;
+    height: 15px;
+    cursor: pointer;
+  }
+
+  .review-source {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .review-term {
+    font-size: 0.78rem;
+    color: #f1f5f9;
+  }
+
+  .review-count {
+    font-size: 0.68rem;
+    color: #94a3b8;
+  }
+
+  .review-example {
+    font-size: 0.68rem;
+    color: #94a3b8;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .result-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding: 0.5rem 0;
+    border-top: 1px solid rgba(51, 65, 85, 0.35);
+  }
+
+  .result-item:first-child {
+    border-top: none;
+    padding-top: 0;
+  }
+
+  .result-waiting {
+    opacity: 0.55;
+  }
+
+  .result-title {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .result-fields {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 7rem minmax(0, 1.4fr);
+    gap: 0.4rem;
+  }
+
+  .result-samples {
+    margin: 0;
+    padding-left: 1rem;
+    font-size: 0.72rem;
+    color: #94a3b8;
+  }
+
+  .review-add {
+    align-self: flex-end;
+    margin-top: 0.35rem;
   }
 
   .modal-footer {
