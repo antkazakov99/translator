@@ -527,9 +527,18 @@ impl<'a> PickleDecoder<'a> {
                     }));
                 }
 
-                // Неизвестный или неподдерживаемый опкод
-                _ => {
-                    // Пропускаем неизвестный байт в попытке продолжить или возвращаем предупреждение
+                // FRAME (Protocol 4): длина блока, данные идут сразу за ней
+                0x95 => {
+                    self.read_u64_le()?;
+                }
+
+                // Пропуск опкода сбил бы разбор: его аргументы читались бы как команды
+                other => {
+                    return Err(format!(
+                        "Неподдерживаемый опкод pickle 0x{:02x} на позиции {}",
+                        other,
+                        self.pos - 1
+                    ));
                 }
             }
         }
@@ -820,6 +829,34 @@ impl Default for PickleEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_lengths_are_not_read_as_opcodes() {
+        let frame = |body: &[u8]| {
+            let mut bytes = vec![0x95];
+            bytes.extend_from_slice(&(body.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(body);
+            bytes
+        };
+        // Длина среднего блока равна опкоду STOP
+        let data = [
+            vec![0x80, 5],
+            frame(b"]("),
+            frame(&b"K\x01".repeat(usize::from(b'.') / 2)),
+            frame(b"e."),
+        ]
+        .concat();
+        assert_eq!(
+            PickleDecoder::new(&data).decode().unwrap(),
+            PickleValue::List(vec![PickleValue::Int(1); usize::from(b'.') / 2])
+        );
+    }
+
+    #[test]
+    fn unknown_opcode_is_an_error() {
+        let error = PickleDecoder::new(&[0x80, 2, 0xff, b'.']).decode().unwrap_err();
+        assert!(error.contains("0xff"), "{error}");
+    }
 
     #[test]
     fn corrupt_data_returns_errors_instead_of_panicking() {

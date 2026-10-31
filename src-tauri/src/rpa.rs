@@ -879,6 +879,22 @@ mod tests {
 
     #[test]
     #[ignore = "Требуются локальные тестовые файлы игры"]
+    fn test_read_real_framed_archive() {
+        let Some(path) = crate::local_test_game(crate::TEST_FRAMED_ARCHIVE) else {
+            return;
+        };
+        let archive = RpaArchive::open(Path::new(&path)).unwrap();
+        assert!(!archive.entries.is_empty());
+        for entry in archive.entries.values() {
+            for segment in &entry.segments {
+                assert!(segment.offset + segment.length <= archive.index_offset, "{}", entry.name);
+            }
+        }
+        println!("{}: файлов {}", path, archive.entries.len());
+    }
+
+    #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
     fn test_read_real_game_of_whores_archive() {
         let Some(game_dir) = crate::local_test_game(crate::TEST_RPA_GAME) else {
             return;
