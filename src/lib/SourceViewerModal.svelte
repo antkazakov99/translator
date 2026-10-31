@@ -154,6 +154,7 @@
       const cleanName = targetSceneName.trim();
       const labelPatColon = `label ${cleanName}:`;
       const labelPatSpace = `label ${cleanName} `;
+      const labelPatParen = `label ${cleanName}(`;
       const tlPat = `translate russian ${cleanName}:`;
       const tlPatPrefix = `translate russian ${cleanName}_`;
 
@@ -162,6 +163,7 @@
         if (
           trimmed.startsWith(labelPatColon) ||
           trimmed.startsWith(labelPatSpace) ||
+          trimmed.startsWith(labelPatParen) ||
           trimmed.startsWith(tlPat) ||
           trimmed.startsWith(tlPatPrefix)
         ) {
@@ -272,6 +274,7 @@
       return (
         trimmed.startsWith(`label ${clean}:`) ||
         trimmed.startsWith(`label ${clean} `) ||
+        trimmed.startsWith(`label ${clean}(`) ||
         trimmed.startsWith(`translate russian ${clean}:`) ||
         trimmed.startsWith(`translate russian ${clean}_`)
       );

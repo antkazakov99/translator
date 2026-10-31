@@ -13,7 +13,7 @@ use crate::pickle::{PickleDecoder, PickleEncoder, PickleValue};
 /// Имя архива, в который упаковывается мод перевода.
 pub(crate) const MOD_ARCHIVE_NAME: &str = "ru_lang.rpa";
 
-const CACHE_VERSION: &str = "v7_archive_priority";
+const CACHE_VERSION: &str = "v8_block_structure";
 const MAX_COMPRESSED_INDEX: u64 = 64 * 1024 * 1024;
 const MAX_DECOMPRESSED_INDEX: usize = 256 * 1024 * 1024;
 const MAX_COMPILED_SCRIPT: u64 = 128 * 1024 * 1024;
