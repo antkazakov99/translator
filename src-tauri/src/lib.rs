@@ -176,10 +176,15 @@ const MAX_SPEAKER_SCAN_FILES: usize = 40;
 /// - скрытые директории и файлы (.codex-backups, .editor-backups, .git)
 /// - файлы бэкапов (*.bak, *.backup, *.tmp)
 fn collect_rpy_files(dir: &Path, files: &mut Vec<PathBuf>) {
-    collect_rpy_files_depth(dir, files, 0);
+    collect_files_depth(dir, &["rpy"], files, 0);
 }
 
-fn collect_rpy_files_depth(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) {
+/// То же для исходных и скомпилированных скриптов.
+pub(crate) fn collect_script_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    collect_files_depth(dir, &["rpy", "rpyc"], files, 0);
+}
+
+fn collect_files_depth(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>, depth: usize) {
     if depth > MAX_SCAN_DEPTH {
         return;
     }
@@ -198,8 +203,8 @@ fn collect_rpy_files_depth(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) {
             }
 
             if path.is_dir() {
-                collect_rpy_files_depth(&path, files, depth + 1);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rpy") {
+                collect_files_depth(&path, extensions, files, depth + 1);
+            } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| extensions.contains(&e)) {
                 // Исключаем любые бэкапы вида *.bak или *.bak.*
                 if !file_name.ends_with(".bak") && !file_name.contains(".bak") {
                     files.push(path);
@@ -207,18 +212,6 @@ fn collect_rpy_files_depth(dir: &Path, files: &mut Vec<PathBuf>, depth: usize) {
             }
         }
     }
-}
-
-/// Проверяет наличие архивов `.rpa` в директории игры
-fn has_rpa_archives(dir: &Path) -> bool {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if entry.path().extension().and_then(|e| e.to_str()) == Some("rpa") {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Папка данных приложения вне каталогов игр.
@@ -519,23 +512,10 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let mut script_files = Vec::new();
         collect_rpy_files(&base_path, &mut script_files);
 
-        // 2. Если в папке игры есть архивы .rpa — распаковываем ТОЛЬКО скрипты в изолированный AppData кэш
+        // 2. Скрипты из архивов и .rpyc без .rpy — в изолированный AppData кэш
         let cache_dir = get_project_scripts_cache_dir(&base_path);
-        if has_rpa_archives(&base_path) {
-            rpa::RpaArchive::extract_scripts_from_game_archives(&base_path, &cache_dir)?;
-            collect_rpy_files(&cache_dir, &mut script_files);
-        } else {
-            let cache_lock = path_lock(&cache_dir);
-            let _guard = cache_lock.lock();
-            if cache_dir.exists() {
-                std::fs::remove_dir_all(&cache_dir).map_err(|e| {
-                    format!(
-                        "Не удалось удалить устаревший кэш скриптов {:?}: {}",
-                        cache_dir, e
-                    )
-                })?;
-            }
-        }
+        rpa::RpaArchive::refresh_script_cache(&base_path, &cache_dir)?;
+        collect_rpy_files(&cache_dir, &mut script_files);
 
         let mut characters_map: std::collections::HashMap<String, String> = script_files
             .par_iter()
@@ -577,77 +557,29 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         }
 
         // 3. Ищем файлы переводов в game/tl/russian в параллельных потоках (сверхбыстрый подсчет строк).
-        // Запакованный перевод к этому моменту восстановлен в кэше
-        let disk_tl_dir = tl_lang_dir(&base_path);
-        let packed_tl_dir = cache_dir.join("tl").join(TL_LANG);
-        let tl_dir = if disk_tl_dir.exists() || !packed_tl_dir.exists() {
-            disk_tl_dir
-        } else {
-            packed_tl_dir
-        };
+        // Остальной перевод к этому моменту восстановлен в кэше, копий файлов с диска в нём нет
         let mut files = Vec::new();
-        let mut grand_total = 0;
-        let mut grand_translated = 0;
-
-        if tl_dir.exists() {
+        for tl_dir in [tl_lang_dir(&base_path), cache_dir.join("tl").join(TL_LANG)] {
             let mut tl_files = Vec::new();
             collect_rpy_files(&tl_dir, &mut tl_files);
-
-            let mut parsed_files = build_translation_file_items(tl_files, &tl_dir);
-
-            for f in &parsed_files {
-                grand_total += f.total_lines;
-                grand_translated += f.translated_lines;
-            }
-
-            parsed_files.sort_by(|a, b| {
-                b.size_kb
-                    .partial_cmp(&a.size_kb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            files = parsed_files;
+            files.extend(build_translation_file_items(tl_files, &tl_dir));
         }
 
-        // 4. Если в tl/russian пусто (новый перевод), но в кэше есть скрипты из RPA — выводим их как базу для перевода
-        if files.is_empty() && cache_dir.exists() {
-            let mut cached_files = Vec::new();
-            collect_rpy_files(&cache_dir, &mut cached_files);
-
-            let mut parsed_cached = build_translation_file_items(cached_files, &cache_dir);
-
-            for f in &parsed_cached {
-                grand_total += f.total_lines;
-                grand_translated += f.translated_lines;
-            }
-
-            parsed_cached.sort_by(|a, b| {
-                b.size_kb
-                    .partial_cmp(&a.size_kb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            files = parsed_cached;
+        // 4. Если перевода нет (новый перевод) — выводим скрипты игры как базу для него
+        if files.is_empty() {
+            let (cached, loose): (Vec<PathBuf>, Vec<PathBuf>) =
+                script_files.into_iter().partition(|p| p.starts_with(&cache_dir));
+            files.extend(build_translation_file_items(cached, &cache_dir));
+            files.extend(build_translation_file_items(loose, &base_path));
         }
 
-        // 5. Если в tl/russian пусто и нет RPA, но есть распакованные .rpy в папке игры
-        if files.is_empty() && !script_files.is_empty() {
-            let loose: Vec<PathBuf> = script_files
-                .into_iter()
-                .filter(|p| !p.starts_with(&cache_dir))
-                .collect();
-            let mut parsed_loose = build_translation_file_items(loose, &base_path);
-
-            for f in &parsed_loose {
-                grand_total += f.total_lines;
-                grand_translated += f.translated_lines;
-            }
-
-            parsed_loose.sort_by(|a, b| {
-                b.size_kb
-                    .partial_cmp(&a.size_kb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            files = parsed_loose;
-        }
+        files.sort_by(|a, b| {
+            b.size_kb
+                .partial_cmp(&a.size_kb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let grand_total = files.iter().map(|f| f.total_lines).sum();
+        let grand_translated = files.iter().map(|f| f.translated_lines).sum();
 
         Ok(ProjectSummary {
             game_name: base_path
@@ -2540,6 +2472,123 @@ mod tests {
             &out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpyc"),
         );
         assert!(!strings.contains("Taken"));
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scan_lists_scripts_the_engine_loads() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_scan_sources_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(game_dir.join("mod")).unwrap();
+        std::fs::create_dir_all(game_dir.join("_mods")).unwrap();
+        let line = |text: &str| format!("label start:\n    e \"{text}\"\n");
+        rpa::RpaArchive::create_archive(
+            &game_dir.join("scripts.rpa"),
+            &[
+                ("packed.rpy".into(), line("Packed").into_bytes()),
+                ("shared.rpy".into(), line("Archived").into_bytes()),
+            ],
+        )
+        .unwrap();
+        std::fs::write(game_dir.join("shared.rpy"), line("On disk")).unwrap();
+        std::fs::write(game_dir.join("mod").join("extra.rpy"), line("Mod")).unwrap();
+        std::fs::write(game_dir.join("_mods").join("tool.rpy"), line("Injector")).unwrap();
+        let compiled = rpyc_writer::compile_script(
+            TEST_FORMAT,
+            TL_LANG,
+            "gallery.rpy",
+            "translate russian strings:\n    old \"Gallery\"\n    new \"Галерея\"\n",
+        )
+        .unwrap();
+        std::fs::write(game_dir.join("gallery.rpyc"), compiled).unwrap();
+
+        let summary = tauri::async_runtime::block_on(scan_game_project(
+            game_dir.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        let mut names: Vec<_> = summary.files.iter().map(|file| file.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["mod/extra.rpy", "packed.rpy", "shared.rpy"]);
+        let shared = summary.files.iter().find(|file| file.name == "shared.rpy").unwrap();
+        assert!(Path::new(&shared.path).starts_with(&game_dir), "{}", shared.path);
+
+        let cache_dir = get_project_scripts_cache_dir(&game_dir);
+        assert!(!cache_dir.join("shared.rpy").exists());
+        assert!(cache_dir.join("gallery.rpy").exists());
+
+        // Появившийся исходник отменяет и компиляцию, и копию из архива
+        std::fs::write(game_dir.join("gallery.rpy"), line("Source")).unwrap();
+        std::fs::write(game_dir.join("packed.rpy"), line("Newer")).unwrap();
+        tauri::async_runtime::block_on(scan_game_project(game_dir.to_string_lossy().into_owned()))
+            .unwrap();
+        assert!(!cache_dir.join("gallery.rpy").exists());
+        assert!(!cache_dir.join("packed.rpy").exists());
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scan_keeps_no_cache_for_readable_scripts() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_scan_nocache_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        std::fs::write(game_dir.join("story.rpy"), "label start:\n    e \"Hi\"\n").unwrap();
+        std::fs::write(game_dir.join("story.rpyc"), b"compiled by game").unwrap();
+        let stale = get_project_scripts_cache_dir(&game_dir);
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("old.rpy"), "stale").unwrap();
+
+        let summary = tauri::async_runtime::block_on(scan_game_project(
+            game_dir.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        assert_eq!(summary.files.len(), 1);
+        assert!(!stale.exists());
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_compiled_translation_on_disk_stays_visible() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_scan_loose_tl_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let tl_dir = tl_lang_dir(&game_dir);
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        let story = game_dir.join("story.rpy");
+        std::fs::write(&story, "label start:\n    e \"Taken\"\n").unwrap();
+        std::fs::write(
+            tl_dir.join("plain.rpy"),
+            "translate russian strings:\n    old \"Plain\"\n    new \"Просто\"\n",
+        )
+        .unwrap();
+        let compiled = rpyc_writer::compile_script(
+            TEST_FORMAT,
+            TL_LANG,
+            "menu.rpy",
+            "translate russian strings:\n    old \"Taken\"\n    new \"Уже есть\"\n",
+        )
+        .unwrap();
+        std::fs::write(tl_dir.join("menu.rpyc"), compiled).unwrap();
+
+        let summary = tauri::async_runtime::block_on(scan_game_project(
+            game_dir.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        let mut names: Vec<_> = summary.files.iter().map(|file| file.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["menu.rpy", "plain.rpy"]);
+
+        // Повтор `old` из скомпилированного файла тоже не должен попасть в мод
+        save_edits(&story, &[("Taken", "Занято")]);
+        let message = pack_and_unpack(&game_dir, &temp_dir.join("mod"));
+        assert!(message.contains("Не перенесено правок: 1"), "{message}");
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
         let _ = std::fs::remove_dir_all(&temp_dir);

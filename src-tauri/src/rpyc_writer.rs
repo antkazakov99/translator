@@ -849,7 +849,7 @@ mod tests {
         };
         let game = Path::new(&game);
         let cache = std::env::temp_dir().join(format!("translator_packed_{}", uuid::Uuid::new_v4()));
-        crate::rpa::RpaArchive::extract_scripts_from_game_archives(game, &cache).unwrap();
+        crate::rpa::RpaArchive::refresh_script_cache(game, &cache).unwrap();
 
         let mut files = Vec::new();
         crate::collect_rpy_files(&cache.join("tl").join(crate::TL_LANG), &mut files);
