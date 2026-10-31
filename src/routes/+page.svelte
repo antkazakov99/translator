@@ -120,12 +120,38 @@
 
   const RECENT_PROJECTS_KEY = "translator.recent-projects";
   const PROJECT_NAMES_KEY = "translator.project-names";
+  const OPENING_PROJECT_KEY = "translator.opening-project";
 
   onMount(() => {
     restoreRecentProjects();
-    void scanProject();
+    // Проект, уронивший приложение, не должен ронять его при каждом запуске
+    if (takeInterruptedProject() === gameDir) {
+      errorMsg = `Прошлое открытие проекта «${projectDisplayName(gameDir)}» не завершилось, поэтому он не загружен автоматически. Чтобы попробовать снова, выберите его в списке проектов.`;
+      gameDir = "";
+    } else {
+      void scanProject();
+    }
     return watchWindowClose();
   });
+
+  function takeInterruptedProject() {
+    try {
+      const path = localStorage.getItem(OPENING_PROJECT_KEY);
+      localStorage.removeItem(OPENING_PROJECT_KEY);
+      return path;
+    } catch {
+      return null;
+    }
+  }
+
+  function markProjectOpening(path: string | null) {
+    try {
+      if (path) localStorage.setItem(OPENING_PROJECT_KEY, path);
+      else localStorage.removeItem(OPENING_PROJECT_KEY);
+    } catch {
+      // Без отметки приложение просто загрузит этот проект при следующем запуске.
+    }
+  }
 
   function restoreRecentProjects() {
     try {
@@ -1036,6 +1062,7 @@
     glossaryDirty = false;
     selectedGlossaryChar = null;
     selectedGlossaryTerm = null;
+    markProjectOpening(selectedPath);
     try {
       const scanPath = await invoke<string>("resolve_game_directory", { path: selectedPath });
       if (seq !== projectScanSeq || gameDir.trim() !== selectedPath) return;
@@ -1050,10 +1077,17 @@
         // Микропауза для отрисовки сайдбара и статов перед загрузкой первого файла
         await new Promise(r => setTimeout(r, 20));
         if (seq !== projectScanSeq || gameDir.trim() !== selectedPath) return;
-        void selectFile(summary.files[0]);
+        void selectFile(summary.files[0]).finally(() => {
+          if (seq === projectScanSeq) markProjectOpening(null);
+        });
+      } else {
+        markProjectOpening(null);
       }
     } catch (e) {
-      if (seq === projectScanSeq) errorMsg = String(e);
+      if (seq === projectScanSeq) {
+        errorMsg = String(e);
+        markProjectOpening(null);
+      }
     } finally {
       if (seq === projectScanSeq) loadingProject = false;
     }

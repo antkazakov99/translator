@@ -573,11 +573,13 @@ impl<'a> PickleDecoder<'a> {
     }
 
     fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], String> {
-        if self.pos + len > self.data.len() {
-            return Err("Неожиданный конец потока данных при чтении среза байт".to_string());
-        }
-        let slice = &self.data[self.pos..self.pos + len];
-        self.pos += len;
+        let end = self
+            .pos
+            .checked_add(len)
+            .filter(|end| *end <= self.data.len())
+            .ok_or("Неожиданный конец потока данных при чтении среза байт")?;
+        let slice = &self.data[self.pos..end];
+        self.pos = end;
         Ok(slice)
     }
 
@@ -634,9 +636,9 @@ fn parse_two_complement_i64(bytes: &[u8]) -> i64 {
 /// Распаковка экранированных строк Python Pickle (S opcode)
 fn unescape_python_str(s: &str) -> String {
     let trimmed = s.trim();
-    let inner = if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-        || (trimmed.starts_with('"') && trimmed.ends_with('"'))
-    {
+    let quoted = (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+        || (trimmed.starts_with('"') && trimmed.ends_with('"'));
+    let inner = if quoted && trimmed.len() >= 2 {
         &trimmed[1..trimmed.len() - 1]
     } else {
         trimmed
@@ -818,6 +820,18 @@ impl Default for PickleEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_data_returns_errors_instead_of_panicking() {
+        let mut huge_length = vec![0x8d];
+        huge_length.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(PickleDecoder::new(&huge_length).decode().is_err());
+
+        assert_eq!(
+            PickleDecoder::new(b"S'\n.").decode().unwrap(),
+            PickleValue::String("'".to_string())
+        );
+    }
 
     #[test]
     fn encoded_values_decode_back() {
