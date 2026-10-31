@@ -40,7 +40,6 @@ tracing-subscriber = "0.3"
 # Парсинг
 regex = "1.11"
 flate2 = "1.0"
-walkdir = "2.5"
 
 # Сеть и LLM
 reqwest = { version = "0.12", features = ["json"] }
