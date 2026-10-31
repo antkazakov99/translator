@@ -4,6 +4,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+use crate::parser::renpy::RenpyParser;
 use crate::pickle::{PickleDecoder, PickleValue};
 
 /// Метаданные слота заголовка RPYC
@@ -480,7 +481,7 @@ impl RpycParser {
                     out.push_str(&format!("\nlabel {}:\n", stmt.scene_name));
                 }
                 "say" => {
-                    let escaped_text = stmt.text.replace('"', "\\\"");
+                    let escaped_text = RenpyParser::escape_renpy_string(&stmt.text);
                     if let Some(ref spk) = stmt.speaker {
                         out.push_str(&format!("    {} \"{}\"\n", spk, escaped_text));
                     } else {
@@ -488,7 +489,7 @@ impl RpycParser {
                     }
                 }
                 "menu" => {
-                    let escaped_text = stmt.text.replace('"', "\\\"");
+                    let escaped_text = RenpyParser::escape_renpy_string(&stmt.text);
                     out.push_str(&format!(
                         "        \"{}\":\n            pass\n",
                         escaped_text
@@ -529,6 +530,26 @@ impl RpycParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::GameParser;
+
+    #[test]
+    fn test_decompiled_text_keeps_line_breaks_and_backslashes() {
+        let text = "First \"line\"\nC:\\new";
+        let statement = |kind: &str| RpycStatement {
+            kind: kind.to_string(),
+            scene_name: "start".to_string(),
+            speaker: None,
+            text: text.to_string(),
+            line_number: 1,
+            target: None,
+        };
+        let script = RpycParser::decompile_to_rpy_text(&[statement("say"), statement("menu")]);
+        let graph = RenpyParser::new()
+            .parse_file(Path::new("story.rpy"), &script)
+            .unwrap();
+        let texts: Vec<_> = graph.dialogues().map(|line| line.original_text.as_str()).collect();
+        assert_eq!(texts, [text, text]);
+    }
 
     #[test]
     #[ignore = "Требуются локальные тестовые файлы игры"]

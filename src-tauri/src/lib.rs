@@ -54,6 +54,20 @@ fn original_script_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Исходный скрипт файла: рядом с файлами игры или в кэше скриптов из архивов.
+fn resolve_original_script(path: &Path, game_root: &Path) -> PathBuf {
+    let direct = original_script_path(path);
+    if !direct.exists()
+        && let Some(name) = tl_relative_name(path)
+    {
+        let cached = get_project_scripts_cache_dir(game_root).join(name);
+        if cached.exists() {
+            return cached;
+        }
+    }
+    direct
+}
+
 /// Путь файла перевода относительно `tl/<язык>`; `None` для остальных файлов.
 pub(crate) fn tl_relative_name(path: &Path) -> Option<String> {
     let parts: Vec<Component> = path.components().collect();
@@ -616,7 +630,10 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
         .and_then(|m| m.modified())
         .map_err(|e| format!("Не удалось получить свойства файла: {}", e))?;
 
-    let orig_path = original_script_path(path);
+    let search_dir = find_game_root(path);
+    let cache_dir = get_project_scripts_cache_dir(&search_dir);
+
+    let orig_path = resolve_original_script(path, &search_dir);
     let orig_path = orig_path.as_path();
     let orig_mtime = if orig_path.exists() {
         std::fs::metadata(orig_path).and_then(|m| m.modified()).ok()
@@ -637,9 +654,6 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
 
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Не удалось прочитать файл: {}", e))?;
-
-    let search_dir = find_game_root(path);
-    let cache_dir = get_project_scripts_cache_dir(&search_dir);
 
     // 2. Персонажи / speakers: берем из кэша проекта, если есть
     let speakers_map = {
@@ -1339,37 +1353,15 @@ async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String
         if is_translation {
             translation_path = Some(file_path.clone());
             // Пробуем найти оригинальный файл скрипта
-            let direct_path = original_script_path(path);
+            let original = resolve_original_script(path, &find_game_root(path));
 
-            if direct_path.exists() && direct_path != path {
-                if let Ok(orig_txt) = read_text_file_safe(&direct_path) {
-                    original_total_lines = Some(orig_txt.lines().count());
-                    original_content = Some(orig_txt);
-                    original_path = Some(direct_path.to_string_lossy().to_string());
-                }
-            } else {
-                let game_root = find_game_root(path);
-                let cache_dir = get_project_scripts_cache_dir(&game_root);
-                let rel = path.strip_prefix(tl_lang_dir(&game_root)).ok();
-                if let Some(r) = rel {
-                    let in_game = game_root.join(r);
-                    let in_cache = cache_dir.join(r);
-                    let chosen = if in_game.exists() {
-                        Some(in_game)
-                    } else if in_cache.exists() {
-                        Some(in_cache)
-                    } else {
-                        None
-                    };
-
-                    if let Some(cp) = chosen
-                        && let Ok(orig_txt) = read_text_file_safe(&cp)
-                    {
-                        original_total_lines = Some(orig_txt.lines().count());
-                        original_content = Some(orig_txt);
-                        original_path = Some(cp.to_string_lossy().to_string());
-                    }
-                }
+            if original.exists()
+                && original != path
+                && let Ok(orig_txt) = read_text_file_safe(&original)
+            {
+                original_total_lines = Some(orig_txt.lines().count());
+                original_content = Some(orig_txt);
+                original_path = Some(original.to_string_lossy().to_string());
             }
         } else {
             // Файл сам является оригинальным скриптом
@@ -2487,6 +2479,63 @@ mod tests {
                     .any(|e| e.from == "PPF_menu" && e.to == "hilde_ar1c_selector"),
                 "Исходящий переход PPF_menu -> hilde_ar1c_selector должен присутствовать в графе PPF HQ"
             );
+        });
+    }
+
+    #[test]
+    fn test_translation_file_uses_original_from_archive() {
+        tauri::async_runtime::block_on(async {
+            let temp_dir = std::env::temp_dir()
+                .join(format!("translator_archived_original_{}", uuid::Uuid::new_v4()));
+            let game_dir = temp_dir.join("game");
+            let tl_dir = tl_lang_dir(&game_dir);
+            std::fs::create_dir_all(&tl_dir).unwrap();
+            let script = concat!(
+                "label start:\n",
+                "    menu:\n",
+                "        \"Go\":\n",
+                "            jump next_scene\n\n",
+                "label next_scene:\n",
+                "    mc \"Next\"\n",
+            );
+            rpa::RpaArchive::create_archive(
+                &game_dir.join("scripts.rpa"),
+                &[("story.rpy".to_string(), script.as_bytes().to_vec())],
+            )
+            .unwrap();
+            let translation = tl_dir.join("story.rpy");
+            std::fs::write(
+                &translation,
+                concat!(
+                    "translate russian strings:\n",
+                    "    old \"Go\"\n",
+                    "    new \"Идти\"\n\n",
+                    "translate russian next_scene_55667788:\n",
+                    "    # mc \"Next\"\n",
+                    "    mc \"Дальше\"\n",
+                ),
+            )
+            .unwrap();
+
+            scan_game_project(game_dir.to_string_lossy().to_string()).await.unwrap();
+            let file_path = translation.to_string_lossy().to_string();
+            let parsed = parse_file_entries(file_path.clone()).await.unwrap();
+
+            let start = parsed.scenes.iter().find(|s| s.name == "start").unwrap();
+            assert_eq!(start.entries[0].original_text, "Go");
+            assert_eq!(start.entries[0].speaker.as_deref(), Some("Выбор в меню"));
+            assert!(
+                parsed
+                    .edges
+                    .iter()
+                    .any(|e| e.from == "start" && e.to == "next_scene" && e.kind == "choice")
+            );
+
+            let details = read_source_file(file_path).await.unwrap();
+            assert_eq!(details.original_content.as_deref(), Some(script));
+
+            let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+            let _ = std::fs::remove_dir_all(&temp_dir);
         });
     }
 
