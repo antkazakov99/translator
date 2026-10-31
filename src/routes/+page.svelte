@@ -15,7 +15,6 @@
     CheckCircle2, 
     AlertCircle, 
     Sparkles, 
-    Play, 
     Search, 
     Users, 
     Languages, 
@@ -124,6 +123,7 @@
 
   onMount(() => {
     restoreRecentProjects();
+    void scanProject();
     return watchWindowClose();
   });
 
@@ -1512,14 +1512,6 @@
           <FolderOpen size={15} />
           <span>Обзор</span>
         </button>
-        <button onclick={scanProject} disabled={loadingProject} class="btn-primary" title="Сканировать проект">
-          {#if loadingProject}
-            <Loader2 size={16} class="spin" />
-          {:else}
-            <Play size={15} />
-          {/if}
-          <span>Сканировать</span>
-        </button>
       </div>
     </div>
 
@@ -1849,7 +1841,7 @@
         </div>
       {:else}
         <div class="empty-sidebar">
-          <p>Введите путь к папке игры и нажмите «Сканировать»</p>
+          <p>Выберите папку игры кнопкой «Обзор»</p>
         </div>
       {/if}
     </aside>
@@ -2504,7 +2496,7 @@
         <div class="empty-workspace">
           <Languages size={48} class="empty-icon" />
           <h2>Проект не загружен</h2>
-          <p>Укажите папку с установленной новеллой сверху и нажмите «Сканировать»</p>
+          <p>Выберите папку с установленной новеллой кнопкой «Обзор» сверху</p>
         </div>
       {/if}
     </main>
@@ -3840,12 +3832,8 @@
     font-size: 10px;
   }
 
-  .btn-browse,
-  .btn-primary {
-    flex: 0 0 auto;
-  }
-
   .btn-browse {
+    flex: 0 0 auto;
     display: flex;
     align-items: center;
     gap: 6px;
@@ -4032,25 +4020,6 @@
     font-size: 10px;
   }
 
-  .btn-primary {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    background: #2563eb;
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 6px 14px;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-
-  .btn-primary:hover {
-    background: #1d4ed8;
-  }
-
   .global-stats {
     display: flex;
     flex-direction: column;
@@ -4098,13 +4067,11 @@
   }
 
   @media (max-width: 1024px) {
-    .dir-bar .btn-browse span,
-    .dir-bar .btn-primary span {
+    .dir-bar .btn-browse span {
       display: none;
     }
 
-    .btn-browse,
-    .dir-bar .btn-primary {
+    .btn-browse {
       justify-content: center;
       min-width: 34px;
       padding: 7px;
