@@ -13,7 +13,7 @@ use crate::pickle::{PickleDecoder, PickleEncoder, PickleValue};
 /// Имя архива, в который упаковывается мод перевода.
 pub(crate) const MOD_ARCHIVE_NAME: &str = "ru_lang.rpa";
 
-const CACHE_VERSION: &str = "v6_translation_blocks";
+const CACHE_VERSION: &str = "v7_archive_priority";
 const MAX_COMPRESSED_INDEX: u64 = 64 * 1024 * 1024;
 const MAX_DECOMPRESSED_INDEX: usize = 256 * 1024 * 1024;
 const MAX_COMPILED_SCRIPT: u64 = 128 * 1024 * 1024;
@@ -666,7 +666,8 @@ impl RpaArchive {
         }
 
         let mut total_extracted = 0;
-        for path in &archives {
+        // Движок перебирает архивы с конца алфавита, а готовый файл кэша не перезаписывается
+        for path in archives.iter().rev() {
             total_extracted += Self::extract_and_decompile_scripts(path, target_cache_dir)?;
         }
         total_extracted += Self::decompile_packed_translation(game_dir, &archives, target_cache_dir)?;
@@ -945,6 +946,31 @@ mod tests {
 
         assert!(RpaArchive::extract_all(&archive_path, &temp_dir.join("output")).is_err());
         assert!(!temp_dir.join("escaped.txt").exists());
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cache_keeps_copy_the_engine_loads() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_rpa_order_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let scripts_dir = temp_dir.join("cache").join("scripts");
+        fs::create_dir_all(&game_dir).unwrap();
+        RpaArchive::create_archive(
+            &game_dir.join("base.rpa"),
+            &[
+                ("story.rpy".into(), b"old".to_vec()),
+                ("extra.rpy".into(), b"only here".to_vec()),
+            ],
+        )
+        .unwrap();
+        RpaArchive::create_archive(&game_dir.join("patch.rpa"), &[("story.rpy".into(), b"new".to_vec())])
+            .unwrap();
+
+        RpaArchive::extract_scripts_from_game_archives(&game_dir, &scripts_dir).unwrap();
+
+        assert_eq!(fs::read(scripts_dir.join("story.rpy")).unwrap(), b"new");
+        assert_eq!(fs::read(scripts_dir.join("extra.rpy")).unwrap(), b"only here");
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
