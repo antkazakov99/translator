@@ -1,6 +1,8 @@
 use crate::get_project_cache_dir;
+use crate::rpa::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Запись персонажа в глоссарии проекта
@@ -33,13 +35,10 @@ pub struct ProjectGlossary {
 impl ProjectGlossary {
     /// Загружает глоссарий из данных приложения. Файл в игре читается только для
     /// совместимости с версиями, которые сохраняли его туда.
-    pub fn load_for_project(game_dir: &Path) -> Self {
+    pub fn load_for_project(game_dir: &Path) -> Result<Self, String> {
         let cache_file = get_project_cache_dir(game_dir).join("glossary.json");
-        if cache_file.exists()
-            && let Ok(content) = fs::read_to_string(&cache_file)
-            && let Ok(glossary) = serde_json::from_str::<ProjectGlossary>(&content)
-        {
-            return glossary;
+        if cache_file.exists() {
+            return Self::read_from(&cache_file);
         }
 
         let game_file = game_dir.join("translator_glossary.json");
@@ -47,26 +46,36 @@ impl ProjectGlossary {
             && let Ok(content) = fs::read_to_string(&game_file)
             && let Ok(glossary) = serde_json::from_str::<ProjectGlossary>(&content)
         {
-            return glossary;
+            return Ok(glossary);
         }
 
-        Self::default()
+        Ok(Self::default())
+    }
+
+    fn read_from(path: &Path) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Не удалось прочитать глоссарий {:?}: {}", path, e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Глоссарий {:?} повреждён: {}", path, e))
     }
 
     /// Сохраняет глоссарий только в данные приложения, не изменяя папку игры.
+    /// Повреждённый файл ещё можно восстановить вручную, поэтому он не заменяется.
     pub fn save_for_project(&self, game_dir: &Path) -> Result<PathBuf, String> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Ошибка сериализации глоссария: {}", e))?;
 
-        let cache_dir = get_project_cache_dir(game_dir);
-        fs::create_dir_all(&cache_dir)
-            .map_err(|e| format!("Не удалось создать папку данных {:?}: {}", cache_dir, e))?;
-        let cache_file = cache_dir.join("glossary.json");
-        fs::write(&cache_file, &json).map_err(|e| {
-            format!(
-                "Не удалось сохранить глоссарий в кэш {:?}: {}",
-                cache_file, e
-            )
+        let cache_file = get_project_cache_dir(game_dir).join("glossary.json");
+        if cache_file.exists() {
+            Self::read_from(&cache_file)?;
+        }
+        write_atomic(&cache_file, |out| {
+            out.write_all(json.as_bytes()).map_err(|e| {
+                format!(
+                    "Не удалось сохранить глоссарий в кэш {:?}: {}",
+                    cache_file, e
+                )
+            })
         })?;
 
         Ok(cache_file)
@@ -127,6 +136,26 @@ fn auto_detect_gender(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_damaged_glossary_is_reported_and_kept() {
+        let game_dir =
+            std::env::temp_dir().join(format!("translator_glossary_{}", uuid::Uuid::new_v4()));
+        let cache_dir = get_project_cache_dir(&game_dir);
+        fs::create_dir_all(&cache_dir).unwrap();
+        let file = cache_dir.join("glossary.json");
+        fs::write(&file, "{\"characters\": [").unwrap();
+
+        let error = ProjectGlossary::load_for_project(&game_dir).unwrap_err();
+        assert!(error.contains("повреждён"), "{error}");
+        assert!(ProjectGlossary::default().save_for_project(&game_dir).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{\"characters\": [");
+
+        fs::remove_file(&file).unwrap();
+        ProjectGlossary::default().save_for_project(&game_dir).unwrap();
+        assert!(ProjectGlossary::load_for_project(&game_dir).is_ok());
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
 
     #[test]
     fn test_glossary_serialization_and_merge() {

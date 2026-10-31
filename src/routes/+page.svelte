@@ -6,7 +6,7 @@
   import GlossaryAiModal from "../lib/GlossaryAiModal.svelte";
   import { invoke, isTauri } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { open as openDialog } from "@tauri-apps/plugin-dialog";
+  import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { 
     Folder,
@@ -152,12 +152,24 @@
     const window = getCurrentWindow();
     let unlisten: (() => void) | undefined;
     let disposed = false;
+    let closing = false;
     void window.onCloseRequested(async (event) => {
       if (!glossaryDirty && !translationDirty) return;
       event.preventDefault();
-      const translationsSaved = await saveTranslations();
-      const glossarySaved = !glossaryDirty || await saveGlossary();
-      if (translationsSaved && glossarySaved) await window.destroy();
+      if (closing) return;
+      closing = true;
+      try {
+        const translationsSaved = await saveTranslations();
+        const glossarySaved = !glossaryDirty || await saveGlossary();
+        // Ошибка сохранения не должна запирать пользователя в приложении
+        const canClose = (translationsSaved && glossarySaved) || await ask(
+          "Не удалось сохранить изменения. Закрыть приложение без них?",
+          { title: "Translator", kind: "warning", okLabel: "Закрыть", cancelLabel: "Остаться" }
+        );
+        if (canClose) await window.destroy();
+      } finally {
+        closing = false;
+      }
     }).then((fn) => {
       // Компонент мог размонтироваться раньше, чем Tauri вернул функцию отписки.
       if (disposed) fn();
@@ -626,8 +638,13 @@
   let selectedGlossaryTerm = $state<TermGlossaryEntry | null>(null);
 
   function handleGlossaryAiApply(updatedChars: CharacterGlossaryEntry[], updatedTerms: TermGlossaryEntry[]) {
+    const selectedAlias = selectedGlossaryChar?.alias;
+    const selectedTermId = selectedGlossaryTerm?.id;
     glossary.characters = updatedChars;
     glossary.terms = updatedTerms;
+    // Инспектор должен править записи нового списка, а не заменённые
+    selectedGlossaryChar = glossary.characters.find(c => c.alias === selectedAlias) ?? glossary.characters[0] ?? null;
+    selectedGlossaryTerm = glossary.terms.find(t => t.id === selectedTermId) ?? glossary.terms[0] ?? null;
     glossaryDirty = true;
     showToast("Глоссарий обновлён через нейросеть!", "info");
   }
@@ -1289,12 +1306,12 @@
     return { totalChars, translatedChars, maleChars, femaleChars, neuterChars, unknownChars, totalTerms };
   });
 
-  async function loadGlossary(silent = false) {
-    if (!gameDir.trim()) return;
+  async function loadGlossary(silent = false): Promise<boolean> {
+    if (!gameDir.trim()) return false;
     const path = gameDir.trim();
     if (glossaryDirty) {
-      if (glossaryProjectPath === path) return;
-      if (!(await saveGlossary())) return;
+      if (glossaryProjectPath === path) return true;
+      if (!(await saveGlossary())) return false;
     }
     const seq = ++glossaryLoadSeq;
     const characters = project?.characters ?? null;
@@ -1304,14 +1321,16 @@
         gameDir: path,
         scannedCharacters: characters
       });
-      if (seq !== glossaryLoadSeq || gameDir.trim() !== path) return;
+      if (seq !== glossaryLoadSeq || gameDir.trim() !== path) return true;
       glossary = res;
       glossaryDirty = false;
       glossaryProjectPath = path;
       selectedGlossaryChar = glossary.characters[0] ?? null;
       selectedGlossaryTerm = glossary.terms[0] ?? null;
+      return true;
     } catch (e) {
-      if (!silent && seq === glossaryLoadSeq) showToast(`Ошибка загрузки глоссария: ${e}`, "error");
+      if (seq === glossaryLoadSeq) showToast(`Ошибка загрузки глоссария: ${e}`, "error");
+      return false;
     } finally {
       if (!silent && seq === glossaryLoadSeq) loadingGlossary = false;
     }
@@ -1326,7 +1345,11 @@
       glossarySearch = filterAlias;
     }
     showGlossaryModal = true;
-    await loadGlossary();
+    // Без загруженного глоссария правки в пустом окне заменили бы данные на диске
+    if (!(await loadGlossary())) {
+      showGlossaryModal = false;
+      return;
+    }
     if (filterAlias && glossary.characters.length > 0) {
       const match = glossary.characters.find(c => 
         c.alias.toLowerCase() === filterAlias.toLowerCase() || 
@@ -1389,7 +1412,7 @@
       notes: newTermNotes.trim()
     };
     glossary.terms = [newEntry, ...glossary.terms];
-    selectedGlossaryTerm = newEntry;
+    selectedGlossaryTerm = glossary.terms[0];
     newTermSource = "";
     newTermTranslation = "";
     newTermNotes = "";
@@ -1426,7 +1449,7 @@
     };
     glossary.characters.push(newChar);
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
-    selectedGlossaryChar = newChar;
+    selectedGlossaryChar = glossary.characters.find(c => c.alias === alias) ?? null;
     newCharAlias = "";
     newCharName = "";
     newCharTranslation = "";

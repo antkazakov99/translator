@@ -154,7 +154,7 @@
   }
 
   function failedBatchesMessage(count: number) {
-    return `Часть ответов модели не удалось разобрать (пакетов с ошибкой: ${count}). Эти записи остались без изменений, запустите обработку ещё раз.`;
+    return `Часть данных модель не обработала (пакетов с ошибкой: ${count}). Эти записи остались без изменений, запустите обработку ещё раз.`;
   }
 
   async function startCharactersAutofill() {
@@ -226,6 +226,13 @@
             currentTermsList.push(ext);
             newExtractedCount++;
           }
+        }
+
+        // Сбой следующего шага не должен отменять уже извлечённые термины
+        if (newExtractedCount > 0) {
+          previewTerms = currentTermsList;
+          statsSummary.updatedTerms = newExtractedCount;
+          hasResults = true;
         }
       }
 
