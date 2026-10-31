@@ -209,6 +209,17 @@ async fn call_chat_completion(
     Ok(text)
 }
 
+/// Обрабатывает сбой запроса: без готовых пакетов ошибка уходит пользователю, иначе
+/// готовое сохраняется, а оставшиеся пакеты считаются сбойными. Дальше обработка
+/// не идёт: у недоступного сервера каждый запрос ждал бы таймаут.
+fn remaining_batches(error: String, batch: usize, total: usize) -> Result<usize, String> {
+    if batch == 0 {
+        return Err(error);
+    }
+    warn!("Запрос к LLM не удался на пакете {} из {}: {}", batch + 1, total, error);
+    Ok(total - batch)
+}
+
 /// Находит в ответе нейросети первый JSON-массив объектов: вне зависимости от
 /// Markdown-блоков, пояснений и объекта-обёртки вида `{"items":[...]}`
 fn extract_json_content(raw: &str) -> &str {
@@ -340,8 +351,9 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
 
     // Обрабатываем пачками по 15 персонажей, чтобы не перегружать контекст модели
     const BATCH_SIZE: usize = 15;
+    let total_batches = indices_to_process.len().div_ceil(BATCH_SIZE);
     let mut failed_batches = 0;
-    for chunk in indices_to_process.chunks(BATCH_SIZE) {
+    for (batch, chunk) in indices_to_process.chunks(BATCH_SIZE).enumerate() {
         let mut user_prompt = String::from("Characters to translate and determine gender:\n\n");
         for &idx in chunk {
             let c = &characters[idx];
@@ -364,7 +376,7 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
 
         user_prompt.push_str("\nProvide JSON array now:");
 
-        let raw_response = call_chat_completion(
+        let raw_response = match call_chat_completion(
             api_url,
             model,
             system_prompt,
@@ -372,7 +384,14 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
             0.2, // низкая температура для точности и следования схеме
             2048,
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                failed_batches += remaining_batches(error, batch, total_batches)?;
+                break;
+            }
+        };
 
         let json_clean = extract_json_content(&raw_response);
         let items: Vec<CharacterLlmItem> = match serde_json::from_str(json_clean) {
@@ -483,8 +502,9 @@ Respond ONLY with a valid JSON array of objects:
 ]"#;
 
     const BATCH_SIZE: usize = 20;
+    let total_batches = indices_to_process.len().div_ceil(BATCH_SIZE);
     let mut failed_batches = 0;
-    for chunk in indices_to_process.chunks(BATCH_SIZE) {
+    for (batch, chunk) in indices_to_process.chunks(BATCH_SIZE).enumerate() {
         let mut user_prompt = String::from("Terms to translate into Russian:\n\n");
         for &idx in chunk {
             let t = &terms[idx];
@@ -495,7 +515,7 @@ Respond ONLY with a valid JSON array of objects:
         }
         user_prompt.push_str("\nProvide JSON array now:");
 
-        let raw_response = call_chat_completion(
+        let raw_response = match call_chat_completion(
             api_url,
             model,
             system_prompt,
@@ -503,7 +523,14 @@ Respond ONLY with a valid JSON array of objects:
             0.2,
             2048,
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                failed_batches += remaining_batches(error, batch, total_batches)?;
+                break;
+            }
+        };
 
         let json_clean = extract_json_content(&raw_response);
         let items: Vec<TermLlmItem> = match serde_json::from_str(json_clean) {
@@ -667,6 +694,76 @@ Respond ONLY with a valid JSON array of up to 25 items:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        )
+    }
+
+    /// Полученная длина запроса покрывает заголовки и тело из `Content-Length`.
+    fn request_is_complete(request: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(request);
+        let Some(headers_end) = text.find("\r\n\r\n") else {
+            return false;
+        };
+        let body_length = text[..headers_end]
+            .lines()
+            .find_map(|line| line.to_lowercase().strip_prefix("content-length:")?.trim().parse().ok())
+            .unwrap_or(0usize);
+        request.len() >= headers_end + 4 + body_length
+    }
+
+    /// Запускает сервер, который отвечает на запросы по порядку, и возвращает его адрес.
+    fn serve_responses(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request_is_complete(&request) {
+                    let read = stream.read(&mut chunk).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{}", address)
+    }
+
+    #[test]
+    fn test_failed_request_keeps_finished_batches() {
+        let content = r#"[{"id":"t0","translated_term":"Первый"}]"#;
+        let body = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
+        let failure = http_response("500 Internal Server Error", "сбой");
+        let terms = || -> Vec<TermGlossaryEntry> {
+            (0..45)
+                .map(|i| TermGlossaryEntry { id: format!("t{i}"), ..Default::default() })
+                .collect()
+        };
+
+        let url = serve_responses(vec![http_response("200 OK", &body), failure.clone()]);
+        let result =
+            tauri::async_runtime::block_on(autofill_terms(&url, "model", terms(), false)).unwrap();
+        assert_eq!(result.failed_batches, 2);
+        assert_eq!(result.items[0].translated_term, "Первый");
+
+        // Если готового ещё нет, пользователь видит саму ошибку сервера
+        let url = serve_responses(vec![failure]);
+        let error = tauri::async_runtime::block_on(autofill_terms(&url, "model", terms(), false))
+            .unwrap_err();
+        assert!(error.contains("сбой"), "{error}");
+    }
 
     #[test]
     fn test_extract_json_content() {

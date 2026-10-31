@@ -1264,7 +1264,7 @@ async fn get_project_glossary(
 ) -> Result<glossary::ProjectGlossary, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
-        let mut gl = glossary::ProjectGlossary::load_for_project(&base_path);
+        let mut gl = glossary::ProjectGlossary::load_for_project(&base_path)?;
         if let Some(ref chars) = scanned_characters {
             gl.merge_with_scanned_characters(chars);
         }
