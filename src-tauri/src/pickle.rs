@@ -697,6 +697,91 @@ impl PickleEncoder {
         self.buf.clone()
     }
 
+    /// Сериализует значение целиком. Объекты без `args` создаются через NEWOBJ и BUILD,
+    /// как их записывает Python, остальные вызываются через REDUCE.
+    pub fn encode_value(&mut self, value: &PickleValue) -> Vec<u8> {
+        self.write_value(value);
+        self.buf.push(b'.');
+        self.buf.clone()
+    }
+
+    fn write_value(&mut self, value: &PickleValue) {
+        match value {
+            PickleValue::None => self.buf.push(b'N'),
+            PickleValue::Bool(true) => self.buf.push(0x88),
+            PickleValue::Bool(false) => self.buf.push(0x89),
+            PickleValue::Int(val) => self.write_int(*val),
+            PickleValue::String(s) => self.write_binunicode(s),
+            PickleValue::Tuple(items) => self.write_tuple(items),
+            PickleValue::List(items) => {
+                self.buf.push(b']');
+                if !items.is_empty() {
+                    self.buf.push(b'(');
+                    for item in items {
+                        self.write_value(item);
+                    }
+                    self.buf.push(b'e');
+                }
+            }
+            PickleValue::Dict(entries) => {
+                self.buf.push(b'}');
+                if !entries.is_empty() {
+                    self.buf.push(b'(');
+                    for (key, val) in entries {
+                        self.write_value(key);
+                        self.write_value(val);
+                    }
+                    self.buf.push(b'u');
+                }
+            }
+            PickleValue::Global { module, name } => self.write_global(module, name),
+            PickleValue::Object {
+                class_module,
+                class_name,
+                state,
+                args,
+            } => {
+                self.write_global(class_module, class_name);
+                self.write_tuple(args);
+                self.buf.push(if args.is_empty() { 0x81 } else { b'R' });
+                if let Some(state) = state {
+                    self.write_value(state);
+                    self.buf.push(b'b');
+                }
+            }
+            PickleValue::Float(_) | PickleValue::Bytes(_) | PickleValue::Set(_) => {
+                unreachable!("значение не встречается в скомпилированных скриптах")
+            }
+        }
+    }
+
+    fn write_tuple(&mut self, items: &[PickleValue]) {
+        match items {
+            [] => self.buf.push(b')'),
+            [_] | [_, _] | [_, _, _] => {
+                for item in items {
+                    self.write_value(item);
+                }
+                self.buf.push(0x84 + items.len() as u8);
+            }
+            _ => {
+                self.buf.push(b'(');
+                for item in items {
+                    self.write_value(item);
+                }
+                self.buf.push(b't');
+            }
+        }
+    }
+
+    fn write_global(&mut self, module: &str, name: &str) {
+        self.buf.push(b'c');
+        self.buf.extend_from_slice(module.as_bytes());
+        self.buf.push(b'\n');
+        self.buf.extend_from_slice(name.as_bytes());
+        self.buf.push(b'\n');
+    }
+
     fn write_binunicode(&mut self, s: &str) {
         let bytes = s.as_bytes();
         self.buf.push(b'X');
@@ -733,6 +818,42 @@ impl Default for PickleEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoded_values_decode_back() {
+        let object = PickleValue::Object {
+            class_module: "renpy.ast".into(),
+            class_name: "Say".into(),
+            state: Some(Box::new(PickleValue::Tuple(vec![
+                PickleValue::None,
+                PickleValue::Dict(vec![(
+                    PickleValue::String("what".into()),
+                    PickleValue::String("Привет".into()),
+                )]),
+            ]))),
+            args: Vec::new(),
+        };
+        let root = PickleValue::Tuple(vec![
+            PickleValue::List(vec![object, PickleValue::List(Vec::new())]),
+            PickleValue::Bool(true),
+            PickleValue::Int(70_000),
+            PickleValue::Tuple(vec![PickleValue::None; 4]),
+        ]);
+        let bytes = PickleEncoder::new().encode_value(&root);
+        assert_eq!(PickleDecoder::new(&bytes).decode().unwrap(), root);
+
+        let reduced = PickleValue::Object {
+            class_module: "collections".into(),
+            class_name: "defaultdict".into(),
+            state: None,
+            args: vec![PickleValue::Global {
+                module: "builtins".into(),
+                name: "list".into(),
+            }],
+        };
+        let bytes = PickleEncoder::new().encode_value(&reduced);
+        assert_eq!(PickleDecoder::new(&bytes).decode().unwrap(), reduced);
+    }
 
     #[test]
     fn rpa_index_uses_only_protocol_2_opcodes() {

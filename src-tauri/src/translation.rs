@@ -1,8 +1,11 @@
 use crate::graph::{DialogueData, ScenarioGraph};
 use crate::parser::renpy::RenpyParser;
+use crate::rpa::collect_folder_files_for_mod;
+use crate::rpyc_writer::{ScriptFormat, compile_script};
 use crate::{
-    TL_LANG, collect_rpy_files, find_game_root, get_project_cache_dir, parse_project_file,
-    path_lock, stable_hash_str, tl_relative_name,
+    TL_LANG, collect_rpy_files, find_game_root, get_project_cache_dir,
+    get_project_scripts_cache_dir, parse_project_file, path_lock, stable_hash_str,
+    tl_relative_name,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -12,6 +15,8 @@ use uuid::Uuid;
 
 /// Файл мода со строками для правок скриптов, у которых нет файла в `tl/<язык>`.
 const SAVED_STRINGS_FILE: &str = "translator_saved_strings.rpy";
+/// Файл мода, включающий язык перевода в играх без такого пункта в настройках.
+const LANGUAGE_FILE: &str = "translator_language.rpy";
 
 /// Идентификатор строки в хранилище правок. Не зависит от положения строки в файле
 /// и от сцены, поэтому правки переживают обновление игры и перегенерацию перевода.
@@ -256,12 +261,13 @@ pub fn prepare_mod_export(game_dir: &Path, tl_dir: &Path) -> Result<ModExport, S
     for saved in saved_sources(game_dir)? {
         match tl_relative_name(&saved.source) {
             Some(name) => patch_translation_file(&saved, name, &mut export)?,
-            None => collect_string_edits(&saved, &mut strings, &mut export.skipped),
+            None => collect_string_edits(&saved, &mut strings, &mut export.skipped)?,
         }
     }
 
     // Повторный `old` в одном языке Ren'Py считает ошибкой и не запускает игру
-    let translated = existing_string_sources(tl_dir);
+    let archived_tl = get_project_scripts_cache_dir(game_dir).join("tl").join(TL_LANG);
+    let translated = existing_string_sources(&[tl_dir, &archived_tl]);
     let before = strings.len();
     strings.retain(|original, _| !translated.contains(original));
     export.skipped += before - strings.len();
@@ -270,7 +276,97 @@ pub fn prepare_mod_export(game_dir: &Path, tl_dir: &Path) -> Result<ModExport, S
             .files
             .insert(SAVED_STRINGS_FILE.to_string(), render_strings_file(&strings));
     }
+
+    // Список языков в настройках задаёт экран игры, мод добавить в него пункт не может
+    if (tl_dir.exists() || !export.files.is_empty()) && !game_offers_language(game_dir) {
+        export.files.insert(
+            LANGUAGE_FILE.to_string(),
+            format!("init python:\n    config.language = \"{}\"\n", TL_LANG).into_bytes(),
+        );
+    }
     Ok(export)
+}
+
+/// Есть ли в скриптах игры действие, переключающее на язык перевода.
+fn game_offers_language(game_dir: &Path) -> bool {
+    let mut files = Vec::new();
+    collect_rpy_files(game_dir, &mut files);
+    collect_rpy_files(&get_project_scripts_cache_dir(game_dir), &mut files);
+    let actions = [
+        format!("Language(\"{}\")", TL_LANG),
+        format!("Language('{}')", TL_LANG),
+    ];
+    files
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .any(|content| actions.iter().any(|action| content.contains(action)))
+}
+
+/// Актуальна ли компиляция исходника: Ren'Py мог оставить её рядом с файлом.
+fn has_current_compilation(source: &Path) -> bool {
+    let modified = |path: &Path| fs::metadata(path).and_then(|meta| meta.modified()).ok();
+    let compiled = modified(&source.with_extension("rpyc"));
+    compiled.is_some() && compiled >= modified(source)
+}
+
+/// Файлы архива мода. Ren'Py загружает из `.rpa` только скомпилированные скрипты,
+/// поэтому `.rpy` компилируются, а готовые `.rpyc` без изменений берутся как есть.
+/// Файлы `generated` заменяют одноимённые файлы `tl_dir` или добавляются к ним.
+pub fn mod_archive_files(
+    tl_dir: &Path,
+    generated: HashMap<String, Vec<u8>>,
+    format: ScriptFormat,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut collected = Vec::new();
+    if tl_dir.exists() {
+        collect_folder_files_for_mod(tl_dir, tl_dir, 0, &mut collected)?;
+    }
+    let compile = |name: &str, source: &str| -> Result<(String, Vec<u8>), String> {
+        let compiled = name.strip_suffix(".rpy").unwrap_or(name);
+        Ok((
+            format!("{}.rpyc", compiled),
+            compile_script(format, TL_LANG, name, source)?,
+        ))
+    };
+
+    let mut files = Vec::new();
+    for (name, path) in &collected {
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+        let source = path.with_extension("rpy");
+        let replaced = name
+            .strip_suffix(".rpyc")
+            .is_some_and(|base| generated.contains_key(&format!("{}.rpy", base)));
+        if generated.contains_key(name) || replaced {
+            continue;
+        }
+        match extension {
+            "rpy" if has_current_compilation(path) => {}
+            "rpy" => {
+                let text = fs::read_to_string(path)
+                    .map_err(|e| format!("Не удалось прочитать файл мода {:?}: {}", path, e))?;
+                files.push(compile(name, &text)?);
+            }
+            "rpym" => return Err(format!("Модуль {} не поддерживается в архиве мода", name)),
+            "rpyc" if source.exists() && !has_current_compilation(&source) => {}
+            _ => {
+                let data = fs::read(path)
+                    .map_err(|e| format!("Не удалось прочитать файл мода {:?}: {}", path, e))?;
+                files.push((name.clone(), data));
+            }
+        }
+    }
+    for (name, data) in &generated {
+        files.push(compile(name, &String::from_utf8_lossy(data))?);
+    }
+
+    if files.is_empty() {
+        return Err("Не найдено файлов для сборки мода".to_string());
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files
+        .into_iter()
+        .map(|(name, data)| (format!("tl/{}/{}", TL_LANG, name), data))
+        .collect())
 }
 
 fn patch_translation_file(
@@ -318,13 +414,33 @@ fn original_text(key: &str) -> Option<String> {
     }
 }
 
+/// Исходные тексты реплик блоков `translate` файла на другом языке:
+/// ключ такой реплики хранит только идентификатор блока.
+fn block_originals(saved: &SavedSource) -> Result<HashMap<String, String>, String> {
+    let has_blocks = saved
+        .entries
+        .keys()
+        .any(|key| matches!(serde_json::from_str(key), Ok(LineKey::Block { .. })));
+    if !has_blocks || !saved.source.is_file() {
+        return Ok(HashMap::new());
+    }
+    let parsed = parse_project_file(saved.source.to_string_lossy().into_owned())?;
+    Ok(parsed
+        .scenes
+        .into_iter()
+        .flat_map(|scene| scene.entries)
+        .map(|entry| (entry.translation_key, entry.original_text))
+        .collect())
+}
+
 fn collect_string_edits(
     saved: &SavedSource,
     strings: &mut BTreeMap<String, String>,
     skipped: &mut usize,
-) {
+) -> Result<(), String> {
+    let originals = block_originals(saved)?;
     for (key, text) in saved.entries.iter().filter(|(_, text)| !text.trim().is_empty()) {
-        let Some(original) = original_text(key) else {
+        let Some(original) = original_text(key).or_else(|| originals.get(key).cloned()) else {
             *skipped += 1;
             continue;
         };
@@ -332,11 +448,14 @@ fn collect_string_edits(
             *skipped += 1;
         }
     }
+    Ok(())
 }
 
-fn existing_string_sources(tl_dir: &Path) -> HashSet<String> {
+fn existing_string_sources(dirs: &[&Path]) -> HashSet<String> {
     let mut files = Vec::new();
-    collect_rpy_files(tl_dir, &mut files);
+    for dir in dirs {
+        collect_rpy_files(dir, &mut files);
+    }
     files
         .iter()
         .filter_map(|path| fs::read_to_string(path).ok())

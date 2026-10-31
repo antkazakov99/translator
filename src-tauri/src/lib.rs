@@ -4,6 +4,7 @@ pub mod parser;
 pub mod pickle;
 pub mod rpa;
 pub mod rpyc;
+pub mod rpyc_writer;
 pub mod translation;
 pub mod llm;
 
@@ -241,8 +242,16 @@ pub struct ProjectSummary {
     pub total_translated: usize,
 }
 
+/// Файл `tl/<язык>` другого языка. Путь задаётся относительно папки скриптов игры.
+fn is_other_language_file(relative: &Path) -> bool {
+    let mut parts = relative.components();
+    parts.next().is_some_and(|part| part.as_os_str().eq_ignore_ascii_case("tl"))
+        && parts.next().is_some_and(|part| !part.as_os_str().eq_ignore_ascii_case(TL_LANG))
+}
+
 /// Параллельно строит список `TranslationFileItem` из набора путей.
-/// Фильтрует файлы без диалоговых строк (`total == 0`).
+/// Фильтрует файлы без диалоговых строк (`total == 0`) и переводы на другие
+/// языки: их реплики дублируют оригинал, а перевод идёт в `tl/<язык>` проекта.
 /// `base_dir` используется для получения относительного имени файла.
 fn build_translation_file_items(
     paths: Vec<PathBuf>,
@@ -250,6 +259,7 @@ fn build_translation_file_items(
 ) -> Vec<TranslationFileItem> {
     paths
         .into_par_iter()
+        .filter(|path| !path.strip_prefix(base_dir).is_ok_and(is_other_language_file))
         .filter_map(|path| {
             let content = std::fs::read_to_string(&path).ok()?;
             let size_kb = content.len() as f64 / 1024.0;
@@ -1062,42 +1072,72 @@ async fn find_scene_target(
     .map_err(|e| format!("Ошибка задачи поиска сцены: {}", e))?
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ModExportResult {
+    message: String,
+    output_path: String,
+}
+
+/// Собирает архив мода: сохранённые правки, файлы `tl/<язык>` и включение языка.
+fn build_mod_archive(
+    base_path: &Path,
+    out_path: &Path,
+    format: rpyc_writer::ScriptFormat,
+) -> Result<String, String> {
+    let tl_dir = tl_lang_dir(base_path);
+    let export = translation::prepare_mod_export(base_path, &tl_dir)?;
+    if !tl_dir.exists() && export.files.is_empty() {
+        return Err(if export.skipped > 0 {
+            format!(
+                "Мод не собран: не удалось перенести сохранённые правки (правок: {})",
+                export.skipped
+            )
+        } else {
+            "Нечего экспортировать: нет ни папки tl/russian, ни сохранённых правок".to_string()
+        });
+    }
+
+    let files = translation::mod_archive_files(&tl_dir, export.files, format)?;
+    rpa::RpaArchive::create_archive(out_path, &files)?;
+
+    let mut message = format!(
+        "Мод собран: {} файлов. Положите {} в папку game игры",
+        files.len(),
+        out_path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    if export.skipped > 0 {
+        message.push_str(&format!(
+            ". Не перенесено правок: {} (их строки изменились или конфликтуют с tl/russian)",
+            export.skipped
+        ));
+    }
+    Ok(message)
+}
+
 #[tauri::command]
-async fn pack_mod_rpa(game_dir: String, output_rpa_path: Option<String>) -> Result<String, String> {
+async fn export_mod(
+    game_dir: String,
+    output_path: Option<String>,
+) -> Result<ModExportResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
-        let tl_dir = tl_lang_dir(&base_path);
-
-        let out_path = if let Some(ref p) = output_rpa_path {
-            PathBuf::from(p)
-        } else {
-            get_project_cache_dir(&base_path)
+        let out_path = match &output_path {
+            Some(path) => PathBuf::from(path),
+            None => get_project_cache_dir(&base_path)
                 .join("exports")
-                .join("russian_mod.rpa")
+                .join(rpa::MOD_ARCHIVE_NAME),
         };
         ensure_output_outside_game(&out_path, std::slice::from_ref(&base_path))?;
 
-        let export = translation::prepare_mod_export(&base_path, &tl_dir)?;
-        if !tl_dir.exists() && export.files.is_empty() {
-            return Err("Папка перевода tl/russian не найдена в директории игры".to_string());
-        }
-
-        let count = rpa::RpaArchive::pack_mod_from_folder(&tl_dir, export.files, &out_path)?;
-        let mut message = format!(
-            "Мод успешно собран! Упаковано {} файлов в {}",
-            count,
-            out_path.to_string_lossy()
-        );
-        if export.skipped > 0 {
-            message.push_str(&format!(
-                ". Не перенесено правок: {} (их строки изменились или конфликтуют с tl/russian)",
-                export.skipped
-            ));
-        }
-        Ok(message)
+        let format = rpyc_writer::ScriptFormat::detect(&base_path)?;
+        let message = build_mod_archive(&base_path, &out_path, format)?;
+        Ok(ModExportResult {
+            message,
+            output_path: out_path.to_string_lossy().to_string(),
+        })
     })
     .await
-    .map_err(|e| format!("Ошибка сборки RPA мода: {}", e))?
+    .map_err(|e| format!("Ошибка экспорта мода: {}", e))?
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1474,7 +1514,7 @@ pub fn run() {
             scan_game_project,
             parse_file_entries,
             find_scene_target,
-            pack_mod_rpa,
+            export_mod,
             unpack_rpa,
             clear_project_script_cache,
             decompile_rpyc_file,
@@ -1692,10 +1732,8 @@ mod tests {
         let out_dir = temp_dir.join("unpacked");
         let message = pack_and_unpack(&game_dir, &out_dir);
         assert!(message.contains("Не перенесено правок: 1"), "{message}");
-        let packed =
-            std::fs::read_to_string(out_dir.join("tl").join(TL_LANG).join("story.rpy")).unwrap();
-        assert!(packed.contains("e \"Единственная\""));
-        assert!(packed.contains("e \"Точная\""));
+        let packed = compiled_text(&out_dir.join("tl").join(TL_LANG).join("story.rpyc"));
+        assert!(packed.contains("Единственная") && packed.contains("Точная"), "{packed}");
         let stored = std::fs::read_dir(get_project_cache_dir(&game_dir).join("translations"))
             .unwrap()
             .flatten()
@@ -1708,16 +1746,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    /// Собирает мод в папку данных приложения и распаковывает его рядом с тестом.
+    const TEST_FORMAT: rpyc_writer::ScriptFormat = rpyc_writer::ScriptFormat {
+        layout: rpyc_writer::AstLayout::Python2,
+        script_version: 5003000,
+    };
+
     fn pack_and_unpack(game_dir: &Path, out_dir: &Path) -> String {
-        tauri::async_runtime::block_on(async {
-            let message = pack_mod_rpa(game_dir.to_string_lossy().to_string(), None)
-                .await
-                .unwrap();
-            let archive = get_project_cache_dir(game_dir).join("exports").join("russian_mod.rpa");
-            rpa::RpaArchive::extract_all(&archive, out_dir).unwrap();
-            message
-        })
+        let archive = out_dir.with_extension("rpa");
+        let message = build_mod_archive(game_dir, &archive, TEST_FORMAT).unwrap();
+        rpa::RpaArchive::extract_all(&archive, out_dir).unwrap();
+        message
+    }
+
+    /// Текстовое представление дерева скрипта из `.rpyc`.
+    fn compiled_text(path: &Path) -> String {
+        let bytes = std::fs::read(path).unwrap();
+        let slots = rpyc::RpycParser::read_slots(&bytes).unwrap();
+        let tree = rpyc::RpycParser::decompress_slot(&bytes, &slots[0]).unwrap();
+        format!("{:?}", pickle::PickleDecoder::new(&tree).decode().unwrap())
     }
 
     #[test]
@@ -1730,9 +1776,7 @@ mod tests {
         let source = concat!(
             "translate russian start_abcd1234:\r\n",
             "\r\n",
-            "    # voice \"line.ogg\"\r\n",
             "    # e happy \"Hello\"\r\n",
-            "    voice \"line.ogg\"\r\n",
             "    e happy \"\"\r\n",
             "\r\n",
             "translate russian strings:\r\n",
@@ -1756,13 +1800,166 @@ mod tests {
         assert!(!message.contains("Не перенесено"), "{message}");
 
         let packed = out_dir.join("tl").join(TL_LANG);
-        let patched = std::fs::read_to_string(packed.join("story.rpy")).unwrap();
-        assert!(patched.contains("    voice \"line.ogg\"\r\n"));
-        assert!(patched.contains("    e happy \"Привет \\\"всем\\\"\"\r\n"));
-        assert_eq!(patched.matches("    new \"Да\"\r\n").count(), 2);
-        assert!(!packed.join("story.rpyc").exists());
-        assert!(packed.join("other.rpyc").exists());
+        let patched = compiled_text(&packed.join("story.rpyc"));
+        assert!(patched.contains("Привет \\\"всем\\\""), "{patched}");
+        assert_eq!(patched.matches("Да").count(), 1);
+        assert_eq!(std::fs::read(packed.join("other.rpyc")).unwrap(), b"kept");
+        assert!(!packed.join("story.rpy").exists());
         assert_eq!(std::fs::read_to_string(&story).unwrap(), source);
+        assert!(compiled_text(&packed.join("translator_language.rpyc")).contains("config.language"));
+
+        // Язык, который игра предлагает сама, выбирает игрок
+        let screens = game_dir.join("screens.rpy");
+        std::fs::write(
+            &screens,
+            "screen preferences():\n    textbutton \"RU\" action Language(\"russian\")\n",
+        )
+        .unwrap();
+        let out_dir = temp_dir.join("selectable");
+        pack_and_unpack(&game_dir, &out_dir);
+        assert!(!out_dir.join("tl").join(TL_LANG).join("translator_language.rpyc").exists());
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_other_language_files_are_hidden_and_their_edits_reach_mod() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_other_lang_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        rpa::RpaArchive::create_archive(
+            &game_dir.join("scripts.rpa"),
+            &[
+                ("story.rpy".to_string(), b"label start:\n    e \"Hello\"\n".to_vec()),
+                (
+                    "tl/PortuguesBR/story.rpy".to_string(),
+                    b"translate PortuguesBR start_abcd1234:\n\n    # e \"Hello\"\n    e \"Ola\"\n".to_vec(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let summary = tauri::async_runtime::block_on(scan_game_project(
+            game_dir.to_string_lossy().to_string(),
+        ))
+        .unwrap();
+        let names: Vec<_> = summary.files.iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(names, ["story.rpy"]);
+        assert_eq!(summary.total_lines, 1);
+
+        // Правка, сохранённая до того, как такие файлы убрали из списка
+        let foreign = get_project_scripts_cache_dir(&game_dir)
+            .join("tl")
+            .join("PortuguesBR")
+            .join("story.rpy");
+        save_edits(&foreign, &[("Hello", "Привет")]);
+
+        let out_dir = temp_dir.join("unpacked");
+        let message = pack_and_unpack(&game_dir, &out_dir);
+        assert!(!message.contains("Не перенесено"), "{message}");
+        let strings = compiled_text(
+            &out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpyc"),
+        );
+        assert!(strings.contains("Hello") && strings.contains("Привет"), "{strings}");
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_mod_archive_contains_only_compiled_scripts_and_assets() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_compiled_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let tl_dir = tl_lang_dir(&game_dir);
+        std::fs::create_dir_all(tl_dir.join("fonts")).unwrap();
+        let story = tl_dir.join("story.rpy");
+        std::fs::write(&story, "translate russian strings:\n").unwrap();
+        std::fs::write(tl_dir.join("fonts").join("ui.ttf"), b"font").unwrap();
+        std::fs::write(tl_dir.join("menu.rpy"), "label custom:\n").unwrap();
+        std::fs::write(tl_dir.join("menu.rpyc"), b"compiled by game").unwrap();
+        let archive = temp_dir.join("mod").join(rpa::MOD_ARCHIVE_NAME);
+
+        // Скрипт с неподдерживаемой конструкцией и устаревшей компиляцией не собрать
+        let menu = std::fs::File::options()
+            .write(true)
+            .open(tl_dir.join("menu.rpy"))
+            .unwrap();
+        menu.set_modified(SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        let error = build_mod_archive(&game_dir, &archive, TEST_FORMAT).unwrap_err();
+        assert!(error.contains("menu.rpy, строка 1"), "{error}");
+        assert!(!archive.exists());
+
+        menu.set_modified(SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+        drop(menu);
+        build_mod_archive(&game_dir, &archive, TEST_FORMAT).unwrap();
+        let entries = rpa::RpaArchive::open(&archive).unwrap().entries;
+        let mut names: Vec<_> = entries.keys().cloned().collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                format!("tl/{TL_LANG}/fonts/ui.ttf"),
+                format!("tl/{TL_LANG}/menu.rpyc"),
+                format!("tl/{TL_LANG}/story.rpyc"),
+                format!("tl/{TL_LANG}/translator_language.rpyc"),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_mod_archive_is_not_treated_as_game_archive() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_mod_archive_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let file = |name: &str, text: &str| (name.to_string(), text.as_bytes().to_vec());
+        rpa::RpaArchive::create_archive(
+            &game_dir.join("scripts.rpa"),
+            &[file("story.rpy", "label start:\n    e \"Hello\"\n")],
+        )
+        .unwrap();
+        rpa::RpaArchive::create_archive(
+            &game_dir.join(rpa::MOD_ARCHIVE_NAME),
+            &[file("tl/russian/mod.rpy", "label modded:\n    e \"Mod\"\n")],
+        )
+        .unwrap();
+
+        let summary = tauri::async_runtime::block_on(scan_game_project(
+            game_dir.to_string_lossy().to_string(),
+        ))
+        .unwrap();
+        let names: Vec<_> = summary.files.iter().map(|file| file.name.as_str()).collect();
+        assert_eq!(names, ["story.rpy"]);
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_pack_explains_when_no_edit_could_be_transferred() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_no_edits_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let story = game_dir.join("story.rpy");
+        std::fs::write(&story, "label start:\n    e \"Hello\"\n").unwrap();
+        let edit = translation::TranslationEdit {
+            key: "line-1".into(),
+            text: "Привет".into(),
+        };
+        translation::save(&story, &[edit]).unwrap();
+
+        let archive = temp_dir.join(rpa::MOD_ARCHIVE_NAME);
+        let error = build_mod_archive(&game_dir, &archive, TEST_FORMAT).unwrap_err();
+        assert!(error.contains("правок: 1"), "{error}");
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1781,13 +1978,10 @@ mod tests {
         save_edits(&story, &[("Say \"hi\"", "Скажи \"привет\""), ("Taken", "Занято")]);
         let out_dir = temp_dir.join("first");
         pack_and_unpack(&game_dir, &out_dir);
-        let strings = std::fs::read_to_string(
-            out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpy"),
-        )
-        .unwrap();
-        assert!(strings.starts_with("# "));
-        assert!(strings.contains(&format!("translate {} strings:\n", TL_LANG)));
-        assert!(strings.contains("    old \"Say \\\"hi\\\"\"\n    new \"Скажи \\\"привет\\\"\"\n"));
+        let strings = compiled_text(
+            &out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpyc"),
+        );
+        assert!(strings.contains(r#"Say \"hi\""#) && strings.contains(r#"Скажи \"привет\""#), "{strings}");
 
         // Повтор `old` в одном языке Ren'Py считает ошибкой загрузки
         let tl_dir = tl_lang_dir(&game_dir);
@@ -1800,10 +1994,9 @@ mod tests {
         let out_dir = temp_dir.join("second");
         let message = pack_and_unpack(&game_dir, &out_dir);
         assert!(message.contains("Не перенесено правок: 1"), "{message}");
-        let strings = std::fs::read_to_string(
-            out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpy"),
-        )
-        .unwrap();
+        let strings = compiled_text(
+            &out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpyc"),
+        );
         assert!(!strings.contains("Taken"));
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
@@ -1974,32 +2167,18 @@ mod tests {
                 return;
             }
 
-            // 2. Тест упаковки мода в RPA архив во временный файл
-            let temp_rpa = std::env::temp_dir().join("test_command_mod.rpa");
-            let result_msg = pack_mod_rpa(
+            // 2. Тест сборки мода во временный архив
+            let temp_mod = std::env::temp_dir().join("test_command_mod.rpa");
+            let result = export_mod(
                 game_dir.to_string(),
-                Some(temp_rpa.to_string_lossy().to_string()),
+                Some(temp_mod.to_string_lossy().to_string()),
             )
             .await
             .unwrap();
-            println!("Результат pack_mod_rpa: {}", result_msg);
-            assert!(temp_rpa.exists(), "Архив мода должен быть создан");
+            println!("Результат export_mod: {}", result.message);
+            assert!(temp_mod.exists(), "Архив мода должен быть создан");
 
-            // 3. Тест распаковки созданного мода через unpack_rpa
-            let temp_unpack_dir = std::env::temp_dir().join("test_command_unpacked");
-            let unpacked = unpack_rpa(
-                temp_rpa.to_string_lossy().to_string(),
-                temp_unpack_dir.to_string_lossy().to_string(),
-                None,
-            )
-            .await
-            .unwrap();
-            println!("Распаковано файлов мода: {}", unpacked.count);
-            assert!(unpacked.count > 0);
-
-            // Очищаем временные файлы
-            let _ = std::fs::remove_file(&temp_rpa);
-            let _ = std::fs::remove_dir_all(&temp_unpack_dir);
+            let _ = std::fs::remove_file(&temp_mod);
         });
     }
 
@@ -2200,23 +2379,21 @@ mod tests {
             assert!(!script_cache.exists());
             assert_eq!(std::fs::read(&compiled).unwrap(), b"original bytecode");
 
-            let in_game_archive = game_dir.join("russian_mod.rpa");
+            let in_game_mod = game_dir.join(rpa::MOD_ARCHIVE_NAME);
             assert!(
-                pack_mod_rpa(
+                export_mod(
                     game_path.clone(),
-                    Some(in_game_archive.to_string_lossy().to_string()),
+                    Some(in_game_mod.to_string_lossy().to_string()),
                 )
                 .await
                 .is_err()
             );
-            assert!(!in_game_archive.exists());
-            pack_mod_rpa(game_path.clone(), None).await.unwrap();
-            assert!(
-                get_project_cache_dir(&game_dir)
-                    .join("exports")
-                    .join("russian_mod.rpa")
-                    .exists()
-            );
+            assert!(!in_game_mod.exists());
+            let default_mod = get_project_cache_dir(&game_dir)
+                .join("exports")
+                .join(rpa::MOD_ARCHIVE_NAME);
+            build_mod_archive(&game_dir, &default_mod, TEST_FORMAT).unwrap();
+            assert!(default_mod.exists());
 
             assert!(
                 unpack_rpa(

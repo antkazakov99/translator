@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 use crate::pickle::{PickleDecoder, PickleEncoder, PickleValue};
 
+/// Имя архива, в который упаковывается мод перевода.
+pub(crate) const MOD_ARCHIVE_NAME: &str = "ru_lang.rpa";
+
 const CACHE_VERSION: &str = "v3_safe_scripts";
 const MAX_COMPRESSED_INDEX: u64 = 64 * 1024 * 1024;
 const MAX_DECOMPRESSED_INDEX: usize = 256 * 1024 * 1024;
@@ -32,7 +35,7 @@ fn read_limited(reader: impl Read, limit: usize, label: &str) -> Result<Vec<u8>,
 
 /// Пишет файл через уникальный временный рядом с целевым, чтобы при сбое
 /// не оставить частичные данные, а параллельные записи не мешали друг другу.
-fn write_atomic(
+pub(crate) fn write_atomic(
     out_file: &Path,
     write: impl FnOnce(&mut File) -> Result<(), String>,
 ) -> Result<(), String> {
@@ -56,7 +59,7 @@ fn write_atomic(
     result
 }
 
-fn safe_output_path(root: &Path, name: &str) -> Result<PathBuf, String> {
+pub(crate) fn safe_output_path(root: &Path, name: &str) -> Result<PathBuf, String> {
     let normalized = name.replace('\\', "/");
     let relative = Path::new(&normalized);
     if normalized.is_empty()
@@ -198,12 +201,6 @@ fn decode_segments(segments: &[PickleValue], key: u64) -> Vec<RpaSegment> {
             })
         })
         .collect()
-}
-
-/// Содержимое файла мода: копия с диска или сгенерированные данные
-enum ModFile {
-    Disk(PathBuf),
-    Generated(Vec<u8>),
 }
 
 pub struct RpaArchive {
@@ -361,16 +358,12 @@ impl RpaArchive {
         Ok(extracted_count)
     }
 
-    /// Создает 100% валидный RPA-3.0 архив из набора файлов в памяти
+    /// Создает RPA-3.0 архив из набора файлов в памяти
     pub fn create_archive(out_path: &Path, files: &[(String, Vec<u8>)]) -> Result<(), String> {
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Не удалось создать директорию {:?}: {}", parent, e))?;
-        }
+        write_atomic(out_path, |out| Self::write_archive(out, files))
+    }
 
-        let mut out = File::create(out_path)
-            .map_err(|e| format!("Не удалось создать файл RPA {:?}: {}", out_path, e))?;
-
+    fn write_archive(out: &mut File, files: &[(String, Vec<u8>)]) -> Result<(), String> {
         // Зарезервированный заголовок 34 байта: "RPA-3.0 0000000000000000 00000000\n"
         let placeholder_header = "RPA-3.0 0000000000000000 00000000\n";
         out.write_all(placeholder_header.as_bytes())
@@ -424,109 +417,6 @@ impl RpaArchive {
             .map_err(|e| format!("Ошибка сброса буфера на диск: {}", e))?;
 
         Ok(())
-    }
-
-    fn create_mod_archive(out_path: &Path, files: &[(String, ModFile)]) -> Result<(), String> {
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Не удалось создать директорию {:?}: {}", parent, e))?;
-        }
-        let mut out = File::create(out_path)
-            .map_err(|e| format!("Не удалось создать файл RPA {:?}: {}", out_path, e))?;
-        out.write_all(b"RPA-3.0 0000000000000000 00000000\n")
-            .map_err(|e| format!("Ошибка записи заголовка RPA: {}", e))?;
-
-        let mut index_entries: Vec<(&str, u64, u64)> = Vec::new();
-        for (name, file) in files {
-            let offset = out
-                .stream_position()
-                .map_err(|e| format!("Ошибка определения позиции: {}", e))?;
-            let length = match file {
-                ModFile::Disk(path) => {
-                    let mut input = File::open(path)
-                        .map_err(|e| format!("Не удалось открыть файл мода {:?}: {}", path, e))?;
-                    std::io::copy(&mut input, &mut out)
-                        .map_err(|e| format!("Не удалось упаковать {:?}: {}", path, e))?
-                }
-                ModFile::Generated(data) => {
-                    out.write_all(data)
-                        .map_err(|e| format!("Не удалось упаковать {}: {}", name, e))?;
-                    data.len() as u64
-                }
-            };
-            index_entries.push((name.as_str(), offset, length));
-        }
-
-        let index_offset = out
-            .stream_position()
-            .map_err(|e| format!("Ошибка позиции оглавления: {}", e))?;
-        let mut encoder = PickleEncoder::new();
-        let pickle_bytes = encoder.encode_rpa_index(&index_entries);
-        let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
-        zlib.write_all(&pickle_bytes)
-            .map_err(|e| format!("Ошибка zlib сжатия оглавления: {}", e))?;
-        let compressed_index = zlib
-            .finish()
-            .map_err(|e| format!("Ошибка завершения сжатия zlib: {}", e))?;
-        out.write_all(&compressed_index)
-            .map_err(|e| format!("Ошибка записи оглавления в RPA: {}", e))?;
-        out.seek(SeekFrom::Start(0))
-            .map_err(|e| format!("Ошибка перемотки в начало RPA: {}", e))?;
-        out.write_all(format!("RPA-3.0 {:016x} 00000000\n", index_offset).as_bytes())
-            .map_err(|e| format!("Ошибка записи финального заголовка: {}", e))?;
-        out.flush()
-            .map_err(|e| format!("Ошибка сброса буфера на диск: {}", e))?;
-        Ok(())
-    }
-
-    /// Собирает директорию мода/перевода (например tl/russian) в единый RPA-3.0 мод-архив.
-    /// Файлы `generated` заменяют одноимённые файлы папки или добавляются к ним; папки
-    /// может не быть, если весь мод собран из них.
-    pub fn pack_mod_from_folder(
-        source_folder: &Path,
-        generated: HashMap<String, Vec<u8>>,
-        out_rpa_path: &Path,
-    ) -> Result<usize, String> {
-        if !source_folder.exists() && generated.is_empty() {
-            return Err(format!(
-                "Папка источника не существует: {:?}",
-                source_folder
-            ));
-        }
-
-        let mut collected_files: Vec<(String, PathBuf)> = Vec::new();
-        if source_folder.exists() {
-            collect_folder_files_for_mod(source_folder, source_folder, 0, &mut collected_files)?;
-        }
-
-        // Старый .rpyc не должен оставаться рядом с изменённым .rpy
-        let replaced = |name: &str| {
-            generated.contains_key(name)
-                || name
-                    .strip_suffix(".rpyc")
-                    .is_some_and(|base| generated.contains_key(&format!("{}.rpy", base)))
-        };
-        let mut files: Vec<(String, ModFile)> = collected_files
-            .into_iter()
-            .filter(|(name, _)| !replaced(name))
-            .map(|(name, path)| (name, ModFile::Disk(path)))
-            .collect();
-        files.extend(
-            generated
-                .into_iter()
-                .map(|(name, data)| (name, ModFile::Generated(data))),
-        );
-
-        if files.is_empty() {
-            return Err("Не найдено файлов для упаковки в мод".to_string());
-        }
-
-        let count = files.len();
-        for (name, _) in &mut files {
-            *name = format!("tl/{}/{}", crate::TL_LANG, name);
-        }
-        Self::create_mod_archive(out_rpa_path, &files)?;
-        Ok(count)
     }
 
     /// Извлекает ТОЛЬКО скрипты (.rpy и .rpyc) из архива в указанную папку кэша,
@@ -647,7 +537,10 @@ impl RpaArchive {
             let path = entry
                 .map_err(|e| format!("Ошибка чтения папки игры: {}", e))?
                 .path();
-            if path.extension().and_then(|e| e.to_str()) == Some("rpa") {
+            // Собственный архив мода не содержит исходных скриптов игры
+            if path.extension().and_then(|e| e.to_str()) == Some("rpa")
+                && path.file_name().is_none_or(|name| name != MOD_ARCHIVE_NAME)
+            {
                 archives.push(path);
             }
         }
@@ -699,7 +592,7 @@ impl RpaArchive {
 }
 
 /// Рекурсивно собирает файлы для создания мода
-fn collect_folder_files_for_mod(
+pub(crate) fn collect_folder_files_for_mod(
     root: &Path,
     current: &Path,
     depth: usize,
@@ -929,24 +822,6 @@ mod tests {
 
         assert!(RpaArchive::extract_all(&archive_path, &temp_dir.join("output")).is_err());
         assert!(!temp_dir.join("escaped.txt").exists());
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn test_mod_archive_keeps_translation_prefix() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("translator_rpa_mod_{}", uuid::Uuid::new_v4()));
-        let source = temp_dir.join("game").join("tl").join("russian");
-        fs::create_dir_all(&source).unwrap();
-        fs::write(source.join("story.rpy"), "translate russian strings:\n").unwrap();
-        let archive_path = temp_dir.join("mod.rpa");
-
-        assert_eq!(
-            RpaArchive::pack_mod_from_folder(&source, HashMap::new(), &archive_path).unwrap(),
-            1
-        );
-        let archive = RpaArchive::open(&archive_path).unwrap();
-        assert!(archive.entries.contains_key("tl/russian/story.rpy"));
         let _ = fs::remove_dir_all(&temp_dir);
     }
 
