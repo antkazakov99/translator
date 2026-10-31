@@ -19,7 +19,8 @@ pub struct RpycSlot {
 /// Извлеченная реплика или сцена из скомпилированного .rpyc
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpycStatement {
-    pub kind: String, // "say", "label", "menu", "jump", "call"
+    /// "say", "label", "menu_start", "menu" (вариант выбора), "if", "block_end", "jump", "call"...
+    pub kind: String,
     pub scene_name: String,
     pub speaker: Option<String>,
     pub text: String,
@@ -425,45 +426,79 @@ impl RpycParser {
                     "Menu" => {
                         let line_number =
                             Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
+                        let marker = |kind: &str, text: &str, scene: &str| RpycStatement {
+                            kind: kind.to_string(),
+                            scene_name: scene.to_string(),
+                            speaker: None,
+                            text: text.to_string(),
+                            line_number,
+                            target: None,
+                        };
+                        stmts.push(marker("menu_start", "", current_scene));
                         // Извлекаем элементы меню
                         let items_val = Self::get_field_val(state.as_deref(), "items");
                         if let Some(PickleValue::List(menu_items)) = items_val {
                             for m in menu_items {
                                 if let PickleValue::Tuple(t) = m {
-                                    if let Some(choice_text) = t.first().and_then(|v| v.as_str()) {
-                                        stmts.push(RpycStatement {
-                                            kind: "menu".to_string(),
-                                            scene_name: current_scene.clone(),
-                                            speaker: Some("Выбор".to_string()),
-                                            text: choice_text.to_string(),
-                                            line_number,
-                                            target: None,
-                                        });
+                                    let text = t.first().and_then(|v| v.as_str());
+                                    // Подпись меню не имеет тела, в отличие от варианта
+                                    let block = t.get(2).filter(|block| block.as_list().is_some());
+                                    if let Some(text) = text {
+                                        let kind = if block.is_some() { "menu" } else { "say" };
+                                        stmts.push(marker(kind, text, current_scene));
                                     }
-                                    // Если у ветки выбора есть свой блок инструкций, парсим его
-                                    if t.len() >= 3 {
+                                    if let Some(block) = block {
                                         Self::extract_statements_from_pickle(
-                                            &t[2],
+                                            block,
                                             current_scene,
                                             stmts,
                                         );
+                                        if text.is_some() {
+                                            stmts.push(marker("block_end", "", current_scene));
+                                        }
                                     }
                                 }
                             }
                         }
+                        stmts.push(marker("block_end", "", current_scene));
                     }
                     "If" => {
+                        let line_number =
+                            Self::get_field_int(state.as_deref(), args, "linenumber").unwrap_or(0);
                         let entries_val = Self::get_field_val(state.as_deref(), "entries");
                         if let Some(PickleValue::List(entries)) = entries_val {
-                            for e in entries {
+                            for (position, e) in entries.iter().enumerate() {
                                 if let PickleValue::Tuple(t) = e
                                     && t.len() >= 2
                                 {
+                                    let condition = Self::extract_pycode_source(&t[0])
+                                        .map(|source| source.split_whitespace().collect::<Vec<_>>().join(" "));
+                                    let header = match condition {
+                                        Some(condition) if position == 0 => format!("if {}", condition),
+                                        Some(condition) if condition != "True" => format!("elif {}", condition),
+                                        _ => "else".to_string(),
+                                    };
+                                    stmts.push(RpycStatement {
+                                        kind: "if".to_string(),
+                                        scene_name: current_scene.clone(),
+                                        speaker: None,
+                                        text: header,
+                                        line_number,
+                                        target: None,
+                                    });
                                     Self::extract_statements_from_pickle(
                                         &t[1],
                                         current_scene,
                                         stmts,
                                     );
+                                    stmts.push(RpycStatement {
+                                        kind: "block_end".to_string(),
+                                        scene_name: current_scene.clone(),
+                                        speaker: None,
+                                        text: String::new(),
+                                        line_number,
+                                        target: None,
+                                    });
                                 }
                             }
                         }
@@ -693,7 +728,12 @@ impl RpycParser {
         let mut out = String::new();
         out.push_str("# Decompiled by Ren'Py Scenario & Localization Studio\n\n");
 
+        // Отступы передают вложенность меню и условий: по ним разбирается структура сцены
+        let mut depth = 0usize;
         for stmt in statements {
+            let indent = " ".repeat(4 * (depth + 1));
+            // Объявления внутри блока не должны закрывать его своим нулевым отступом
+            let top = if depth == 0 { "" } else { indent.as_str() };
             match stmt.kind.as_str() {
                 "label" => {
                     out.push_str(&format!("\nlabel {}:\n", stmt.scene_name));
@@ -701,39 +741,46 @@ impl RpycParser {
                 "say" => {
                     let escaped_text = RenpyParser::escape_renpy_string(&stmt.text);
                     if let Some(ref spk) = stmt.speaker {
-                        out.push_str(&format!("    {} \"{}\"\n", spk, escaped_text));
+                        out.push_str(&format!("{}{} \"{}\"\n", indent, spk, escaped_text));
                     } else {
-                        out.push_str(&format!("    \"{}\"\n", escaped_text));
+                        out.push_str(&format!("{}\"{}\"\n", indent, escaped_text));
                     }
+                }
+                "menu_start" => {
+                    out.push_str(&format!("{}menu:\n", indent));
+                    depth += 1;
                 }
                 "menu" => {
                     let escaped_text = RenpyParser::escape_renpy_string(&stmt.text);
-                    out.push_str(&format!(
-                        "        \"{}\":\n            pass\n",
-                        escaped_text
-                    ));
+                    out.push_str(&format!("{0}\"{1}\":\n{0}    pass\n", indent, escaped_text));
+                    depth += 1;
                 }
+                "if" => {
+                    out.push_str(&format!("{0}{1}:\n{0}    pass\n", indent, stmt.text));
+                    depth += 1;
+                }
+                "block_end" => depth = depth.saturating_sub(1),
                 "jump" => {
                     if let Some(ref target) = stmt.target {
-                        out.push_str(&format!("    jump {}\n", target));
+                        out.push_str(&format!("{}jump {}\n", indent, target));
                     }
                 }
                 "call" => {
                     if let Some(ref target) = stmt.target {
-                        out.push_str(&format!("    call {}\n", target));
+                        out.push_str(&format!("{}call {}\n", indent, target));
                     }
                 }
                 "define" => {
-                    out.push_str(&format!("define {} = {}\n", stmt.scene_name, stmt.text));
+                    out.push_str(&format!("{}define {} = {}\n", top, stmt.scene_name, stmt.text));
                 }
                 "default" => {
-                    out.push_str(&format!("default {} = {}\n", stmt.scene_name, stmt.text));
+                    out.push_str(&format!("{}default {} = {}\n", top, stmt.scene_name, stmt.text));
                 }
                 "python" => {
                     for line in stmt.text.lines() {
                         let trimmed = line.trim();
                         if !trimmed.is_empty() {
-                            out.push_str(&format!("$ {}\n", trimmed));
+                            out.push_str(&format!("{}$ {}\n", top, trimmed));
                         }
                     }
                 }
@@ -947,6 +994,55 @@ mod tests {
             .unwrap();
         let texts: Vec<_> = graph.dialogues().map(|line| line.original_text.as_str()).collect();
         assert_eq!(texts, [text, text]);
+    }
+
+    #[test]
+    fn test_decompiled_blocks_keep_menu_and_conditions() {
+        let statement = |kind: &str, text: &str, target: Option<&str>| RpycStatement {
+            kind: kind.to_string(),
+            scene_name: "start".to_string(),
+            speaker: None,
+            text: text.to_string(),
+            line_number: 1,
+            target: target.map(str::to_string),
+        };
+        let script = RpycParser::decompile_to_rpy_text(&[
+            statement("label", "", None),
+            statement("menu_start", "", None),
+            statement("say", "Caption", None),
+            statement("menu", "First", None),
+            statement("python", "x = 1", None),
+            statement("menu_start", "", None),
+            statement("menu", "Inner", None),
+            statement("jump", "", Some("inner")),
+            statement("block_end", "", None),
+            statement("block_end", "", None),
+            statement("block_end", "", None),
+            statement("menu", "Second", None),
+            statement("if", "if flag", None),
+            statement("jump", "", Some("second")),
+            statement("block_end", "", None),
+            statement("block_end", "", None),
+            statement("block_end", "", None),
+            statement("if", "if flag", None),
+            statement("say", "Inside", None),
+            statement("block_end", "", None),
+            statement("jump", "", Some("after")),
+        ]);
+
+        let structure = RenpyParser::parse_script_structure(&script);
+        let blocks = &structure.scene_choices["start"];
+        assert_eq!(blocks[0].options[0].text, "Inner");
+        let outer: Vec<_> = blocks[1].options.iter().map(|option| option.text.as_str()).collect();
+        assert_eq!(outer, ["First", "Second"]);
+        let edge = |to: &str| structure.edges.iter().find(|edge| edge.to == to).unwrap();
+        assert_eq!(edge("second").kind, "choice");
+        assert_eq!(edge("after").kind, "jump");
+        assert_eq!(edge("after").condition, None);
+
+        let graph = RenpyParser::new().parse_file(Path::new("story.rpy"), &script).unwrap();
+        let lines: Vec<_> = graph.dialogues().map(|line| line.original_text.as_str()).collect();
+        assert_eq!(lines, ["Caption", "First", "Inner", "Second", "Inside"]);
     }
 
     #[test]

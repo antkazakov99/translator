@@ -1008,6 +1008,7 @@ async fn find_scene_target(
 
         let pattern_label_colon = format!("label {}:", target_name);
         let pattern_label_space = format!("label {} ", target_name);
+        let pattern_label_paren = format!("label {}(", target_name);
         let pattern_screen_colon = format!("screen {}:", target_name);
         let pattern_screen_paren = format!("screen {}(", target_name);
 
@@ -1017,6 +1018,7 @@ async fn find_scene_target(
                     let trimmed = line.trim();
                     if trimmed.starts_with(&pattern_label_colon)
                         || trimmed.starts_with(&pattern_label_space)
+                        || trimmed.starts_with(&pattern_label_paren)
                         || trimmed.starts_with(&pattern_screen_colon)
                         || trimmed.starts_with(&pattern_screen_paren)
                     {

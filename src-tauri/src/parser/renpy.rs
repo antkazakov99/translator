@@ -19,27 +19,35 @@ static RE_CUSTOM_CHARS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?:define\s+|\$\s*)?([A-Za-z_]\w*)\s*=\s*Chars\s*\(\s*['"]([^'"]+)['"]"#).unwrap()
 });
 
-static RE_STRUCT_LABEL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^\s*label\s+([A-Za-z_]\w*)\s*:"#).unwrap());
+// Имя метки может содержать точку, после него идут параметры и `hide`
+static RE_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*label\s+([\w.]+)\s*(?:\(.*\))?\s*(?:hide\s*)?:"#).unwrap()
+});
 
-static RE_STRUCT_MENU: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^\s*menu(?:\s*([A-Za-z_]\w*))?\s*:"#).unwrap());
+static RE_STRUCT_MENU: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*menu(?:\s+[A-Za-z_]\w*)?\s*(?:\(.*\))?\s*:"#).unwrap()
+});
 
-static RE_STRUCT_CHOICE_OPT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^\s*"([^"]+)"\s*(?:if\s+[^:]+)?\s*:"#).unwrap());
+static RE_STRUCT_CHOICE_OPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r#"^\s*(?:"(?P<text>(?:[^"\\]|\\.)*)"|'(?P<text_sq>(?:[^'\\]|\\.)*)')"#,
+        r#"\s*(?:\(.*\)\s*)?(?:if\s+.+?)?\s*:\s*(?:#.*)?$"#,
+    ))
+    .unwrap()
+});
 
 static RE_STRUCT_JUMP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*(?:if\s+(?P<cond>[^:]+):\s*)?(?P<cmd>jump|call)\s+(?P<target>[A-Za-z_]\w*)"#)
+    Regex::new(r#"^\s*(?:if\s+(?P<cond>[^:]+):\s*)?(?P<cmd>jump|call)\s+(?P<target>[\w.]+)"#)
         .unwrap()
 });
+
+/// Слова после `jump` и `call`, которые не называют метку: `call screen inventory`.
+const NON_LABEL_TARGETS: &[&str] = &["screen", "expression"];
 
 static RE_STRUCT_IF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*(?:elif|if)\s+(.+?)\s*:"#).unwrap());
 
 static RE_STRUCT_ELSE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s*else\s*:"#).unwrap());
-
-static RE_ORIG_LABEL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"^\s*label\s+([A-Za-z0-9_.]+)\s*:"#).unwrap());
 
 static RE_STRINGS_BLOCK: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^translate\s+\w+\s+strings\s*:"#).unwrap());
@@ -69,6 +77,15 @@ const NON_DIALOGUE_STATEMENTS: &[&str] = &[
     "default", "transform", "style", "screen", "init", "python", "label", "menu", "jump", "call",
     "return", "pause", "window", "if", "elif", "while", "for",
 ];
+
+// Блоки определений: их свойства со строками выглядят как реплики (`font "a.ttf"`).
+// Блоки python не входят: списки строк в них игрок видит на экранах
+static RE_DEFINITION_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(?:screen|style|transform|image|layeredimage)\b.*:\s*(?:#.*)?$"#).unwrap()
+});
+
+/// Операторы экрана с текстом, который видит игрок.
+const SCREEN_TEXT_STATEMENTS: &[&str] = &["text", "textbutton", "tooltip"];
 
 static RE_REPEATED_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(" {2,}").unwrap());
 
@@ -111,6 +128,56 @@ pub struct ScriptStructure {
     pub scene_choices: HashMap<String, Vec<ChoiceBlockDto>>,
     pub scene_jumps: HashMap<String, Vec<(String, Option<String>)>>,
     pub edges: Vec<SceneEdgeDto>,
+}
+
+/// Блок `menu:`, в котором находится разбор. Меню могут быть вложенными.
+struct OpenMenu {
+    indent: usize,
+    /// Отступ вариантов: глубже идут только их тела.
+    option_indent: Option<usize>,
+    options: Vec<ChoiceOptionDto>,
+}
+
+impl ScriptStructure {
+    /// Закрывает меню, в тело которых строка с таким отступом уже не входит.
+    fn close_menus(&mut self, scene: Option<&str>, menus: &mut Vec<OpenMenu>, indent: usize) {
+        while menus.last().is_some_and(|menu| menu.indent >= indent) {
+            let options = menus.pop().map(|menu| menu.options).unwrap_or_default();
+            if let Some(scene) = scene.filter(|_| !options.is_empty()) {
+                self.scene_choices
+                    .entry(scene.to_string())
+                    .or_default()
+                    .push(ChoiceBlockDto { prompt: None, options });
+            }
+        }
+    }
+}
+
+/// Отслеживает блоки определений в оригинальном скрипте.
+#[derive(Default)]
+struct DefinitionBlocks {
+    /// Отступ открытого блока и признак экрана.
+    current: Option<(usize, bool)>,
+}
+
+impl DefinitionBlocks {
+    /// Скрыта ли строка от списка реплик. Вызывается по порядку для всех строк с кодом.
+    fn hides(&mut self, line: &str) -> bool {
+        let trimmed = line.trim();
+        let indent = line.len() - line.trim_start().len();
+        if let Some((block_indent, is_screen)) = self.current {
+            if indent > block_indent {
+                let speaker = parse_say_line(trimmed).and_then(|say| say.speaker);
+                return !(is_screen && speaker.is_some_and(|name| SCREEN_TEXT_STATEMENTS.contains(&name)));
+            }
+            self.current = None;
+        }
+        if RE_DEFINITION_BLOCK.is_match(trimmed) {
+            self.current = Some((indent, trimmed.starts_with("screen")));
+            return true;
+        }
+        false
+    }
 }
 
 /// Реплика, найденная в строке скрипта.
@@ -344,10 +411,16 @@ impl RenpyParser {
     /// так же, как в полном разборе, поэтому счётчики не расходятся.
     pub fn quick_translation_stats(content: &str) -> (usize, usize) {
         if !has_translate_blocks(content) {
+            let mut blocks = DefinitionBlocks::default();
             let total = content
                 .lines()
-                .map(str::trim)
-                .filter(|line| !line.starts_with('#') && parse_say_line(line).is_some())
+                .filter(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.is_empty()
+                        && !trimmed.starts_with('#')
+                        && !blocks.hides(line)
+                        && parse_say_line(trimmed).is_some()
+                })
                 .count();
             return (total, 0);
         }
@@ -520,11 +593,9 @@ impl RenpyParser {
         let mut structure = ScriptStructure::default();
 
         let mut current_label: Option<String> = None;
-        let mut in_menu = false;
-        let mut menu_indent = 0;
-        let mut current_menu_options: Vec<ChoiceOptionDto> = Vec::new();
-        let mut current_condition: Option<String> = None;
-        let mut last_choice_idx: Option<usize> = None;
+        let mut menus: Vec<OpenMenu> = Vec::new();
+        // Условия открытых блоков if/elif/else с их отступами
+        let mut conditions: Vec<(usize, String)> = Vec::new();
 
         for (idx, line) in content.lines().enumerate() {
             let line_num = idx + 1;
@@ -536,23 +607,9 @@ impl RenpyParser {
             let indent = line.len() - line.trim_start().len();
 
             // 1. Проверяем объявление сцены (label)
-            if let Some(caps) = RE_STRUCT_LABEL.captures(line) {
-                if in_menu
-                    && !current_menu_options.is_empty()
-                    && let Some(ref lbl) = current_label
-                {
-                    structure
-                        .scene_choices
-                        .entry(lbl.clone())
-                        .or_default()
-                        .push(ChoiceBlockDto {
-                            prompt: None,
-                            options: std::mem::take(&mut current_menu_options),
-                        });
-                }
-                in_menu = false;
-                current_condition = None;
-                last_choice_idx = None;
+            if let Some(caps) = RE_LABEL.captures(line) {
+                structure.close_menus(current_label.as_deref(), &mut menus, 0);
+                conditions.clear();
 
                 let label_name = caps.get(1).unwrap().as_str().to_string();
                 structure.labels.push(LabelInfoDto {
@@ -568,66 +625,51 @@ impl RenpyParser {
                 None => continue,
             };
 
+            // Отступ показывает, какие блоки уже закончились
+            structure.close_menus(Some(&lbl), &mut menus, indent);
+            conditions.retain(|(block_indent, _)| *block_indent < indent);
+
             // 2. Проверяем начало блока menu:
             if RE_STRUCT_MENU.is_match(line) {
-                if in_menu && !current_menu_options.is_empty() {
-                    structure
-                        .scene_choices
-                        .entry(lbl.clone())
-                        .or_default()
-                        .push(ChoiceBlockDto {
-                            prompt: None,
-                            options: std::mem::take(&mut current_menu_options),
-                        });
-                }
-                in_menu = true;
-                menu_indent = indent;
-                last_choice_idx = None;
+                menus.push(OpenMenu {
+                    indent,
+                    option_indent: None,
+                    options: Vec::new(),
+                });
                 continue;
             }
 
-            // Если были в menu, но отступ уменьшился
-            if in_menu && indent <= menu_indent && !RE_STRUCT_CHOICE_OPT.is_match(line) {
-                if !current_menu_options.is_empty() {
-                    structure
-                        .scene_choices
-                        .entry(lbl.clone())
-                        .or_default()
-                        .push(ChoiceBlockDto {
-                            prompt: None,
-                            options: std::mem::take(&mut current_menu_options),
-                        });
-                }
-                in_menu = false;
-                last_choice_idx = None;
-            }
-
             // 3. Варианты выбора внутри menu
-            if in_menu && let Some(caps) = RE_STRUCT_CHOICE_OPT.captures(line) {
-                let opt_text = caps.get(1).unwrap().as_str().to_string();
-                current_menu_options.push(ChoiceOptionDto {
-                    text: opt_text,
+            if let Some(menu) = menus.last_mut()
+                && menu.option_indent.is_none_or(|expected| expected == indent)
+                && let Some(caps) = RE_STRUCT_CHOICE_OPT.captures(line)
+            {
+                let text = caps.name("text").or_else(|| caps.name("text_sq")).unwrap();
+                menu.option_indent = Some(indent);
+                menu.options.push(ChoiceOptionDto {
+                    text: Self::unescape_renpy_string(text.as_str()),
                     target_jump: None,
                 });
-                last_choice_idx = Some(current_menu_options.len() - 1);
                 continue;
             }
 
             // 4. Ветвления if/elif/else
             if let Some(caps) = RE_STRUCT_IF.captures(line) {
-                current_condition = Some(caps.get(1).unwrap().as_str().trim().to_string());
+                conditions.push((indent, caps.get(1).unwrap().as_str().trim().to_string()));
             } else if RE_STRUCT_ELSE.is_match(line) {
-                current_condition = Some("иначе".to_string());
+                conditions.push((indent, "иначе".to_string()));
             }
 
             // 5. Переходы jump / call
-            if let Some(caps) = RE_STRUCT_JUMP.captures(line) {
+            if let Some(caps) = RE_STRUCT_JUMP.captures(line)
+                && !NON_LABEL_TARGETS.contains(&caps.name("target").unwrap().as_str())
+            {
                 let cmd = caps.name("cmd").unwrap().as_str();
                 let target = caps.name("target").unwrap().as_str().to_string();
                 let inline_cond = caps.name("cond").map(|c| c.as_str().trim().to_string());
-                let cond = inline_cond.or_else(|| current_condition.clone());
+                let cond = inline_cond.or_else(|| conditions.last().map(|(_, cond)| cond.clone()));
 
-                let kind = if in_menu {
+                let kind = if !menus.is_empty() {
                     "choice".to_string()
                 } else if cond.is_some() {
                     "branch".to_string()
@@ -637,19 +679,13 @@ impl RenpyParser {
                     "jump".to_string()
                 };
 
-                let condition_label = if in_menu {
-                    if let Some(idx) = last_choice_idx {
-                        if let Some(opt) = current_menu_options.get_mut(idx) {
-                            opt.target_jump = Some(target.clone());
-                            Some(format!("Выбор: \"{}\"", opt.text))
-                        } else {
-                            cond.clone()
-                        }
-                    } else {
-                        cond.clone()
+                let option = menus.last_mut().and_then(|menu| menu.options.last_mut());
+                let condition_label = match option {
+                    Some(opt) => {
+                        opt.target_jump = Some(target.clone());
+                        Some(format!("Выбор: \"{}\"", opt.text))
                     }
-                } else {
-                    cond.clone()
+                    None => cond.clone(),
                 };
 
                 structure.edges.push(SceneEdgeDto {
@@ -667,20 +703,7 @@ impl RenpyParser {
             }
         }
 
-        if in_menu
-            && !current_menu_options.is_empty()
-            && let Some(lbl) = current_label
-        {
-            structure
-                .scene_choices
-                .entry(lbl)
-                .or_default()
-                .push(ChoiceBlockDto {
-                    prompt: None,
-                    options: current_menu_options,
-                });
-        }
-
+        structure.close_menus(current_label.as_deref(), &mut menus, 0);
         structure
     }
 
@@ -691,6 +714,7 @@ impl RenpyParser {
 
         let mut current_scene_name = "Общие диалоги".to_string();
         let mut last_node_idx = None;
+        let mut blocks = DefinitionBlocks::default();
 
         for (idx, raw_line) in content.lines().enumerate() {
             let line_num = idx + 1;
@@ -700,11 +724,15 @@ impl RenpyParser {
                 continue;
             }
 
-            if let Some(caps) = RE_ORIG_LABEL.captures(trimmed) {
+            let hidden = blocks.hides(raw_line);
+            if let Some(caps) = RE_LABEL.captures(trimmed) {
                 let label_name = caps.get(1).unwrap().as_str().to_string();
                 current_scene_name = label_name.clone();
                 let label_node = graph.add_node(ScenarioNode::label(label_name));
                 last_node_idx = Some(label_node);
+                continue;
+            }
+            if hidden {
                 continue;
             }
 
@@ -1067,6 +1095,126 @@ translate russian strings:
             "Дублирующиеся строки UI должны быть схлопнуты в 1 запись"
         );
         assert_eq!(translated, 1);
+    }
+
+    #[test]
+    fn test_definition_blocks_hide_their_properties() {
+        let script = concat!(
+            "style big:\n",
+            "    font \"a.ttf\"\n",
+            "image logo:\n",
+            "    \"logo.png\"\n",
+            "screen hud(x):\n",
+            "    # Комментарий без отступа не закрывает блок\n",
+            "# Первая колонка\n",
+            "    add \"bg.png\" zoom 0.5\n",
+            "    text \"Score\" size 20\n",
+            "    textbutton \"Start\" action Start()\n",
+            "    hover_color \"#fff\"\n",
+            "label start:\n",
+            "    e \"Hello\"\n",
+            "    e \"After\"\n",
+        );
+        let graph = RenpyParser::new()
+            .parse_original_script(Path::new("story.rpy"), script)
+            .unwrap();
+        let lines: Vec<_> = graph.dialogues().map(|line| line.original_text.as_str()).collect();
+        assert_eq!(lines, ["Score", "Start", "Hello", "After"]);
+        assert_eq!(RenpyParser::quick_translation_stats(script), (4, 0));
+    }
+
+    #[test]
+    fn test_nested_menu_keeps_outer_options() {
+        let script = r#"
+label start:
+    menu ask(screen="choice"):
+        "Pick one"
+        "Say \"hi\"":
+            menu:
+                "Inner":
+                    jump inner
+            jump after_inner
+        'Quoted' if gold > 1:
+            jump quoted
+        "Last" (price=1):
+            jump last
+    jump outside
+"#;
+        let structure = RenpyParser::parse_script_structure(script);
+        let blocks = &structure.scene_choices["start"];
+        let texts = |block: &ChoiceBlockDto| {
+            block.options.iter().map(|option| option.text.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&blocks[0]), ["Inner"]);
+        assert_eq!(texts(&blocks[1]), ["Say \"hi\"", "Quoted", "Last"]);
+        assert_eq!(blocks[0].options[0].target_jump.as_deref(), Some("inner"));
+        assert_eq!(blocks[1].options[0].target_jump.as_deref(), Some("after_inner"));
+
+        let edge = |to: &str| structure.edges.iter().find(|edge| edge.to == to).unwrap();
+        assert_eq!(edge("after_inner").condition.as_deref(), Some("Выбор: \"Say \"hi\"\""));
+        assert_eq!(edge("last").kind, "choice");
+        assert_eq!(edge("outside").kind, "jump");
+    }
+
+    #[test]
+    fn test_condition_ends_with_its_block() {
+        let script = concat!(
+            "label start:\n",
+            "    if flag:\n",
+            "        $ x = 1\n",
+            "    jump next\n",
+            "    if a:\n",
+            "        jump one\n",
+            "    elif b:\n",
+            "        if c:\n",
+            "            jump two\n",
+            "        jump three\n",
+            "    else:\n",
+            "        jump four\n",
+            "    call five\n",
+        );
+        let structure = RenpyParser::parse_script_structure(script);
+        let found: Vec<_> = structure
+            .edges
+            .iter()
+            .map(|edge| (edge.to.as_str(), edge.kind.as_str(), edge.condition.as_deref()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("next", "jump", None),
+                ("one", "branch", Some("a")),
+                ("two", "branch", Some("c")),
+                ("three", "branch", Some("b")),
+                ("four", "branch", Some("иначе")),
+                ("five", "call", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_jump_targets_and_labels() {
+        let script = concat!(
+            "label greet(name, title=(1, 2)):\n",
+            "    e \"Hi\"\n",
+            "    call screen inventory\n",
+            "    jump expression target\n",
+            "    call expression \"x\" pass (1)\n",
+            "    jump chapter.part\n",
+            "label chapter.part hide:\n",
+            "    e \"Bye\"\n",
+        );
+        let structure = RenpyParser::parse_script_structure(script);
+        let names: Vec<_> = structure.labels.iter().map(|label| label.name.as_str()).collect();
+        assert_eq!(names, ["greet", "chapter.part"]);
+        assert_eq!(structure.edges.len(), 1);
+        assert_eq!(structure.edges[0].to, "chapter.part");
+
+        let graph = RenpyParser::new()
+            .parse_original_script(Path::new("story.rpy"), script)
+            .unwrap();
+        let lines: Vec<_> = graph.dialogues().map(|line| line.block_id.clone().unwrap()).collect();
+        assert_eq!(lines, ["greet", "chapter.part"]);
     }
 
     #[test]
