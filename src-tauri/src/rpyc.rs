@@ -1,5 +1,6 @@
 use flate2::read::ZlibDecoder;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -126,6 +127,17 @@ impl RpycParser {
 
     /// Декомпилирует/парсит байты .rpyc из памяти и извлекает диалоговые инструкции
     pub fn parse_rpyc_bytes(data: &[u8]) -> Result<Vec<RpycStatement>, String> {
+        let root_val = Self::load_tree(data)?;
+
+        let mut statements = Vec::new();
+        let mut current_scene = "Общие диалоги".to_string();
+
+        Self::extract_statements_from_pickle(&root_val, &mut current_scene, &mut statements);
+
+        Ok(statements)
+    }
+
+    fn load_tree(data: &[u8]) -> Result<PickleValue, String> {
         let slots = Self::read_slots(data)?;
         let slot1 = slots
             .iter()
@@ -135,16 +147,222 @@ impl RpycParser {
         let decompressed_ast = Self::decompress_slot(data, slot1)?;
 
         let mut decoder = PickleDecoder::new(&decompressed_ast);
-        let root_val = decoder
+        decoder
             .decode()
-            .map_err(|e| format!("Ошибка парсинга AST pickle: {}", e))?;
+            .map_err(|e| format!("Ошибка парсинга AST pickle: {}", e))
+    }
 
-        let mut statements = Vec::new();
-        let mut current_scene = "Общие диалоги".to_string();
+    /// Собирает реплики оригинала по идентификаторам блоков `translate`.
+    pub fn collect_original_dialogue(
+        data: &[u8],
+        originals: &mut HashMap<String, String>,
+    ) -> Result<(), String> {
+        let tree = Self::load_tree(data)?;
+        let statements = Self::tree_statements(&tree)?;
+        DialogueIdentifiers::new(originals).walk(statements);
+        Ok(())
+    }
 
-        Self::extract_statements_from_pickle(&root_val, &mut current_scene, &mut statements);
+    fn tree_statements(tree: &PickleValue) -> Result<&[PickleValue], String> {
+        tree.as_tuple()
+            .and_then(|root| root.get(1))
+            .and_then(PickleValue::as_list)
+            .ok_or_else(|| "Неизвестная структура скрипта .rpyc".to_string())
+    }
 
-        Ok(statements)
+    fn class_of(node: &PickleValue) -> &str {
+        match node {
+            PickleValue::Object { class_name, .. } => class_name,
+            _ => "",
+        }
+    }
+
+    fn state_of(node: &PickleValue) -> Option<&PickleValue> {
+        match node {
+            PickleValue::Object { state, .. } => state.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn language_of(state: Option<&PickleValue>) -> Option<&str> {
+        Self::get_field_val(state, "language").and_then(PickleValue::as_str)
+    }
+
+    fn words(state: Option<&PickleValue>, field: &str) -> Vec<String> {
+        match Self::get_field_val(state, field) {
+            Some(PickleValue::Tuple(items) | PickleValue::List(items)) => items
+                .iter()
+                .filter_map(PickleValue::as_str)
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Аргументы реплики в виде `("base", xpos="far_left")`.
+    fn arguments_code(info: &PickleValue) -> Option<String> {
+        let state = Self::state_of(info);
+        let Some(PickleValue::Tuple(items) | PickleValue::List(items)) =
+            Self::get_field_val(state, "arguments")
+        else {
+            return None;
+        };
+        let indexes = |field: &str| match Self::get_field_val(state, field) {
+            Some(PickleValue::Set(items)) => {
+                items.iter().filter_map(PickleValue::as_i64).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+        let (starred, doublestarred) = (indexes("starred_indexes"), indexes("doublestarred_indexes"));
+
+        let mut parts = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let pair = item.as_tuple()?;
+            let expression = Self::extract_pycode_source(pair.get(1)?)?;
+            parts.push(match pair.first().and_then(PickleValue::as_str) {
+                _ if starred.contains(&(index as i64)) => format!("*{}", expression),
+                _ if doublestarred.contains(&(index as i64)) => format!("**{}", expression),
+                Some(name) => format!("{}={}", name, expression),
+                None => expression,
+            });
+        }
+        // Старые движки хранят распаковку в отдельных полях
+        for (field, prefix) in [("extrapos", "*"), ("extrakw", "**")] {
+            if let Some(expression) =
+                Self::get_field_val(state, field).and_then(Self::extract_pycode_source)
+            {
+                parts.push(format!("{}{}", prefix, expression));
+            }
+        }
+        Some(format!("({})", parts.join(", ")))
+    }
+
+    /// Восстанавливает строку реплики как `Say.get_code` в Ren'Py: от этого текста
+    /// зависит идентификатор блока, поэтому порядок частей менять нельзя.
+    fn say_code(state: Option<&PickleValue>) -> Option<String> {
+        let what = Self::get_field_val(state, "what")?.as_str()?;
+        let mut parts = Vec::new();
+        if let Some(who) = Self::get_field_val(state, "who").and_then(Self::extract_pycode_source) {
+            parts.push(who);
+            parts.extend(Self::words(state, "attributes"));
+            let temporary = Self::words(state, "temporary_attributes");
+            if !temporary.is_empty() {
+                parts.push("@".to_string());
+                parts.extend(temporary);
+            }
+        }
+        parts.push(encode_say_string(what));
+        if Self::get_field_val(state, "interact") == Some(&PickleValue::Bool(false)) {
+            parts.push("nointeract".to_string());
+        }
+        if let Some(identifier) = Self::get_field_val(state, "identifier").and_then(PickleValue::as_str) {
+            parts.push(format!("id {}", identifier));
+        }
+        if let Some(info) = Self::get_field_val(state, "arguments")
+            && *info != PickleValue::None
+        {
+            parts.push(Self::arguments_code(info)?);
+        }
+        if let Some(with) = Self::get_field_val(state, "with_").and_then(Self::extract_pycode_source) {
+            parts.push(format!("with {}", with));
+        }
+        Some(parts.join(" "))
+    }
+
+    /// Оператор, который нельзя восстановить, остаётся заметной строкой: файл с ним
+    /// не соберётся заново, а молчаливая потеря изменила бы поведение перевода.
+    fn opaque_statement(node: &PickleValue) -> String {
+        format!("<{}>", Self::class_of(node))
+    }
+
+    /// Операторы блока `translate`: признак реплики и текст оператора.
+    fn translate_statements(state: Option<&PickleValue>) -> Vec<(bool, String)> {
+        let block = Self::get_field_val(state, "block").and_then(PickleValue::as_list);
+        block
+            .unwrap_or_default()
+            .iter()
+            .map(|node| {
+                let node_state = Self::state_of(node);
+                let class = Self::class_of(node);
+                let statement = match class {
+                    "Say" => Self::say_code(node_state),
+                    "Pass" => Some("pass".to_string()),
+                    "UserStatement" => Self::get_field_val(node_state, "line")
+                        .and_then(PickleValue::as_str)
+                        .map(str::to_string),
+                    _ => None,
+                };
+                (class == "Say", statement.unwrap_or_else(|| Self::opaque_statement(node)))
+            })
+            .collect()
+    }
+
+    /// Восстанавливает файл перевода: блоки `translate` с идентификаторами и строки
+    /// `old`/`new`. Над репликой стоит комментарий с оригиналом, как в файлах Ren'Py.
+    pub fn decompile_translation(
+        data: &[u8],
+        originals: &HashMap<String, String>,
+    ) -> Result<String, String> {
+        let tree = Self::load_tree(data)?;
+        let statements = Self::tree_statements(&tree)?;
+
+        let mut out = String::new();
+        for node in statements {
+            let state = Self::state_of(node);
+            match Self::class_of(node) {
+                "Translate" | "TranslateSay" => {
+                    let identifier = Self::get_field_val(state, "identifier").and_then(PickleValue::as_str);
+                    let (Some(identifier), Some(language)) = (identifier, Self::language_of(state)) else {
+                        out.push_str(&format!("{}\n", Self::opaque_statement(node)));
+                        continue;
+                    };
+                    let statements = if Self::class_of(node) == "TranslateSay" {
+                        vec![(true, Self::say_code(state).unwrap_or_else(|| Self::opaque_statement(node)))]
+                    } else {
+                        Self::translate_statements(state)
+                    };
+                    out.push_str(&format!("translate {} {}:\n", language, identifier));
+                    let mut commented = false;
+                    for (is_say, statement) in &statements {
+                        if *is_say && !commented {
+                            commented = true;
+                            let source = originals.get(identifier).unwrap_or(statement);
+                            out.push_str(&format!("    # {}\n", source));
+                        }
+                        out.push_str(&format!("    {}\n", statement));
+                    }
+                    out.push('\n');
+                }
+                "EndTranslate" | "Return" => {}
+                "Init" => {
+                    let block = Self::get_field_val(state, "block").and_then(PickleValue::as_list);
+                    let mut language = None;
+                    let mut strings = String::new();
+                    for item in block.unwrap_or_default() {
+                        let item_state = Self::state_of(item);
+                        let pair = (
+                            Self::get_field_val(item_state, "old").and_then(PickleValue::as_str),
+                            Self::get_field_val(item_state, "new").and_then(PickleValue::as_str),
+                        );
+                        if let ("TranslateString", (Some(old), Some(new))) = (Self::class_of(item), pair) {
+                            language = language.or(Self::language_of(item_state));
+                            strings.push_str(&format!(
+                                "\n    old \"{}\"\n    new \"{}\"\n",
+                                RenpyParser::escape_renpy_string(old),
+                                RenpyParser::escape_renpy_string(new)
+                            ));
+                        } else {
+                            out.push_str(&format!("{}\n", Self::opaque_statement(item)));
+                        }
+                    }
+                    if let Some(language) = language {
+                        out.push_str(&format!("translate {} strings:\n{}\n", language, strings));
+                    }
+                }
+                _ => out.push_str(&format!("{}\n", Self::opaque_statement(node))),
+            }
+        }
+        Ok(out)
     }
 
     /// Рекурсивно извлекает AST узлы (Say, Label, Menu, Jump, Call) из дерева десериализации Pickle
@@ -527,10 +745,190 @@ impl RpycParser {
     }
 }
 
+/// Запись строки реплики, как `encode_say_string` в Ren'Py.
+fn encode_say_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    let mut previous = None;
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '"' => out.push_str("\\\""),
+            ' ' if previous == Some(' ') => out.push_str("\\ "),
+            _ => out.push(c),
+        }
+        previous = Some(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Вычисляет идентификаторы блоков, как `Restructurer` в Ren'Py: в `.rpyc` игры их нет,
+/// движок получает их при загрузке из меток и текста реплик.
+struct DialogueIdentifiers<'a> {
+    label: Option<String>,
+    alternate: Option<String>,
+    originals: &'a mut HashMap<String, String>,
+}
+
+impl<'a> DialogueIdentifiers<'a> {
+    fn new(originals: &'a mut HashMap<String, String>) -> Self {
+        Self {
+            label: None,
+            alternate: None,
+            originals,
+        }
+    }
+
+    fn unique(&self, label: Option<&str>, digest: &str) -> String {
+        let base = label.map_or(digest.to_string(), |label| {
+            format!("{}_{}", label.replace('.', "_"), digest)
+        });
+        let mut identifier = base.clone();
+        let mut suffix = 0;
+        while self.originals.contains_key(&identifier) {
+            suffix += 1;
+            identifier = format!("{}_{}", base, suffix);
+        }
+        identifier
+    }
+
+    fn finish_group(&mut self, group: &mut Vec<String>, explicit: Option<String>) {
+        let Some(code) = group.last().cloned() else {
+            return;
+        };
+        let mut context = md5::Context::new();
+        for statement in group.iter() {
+            context.consume(statement.as_bytes());
+            context.consume(b"\r\n");
+        }
+        let digest = format!("{:x}", context.compute());
+        let digest = &digest[..8];
+
+        let identifier = self.unique(self.label.as_deref(), digest);
+        self.originals.insert(identifier, code.clone());
+        if let Some(alternate) = self.alternate.clone() {
+            let identifier = self.unique(Some(&alternate), digest);
+            self.originals.insert(identifier, code.clone());
+        }
+        if let Some(explicit) = explicit {
+            self.originals.insert(explicit, code);
+        }
+        group.clear();
+    }
+
+    fn walk_nested(&mut self, node: &PickleValue) {
+        let state = RpycParser::state_of(node);
+        match RpycParser::class_of(node) {
+            "Label" | "Init" | "While" => {
+                if let Some(block) = RpycParser::get_field_val(state, "block").and_then(PickleValue::as_list) {
+                    self.walk(block);
+                }
+            }
+            class @ ("If" | "Menu") => {
+                let (field, position) = if class == "If" { ("entries", 1) } else { ("items", 2) };
+                let entries = RpycParser::get_field_val(state, field).and_then(PickleValue::as_list);
+                for entry in entries.unwrap_or_default() {
+                    let block = entry.as_tuple().and_then(|entry| entry.get(position));
+                    if let Some(block) = block.and_then(PickleValue::as_list) {
+                        self.walk(block);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk(&mut self, children: &[PickleValue]) {
+        let mut group = Vec::new();
+        for node in children {
+            let state = RpycParser::state_of(node);
+            let class = RpycParser::class_of(node);
+            if class == "Label"
+                && RpycParser::get_field_val(state, "hide") != Some(&PickleValue::Bool(true))
+                && let Some(name) = RpycParser::get_field_val(state, "name")
+                    .and_then(PickleValue::as_str)
+                    .or_else(|| RpycParser::get_field_val(state, "_name").and_then(PickleValue::as_str))
+            {
+                if name.starts_with('_') {
+                    self.alternate = Some(name.to_string());
+                } else {
+                    self.label = Some(name.to_string());
+                    self.alternate = None;
+                }
+            }
+            self.walk_nested(node);
+
+            let translatable = class == "UserStatement"
+                && RpycParser::get_field_val(state, "translatable") == Some(&PickleValue::Bool(true));
+            if class == "Say"
+                && let Some(code) = RpycParser::say_code(state)
+            {
+                group.push(code);
+                let explicit = RpycParser::get_field_val(state, "identifier")
+                    .and_then(PickleValue::as_str)
+                    .map(str::to_string);
+                self.finish_group(&mut group, explicit);
+            } else if translatable {
+                let line = RpycParser::get_field_val(state, "line").and_then(PickleValue::as_str);
+                group.extend(line.map(str::to_string));
+            } else {
+                self.finish_group(&mut group, None);
+            }
+        }
+        self.finish_group(&mut group, None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::GameParser;
+
+    fn node(class: &str, fields: Vec<(&str, PickleValue)>) -> PickleValue {
+        let dict = fields
+            .into_iter()
+            .map(|(name, value)| (PickleValue::String(name.to_string()), value))
+            .collect();
+        PickleValue::Object {
+            class_module: "renpy.ast".to_string(),
+            class_name: class.to_string(),
+            state: Some(Box::new(PickleValue::Tuple(vec![PickleValue::None, PickleValue::Dict(dict)]))),
+            args: Vec::new(),
+        }
+    }
+
+    fn say(who: &str, what: &str) -> PickleValue {
+        node(
+            "Say",
+            vec![
+                ("who", PickleValue::String(who.to_string())),
+                ("what", PickleValue::String(what.to_string())),
+                ("interact", PickleValue::Bool(true)),
+            ],
+        )
+    }
+
+    #[test]
+    fn computes_identifiers_like_the_engine() {
+        // md5("e \"Hello\"\r\n") = 3a1a6e58...
+        let digest = format!("{:x}", md5::compute("e \"Hello\"\r\n"));
+        let label = node(
+            "Label",
+            vec![
+                ("name", PickleValue::String("start.intro".to_string())),
+                ("block", PickleValue::List(vec![say("e", "Hello"), say("e", "Hello")])),
+            ],
+        );
+        let mut originals = HashMap::new();
+        DialogueIdentifiers::new(&mut originals).walk(&[label]);
+
+        let first = format!("start_intro_{}", &digest[..8]);
+        assert_eq!(originals[&first], "e \"Hello\"");
+        assert_eq!(originals[&format!("{first}_1")], "e \"Hello\"");
+        assert_eq!(encode_say_string("a  b\n\"c\"\\"), "\"a \\ b\\n\\\"c\\\"\\\\\"");
+    }
 
     #[test]
     fn test_decompiled_text_keeps_line_breaks_and_backslashes() {

@@ -613,6 +613,7 @@ mod tests {
     use super::*;
     use crate::pickle::PickleDecoder;
     use crate::rpyc::RpycParser;
+    use std::collections::HashMap;
 
     const FORMATS: [AstLayout; 3] = [
         AstLayout::Python2,
@@ -781,6 +782,47 @@ mod tests {
     }
 
     #[test]
+    fn restores_translation_blocks_from_compiled_scripts() {
+        let source = concat!(
+            "translate russian a_1:\n",
+            "    gen happy @ cheeks \"Да,  \\\"так\\\"\" (\"base\", xpos=\"far_left\") nointeract with fade\n",
+            "translate russian a_2:\n",
+            "    \"Автор\"\n",
+            "translate russian a_3:\n",
+            "    pass\n",
+            "translate russian strings:\n",
+            "    old \"Start\"\n",
+            "    new \"Начать\"\n",
+        );
+        let originals = HashMap::from([("a_1".to_string(), "gen \"Yes\"".to_string())]);
+        for layout in FORMATS {
+            let compiled = compile(layout, source).unwrap();
+            let text = RpycParser::decompile_translation(&compiled, &originals).unwrap();
+            for expected in [
+                "translate russian a_1:\n    # gen \"Yes\"\n",
+                "    gen happy @ cheeks \"Да, \\\"так\\\"\" nointeract (\"base\", xpos=\"far_left\") with fade\n",
+                "translate russian a_2:\n    # \"Автор\"\n    \"Автор\"\n",
+                "translate russian a_3:\n    pass\n",
+                "translate russian strings:\n\n    old \"Start\"\n    new \"Начать\"\n",
+            ] {
+                assert!(text.contains(expected), "{layout:?}: {expected} in {text}");
+            }
+
+            let again = compile(layout, &text).unwrap();
+            let restored = RpycParser::decompile_translation(&again, &originals).unwrap();
+            assert_eq!(restored, text, "{layout:?}");
+        }
+    }
+
+    #[test]
+    fn marks_statements_it_cannot_restore() {
+        let compiled = compile(AstLayout::Python3, "init python:\n    x = 1\n").unwrap();
+        let text = RpycParser::decompile_translation(&compiled, &HashMap::new()).unwrap();
+        assert!(text.contains("<Python>"), "{text}");
+        assert!(compile(AstLayout::Python3, &text).is_err());
+    }
+
+    #[test]
     #[ignore = "Требуются локальные тестовые файлы игры"]
     fn compiles_real_translation_folder() {
         let Some(dir) = crate::local_test_game(crate::TEST_TL_DIR) else {
@@ -796,6 +838,57 @@ mod tests {
             println!("{failure}");
         }
         assert!(failures.is_empty(), "не собрано {} из {}", failures.len(), files.len());
+    }
+
+    /// Восстанавливает запакованный перевод игры и собирает его заново.
+    #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
+    fn recompiles_packed_translation() {
+        let Some(game) = crate::local_test_game(crate::TEST_PACKED_TL_GAME) else {
+            return;
+        };
+        let game = Path::new(&game);
+        let cache = std::env::temp_dir().join(format!("translator_packed_{}", uuid::Uuid::new_v4()));
+        crate::rpa::RpaArchive::extract_scripts_from_game_archives(game, &cache).unwrap();
+
+        let mut files = Vec::new();
+        crate::collect_rpy_files(&cache.join("tl").join(crate::TL_LANG), &mut files);
+        let format = ScriptFormat::detect(game).unwrap();
+        let mut failures = std::collections::BTreeMap::new();
+        let (mut blocks, mut with_original) = (0, 0);
+        let mut samples = Vec::new();
+        for file in &files {
+            let text = fs::read_to_string(file).unwrap();
+            blocks += text.matches("    # ").count();
+            with_original += text
+                .lines()
+                .filter(|line| line.trim_start().starts_with("# "))
+                .filter(|line| !crate::parser::renpy::RenpyParser::has_cyrillic(line))
+                .count();
+            for (index, line) in text.lines().enumerate() {
+                let is_russian_comment = line.trim_start().starts_with("# ")
+                    && crate::parser::renpy::RenpyParser::has_cyrillic(line);
+                if is_russian_comment && samples.len() < 3 {
+                    samples.push((index, line.to_string()));
+                }
+            }
+            if let Err(error) = compile_script(format, "russian", "file.rpy", &text) {
+                let kind = error.split('«').nth(1).unwrap_or(&error).split(' ').next().unwrap_or("").to_string();
+                *failures.entry(kind).or_insert(0) += 1;
+            }
+        }
+        let packed = crate::rpa::RpaArchive::packed_translation_files(game).unwrap();
+        println!(
+            "файлов {}, реплик {}, с оригиналом {}, файлов архива {}, не собрано {:?}\nбез оригинала: {:?}",
+            files.len(),
+            blocks,
+            with_original,
+            packed.len(),
+            failures,
+            samples
+        );
+        let _ = fs::remove_dir_all(&cache);
+        assert!(!files.is_empty());
     }
 
     /// Пишет архивы для проверки настоящим движком: `TRANSLATOR_RPYC_PROBE_DIR=<папка>`

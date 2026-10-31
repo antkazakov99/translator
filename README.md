@@ -14,6 +14,10 @@ version of the game, without running the game. Edits of `tl/russian` files are a
 compiled copies, and edits of other scripts become string translations. If the game has no
 action for this language, the archive also enables it at launch.
 
+A translation packed into the game's `.rpa` archives can be the starting point too: the app
+restores its `translate` blocks, matches them to the original lines, and the exported mod carries
+the whole translation with its images and fonts, so it works in a copy of the game without it.
+
 Ren'Py reads files on disk before archives, so a `tl/russian` folder on disk wins over the mod.
 To use the mod in such a game, remove that folder first.
 

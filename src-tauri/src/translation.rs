@@ -285,7 +285,11 @@ fn saved_sources(game_dir: &Path) -> Result<Vec<SavedSource>, String> {
 /// Готовит файлы мода: правки файлов `tl/<язык>` подставляются в их копии, а правки
 /// остальных скриптов становятся строковыми переводами, потому что идентификаторы
 /// блоков `translate` вычисляет сам Ren'Py. Строковый перевод действует и на диалоги.
-pub fn prepare_mod_export(game_dir: &Path, tl_dir: &Path) -> Result<ModExport, String> {
+pub fn prepare_mod_export(
+    game_dir: &Path,
+    tl_dir: &Path,
+    has_packed_translation: bool,
+) -> Result<ModExport, String> {
     // Файлы, которые ещё не открывались, тоже могут хранить ключи старого формата
     for saved in saved_sources(game_dir)? {
         if saved.source.is_file() && saved.entries.keys().any(|key| needs_migration(key)) {
@@ -315,7 +319,8 @@ pub fn prepare_mod_export(game_dir: &Path, tl_dir: &Path) -> Result<ModExport, S
     }
 
     // Список языков в настройках задаёт экран игры, мод добавить в него пункт не может
-    if (tl_dir.exists() || !export.files.is_empty()) && !game_offers_language(game_dir) {
+    let has_translation = tl_dir.exists() || has_packed_translation || !export.files.is_empty();
+    if has_translation && !game_offers_language(game_dir) {
         export.files.insert(
             LANGUAGE_FILE.to_string(),
             format!("init python:\n    config.language = \"{}\"\n", TL_LANG).into_bytes(),
@@ -349,8 +354,10 @@ fn has_current_compilation(source: &Path) -> bool {
 /// Файлы архива мода. Ren'Py загружает из `.rpa` только скомпилированные скрипты,
 /// поэтому `.rpy` компилируются, а готовые `.rpyc` без изменений берутся как есть.
 /// Файлы `generated` заменяют одноимённые файлы `tl_dir` или добавляются к ним.
+/// `packed` содержит перевод из архивов игры: файлы с диска приоритетнее, как и в движке.
 pub fn mod_archive_files(
     tl_dir: &Path,
+    packed: HashMap<String, Vec<u8>>,
     generated: HashMap<String, Vec<u8>>,
     format: ScriptFormat,
 ) -> Result<Vec<(String, Vec<u8>)>, String> {
@@ -390,6 +397,17 @@ pub fn mod_archive_files(
                     .map_err(|e| format!("Не удалось прочитать файл мода {:?}: {}", path, e))?;
                 files.push((name.clone(), data));
             }
+        }
+    }
+    let script_base = |name: &str| name.strip_suffix(".rpyc").map(str::to_string);
+    let on_disk: HashSet<String> = collected
+        .iter()
+        .map(|(name, _)| name.strip_suffix(".rpy").map_or(name.clone(), |base| format!("{}.rpyc", base)))
+        .collect();
+    for (name, data) in packed {
+        let replaced = script_base(&name).is_some_and(|base| generated.contains_key(&format!("{}.rpy", base)));
+        if !replaced && !on_disk.contains(&name) && !generated.contains_key(&name) {
+            files.push((name, data));
         }
     }
     for (name, data) in &generated {
