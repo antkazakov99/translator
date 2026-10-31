@@ -14,6 +14,10 @@ version of the game, without running the game. Edits of `tl/russian` files are a
 compiled copies, and edits of other scripts become string translations. If the game has no
 action for this language, the archive also enables it at launch.
 
-The compiler covers string translations, `translate` blocks with dialogue, its `nointeract` and
-`with` clauses, and `init python`.
-Other statements, such as `voice`, stop the build unless the game already compiled that file.
+Ren'Py reads files on disk before archives, so a `tl/russian` folder on disk wins over the mod.
+To use the mod in such a game, remove that folder first.
+
+The compiler covers string translations, `translate` blocks with dialogue, its arguments,
+temporary `@` attributes, `nointeract` and `with` clauses, and `init python`.
+Other statements, such as `voice` or `*` unpacking in arguments, stop the build unless the game
+already compiled that file.

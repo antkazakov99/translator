@@ -150,24 +150,28 @@ impl NodeBuilder {
             ("what", text(say.what)),
             ("with_", say.with_.map_or(PickleValue::None, text)),
         ];
-        let attributes = if say.attributes.is_empty() {
-            PickleValue::None
-        } else {
-            PickleValue::Tuple(say.attributes.into_iter().map(text).collect())
-        };
+        let attributes = attribute_names(say.attributes);
+        let temporary_attributes = attribute_names(say.temporary_attributes);
+        let arguments = say.arguments.map_or(PickleValue::None, argument_info);
         if self.format.layout == AstLayout::CompactNames {
             if !say.interact {
                 fields.push(("interact", PickleValue::Bool(false)));
             }
-            if attributes != PickleValue::None {
-                fields.push(("attributes", attributes));
+            for (name, value) in [
+                ("attributes", attributes),
+                ("arguments", arguments),
+                ("temporary_attributes", temporary_attributes),
+            ] {
+                if value != PickleValue::None {
+                    fields.push((name, value));
+                }
             }
         } else {
             fields.extend([
                 ("interact", PickleValue::Bool(say.interact)),
                 ("attributes", attributes),
-                ("arguments", PickleValue::None),
-                ("temporary_attributes", PickleValue::None),
+                ("arguments", arguments),
+                ("temporary_attributes", temporary_attributes),
                 ("rollback", text("normal")),
             ]);
         }
@@ -241,13 +245,46 @@ fn object(class: &str, state: Option<PickleValue>) -> PickleValue {
     }
 }
 
+fn attribute_names(attributes: Vec<String>) -> PickleValue {
+    if attributes.is_empty() {
+        PickleValue::None
+    } else {
+        PickleValue::Tuple(attributes.into_iter().map(text).collect())
+    }
+}
+
+/// `ArgumentInfo`: класс виден из `renpy.ast` во всех версиях. Поля `extrapos` и
+/// `extrakw` нужны старым движкам, новые их не используют.
+fn argument_info(arguments: Vec<SayArgument>) -> PickleValue {
+    let arguments = arguments
+        .into_iter()
+        .map(|(name, expression)| {
+            PickleValue::Tuple(vec![name.map_or(PickleValue::None, text), text(expression)])
+        })
+        .collect();
+    object(
+        "ArgumentInfo",
+        Some(dict(vec![
+            ("arguments", PickleValue::List(arguments)),
+            ("extrapos", PickleValue::None),
+            ("extrakw", PickleValue::None),
+            ("__version__", PickleValue::Int(1)),
+        ])),
+    )
+}
+
+/// Аргумент реплики: необязательное имя и выражение.
+type SayArgument = (Option<String>, String);
+
 struct SayStatement {
     who: Option<String>,
     who_fast: bool,
     attributes: Vec<String>,
+    temporary_attributes: Vec<String>,
     what: String,
     with_: Option<String>,
     interact: bool,
+    arguments: Option<Vec<SayArgument>>,
 }
 
 fn unsupported(name: &str, line: usize, text: &str) -> String {
@@ -266,8 +303,15 @@ fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
     (!rest.starts_with(is_name_char)).then_some(rest)
 }
 
-/// Отделяет простое выражение после `with`: оно кончается на пробеле вне скобок и строк.
-fn split_simple_expression(text: &str) -> Option<(&str, &str)> {
+fn is_name(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Ищет конец выражения: первый подходящий символ вне строк и скобок либо конец текста.
+/// `None` значит, что строка или скобка в тексте не закрыта.
+fn expression_end(text: &str, is_end: impl Fn(char) -> bool) -> Option<usize> {
     let mut depth = 0usize;
     let mut quote = None;
     let mut escaped = false;
@@ -282,27 +326,72 @@ fn split_simple_expression(text: &str) -> Option<(&str, &str)> {
             continue;
         }
         match c {
+            _ if depth == 0 && is_end(c) => return Some(index),
             '"' | '\'' | '`' => quote = Some(c),
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.checked_sub(1)?,
-            '#' if depth == 0 => return Some(text.split_at(index)),
-            c if c.is_whitespace() && depth == 0 => return Some(text.split_at(index)),
             _ => {}
         }
     }
-    (depth == 0 && quote.is_none()).then_some((text, ""))
+    (depth == 0 && quote.is_none()).then_some(text.len())
 }
 
-/// Разбирает реплику. Аргументы, `id` и `@` меняют её показ и не поддерживаются.
+/// Отделяет простое выражение после `with`: оно кончается на пробеле или комментарии.
+fn split_simple_expression(text: &str) -> Option<(&str, &str)> {
+    let end = expression_end(text, |c| c == '#' || c.is_whitespace())?;
+    Some(text.split_at(end))
+}
+
+/// Разбирает аргументы реплики после `(` с теми же запретами, что и `parse_arguments`
+/// в Ren'Py. Возвращает их и текст после `)`. Распаковка `*` и `**` не поддерживается:
+/// разные версии движка хранят её по-разному.
+fn parse_arguments(text: &str) -> Option<(Vec<SayArgument>, &str)> {
+    let mut arguments: Vec<SayArgument> = Vec::new();
+    let mut rest = text.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix(')') {
+            return Some((arguments, after));
+        }
+        if rest.starts_with('*') {
+            return None;
+        }
+
+        let (argument, after) = rest.split_at(expression_end(rest, |c| c == ',' || c == ')')?);
+        let keyword = argument
+            .split_once('=')
+            .map(|(name, value)| (name.trim(), value))
+            .filter(|(name, value)| is_name(name) && !value.starts_with('='));
+        let (name, expression) = keyword.map_or((None, argument), |(name, value)| (Some(name), value));
+        let expression = expression.trim();
+        let repeated = arguments.iter().any(|(other, _)| other.as_deref() == name);
+        let after_keyword = name.is_none() && arguments.iter().any(|(other, _)| other.is_some());
+        if expression.is_empty() || (name.is_some() && repeated) || after_keyword {
+            return None;
+        }
+        arguments.push((name.map(str::to_string), expression.to_string()));
+
+        rest = match after.strip_prefix(',') {
+            Some(next) => next.trim_start(),
+            None if after.starts_with(')') => after,
+            None => return None,
+        };
+    }
+}
+
+/// Разбирает реплику. Атрибуты после `@` действуют только на время этой реплики.
 fn parse_say(name: &str, line_number: usize, line: &str) -> Result<SayStatement, String> {
     let fail = || unsupported(name, line_number, line);
     let say = RenpyParser::say_statement(line).ok_or_else(fail)?;
-    if say.attributes.iter().any(|a| a == "@") {
+    let mut attribute_groups = say.attributes.split(|attribute| attribute == "@");
+    let attributes = attribute_groups.next().unwrap_or_default().to_vec();
+    let temporary_attributes = attribute_groups.next().unwrap_or_default().to_vec();
+    if attribute_groups.next().is_some() {
         return Err(fail());
     }
 
     let mut with_ = None;
     let mut interact = true;
+    let mut arguments = None;
     let mut tail = say.rest.trim();
     while !tail.is_empty() && !tail.starts_with('#') {
         if let Some(rest) = strip_keyword(tail, "nointeract") {
@@ -316,6 +405,12 @@ fn parse_say(name: &str, line_number: usize, line: &str) -> Result<SayStatement,
                 return Err(fail());
             }
             with_ = Some(expression.to_string());
+            tail = rest.trim_start();
+        } else if let Some(rest) = tail.strip_prefix('(')
+            && arguments.is_none()
+        {
+            let (parsed, rest) = parse_arguments(rest).ok_or_else(fail)?;
+            arguments = Some(parsed);
             tail = rest.trim_start();
         } else {
             return Err(fail());
@@ -333,10 +428,12 @@ fn parse_say(name: &str, line_number: usize, line: &str) -> Result<SayStatement,
     Ok(SayStatement {
         who,
         who_fast,
-        attributes: say.attributes,
+        attributes,
+        temporary_attributes,
         what: RenpyParser::unescape_renpy_string(&say.text),
         with_,
         interact,
+        arguments,
     })
 }
 
@@ -623,19 +720,57 @@ mod tests {
         // В новых версиях поле `with_` не имеет значения по умолчанию
         let compact = decoded(&compile(AstLayout::CompactNames, "translate russian a_1:\n    e \"Hi\"\n").unwrap());
         assert!(compact.contains("with_"), "{compact}");
+        assert!(!compact.contains("arguments"), "{compact}");
+    }
+
+    #[test]
+    fn keeps_arguments_and_temporary_attributes_on_dialogue() {
+        let source = concat!(
+            "translate russian a_1:\n",
+            "    gen \"(Да, *а*?)\" (\"base\", xpos=\"far (left\", ypos=\"head\") # комментарий\n",
+            "    her happy @ cheeks -blush \"Привет\" (size == 2, f(1, 2)) with fade\n",
+            "    \"Автор\" () nointeract\n",
+        );
+        for layout in FORMATS {
+            let text = decoded(&compile(layout, source).unwrap());
+            for expected in [
+                "ArgumentInfo",
+                "\"\\\"base\\\"\"",
+                "\"xpos\"",
+                "\"\\\"far (left\\\"\"",
+                "\"size == 2\"",
+                "\"f(1, 2)\"",
+                "\"temporary_attributes\"",
+                "\"cheeks\"",
+                "\"-blush\"",
+                "\"happy\"",
+                "\"fade\"",
+                "(Да, *а*?)",
+            ] {
+                assert!(text.contains(expected), "{layout:?}: {expected} in {text}");
+            }
+            assert!(!text.contains("комментарий"), "{layout:?}: {text}");
+            assert!(!text.contains("\"@\""), "{layout:?}: {text}");
+        }
     }
 
     #[test]
     fn rejects_statements_it_cannot_compile() {
         for (source, line) in [
             ("translate russian a_1:\n    voice \"a.ogg\"\n", 2),
-            ("translate russian a_1:\n    e \"Hi\" (multiple=2)\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" (*args)\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" (**kwargs)\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" (\"a\"\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" (a=1, \"b\")\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" (a=1, a=2)\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" (a) (b)\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" (,)\n", 2),
+            ("translate russian a_1:\n    e @ a @ b \"Hi\"\n", 2),
             ("translate russian a_1:\n    e \"Hi\" id custom\n", 2),
             ("translate russian a_1:\n    e \"Hi\" with\n", 2),
             ("translate russian a_1:\n    e \"Hi\" with fade with dissolve\n", 2),
             ("translate russian a_1:\n    e \"Hi\" with Fade(1\n", 2),
             ("translate russian a_1:\n    e \"Hi\" nointeractive\n", 2),
-            ("translate russian a_1:\n    e @ happy \"Hi\"\n", 2),
             ("translate russian python:\n    x = 1\n", 1),
             ("translate russian strings:\n    old \"a\"\n", 2),
             ("# ok\nlabel start:\n", 2),
@@ -690,6 +825,8 @@ mod tests {
                     "    \"Stranger\" \"Кто там?\"\n",
                     "translate russian start_abcd1235:\n",
                     "    pass\n",
+                    "translate russian line_a:\n",
+                    "    e happy @ cheeks \"Блок мода\" (\"base\", xpos=\"far_left\", size=1 + 1)\n",
                 ),
             ),
         ];
