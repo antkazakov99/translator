@@ -31,6 +31,7 @@ pub struct RpycStatement {
 pub struct RpycParser;
 
 const MAX_RPYC_BYTES: u64 = 128 * 1024 * 1024;
+const TREE_WALK_STACK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AST_BYTES: usize = 256 * 1024 * 1024;
 
 impl RpycParser {
@@ -128,14 +129,25 @@ impl RpycParser {
 
     /// Декомпилирует/парсит байты .rpyc из памяти и извлекает диалоговые инструкции
     pub fn parse_rpyc_bytes(data: &[u8]) -> Result<Vec<RpycStatement>, String> {
-        let root_val = Self::load_tree(data)?;
+        Self::statements_of(&Self::load_tree(data)?)
+    }
 
-        let mut statements = Vec::new();
-        let mut current_scene = "Общие диалоги".to_string();
-
-        Self::extract_statements_from_pickle(&root_val, &mut current_scene, &mut statements);
-
-        Ok(statements)
+    /// Обход рекурсивный, а один его шаг в отладочной сборке занимает много килобайт стека.
+    /// Отдельный поток даёт запас на всю глубину, допустимую при разборе pickle.
+    pub(crate) fn statements_of(tree: &PickleValue) -> Result<Vec<RpycStatement>, String> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(TREE_WALK_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    let mut statements = Vec::new();
+                    let mut current_scene = "Общие диалоги".to_string();
+                    Self::extract_statements_from_pickle(tree, &mut current_scene, &mut statements);
+                    statements
+                })
+                .map_err(|e| format!("Не удалось запустить разбор .rpyc: {}", e))?
+                .join()
+                .map_err(|_| "Разбор .rpyc завершился с ошибкой".to_string())
+        })
     }
 
     fn load_tree(data: &[u8]) -> Result<PickleValue, String> {
@@ -577,6 +589,43 @@ impl RpycParser {
                             });
                         }
                     }
+                    "UserStatement" => {
+                        let line = Self::get_field_val(state.as_deref(), "line")
+                            .and_then(PickleValue::as_str)
+                            .filter(|line| line.starts_with("call screen ") || line.starts_with("show screen "));
+                        if let Some(line) = line {
+                            stmts.push(RpycStatement {
+                                kind: "statement".to_string(),
+                                scene_name: current_scene.clone(),
+                                speaker: None,
+                                text: line.to_string(),
+                                line_number: Self::get_field_int(state.as_deref(), args, "linenumber")
+                                    .unwrap_or(0),
+                                target: None,
+                            });
+                        }
+                    }
+                    "Screen" => {
+                        // Нужны только связи экрана: его разметка на разбор сцен не влияет
+                        let screen = Self::get_field_val(state.as_deref(), "screen")
+                            .map(Self::state_of);
+                        let name = screen.flatten().and_then(|screen| {
+                            Self::get_field_val(Some(screen), "name").and_then(PickleValue::as_str)
+                        });
+                        if let Some(name) = name {
+                            let mut links = Vec::new();
+                            Self::collect_screen_links(val, &mut links);
+                            stmts.push(RpycStatement {
+                                kind: "screen".to_string(),
+                                scene_name: name.to_string(),
+                                speaker: None,
+                                text: links.join("\n"),
+                                line_number: Self::get_field_int(state.as_deref(), args, "linenumber")
+                                    .unwrap_or(0),
+                                target: None,
+                            });
+                        }
+                    }
                     "Python" | "EarlyPython" => {
                         let code_val = Self::get_field_val(state.as_deref(), "code");
                         let py_source = code_val
@@ -613,6 +662,45 @@ impl RpycParser {
             PickleValue::Dict(entries) => {
                 for (_, v) in entries {
                     Self::extract_statements_from_pickle(v, current_scene, stmts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Собирает из узлов экрана строки с действиями кнопок и вложенные экраны.
+    /// Узлы экранов различаются между версиями Ren'Py, поэтому обход не зависит от их полей.
+    fn collect_screen_links(val: &PickleValue, links: &mut Vec<String>) {
+        match val {
+            PickleValue::String(text) => {
+                if text.contains("Jump(") || text.contains("Call(") || text.contains("Show(") || text.contains("ToggleScreen(") {
+                    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !links.contains(&line) {
+                        links.push(line);
+                    }
+                }
+            }
+            PickleValue::List(items) | PickleValue::Tuple(items) | PickleValue::Set(items) => {
+                for item in items {
+                    Self::collect_screen_links(item, links);
+                }
+            }
+            PickleValue::Dict(entries) => {
+                for (_, value) in entries {
+                    Self::collect_screen_links(value, links);
+                }
+            }
+            PickleValue::Object { class_name, state, args, .. } => {
+                if class_name == "SLUse"
+                    && let Some(target) = Self::get_field_val(state.as_deref(), "target").and_then(PickleValue::as_str)
+                {
+                    links.push(format!("use {}", target));
+                }
+                if let Some(state) = state {
+                    Self::collect_screen_links(state, links);
+                }
+                for arg in args {
+                    Self::collect_screen_links(arg, links);
                 }
             }
             _ => {}
@@ -768,6 +856,15 @@ impl RpycParser {
                 "call" => {
                     if let Some(ref target) = stmt.target {
                         out.push_str(&format!("{}call {}\n", indent, target));
+                    }
+                }
+                "statement" => {
+                    out.push_str(&format!("{}{}\n", indent, stmt.text));
+                }
+                "screen" => {
+                    out.push_str(&format!("{}screen {}:\n", top, stmt.scene_name));
+                    for line in stmt.text.lines() {
+                        out.push_str(&format!("{}    {}\n", top, line));
                     }
                 }
                 "define" => {
@@ -1043,6 +1140,56 @@ mod tests {
         let graph = RenpyParser::new().parse_file(Path::new("story.rpy"), &script).unwrap();
         let lines: Vec<_> = graph.dialogues().map(|line| line.original_text.as_str()).collect();
         assert_eq!(lines, ["Caption", "First", "Inner", "Second", "Inside"]);
+    }
+
+    #[test]
+    fn test_decompiled_screen_keeps_its_links() {
+        let object = |class: &str, fields: Vec<(&str, PickleValue)>| PickleValue::Object {
+            class_module: "renpy".to_string(),
+            class_name: class.to_string(),
+            state: Some(Box::new(PickleValue::Dict(
+                fields
+                    .into_iter()
+                    .map(|(key, value)| (PickleValue::String(key.to_string()), value))
+                    .collect(),
+            ))),
+            args: Vec::new(),
+        };
+        let text = |value: &str| PickleValue::String(value.to_string());
+        let button = object(
+            "SLDisplayable",
+            vec![(
+                "keyword",
+                PickleValue::List(vec![PickleValue::Tuple(vec![
+                    text("action"),
+                    text("[Hide(\"menu\"), Jump(\"beach\")]"),
+                ])]),
+            )],
+        );
+        let screen = object(
+            "SLScreen",
+            vec![
+                ("name", text("map")),
+                (
+                    "children",
+                    PickleValue::List(vec![button, object("SLUse", vec![("target", text("clock"))])]),
+                ),
+            ],
+        );
+        let tree = PickleValue::List(vec![
+            object("Screen", vec![("screen", screen)]),
+            object("Label", vec![("name", text("start"))]),
+            object("UserStatement", vec![("line", text("call screen map"))]),
+        ]);
+
+        let mut statements = Vec::new();
+        RpycParser::extract_statements_from_pickle(&tree, &mut String::new(), &mut statements);
+        let structure =
+            RenpyParser::parse_script_structure(&RpycParser::decompile_to_rpy_text(&statements));
+
+        assert_eq!(structure.screens["map"].targets, ["beach"]);
+        assert_eq!(structure.screens["map"].screens, ["clock"]);
+        assert_eq!(structure.shown_screens, [("start".to_string(), "map".to_string())]);
     }
 
     #[test]

@@ -11,6 +11,7 @@
     type GraphEdge,
     type GraphNode,
   } from './scene-graph';
+  import { progressLabel } from './progress';
 
   let {
     scenes,
@@ -492,9 +493,6 @@
           {@const isCenter = node.role === 'center' || node.scene?.id === selected?.id}
           {@const isExternal = !node.scene}
           {@const isThisNodeBusy = isExternal && busy && ((busyTarget != null && busyTarget === node.name) || localBusyTarget === node.name)}
-          {@const pct = node.scene && node.scene.total_lines > 0
-            ? Math.round((node.scene.translated_lines / node.scene.total_lines) * 100)
-            : 0}
           <div
             id={node.scene ? `scene-node-${node.scene.id}` : `scene-node-${node.name}`}
             class="node"
@@ -551,7 +549,7 @@
               <div class="node-footer">
                 {#if node.scene.total_lines > 0}
                   <span class="node-stats">
-                    {node.scene.translated_lines}/{node.scene.total_lines} строк ({pct}%)
+                    {node.scene.translated_lines}/{node.scene.total_lines} строк ({progressLabel(node.scene.translated_lines, node.scene.total_lines)})
                   </span>
                   <div class="node-footer-btns">
                     {#if onviewcode}

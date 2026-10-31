@@ -4,6 +4,7 @@
   import SceneNodeIcon from "../lib/SceneNodeIcon.svelte";
   import SourceViewerModal from "../lib/SourceViewerModal.svelte";
   import GlossaryAiModal from "../lib/GlossaryAiModal.svelte";
+  import { progressLabel, progressPercent } from "../lib/progress";
   import { invoke, isTauri } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -980,27 +981,21 @@
   );
 
   let activeSceneStats = $derived.by(() => {
-    if (!currentFile) return { total: 0, trans: 0, pct: 0 };
+    if (!currentFile) return { total: 0, trans: 0, pct: 0, label: "0%" };
+    let total = 0;
+    let trans = 0;
     if (selectedSceneId === 'all') {
-      const total = currentFile.total_lines || 0;
-      const trans = currentFile.scenes.reduce((acc, s) => acc + s.translated_lines, 0);
-      const pct = total > 0 ? Math.round((trans / total) * 100) : 0;
-      return { total, trans, pct };
+      total = currentFile.total_lines || 0;
+      trans = currentFile.scenes.reduce((acc, s) => acc + s.translated_lines, 0);
+    } else if (currentScene) {
+      total = currentScene.total_lines || currentScene.entries.length;
+      trans = currentScene.translated_lines;
     }
-    if (currentScene) {
-      const total = currentScene.total_lines || currentScene.entries.length;
-      const trans = currentScene.translated_lines;
-      const pct = total > 0 ? Math.round((trans / total) * 100) : 0;
-      return { total, trans, pct };
-    }
-    return { total: 0, trans: 0, pct: 0 };
+    return { total, trans, pct: progressPercent(trans, total), label: progressLabel(trans, total) };
   });
 
-  let totalPercent = $derived(
-    project && project.total_lines > 0
-      ? Math.round((project.total_translated / project.total_lines) * 100)
-      : 0
-  );
+  let totalPercent = $derived(project ? progressPercent(project.total_translated, project.total_lines) : 0);
+  let totalLabel = $derived(project ? progressLabel(project.total_translated, project.total_lines) : "0%");
 
   function updateTranslationStats() {
     if (!currentFile) return;
@@ -1606,10 +1601,10 @@
             <div class="progress-track skeleton-shimmer"></div>
           </div>
         {:else if project}
-          <div class="global-stats" title="Прогресс перевода: {project.total_translated} / {project.total_lines} ({totalPercent}%)">
+          <div class="global-stats" title="Прогресс перевода: {project.total_translated} / {project.total_lines} ({totalLabel})">
             <div class="stat-text">
               <span class="stat-num">{project.total_translated} / {project.total_lines}</span>
-              <span class="stat-pct">({totalPercent}%)</span>
+              <span class="stat-pct">({totalLabel})</span>
             </div>
             <div class="progress-track">
               <div class="progress-fill" style="width: {totalPercent}%"></div>
@@ -1784,7 +1779,7 @@
         {#snippet renderTreeNode(node: FileTreeNode)}
           {#if node.isFolder}
             {@const isExp = isFolderExpanded(node.path) || fileSearchFilter.trim() !== ''}
-            {@const pct = node.totalLines > 0 ? Math.round((node.translatedLines / node.totalLines) * 100) : 0}
+            {@const pct = progressPercent(node.translatedLines, node.totalLines)}
             <div class="tree-node-group">
               <button 
                 class="tree-row tree-folder-row"
@@ -1810,7 +1805,7 @@
                 <div class="tree-meta">
                   <span class="tree-count">{node.children.length}</span>
                   {#if node.totalLines > 0}
-                    <span class="tree-pct-badge" class:pct-complete={pct === 100}>{pct}%</span>
+                    <span class="tree-pct-badge" class:pct-complete={pct === 100}>{progressLabel(node.translatedLines, node.totalLines)}</span>
                   {/if}
                 </div>
               </button>
@@ -1825,14 +1820,15 @@
             </div>
           {:else if node.file}
             {@const f = node.file}
-            {@const pct = f.total_lines > 0 ? Math.round((f.translated_lines / f.total_lines) * 100) : 0}
+            {@const pct = progressPercent(f.translated_lines, f.total_lines)}
+            {@const pctLabel = progressLabel(f.translated_lines, f.total_lines)}
             {@const isSel = selectedFile?.path === f.path}
             <button 
               id={`sidebar-file-${encodeURIComponent(f.path).replace(/%/g, '_')}`}
               class="tree-row tree-file-row"
               class:active={isSel}
               onclick={() => selectFile(f)}
-              title="{f.name} • {f.translated_lines}/{f.total_lines} переведено ({pct}%) • {f.size_kb.toFixed(0)} KB"
+              title="{f.name} • {f.translated_lines}/{f.total_lines} переведено ({pctLabel}) • {f.size_kb.toFixed(0)} KB"
             >
               <span class="tree-caret-spacer"></span>
               <span class="tree-icon">
@@ -1854,7 +1850,7 @@
                 {#if pct === 100}
                   <span class="tree-pct-badge pct-complete">100%</span>
                 {:else if pct > 0}
-                  <span class="tree-pct-badge pct-progress">{pct}%</span>
+                  <span class="tree-pct-badge pct-progress">{pctLabel}</span>
                 {/if}
               </div>
 
@@ -2049,14 +2045,14 @@
                 </div>
               {:else}
                 {#each filteredScenes as scene, idx}
-                  {@const pct = scene.total_lines > 0 ? Math.round((scene.translated_lines / scene.total_lines) * 100) : 0}
+                  {@const pctLabel = progressLabel(scene.translated_lines, scene.total_lines)}
                   {@const isSelected = selectedSceneId === scene.id || (viewMode === 'scenes' && focusedSceneName === scene.name)}
                   <button 
                     type="button"
                     class="scene-sidebar-item" 
                     class:active={isSelected}
                     onclick={() => selectScene(scene)}
-                    title="{scene.name} • {scene.translated_lines}/{scene.total_lines} строк ({pct}%)"
+                    title="{scene.name} • {scene.translated_lines}/{scene.total_lines} строк ({pctLabel})"
                   >
                     <div class="scene-sidebar-item-left">
                       <span class="scene-sidebar-seq">#{idx + 1}</span>
@@ -2069,7 +2065,7 @@
                           <Zap size={10} />
                         </span>
                       {/if}
-                      <span class="scene-sidebar-pct" class:pct-done={pct === 100}>{pct}%</span>
+                      <span class="scene-sidebar-pct" class:pct-done={pctLabel === "100%"}>{pctLabel}</span>
                     </div>
                   </button>
                 {/each}
@@ -2159,8 +2155,8 @@
                   <div class="subtoolbar-divider"></div>
 
                   <div class="table-subtoolbar-progress">
-                    <span class="scene-trans-stat">{activeSceneStats.trans}/{activeSceneStats.total} переведено ({activeSceneStats.pct}%)</span>
-                    <div class="scene-mini-track" title="Переведено {activeSceneStats.pct}% ({activeSceneStats.trans} из {activeSceneStats.total})">
+                    <span class="scene-trans-stat">{activeSceneStats.trans}/{activeSceneStats.total} переведено ({activeSceneStats.label})</span>
+                    <div class="scene-mini-track" title="Переведено {activeSceneStats.label} ({activeSceneStats.trans} из {activeSceneStats.total})">
                       <div class="scene-mini-fill" style="width: {activeSceneStats.pct}%"></div>
                     </div>
                   </div>
@@ -4870,6 +4866,8 @@
 
   .tree-micro-fill {
     height: 100%;
+    /* Одна строка большого файла тоже должна быть заметна */
+    min-width: 4px;
     background: #0284c7;
     border-radius: 999px;
     transition: width 0.2s ease;

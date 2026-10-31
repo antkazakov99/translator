@@ -8,9 +8,9 @@ pub mod rpyc_writer;
 pub mod translation;
 pub mod llm;
 
-use crate::graph::ScenarioNode;
+use crate::graph::{DialogueData, ScenarioNode};
 use crate::parser::GameParser;
-use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto, ScriptStructure};
+use crate::parser::renpy::{ChoiceBlockDto, RenpyParser, SceneEdgeDto, ScreenLinks, ScriptStructure};
 use rayon::prelude::*;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -38,42 +38,52 @@ fn tl_lang_dir(game_dir: &Path) -> PathBuf {
     game_dir.join("tl").join(TL_LANG)
 }
 
-fn tl_segment_position(parts: &[Component]) -> Option<usize> {
-    parts.windows(2).position(|pair| {
-        pair[0].as_os_str().eq_ignore_ascii_case("tl")
-            && pair[1].as_os_str().eq_ignore_ascii_case(TL_LANG)
+/// Путь без начала `root`. Регистр не важен: по нему не различаются и папки проектов.
+pub(crate) fn path_within(path: &Path, root: &Path) -> Option<PathBuf> {
+    let name = |part: Component| part.as_os_str().to_string_lossy().to_lowercase();
+    let mut parts = path.components();
+    for expected in root.components() {
+        if parts.next().map(name) != Some(name(expected)) {
+            return None;
+        }
+    }
+    Some(parts.collect())
+}
+
+/// Путь файла относительно папки игры или кэша её скриптов. Части пути выше корня игры
+/// ничего не значат: папка `tl` может встретиться и там.
+fn path_in_game(path: &Path, game_root: &Path) -> Option<PathBuf> {
+    path_within(path, game_root)
+        .or_else(|| path_within(path, &get_project_scripts_cache_dir(game_root)))
+}
+
+/// Файл из папки `tl` игры, на любом языке.
+fn is_translation_path(path: &Path, game_root: &Path) -> bool {
+    path_in_game(path, game_root).is_some_and(|relative| {
+        relative.components().next().is_some_and(|part| part.as_os_str().eq_ignore_ascii_case("tl"))
     })
 }
 
-/// Путь к исходному скрипту: убирает сегмент `tl/<язык>` из пути файла перевода.
-fn original_script_path(path: &Path) -> PathBuf {
-    let parts: Vec<Component> = path.components().collect();
-    match tl_segment_position(&parts) {
-        Some(pos) => parts[..pos].iter().chain(&parts[pos + 2..]).collect(),
-        None => path.to_path_buf(),
-    }
-}
-
-/// Исходный скрипт файла: рядом с файлами игры или в кэше скриптов из архивов.
+/// Исходный скрипт файла перевода: рядом с файлами игры или в кэше скриптов из архивов.
 fn resolve_original_script(path: &Path, game_root: &Path) -> PathBuf {
-    let direct = original_script_path(path);
-    if !direct.exists()
-        && let Some(name) = tl_relative_name(path)
-    {
-        let cached = get_project_scripts_cache_dir(game_root).join(name);
-        if cached.exists() {
-            return cached;
-        }
+    let Some(name) = tl_relative_name(path, game_root) else {
+        return path.to_path_buf();
+    };
+    let direct = game_root.join(&name);
+    let cached = get_project_scripts_cache_dir(game_root).join(name);
+    if !direct.exists() && cached.exists() {
+        return cached;
     }
     direct
 }
 
 /// Путь файла перевода относительно `tl/<язык>`; `None` для остальных файлов.
-pub(crate) fn tl_relative_name(path: &Path) -> Option<String> {
-    let parts: Vec<Component> = path.components().collect();
-    let pos = tl_segment_position(&parts)?;
-    let relative: PathBuf = parts[pos + 2..].iter().collect();
-    Some(relative.to_string_lossy().replace('\\', "/"))
+pub(crate) fn tl_relative_name(path: &Path, game_root: &Path) -> Option<String> {
+    let relative = path_in_game(path, game_root)?;
+    let mut parts = relative.components();
+    let is_language_dir = parts.next()?.as_os_str().eq_ignore_ascii_case("tl")
+        && parts.next()?.as_os_str().eq_ignore_ascii_case(TL_LANG);
+    is_language_dir.then(|| parts.as_path().to_string_lossy().replace('\\', "/"))
 }
 
 static PATH_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
@@ -264,6 +274,40 @@ fn is_other_language_file(relative: &Path) -> bool {
         && parts.next().is_some_and(|part| !part.as_os_str().eq_ignore_ascii_case(TL_LANG))
 }
 
+/// Ключ реплики и её текст с учётом сохранённых правок.
+fn line_translation(
+    line: &DialogueData,
+    saved: &HashMap<String, String>,
+    repeats: &mut HashMap<translation::LineKey, usize>,
+) -> Result<(String, Option<String>), String> {
+    let key = translation::LineKey::for_line(line, repeats).encode()?;
+    let text = saved
+        .get(&key)
+        .map(|text| Some(text.clone()))
+        .unwrap_or_else(|| line.translated_text.clone());
+    Ok((key, text))
+}
+
+/// Всего реплик в файле и сколько из них переведено с учётом сохранённых правок.
+/// Считается без сцен и переходов: при скане таких файлов может быть много.
+fn saved_translation_stats(path: &Path, content: &str) -> Result<(usize, usize), String> {
+    let graph = RenpyParser::new()
+        .parse_file(path, content)
+        .map_err(|e| format!("Ошибка парсинга: {}", e))?;
+    let saved = translation::load_for_graph(path, &graph)?;
+    let mut repeats = HashMap::new();
+    let mut total = 0;
+    let mut translated = 0;
+    for line in graph.dialogues() {
+        let (_, text) = line_translation(line, &saved, &mut repeats)?;
+        total += 1;
+        if text.is_some_and(|text| !text.trim().is_empty()) {
+            translated += 1;
+        }
+    }
+    Ok((total, translated))
+}
+
 /// Параллельно строит список `TranslationFileItem` из набора путей.
 /// Фильтрует файлы без диалоговых строк (`total == 0`) и переводы на другие
 /// языки: их реплики дублируют оригинал, а перевод идёт в `tl/<язык>` проекта.
@@ -282,6 +326,12 @@ fn build_translation_file_items(
             if total == 0 {
                 return None;
             }
+            // Повреждённые правки не мешают открыть проект: об ошибке скажет открытие файла
+            let (total, translated) = if translation::has_saved_edits(&path) {
+                saved_translation_stats(&path, &content).unwrap_or((total, translated))
+            } else {
+                (total, translated)
+            };
             let relative_name = path
                 .strip_prefix(base_dir)
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -439,7 +489,7 @@ fn find_game_root(file_path: &Path) -> PathBuf {
             .project_roots
             .iter()
             .filter(|(scripts_dir, game_dir)| {
-                file_path.starts_with(scripts_dir) || file_path.starts_with(game_dir)
+                path_within(file_path, scripts_dir).is_some() || path_within(file_path, game_dir).is_some()
             })
             .map(|(_, game_dir)| game_dir)
             .max_by_key(|game_dir| game_dir.components().count())
@@ -490,8 +540,7 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let mut characters_map: std::collections::HashMap<String, String> = script_files
             .par_iter()
             .filter_map(|path| {
-                let path_str = path.to_string_lossy();
-                if !path_str.contains(r"\tl\") && !path_str.contains("/tl/") {
+                if !is_translation_path(path, &base_path) {
                     std::fs::read_to_string(path)
                         .ok()
                         .map(|content| RenpyParser::extract_speakers(&content))
@@ -641,6 +690,67 @@ fn choice_scenes(structure: &ScriptStructure) -> HashMap<String, String> {
     scenes
 }
 
+/// Куда ведут кнопки каждого экрана проекта, включая вложенные и открытые ими экраны.
+/// Строки вроде `Jump("slot_1")` могут не быть метками, поэтому остаются только настоящие метки.
+fn screen_targets<'a>(
+    structures: impl Iterator<Item = &'a ScriptStructure>,
+) -> HashMap<String, Vec<String>> {
+    let mut links: HashMap<&str, Vec<&ScreenLinks>> = HashMap::new();
+    let mut labels = std::collections::HashSet::new();
+    for structure in structures {
+        labels.extend(structure.labels.iter().map(|label| label.name.as_str()));
+        for (name, screen) in &structure.screens {
+            links.entry(name).or_default().push(screen);
+        }
+    }
+
+    links
+        .keys()
+        .map(|name| {
+            let mut targets = Vec::new();
+            let mut seen = std::collections::HashSet::from([*name]);
+            let mut pending = vec![*name];
+            while let Some(screen) = pending.pop() {
+                for part in links.get(screen).into_iter().flatten() {
+                    for target in &part.targets {
+                        if labels.contains(target.as_str()) && !targets.contains(target) {
+                            targets.push(target.clone());
+                        }
+                    }
+                    for nested in &part.screens {
+                        if seen.insert(nested) {
+                            pending.push(nested);
+                        }
+                    }
+                }
+            }
+            (name.to_string(), targets)
+        })
+        .collect()
+}
+
+/// Переходы сцен через кнопки показанных экранов.
+fn screen_edges(
+    structure: &ScriptStructure,
+    screens: &HashMap<String, Vec<String>>,
+) -> Vec<SceneEdgeDto> {
+    let mut seen = std::collections::HashSet::new();
+    let mut edges = Vec::new();
+    for (scene, screen) in &structure.shown_screens {
+        for target in screens.get(screen).into_iter().flatten() {
+            if target != scene && seen.insert((scene, screen, target)) {
+                edges.push(SceneEdgeDto {
+                    from: scene.clone(),
+                    to: target.clone(),
+                    kind: "choice".to_string(),
+                    condition: Some(format!("Экран: {}", screen)),
+                });
+            }
+        }
+    }
+    edges
+}
+
 /// Разбирает файл проекта на сцены и подставляет сохранённые правки перевода.
 pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, String> {
     let path = Path::new(&file_path);
@@ -741,12 +851,8 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
                             (current_scene_name.clone(), false)
                         };
 
-                    let translation_key =
-                        translation::LineKey::for_line(d, &mut line_repeats).encode()?;
-                    let translated_text = saved_translations
-                        .get(&translation_key)
-                        .map(|text| Some(text.clone()))
-                        .unwrap_or_else(|| d.translated_text.clone());
+                    let (translation_key, translated_text) =
+                        line_translation(d, &saved_translations, &mut line_repeats)?;
                     let is_trans = translated_text
                         .as_deref()
                         .is_some_and(|text| !text.trim().is_empty());
@@ -848,7 +954,36 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
         }
     }
 
+    let current_scene_names: std::collections::HashSet<String> = scenes
+        .iter()
+        .map(|s| s.name.clone())
+        .filter(|name| name != "Интерфейс и меню (strings)")
+        .collect();
+
+    // Структура остальных скриптов проекта: нужны входящие переходы и экраны из других файлов
+    let other_structures: Vec<ScriptStructure> = if current_scene_names.is_empty() {
+        Vec::new()
+    } else {
+        let cur_file_norm = path.to_string_lossy().to_lowercase().replace('\\', "/");
+        let cur_orig_norm = orig_path
+            .to_string_lossy()
+            .to_lowercase()
+            .replace('\\', "/");
+
+        get_project_scripts(&search_dir, &cache_dir)
+            .into_par_iter()
+            .filter(|p| {
+                let s_lower = p.to_string_lossy().replace('\\', "/").to_lowercase();
+                !is_translation_path(p, &search_dir) && s_lower != cur_file_norm && s_lower != cur_orig_norm
+            })
+            .filter_map(|other_path| get_cached_script_structure(&other_path))
+            .collect()
+    };
+    let screens = screen_targets(other_structures.iter().chain([&script_struct]));
+
+    let own_screen_edges = screen_edges(&script_struct, &screens);
     let mut edges = script_struct.edges;
+    edges.extend(own_screen_edges);
     // Если переходов в файле не обнаружено, связываем сцены последовательно
     if edges.is_empty() && scenes.len() > 1 {
         for i in 0..scenes.len() - 1 {
@@ -866,58 +1001,28 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
     }
 
     // Поиск входящих переходов из ДРУГИХ скриптов проекта в сцены текущего файла
-    let current_scene_names: std::collections::HashSet<String> = scenes
-        .iter()
-        .map(|s| s.name.clone())
-        .filter(|name| name != "Интерфейс и меню (strings)")
-        .collect();
+    {
+        let external_incoming_edges = other_structures.iter().flat_map(|other| {
+            other
+                .edges
+                .iter()
+                .cloned()
+                .chain(screen_edges(other, &screens))
+                .filter(|edge| current_scene_names.contains(&edge.to))
+        });
 
-    if !current_scene_names.is_empty() {
-        let all_scripts = get_project_scripts(&search_dir, &cache_dir);
-
-        let cur_file_norm = path.to_string_lossy().to_lowercase().replace('\\', "/");
-        let cur_orig_norm = orig_path
-            .to_string_lossy()
-            .to_lowercase()
-            .replace('\\', "/");
-
-        let external_incoming_edges: Vec<SceneEdgeDto> = all_scripts
-            .into_par_iter()
-            .filter(|p| {
-                let s = p.to_string_lossy().replace('\\', "/");
-                let s_lower = s.to_lowercase();
-                if s_lower.contains("/tl/") {
-                    return false;
-                }
-                if s_lower == cur_file_norm || s_lower == cur_orig_norm {
-                    return false;
-                }
-                true
-            })
-            .filter_map(|other_path| {
-                let other_struct = get_cached_script_structure(&other_path)?;
-                let mut matched = Vec::new();
-                for edge in other_struct.edges {
-                    if current_scene_names.contains(&edge.to) {
-                        matched.push(edge);
-                    }
-                }
-                if matched.is_empty() {
-                    None
-                } else {
-                    Some(matched)
-                }
-            })
-            .flatten()
+        let mut known: std::collections::HashSet<_> = edges
+            .iter()
+            .map(|e| (e.from.clone(), e.to.clone(), e.kind.clone(), e.condition.clone()))
             .collect();
-
         for ext_edge in external_incoming_edges {
-            if !edges.iter().any(|e| {
-                e.from == ext_edge.from
-                    && e.to == ext_edge.to
-                    && e.kind == ext_edge.kind
-                    && e.condition == ext_edge.condition
-            }) {
+            let key = (
+                ext_edge.from.clone(),
+                ext_edge.to.clone(),
+                ext_edge.kind.clone(),
+                ext_edge.condition.clone(),
+            );
+            if known.insert(key) {
                 edges.push(ext_edge);
             }
         }
@@ -999,10 +1104,7 @@ async fn find_scene_target(
         // 1. Сначала ищем в оригинальных скриптах игры (быстрее всего)
         let orig_scripts: Vec<_> = script_files
             .iter()
-            .filter(|p| {
-                let s = p.to_string_lossy();
-                !s.contains(r"\tl\") && !s.contains("/tl/")
-            })
+            .filter(|p| !is_translation_path(p, &base_path))
             .cloned()
             .collect();
 
@@ -1062,10 +1164,7 @@ async fn find_scene_target(
         // 2. Если не нашли в оригинале, ищем в tl/russian (по блокам translate russian <target>:)
         let tl_scripts: Vec<_> = script_files
             .into_iter()
-            .filter(|p| {
-                let s = p.to_string_lossy();
-                s.contains(r"\tl\") || s.contains("/tl/")
-            })
+            .filter(|p| is_translation_path(p, &base_path))
             .collect();
 
         let tl_prefix_hash = format!("translate {} {}_", TL_LANG, target_name);
@@ -1428,8 +1527,8 @@ async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "script.rpy".to_string());
 
-        let path_str = path.to_string_lossy();
-        let is_translation = path_str.contains(r"\tl\") || path_str.contains("/tl/");
+        let game_root = find_game_root(path);
+        let is_translation = is_translation_path(path, &game_root);
 
         let mut original_path = None;
         let mut original_content = None;
@@ -1439,7 +1538,7 @@ async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String
         if is_translation {
             translation_path = Some(file_path.clone());
             // Пробуем найти оригинальный файл скрипта
-            let original = resolve_original_script(path, &find_game_root(path));
+            let original = resolve_original_script(path, &game_root);
 
             if original.exists()
                 && original != path
@@ -1453,7 +1552,6 @@ async fn read_source_file(file_path: String) -> Result<SourceFileDetails, String
             // Файл сам является оригинальным скриптом
             original_path = Some(file_path.clone());
             original_total_lines = Some(total_lines);
-            let game_root = find_game_root(path);
             if let Ok(rel) = path.strip_prefix(&game_root) {
                 let tl_cand = tl_lang_dir(&game_root).join(rel);
                 if tl_cand.exists() {
@@ -1700,6 +1798,152 @@ mod tests {
     }
 
     #[test]
+    fn test_folders_above_game_do_not_mean_translation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_tl_parent_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("tl").join(TL_LANG).join("VN").join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let story = game_dir.join("story.rpy");
+        std::fs::write(&story, "define e = Character(\"Eileen\")\nlabel start:\n    e \"Hello\"\n").unwrap();
+        let translation = tl_lang_dir(&game_dir).join("story.rpy");
+        std::fs::create_dir_all(translation.parent().unwrap()).unwrap();
+        std::fs::write(&translation, "translate russian start_1:\n\n    # e \"Hello\"\n    e \"Привет\"\n").unwrap();
+
+        let summary = tauri::async_runtime::block_on(scan_game_project(
+            game_dir.to_string_lossy().to_string(),
+        ))
+        .unwrap();
+
+        assert_eq!(summary.characters, [("e".to_string(), "Eileen".to_string())]);
+        assert!(!is_translation_path(&story, &game_dir));
+        assert!(is_translation_path(&translation, &game_dir));
+        assert_eq!(tl_relative_name(&story, &game_dir), None);
+        assert_eq!(tl_relative_name(&translation, &game_dir).as_deref(), Some("story.rpy"));
+        assert_eq!(resolve_original_script(&story, &game_dir), story);
+        assert_eq!(resolve_original_script(&translation, &game_dir), story);
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_edits_open_under_other_case_of_cyrillic_path() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_case_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("Игры").join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let story = game_dir.join("story.rpy");
+        std::fs::write(&story, "label start:\n    e \"Hello\"\n").unwrap();
+        register_project(&game_dir);
+        save_edits(&story, &[("Hello", "Привет")]);
+
+        let other_case = temp_dir.join("ИГРЫ").join("game").join("story.rpy");
+        if other_case.exists() {
+            assert_eq!(translated_text(&other_case, "Hello").as_deref(), Some("Привет"));
+        }
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_screen_buttons_become_scene_edges_across_files() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_screen_edges_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        std::fs::write(
+            game_dir.join("screens.rpy"),
+            concat!(
+                "screen map():\n",
+                "    use clock\n",
+                "    textbutton \"Beach\" action [Hide(\"map\"), Jump(\"beach\")]\n",
+                "    # textbutton \"Old\" action Jump(\"old\")\n",
+                "    textbutton \"Slot\" action Jump(\"not_a_label\")\n",
+                "    textbutton \"Home\" action Jump(\"start\")\n",
+                "screen clock():\n",
+                "    use map\n",
+                "    key \"c\" action Call(\"school\")\n",
+            ),
+        )
+        .unwrap();
+        let story = game_dir.join("story.rpy");
+        std::fs::write(&story, "label start:\n    e \"Hi\"\n    call screen map\n").unwrap();
+        let places = game_dir.join("places.rpy");
+        std::fs::write(
+            &places,
+            concat!(
+                "label beach:\n    e \"Sea\"\n",
+                "label school:\n    e \"Desk\"\n",
+                "label old:\n    e \"Gone\"\n",
+            ),
+        )
+        .unwrap();
+        tauri::async_runtime::block_on(scan_game_project(game_dir.to_string_lossy().to_string()))
+            .unwrap();
+
+        let parsed = parse_project_file(story.to_string_lossy().to_string()).unwrap();
+        let mut targets: Vec<_> = parsed.edges.iter().map(|edge| edge.to.as_str()).collect();
+        targets.sort();
+        assert_eq!(targets, ["beach", "school"]);
+        assert!(parsed.edges.iter().all(|edge| edge.from == "start"
+            && edge.kind == "choice"
+            && edge.condition.as_deref() == Some("Экран: map")));
+
+        // Другой файл видит тот же переход как входящий
+        let parsed = parse_project_file(places.to_string_lossy().to_string()).unwrap();
+        assert!(parsed.edges.iter().any(|edge| edge.from == "start" && edge.to == "beach"));
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scan_counts_saved_edits() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_scan_edits_{}", uuid::Uuid::new_v4()));
+        let scan = |game_dir: &Path| {
+            let summary = tauri::async_runtime::block_on(scan_game_project(
+                game_dir.to_string_lossy().to_string(),
+            ))
+            .unwrap();
+            (summary.files[0].translated_lines, summary.files[0].total_lines, summary.total_translated)
+        };
+
+        // Игра без перевода: скан видит только правки
+        let script_game = temp_dir.join("script").join("game");
+        std::fs::create_dir_all(&script_game).unwrap();
+        let story = script_game.join("story.rpy");
+        std::fs::write(&story, "label start:\n    e \"Hello\"\n    e \"Bye\"\n").unwrap();
+        assert_eq!(scan(&script_game), (0, 2, 0));
+        save_edits(&story, &[("Hello", "Привет")]);
+        assert_eq!(scan(&script_game), (1, 2, 1));
+
+        // Готовый перевод: правка может и добавить строку, и очистить её
+        let translated_game = temp_dir.join("translated").join("game");
+        let tl_dir = tl_lang_dir(&translated_game);
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        let tl_story = tl_dir.join("story.rpy");
+        std::fs::write(
+            &tl_story,
+            concat!(
+                "translate russian start_1:\n\n    # e \"Hello\"\n    e \"Привет\"\n\n",
+                "translate russian start_2:\n\n    # e \"Bye\"\n    e \"\"\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(scan(&translated_game), (1, 2, 1));
+        save_edits(&tl_story, &[("Bye", "Пока")]);
+        assert_eq!(scan(&translated_game), (2, 2, 2));
+        save_edits(&tl_story, &[("Hello", "")]);
+        assert_eq!(scan(&translated_game), (1, 2, 1));
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&script_game));
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&translated_game));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
     fn test_edit_without_translation_line_is_reported() {
         let temp_dir =
             std::env::temp_dir().join(format!("translator_unapplied_{}", uuid::Uuid::new_v4()));
@@ -1786,17 +2030,18 @@ mod tests {
 
     #[test]
     fn test_original_script_path_strips_language_folder() {
+        let game = Path::new(r"D:\VN\game");
         assert_eq!(
-            original_script_path(Path::new(r"D:\VN\game\tl\russian\script\arc.rpy")),
+            resolve_original_script(Path::new(r"D:\VN\game\tl\russian\script\arc.rpy"), game),
             Path::new(r"D:\VN\game\script\arc.rpy")
         );
         assert_eq!(
-            original_script_path(Path::new("D:/VN/game/TL/Russian/story.rpy")),
-            Path::new("D:/VN/game/story.rpy")
+            resolve_original_script(Path::new("D:/VN/game/TL/Russian/story.rpy"), game),
+            Path::new(r"D:\VN\game\story.rpy")
         );
         assert_eq!(
-            original_script_path(Path::new(r"D:\tl\russianish\story.rpy")),
-            Path::new(r"D:\tl\russianish\story.rpy")
+            resolve_original_script(Path::new(r"D:\VN\game\tl\russianish\story.rpy"), game),
+            Path::new(r"D:\VN\game\tl\russianish\story.rpy")
         );
     }
 
