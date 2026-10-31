@@ -1,13 +1,44 @@
 use crate::glossary::{CharacterGlossaryEntry, TermGlossaryEntry};
-use crate::parser::renpy::RenpyParser;
-use crate::terms::TermCandidate;
+use crate::scenes::{self, GameLines, ScriptLine};
+use crate::terms::{TermCandidate, is_stuttering};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
+
+/// Сколько реплик персонажа получает модель, если не задано другое.
+pub const DEFAULT_CHARACTER_SAMPLES: usize = 64;
+pub const MAX_CHARACTER_SAMPLES: usize = 256;
+/// Предел текста реплик на персонажа и на запрос: окно контекста модели не бесконечно.
+const MAX_SAMPLE_TEXT: usize = 12_000;
+/// Подробные описания длинные: больше персонажей в ответе не успевают и не помещаются.
+const MAX_BATCH_CHARACTERS: usize = 3;
+const CHARACTER_ANSWER_TOKENS: u32 = 3072;
+/// Локальная модель пишет подробный ответ минутами.
+const REQUEST_TIMEOUT_SECS: u64 = 300;
+const MAX_SAMPLE_CHARS: usize = 200;
+const MIN_SAMPLE_WORDS: usize = 4;
+const EXPLICIT_WORDS: &[&str] = &[
+    "anal", "ass", "balls", "blowjob", "boobs", "breasts", "clit", "cock", "cum", "cumming", "dick",
+    "fuck", "fucking", "horny", "moan", "nipples", "orgasm", "pussy", "slut", "suck", "tits", "wet",
+    "whore", "киска", "киску", "киски", "кончаю", "кончи", "член", "члена", "члену", "сиськи",
+    "сиски", "соси", "трахни", "трахай",
+];
+
+/// Теги оформления вроде `{i}`. Подстановки `[name]` остаются: без них фраза теряет смысл.
+static RE_TEXT_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{[^}]*\}").unwrap());
+static RE_TEXT_VARIABLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([A-Za-z_][\w.]*)(?:![a-z]+)?\]").unwrap());
+static RE_STRING_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:(?:default|define)\s+|\$\s*)?(?:store\.)?([A-Za-z_][\w.]*)\s*=\s*_?\(?\s*(?:"([^"\\]*)"|'([^'\\]*)')\s*\)?\s*(?:#.*)?$"#).unwrap()
+});
+const MAX_VARIABLE_VALUES: usize = 3;
+const MAX_VARIABLE_CHARS: usize = 40;
 
 /// Результат пакетного автозаполнения. Сбой отдельного пакета не отменяет
 /// уже полученные переводы, поэтому число сбоев передаётся интерфейсу.
@@ -89,6 +120,7 @@ struct CharacterLlmItem {
     translated_name: Option<String>,
     gender: Option<String>,
     notes: Option<String>,
+    speech: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,7 +211,7 @@ async fn call_chat_completion(
         format!("{}/v1/chat/completions", base_url)
     };
 
-    let client = make_client(180)?;
+    let client = make_client(REQUEST_TIMEOUT_SECS)?;
     let request_body = ChatCompletionRequest {
         model: model.to_string(),
         messages: vec![
@@ -264,52 +296,211 @@ fn extract_json_content(raw: &str) -> &str {
     trimmed
 }
 
-/// Реплики скрипта по порядку: псевдоним говорящего и текст. Разбор сам отделяет
-/// их от кода и не обрывает текст на апострофах и экранированных кавычках.
-fn script_lines(path: &Path) -> Vec<(Option<String>, String)> {
-    let Ok(content) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(graph) = RenpyParser::new().parse_original_script(path, &content) else {
-        return Vec::new();
-    };
-    graph
-        .dialogues()
-        .map(|line| (line.speaker_alias.clone(), line.original_text.clone()))
-        .collect()
+/// Подходит ли строка для понимания персонажа: короткие возгласы и стоны о нём не говорят.
+fn is_informative(text: &str) -> bool {
+    text.split_whitespace().count() >= MIN_SAMPLE_WORDS && !is_stuttering(text)
 }
 
-/// Собирает до 2 коротких контекстных реплик для каждого алиаса персонажа
-pub fn collect_character_dialogue_samples(
-    scripts: &[PathBuf],
-    aliases: &[String],
-) -> HashMap<String, Vec<String>> {
-    let mut samples: HashMap<String, Vec<String>> = HashMap::new();
-    let alias_set: std::collections::HashSet<String> =
-        aliases.iter().map(|a| a.to_lowercase()).collect();
+/// Откровенная реплика мало говорит о характере, поэтому берётся только при нехватке других.
+fn is_explicit(text: &str) -> bool {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphabetic())
+        .any(|word| EXPLICIT_WORDS.contains(&word))
+}
 
+/// Берёт строки равномерно по списку, чтобы они оказались из разных частей игры.
+fn spread(lines: &[&String], count: usize) -> Vec<String> {
+    let count = count.min(lines.len());
+    (0..count).map(|i| lines[i * lines.len() / count].clone()).collect()
+}
+
+/// Значения строковых переменных из скриптов: `default`, `define` и присваивания.
+/// Значений может быть несколько, если игра меняет переменную по ходу сюжета.
+pub fn string_variables(scripts: &[PathBuf]) -> HashMap<String, Vec<String>> {
+    let mut variables: HashMap<String, Vec<String>> = HashMap::new();
     for path in scripts {
-        for (speaker, text) in script_lines(path) {
-            let Some(speaker) = speaker.map(|s| s.to_lowercase()) else {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in content.lines() {
+            let Some(caps) = RE_STRING_ASSIGNMENT.captures(line) else {
                 continue;
             };
-            let text = text.trim().to_string();
-            if alias_set.contains(&speaker) && (3..=120).contains(&text.chars().count()) {
-                let list = samples.entry(speaker).or_default();
-                if list.len() < 2 && !list.contains(&text) {
-                    list.push(text);
-                }
+            let value = caps.get(2).or_else(|| caps.get(3)).map_or("", |value| value.as_str()).trim();
+            if value.is_empty() || value.chars().count() > MAX_VARIABLE_CHARS {
+                continue;
+            }
+            let values = variables.entry(caps[1].to_string()).or_default();
+            if !values.iter().any(|known| known == value) {
+                values.push(value.to_string());
             }
         }
-        // Если для всех нашли по 2 реплики, можно остановиться раньше
-        if aliases
-            .iter()
-            .all(|a| samples.get(&a.to_lowercase()).map_or(0, |l| l.len()) >= 2)
-        {
-            break;
+    }
+    variables
+}
+
+/// Подставляет значения переменных. Переменная с неясным значением остаётся как есть:
+/// модели сказано не делать выводов из её имени.
+fn resolve_variables(text: &str, variables: &HashMap<String, Vec<String>>) -> String {
+    RE_TEXT_VARIABLE
+        .replace_all(text, |caps: &regex::Captures| match variables.get(&caps[1]) {
+            Some(values) if values.len() <= MAX_VARIABLE_VALUES => values.join("/"),
+            _ => caps[0].to_string(),
+        })
+        .into_owned()
+}
+
+/// Выбирает реплики персонажа: сначала полезные и обычные, затем остальные.
+fn pick_samples(lines: &[String], count: usize) -> Vec<String> {
+    let usable = |line: &&String| is_informative(line);
+    let plain: Vec<&String> = lines.iter().filter(usable).filter(|line| !is_explicit(line)).collect();
+    let explicit: Vec<&String> = lines.iter().filter(usable).filter(|line| is_explicit(line)).collect();
+    let rest: Vec<&String> = lines.iter().filter(|line| !is_informative(line)).collect();
+
+    let mut picked = spread(&plain, count);
+    for pool in [explicit, rest] {
+        let missing = count - picked.len();
+        picked.extend(spread(&pool, missing));
+    }
+
+    let text: usize = picked.iter().map(|line| line.chars().count()).sum();
+    if text > MAX_SAMPLE_TEXT {
+        let keep = (picked.len() * MAX_SAMPLE_TEXT / text).max(1);
+        return spread(&picked.iter().collect::<Vec<_>>(), keep);
+    }
+    picked
+}
+
+/// Делит персонажей на запросы так, чтобы их реплики уместились в окно контекста.
+fn character_batches(
+    indices: &[usize],
+    characters: &[CharacterGlossaryEntry],
+    samples: &HashMap<String, Vec<String>>,
+) -> Vec<Vec<usize>> {
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    let mut text = 0;
+    for &idx in indices {
+        let size: usize = samples
+            .get(&characters[idx].alias.to_lowercase())
+            .into_iter()
+            .flatten()
+            .map(|line| line.chars().count())
+            .sum();
+        match batches.last_mut() {
+            Some(batch) if batch.len() < MAX_BATCH_CHARACTERS && text + size <= MAX_SAMPLE_TEXT => {
+                batch.push(idx);
+                text += size;
+            }
+            _ => {
+                batches.push(vec![idx]);
+                text = size;
+            }
+        }
+    }
+    batches
+}
+
+/// Текст реплики в том виде, в каком его видит модель.
+fn sample_text(text: &str, variables: &HashMap<String, Vec<String>>) -> String {
+    let text = RE_TEXT_TAG.replace_all(text, "").replace('\n', " ");
+    resolve_variables(text.trim(), variables)
+}
+
+/// Собирает реплики каждого персонажа из разных частей игры, кроме исключённых сцен
+pub fn collect_character_dialogue_samples(
+    script_lines: &[ScriptLine],
+    variables: &HashMap<String, Vec<String>>,
+    characters: &[CharacterGlossaryEntry],
+    count: usize,
+) -> HashMap<String, Vec<String>> {
+    // Реплики всех кодов персонажа копятся под основным
+    let mut owners: HashMap<String, (String, HashSet<&str>)> = HashMap::new();
+    for character in characters {
+        let excluded: HashSet<&str> = character.excluded_scenes.iter().map(String::as_str).collect();
+        for alias in character.aliases() {
+            owners.insert(alias.to_lowercase(), (character.alias.to_lowercase(), excluded.clone()));
+        }
+    }
+    let mut lines: HashMap<String, Vec<String>> = HashMap::new();
+
+    for line in script_lines {
+        let Some((owner, skipped)) = line.alias.as_ref().and_then(|s| owners.get(&s.to_lowercase())) else {
+            continue;
+        };
+        if skipped.contains(line.key().as_str()) {
+            continue;
+        }
+        let text = sample_text(&line.text, variables);
+        if (3..=MAX_SAMPLE_CHARS).contains(&text.chars().count()) {
+            let list = lines.entry(owner.clone()).or_default();
+            if !list.contains(&text) {
+                list.push(text);
+            }
         }
     }
 
+    lines
+        .into_iter()
+        .map(|(speaker, list)| (speaker, pick_samples(&list, count)))
+        .collect()
+}
+
+/// Собирает сцены персонажа целиком, со всеми участниками: так видно, кто с кем говорит.
+/// Сцены берутся равномерно в пределах объёма.
+pub fn collect_scene_samples(
+    game: &GameLines,
+    variables: &HashMap<String, Vec<String>>,
+    characters: &[CharacterGlossaryEntry],
+) -> HashMap<String, Vec<String>> {
+    let names: HashMap<String, &str> = characters
+        .iter()
+        .flat_map(|c| c.aliases().into_iter().map(|alias| (alias.to_lowercase(), c.original_name.as_str())))
+        .collect();
+    let mut by_scene: HashMap<String, Vec<String>> = HashMap::new();
+    for line in &game.lines {
+        let alias = line.alias.as_ref().map(|alias| alias.to_lowercase());
+        let speaker = alias
+            .as_ref()
+            .and_then(|alias| names.get(alias).copied())
+            .or(line.speaker.as_deref())
+            .or(line.alias.as_deref())
+            .unwrap_or("Narrator");
+        by_scene
+            .entry(line.key())
+            .or_default()
+            .push(format!("{}: {}", speaker, sample_text(&line.text, variables)));
+    }
+
+    let mut samples = HashMap::new();
+    for character in characters {
+        let keys: Vec<String> = scenes::character_scenes(game, &character.aliases(), &character.names())
+            .into_iter()
+            .map(|scene| scene.key)
+            .filter(|key| !character.excluded_scenes.contains(key))
+            .collect();
+        let text: usize = keys
+            .iter()
+            .flat_map(|key| by_scene.get(key).into_iter().flatten())
+            .map(|line| line.chars().count())
+            .sum();
+        let scene_count = (keys.len() * MAX_SAMPLE_TEXT / text.max(1)).clamp(1, keys.len().max(1));
+
+        let mut picked = Vec::new();
+        let mut size = 0;
+        'scenes: for i in 0..scene_count.min(keys.len()) {
+            let key = &keys[i * keys.len() / scene_count];
+            for line in by_scene.get(key).into_iter().flatten() {
+                size += line.chars().count();
+                if size > MAX_SAMPLE_TEXT {
+                    break 'scenes;
+                }
+                picked.push(line.clone());
+            }
+        }
+        if !picked.is_empty() {
+            samples.insert(character.alias.to_lowercase(), picked);
+        }
+    }
     samples
 }
 
@@ -334,6 +525,8 @@ pub async fn autofill_characters(
                 c.translated_name.trim().is_empty()
                     || c.gender == "unknown"
                     || c.gender.trim().is_empty()
+                    || c.notes.trim().is_empty()
+                    || c.speech.trim().is_empty()
             }
         })
         .map(|(i, _)| i)
@@ -365,21 +558,25 @@ For each character provided, you must output:
    - "male": men, boys, male creatures (согласование: сказал, пришёл).
    - "neuter": genderless entities, monsters, things, spirits, constructs (согласование: пришло, сказало).
    - "unknown": only if completely impossible to infer from name and context lines.
-4. "notes": Brief helpful note in Russian on role, demeanor or speech tone (e.g. "дерзкая, на 'ты'", "вежливый тон", "главный герой"), or empty string if standard.
+4. "notes": Detailed description in Russian, 3 to 6 sentences, based only on the provided lines: occupation and place in the story, who they are to the protagonist (lines addressed to "you" are usually addressed to the protagonist), character and motives, how they speak, how they treat others, and what happens to them in the story. A translator will rely on it to keep the voice consistent. Do not invent facts. If there are few lines, write less.
+5. "speech": Required separate field, 1 to 2 sentences in Russian on the manner of speech: tone, vocabulary or slang, and whether they use "ты" or "вы" with others. Fill it for every character, even with few lines. It may repeat what "notes" says: do not shorten "notes" because of it.
+
+Text in [square brackets] is an in-game variable whose value is unknown. Never infer an occupation, kinship or name from the variable's own name.
+Lines may come as a scene transcript in the form "Speaker: text". Only lines of that speaker show their own manner; lines of others show how they see the character.
 
 Respond ONLY with a valid JSON array of objects without markdown fences or explanations:
 [
-  {"alias": "lis", "translated_name": "Лиза", "gender": "female", "notes": "Подруга"}
+  {"alias": "lis", "translated_name": "Лиза", "gender": "female", "notes": "Младшая сестра героя, студентка. Дерзкая и насмешливая, за колкостями скрывает неуверенность. Говорит коротко и с подколками. С героем спорит и поддразнивает его, но быстро приходит на помощь. По ходу истории становится мягче и откровеннее.", "speech": "Говорит коротко и с подколками, часто использует сленг, со всеми на 'ты'."}
 ]"#;
 
     // Небольшие пакеты: результат виден чаще, а сбой портит меньше записей
-    const BATCH_SIZE: usize = 5;
-    let total_batches = indices_to_process.len().div_ceil(BATCH_SIZE);
+    let batches = character_batches(&indices_to_process, &characters, &samples);
+    let total_batches = batches.len();
     let mut failed_batches = 0;
     let report = |batch: usize, failed_batches: usize, items: Vec<CharacterResult>| {
         on_batch(BatchProgress { batch: batch + 1, total_batches, failed_batches, items })
     };
-    for (batch, chunk) in indices_to_process.chunks(BATCH_SIZE).enumerate() {
+    for (batch, chunk) in batches.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -411,7 +608,7 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
             system_prompt,
             &user_prompt,
             0.2, // низкая температура для точности и следования схеме
-            2048,
+            CHARACTER_ANSWER_TOKENS,
         )
         .await
         {
@@ -468,12 +665,14 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
                     }
                 }
 
-                if let Some(n) = &item.notes {
-                    let trimmed = n.trim();
-                    if !trimmed.is_empty() && (c.notes.trim().is_empty() || !only_empty) {
-                        c.notes = trimmed.to_string();
+                let fill = |field: &mut String, value: &Option<String>| {
+                    let trimmed = value.as_deref().unwrap_or_default().trim();
+                    if !trimmed.is_empty() && (field.trim().is_empty() || !only_empty) {
+                        *field = trimmed.to_string();
                     }
-                }
+                };
+                fill(&mut c.notes, &item.notes);
+                fill(&mut c.speech, &item.speech);
             }
         }
 
@@ -632,10 +831,9 @@ Respond ONLY with a valid JSON array of objects:
 
 /// Тексты всех реплик скриптов.
 pub fn script_texts(scripts: &[PathBuf]) -> Vec<String> {
-    scripts
-        .iter()
-        .flat_map(|path| script_lines(path))
-        .map(|(_, text)| text)
+    scenes::load_lines(scripts, |_| String::new())
+        .into_iter()
+        .map(|line| line.text)
         .collect()
 }
 
@@ -826,6 +1024,16 @@ mod tests {
         assert!(error.contains("сбой"), "{error}");
     }
 
+    /// Реплики персонажей из скрипта теми же шагами, что и в команде.
+    fn samples_from(scripts: &[PathBuf], aliases: &[&str], count: usize) -> HashMap<String, Vec<String>> {
+        let lines = scenes::load_lines(scripts, |_| "story.rpy".to_string());
+        let characters: Vec<CharacterGlossaryEntry> = aliases
+            .iter()
+            .map(|alias| CharacterGlossaryEntry { alias: alias.to_string(), ..Default::default() })
+            .collect();
+        collect_character_dialogue_samples(&lines, &string_variables(scripts), &characters, count)
+    }
+
     fn script_with(content: &str) -> (PathBuf, Vec<PathBuf>) {
         let dir = std::env::temp_dir().join(format!("translator_llm_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
@@ -838,16 +1046,156 @@ mod tests {
     fn test_character_samples_keep_whole_lines() {
         let (dir, scripts) = script_with(concat!(
             "label start:\n",
-            "    # e \"Commented out\"\n",
-            "    e \"Don't go to Jack's Bar\"\n",
+            "    # e \"Commented out here for now\"\n",
+            "    e \"Don't go to Jack's Bar tonight\"\n",
             "    m \"Hi\"\n",
-            "    e \"She said \\\"no\\\" twice\"\n",
-            "    e \"One more\"\n",
+            "    e \"{i}She said \\\"no\\\" to me twice{/i}\"\n",
         ));
-        let samples = collect_character_dialogue_samples(&scripts, &["e".to_string(), "m".to_string()]);
-        assert_eq!(samples["e"], ["Don't go to Jack's Bar", "She said \"no\" twice"]);
+        let samples = samples_from(&scripts, &["e", "m"], 5);
+        assert_eq!(samples["e"], ["Don't go to Jack's Bar tonight", "She said \"no\" to me twice"]);
         assert!(!samples.contains_key("m"), "короткая реплика не даёт контекста");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_samples_come_from_whole_game() {
+        let lines: Vec<String> = (0..100).map(|i| format!("Line number {i} of the story")).collect();
+        let samples = pick_samples(&lines, 5);
+        assert_eq!(samples.len(), 5);
+        assert_eq!(samples[0], "Line number 0 of the story");
+        assert_eq!(samples[4], "Line number 80 of the story");
+    }
+
+    #[test]
+    fn test_samples_prefer_lines_about_the_character() {
+        let plain = "I was the best student in my class";
+        let lines: Vec<String> = [
+            "Aaaah... mmmmh...",
+            "Oh!",
+            "Please fuck me harder right now",
+            plain,
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            pick_samples(&lines, 5),
+            [plain, "Please fuck me harder right now", "Aaaah... mmmmh...", "Oh!"]
+        );
+    }
+
+    #[test]
+    fn test_samples_fit_context_window() {
+        let lines: Vec<String> = (0..300).map(|i| format!("{i} {}", "word ".repeat(30))).collect();
+        let samples = pick_samples(&lines, 256);
+        let text: usize = samples.iter().map(|line| line.chars().count()).sum();
+        assert!(text <= MAX_SAMPLE_TEXT, "{text}");
+        assert!(samples.len() > 50);
+        assert!(samples.last().unwrap().starts_with("29") || samples.last().unwrap().starts_with("2"));
+    }
+
+    #[test]
+    fn test_batches_respect_text_limit() {
+        let characters = characters(8);
+        let long = vec!["x".repeat(5_000)];
+        let samples: HashMap<String, Vec<String>> = [
+            ("c0".to_string(), long.clone()),
+            ("c1".to_string(), long.clone()),
+            ("c2".to_string(), long),
+        ]
+        .into();
+        let batches = character_batches(&(0..8).collect::<Vec<_>>(), &characters, &samples);
+        assert_eq!(batches, [vec![0, 1], vec![2, 3, 4], vec![5, 6, 7]]);
+    }
+
+    #[test]
+    fn test_variables_are_replaced_with_their_values() {
+        let (dir, scripts) = script_with(concat!(
+            "default houselady = \"mom\"\n",
+            "define nick = _(\"sis\")\n",
+            "default empty_name = \"\"\n",
+            "label start:\n",
+            "    $ place = \"bar\"\n",
+            "    $ place = 'club'\n",
+            "    k \"I am your [houselady], [nick!c].\"\n",
+            "    k \"Going to the [place] with [friend.name] now.\"\n",
+        ));
+        let samples = samples_from(&scripts, &["k"], 5);
+        assert_eq!(
+            samples["k"],
+            ["I am your mom, sis.", "Going to the bar/club with [friend.name] now."]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    const TWO_SCENES: &str = concat!(
+        "label home:\n",
+        "    k \"I am staying home tonight.\"\n",
+        "    m \"Then I will cook, Kate.\"\n",
+        "label bar:\n",
+        "    k \"One more drink for me.\"\n",
+        "    b \"Last one, Kate.\"\n",
+    );
+
+    fn kate(excluded: &[&str]) -> CharacterGlossaryEntry {
+        CharacterGlossaryEntry {
+            alias: "k".to_string(),
+            original_name: "Kate".to_string(),
+            excluded_scenes: excluded.iter().map(|key| key.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_excluded_scene_is_not_sent_to_model() {
+        let (dir, scripts) = script_with(TWO_SCENES);
+        let lines = scenes::load_lines(&scripts, |_| "story.rpy".to_string());
+        let samples =
+            collect_character_dialogue_samples(&lines, &HashMap::new(), &[kate(&["story.rpy::bar"])], 5);
+        assert_eq!(samples["k"], ["I am staying home tonight."]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_samples_join_merged_codes() {
+        let (dir, scripts) = script_with("label one:\n    hil \"First line of her.\"\n    hi \"Second line of her.\"\n");
+        let lines = scenes::load_lines(&scripts, |_| "story.rpy".to_string());
+        let hilde = CharacterGlossaryEntry {
+            alias: "hil".to_string(),
+            original_name: "Hilde".to_string(),
+            merged: vec![crate::glossary::MergedCharacter {
+                alias: "hi".to_string(),
+                original_name: "Hilde".to_string(),
+            }],
+            ..Default::default()
+        };
+        let samples = collect_character_dialogue_samples(&lines, &HashMap::new(), &[hilde], 5);
+        assert_eq!(samples["hil"], ["First line of her.", "Second line of her."]);
+        assert!(!samples.contains_key("hi"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_whole_scene_keeps_all_speakers() {
+        let (dir, scripts) = script_with(TWO_SCENES);
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()));
+
+        let all = collect_scene_samples(&game, &HashMap::new(), &[kate(&["story.rpy::bar"])]);
+        assert_eq!(all["k"], ["Kate: I am staying home tonight.", "m: Then I will cook, Kate."]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_model_fills_description() {
+        let content = r#"[{"alias":"c0","translated_name":"Катя","gender":"female","notes":"Вежливая","speech":"На 'вы'"}]"#;
+        let body = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
+        let url = serve_responses(vec![http_response("200 OK", &body)]);
+        let cancel = AtomicBool::new(false);
+        let result = tauri::async_runtime::block_on(autofill_characters(
+            &url, "model", characters(1), true, HashMap::new(), &cancel, |_| {},
+        ))
+        .unwrap();
+        assert_eq!(result.items[0].notes, "Вежливая");
+        assert_eq!(result.items[0].speech, "На 'вы'");
     }
 
     #[test]
@@ -939,24 +1287,24 @@ mod tests {
             let body = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
             http_response("200 OK", &body)
         };
-        let url = serve_responses(vec![answer(0, 5), answer(5, 7)]);
-        let samples = HashMap::from([("c6".to_string(), vec!["Don't go".to_string()])]);
+        let url = serve_responses(vec![answer(0, 3), answer(3, 5)]);
+        let samples = HashMap::from([("c4".to_string(), vec!["Don't go".to_string()])]);
         let cancel = AtomicBool::new(false);
         let reports = std::sync::Mutex::new(Vec::new());
 
         let result = tauri::async_runtime::block_on(autofill_characters(
-            &url, "model", characters(7), true, samples, &cancel,
+            &url, "model", characters(5), true, samples, &cancel,
             |progress| reports.lock().unwrap().push(progress),
         ))
         .unwrap();
 
         let reports = reports.into_inner().unwrap();
         assert_eq!(reports.len(), 2);
-        assert_eq!((reports[0].batch, reports[0].total_batches, reports[0].items.len()), (1, 2, 5));
+        assert_eq!((reports[0].batch, reports[0].total_batches, reports[0].items.len()), (1, 2, 3));
         assert_eq!(reports[0].items[0].character.translated_name, "Имя 0");
         assert!(reports[0].items[0].samples.is_empty());
         assert_eq!(reports[1].items[1].samples, ["Don't go"]);
-        assert_eq!(result.items[6].translated_name, "Имя 6");
+        assert_eq!(result.items[4].translated_name, "Имя 4");
     }
 
     #[test]
