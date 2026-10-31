@@ -81,6 +81,51 @@ impl ProjectGlossary {
         Ok(cache_file)
     }
 
+    /// Дополняет глоссарий записями другого проекта и возвращает их число. Заполненные
+    /// здесь записи важнее, а пустые могли появиться сами при сканировании.
+    pub fn merge_from(&mut self, other: Self) -> usize {
+        let mut merged = 0;
+        for character in other.characters {
+            let own = self
+                .characters
+                .iter_mut()
+                .find(|own| own.alias.eq_ignore_ascii_case(&character.alias));
+            match own {
+                Some(own) if own.translated_name.trim().is_empty() => {
+                    if !character.translated_name.trim().is_empty() {
+                        *own = character;
+                        merged += 1;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.characters.push(character);
+                    merged += 1;
+                }
+            }
+        }
+        for term in other.terms {
+            let own = self
+                .terms
+                .iter_mut()
+                .find(|own| own.source_term.eq_ignore_ascii_case(&term.source_term));
+            match own {
+                Some(own) if own.translated_term.trim().is_empty() => {
+                    if !term.translated_term.trim().is_empty() {
+                        *own = term;
+                        merged += 1;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.terms.push(term);
+                    merged += 1;
+                }
+            }
+        }
+        merged
+    }
+
     /// Объединяет сохраненный глоссарий с новыми персонажами, найденными при сканировании
     pub fn merge_with_scanned_characters(&mut self, scanned: &[(String, String)]) {
         for (alias, name) in scanned {

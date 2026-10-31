@@ -42,6 +42,7 @@
     X,
     Pencil,
     Copy,
+    Import,
     BookOpen,
     Plus,
     Save,
@@ -273,6 +274,29 @@
       // Удаление из списка всё равно действует в текущем запуске.
     }
     persistRecentProjects();
+  }
+
+  // Папка данных зависит от пути к игре: после переезда или в новой версии её надо перенести
+  async function transferProjectData(path: string) {
+    if (!activeProjectPath) return;
+    const confirmed = await ask(
+      `Скопировать правки и глоссарий из «${projectDisplayName(path)}» в открытый проект? Правки, уже сделанные в нём, останутся.`,
+      { title: "Перенос данных проекта", kind: "info" }
+    );
+    if (!confirmed) return;
+    if (!(await saveTranslations())) return;
+    if (glossaryDirty && !(await saveGlossary())) return;
+    try {
+      const message = await invoke<string>("transfer_project_data", {
+        sourceDir: path,
+        gameDir: activeProjectPath
+      });
+      showProjectManager = false;
+      await scanProject();
+      showToast(message, "success");
+    } catch (e) {
+      showToast(`Ошибка переноса данных: ${e}`, "error");
+    }
   }
 
   function openProjectManager() {
@@ -3543,6 +3567,17 @@
                     </span>
                     <span class="project-manager-open-label">Открыть</span>
                   </button>
+                  {#if activeProjectPath && projectKey(activeProjectPath) !== projectKey(path)}
+                    <button
+                      class="project-manager-rename-trigger"
+                      title="Скопировать правки и глоссарий в открытый проект"
+                      aria-label={`Скопировать данные ${projectDisplayName(path)} в открытый проект`}
+                      disabled={loadingProject}
+                      onclick={() => transferProjectData(path)}
+                    >
+                      <Import size={14} />
+                    </button>
+                  {/if}
                   <button
                     class="project-manager-rename-trigger"
                     title="Переименовать проект"

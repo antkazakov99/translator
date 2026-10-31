@@ -105,7 +105,8 @@ type SpeakerMap = HashMap<String, String>;
 struct ProjectCache {
     scripts: HashMap<PathBuf, (Instant, Vec<PathBuf>)>,
     speakers: HashMap<PathBuf, SpeakerMap>,
-    cached_script_projects: HashMap<PathBuf, PathBuf>,
+    /// Корни открытых проектов по их папкам скриптов в кэше.
+    project_roots: HashMap<PathBuf, PathBuf>,
 }
 
 static PROJECT_CACHE: LazyLock<Mutex<ProjectCache>> =
@@ -420,16 +421,29 @@ fn ensure_output_outside_game(output: &Path, game_dirs: &[PathBuf]) -> Result<()
     Ok(())
 }
 
-/// Находит базовую директорию игры (`game`), поднимаясь по дереву каталогов от файла перевода или скрипта.
+/// Запоминает корень открытого проекта. По нему экспорт читает правки, поэтому
+/// файлы проекта не должны относиться к другому корню из-за признаков на диске.
+fn register_project(game_dir: &Path) {
+    PROJECT_CACHE
+        .lock()
+        .project_roots
+        .insert(get_project_scripts_cache_dir(game_dir), game_dir.to_path_buf());
+}
+
+/// Находит базовую директорию игры (`game`) по открытым проектам, а если файл не из них,
+/// поднимаясь по дереву каталогов от файла перевода или скрипта.
 fn find_game_root(file_path: &Path) -> PathBuf {
     if let Some(game_dir) = {
         let cache = PROJECT_CACHE.lock();
         cache
-            .cached_script_projects
+            .project_roots
             .iter()
-            .find_map(|(cache_dir, game_dir)| {
-                file_path.starts_with(cache_dir).then(|| game_dir.clone())
+            .filter(|(scripts_dir, game_dir)| {
+                file_path.starts_with(scripts_dir) || file_path.starts_with(game_dir)
             })
+            .map(|(_, game_dir)| game_dir)
+            .max_by_key(|game_dir| game_dir.components().count())
+            .cloned()
     } {
         return game_dir;
     }
@@ -449,6 +463,7 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         if !base_path.exists() {
             return Err(format!("Папка игры не найдена: {}", game_dir));
         }
+        register_project(&base_path);
 
         // 1. Ищем персонажей в оригинальных скриптах игры в параллельных потоках (Rayon)
         let mut script_files = Vec::new();
@@ -458,10 +473,6 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let cache_dir = get_project_scripts_cache_dir(&base_path);
         if has_rpa_archives(&base_path) {
             rpa::RpaArchive::extract_scripts_from_game_archives(&base_path, &cache_dir)?;
-            PROJECT_CACHE
-                .lock()
-                .cached_script_projects
-                .insert(cache_dir.clone(), base_path.clone());
             collect_rpy_files(&cache_dir, &mut script_files);
         } else {
             let cache_lock = path_lock(&cache_dir);
@@ -1150,6 +1161,7 @@ async fn export_mod(
                 .join(rpa::MOD_ARCHIVE_NAME),
         };
         ensure_output_outside_game(&out_path, std::slice::from_ref(&base_path))?;
+        register_project(&base_path);
 
         let format = rpyc_writer::ScriptFormat::detect(&base_path)?;
         let message = build_mod_archive(&base_path, &out_path, format)?;
@@ -1226,7 +1238,6 @@ async fn clear_project_script_cache(game_dir: String) -> Result<(), String> {
         }
         {
             let mut cache = PROJECT_CACHE.lock();
-            cache.cached_script_projects.remove(&cache_dir);
             cache.scripts.remove(&base_path);
             cache.speakers.remove(&base_path);
         }
@@ -1311,6 +1322,71 @@ async fn save_project_glossary(
     })
     .await
     .map_err(|e| format!("Ошибка сохранения глоссария: {}", e))?
+}
+
+/// Корень проекта, из которого копируются данные. Его папки могло уже не остаться,
+/// поэтому вложенная `game` ищется и среди данных приложения.
+fn saved_project_root(path: &Path) -> PathBuf {
+    let nested = path.join("game");
+    if nested.is_dir() || get_project_cache_dir(&nested).exists() {
+        nested
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Копирует правки и глоссарий проекта `source` в `target`. Папка проекта зависит от пути
+/// к игре, поэтому после переезда или в новой версии игры данные остаются на старом месте.
+fn transfer_project(source: &Path, target: &Path) -> Result<String, String> {
+    if !target.is_dir() {
+        return Err(format!("Папка игры не найдена: {:?}", target));
+    }
+    if get_project_cache_dir(source) == get_project_cache_dir(target) {
+        return Err("Это тот же проект".to_string());
+    }
+    if !get_project_cache_dir(source).exists() {
+        return Err(format!("Нет сохранённых данных проекта {:?}", source));
+    }
+    let glossary_file = get_project_cache_dir(source).join("glossary.json");
+    let glossary_terms = if glossary_file.exists() {
+        let mut glossary = glossary::ProjectGlossary::load_for_project(target)?;
+        let merged = glossary.merge_from(glossary::ProjectGlossary::load_for_project(source)?);
+        if merged > 0 {
+            glossary.save_for_project(target)?;
+        }
+        merged
+    } else {
+        0
+    };
+    let edits = translation::transfer_edits(source, target)?;
+    PARSED_FILE_CACHE.lock().clear();
+
+    let mut message = format!(
+        "Перенесено правок: {}, записей глоссария: {}",
+        edits.added, glossary_terms
+    );
+    if edits.kept > 0 {
+        message.push_str(&format!(". Оставлены текущие правки: {}", edits.kept));
+    }
+    if edits.without_file > 0 {
+        message.push_str(&format!(". Нет файла в этой версии у правок: {}", edits.without_file));
+    }
+    if edits.lost > 0 {
+        message.push_str(&format!(". Не перенесено правок: {}", edits.lost));
+    }
+    Ok(message)
+}
+
+#[tauri::command]
+async fn transfer_project_data(source_dir: String, game_dir: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        transfer_project(
+            &saved_project_root(Path::new(&source_dir)),
+            &effective_game_directory(Path::new(&game_dir)),
+        )
+    })
+    .await
+    .map_err(|e| format!("Ошибка переноса данных проекта: {}", e))?
 }
 
 fn read_text_file_safe(path: &Path) -> Result<String, String> {
@@ -1520,6 +1596,7 @@ pub fn run() {
             decompile_rpyc_file,
             get_project_glossary,
             save_project_glossary,
+            transfer_project_data,
             save_file_translations,
             read_source_file,
             open_in_system_editor,
@@ -1590,6 +1667,118 @@ mod tests {
             assert_eq!(find_game_root(&tl_dir.join("script").join("arc.rpy")), game_dir);
             assert_eq!(find_game_root(&game_dir.join("story.rpy")), game_dir);
         }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_edits_of_nested_folder_reach_mod_of_open_project() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_nested_root_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let tl_dir = tl_lang_dir(&game_dir);
+        let nested = game_dir.join("mods").join("extra");
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("gui.rpy"), "").unwrap();
+        let story = nested.join("story.rpy");
+        std::fs::write(&story, "label start:\n    e \"Hello\"\n").unwrap();
+        assert_eq!(find_game_root(&story), nested);
+
+        register_project(&game_dir);
+        assert_eq!(find_game_root(&story), game_dir);
+        save_edits(&story, &[("Hello", "Привет")]);
+        let out_dir = temp_dir.join("unpacked");
+        let message = pack_and_unpack(&game_dir, &out_dir);
+        assert!(!message.contains("Не перенесено"), "{message}");
+        let strings = out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpyc");
+        assert!(compiled_text(&strings).contains("Привет"));
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_edit_without_translation_line_is_reported() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_unapplied_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let tl_dir = tl_lang_dir(&game_dir);
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        // Обычная метка в папке перевода: строки для подстановки у реплики нет
+        let extra = tl_dir.join("extra.rpy");
+        std::fs::write(&extra, "label extra:\n    e \"Hello\"\n").unwrap();
+        std::fs::write(tl_dir.join("extra.rpyc"), b"compiled").unwrap();
+        save_edits(&extra, &[("Hello", "Привет")]);
+
+        let out_dir = temp_dir.join("unpacked");
+        let message = pack_and_unpack(&game_dir, &out_dir);
+        assert!(message.contains("Не перенесено правок: 1"), "{message}");
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_transfer_keeps_edits_and_glossary_of_moved_game() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_transfer_{}", uuid::Uuid::new_v4()));
+        let story_text = concat!(
+            "translate russian start_abcd1234:\n",
+            "    # e \"Hello\"\n",
+            "    e \"\"\n",
+            "translate russian start_abcd1235:\n",
+            "    # e \"Bye\"\n",
+            "    e \"\"\n",
+        );
+        let old_game = temp_dir.join("v1").join("game");
+        let new_game = temp_dir.join("v2").join("game");
+        for game in [&old_game, &new_game] {
+            std::fs::create_dir_all(tl_lang_dir(game)).unwrap();
+            std::fs::write(tl_lang_dir(game).join("story.rpy"), story_text).unwrap();
+        }
+        let old_story = tl_lang_dir(&old_game).join("story.rpy");
+        let new_story = tl_lang_dir(&new_game).join("story.rpy");
+        save_edits(&old_story, &[("Hello", "Привет"), ("Bye", "Пока")]);
+        save_edits(&new_story, &[("Bye", "До встречи")]);
+        let character = |translated: &str| glossary::CharacterGlossaryEntry {
+            alias: "e".into(),
+            translated_name: translated.into(),
+            ..Default::default()
+        };
+        glossary::ProjectGlossary {
+            characters: vec![character("Эйлин")],
+            terms: Vec::new(),
+        }
+        .save_for_project(&old_game)
+        .unwrap();
+        glossary::ProjectGlossary {
+            characters: vec![character("")],
+            terms: Vec::new(),
+        }
+        .save_for_project(&new_game)
+        .unwrap();
+
+        // Старой папки могло уже не остаться: данные проекта лежат в данных приложения
+        std::fs::remove_dir_all(temp_dir.join("v1")).unwrap();
+        let source = saved_project_root(&temp_dir.join("v1"));
+        assert_eq!(source, old_game);
+        let message = transfer_project(&source, &new_game).unwrap();
+        assert!(message.contains("Перенесено правок: 1, записей глоссария: 1"), "{message}");
+        assert!(message.contains("Оставлены текущие правки: 1"), "{message}");
+
+        assert_eq!(translated_text(&new_story, "Hello").as_deref(), Some("Привет"));
+        assert_eq!(translated_text(&new_story, "Bye").as_deref(), Some("До встречи"));
+        let merged = glossary::ProjectGlossary::load_for_project(&new_game).unwrap();
+        assert_eq!(merged.characters[0].translated_name, "Эйлин");
+
+        // Повторный перенос ничего не меняет, а исходные данные остаются
+        let message = transfer_project(&source, &new_game).unwrap();
+        assert!(message.contains("Перенесено правок: 0, записей глоссария: 0"), "{message}");
+        assert!(get_project_cache_dir(&old_game).join("glossary.json").exists());
+        assert!(transfer_project(&new_game, &new_game).is_err());
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&old_game));
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&new_game));
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
