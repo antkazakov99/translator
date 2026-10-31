@@ -138,6 +138,19 @@ fn parse_say_line(line: &str) -> Option<SayLine<'_>> {
     })
 }
 
+/// Реплика со всеми частями, нужными для её компиляции.
+pub struct SayParts {
+    pub speaker: Option<String>,
+    /// Говорящий задан строкой, а не псевдонимом персонажа.
+    pub speaker_is_string: bool,
+    /// Атрибуты спрайта между говорящим и текстом, включая `@`.
+    pub attributes: Vec<String>,
+    /// Текст без кавычек, экранирование не снято.
+    pub text: String,
+    /// Всё, что стоит после текста.
+    pub rest: String,
+}
+
 /// Файл перевода объявляет блоки `translate` в начале строки. Слово внутри
 /// реплики или комментария оригинального скрипта признаком не считается.
 fn has_translate_blocks(content: &str) -> bool {
@@ -279,6 +292,37 @@ impl RenpyParser {
     /// Проверяет наличие кириллических символов в тексте
     pub fn has_cyrillic(text: &str) -> bool {
         text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+    }
+
+    /// Разбирает реплику на части. Текст файла остаётся без снятия экранирования.
+    pub fn say_statement(line: &str) -> Option<SayParts> {
+        let say = parse_say_line(line)?;
+        let caps = RE_DIALOGUE.captures(line)?;
+        let attributes = caps
+            .name("speaker")
+            .map(|speaker| &line[speaker.end()..say.quoted.start])
+            .unwrap_or_default();
+        Some(SayParts {
+            speaker: say.speaker.map(str::to_string),
+            speaker_is_string: caps.name("name").is_some(),
+            attributes: attributes.split_whitespace().map(str::to_string).collect(),
+            text: say.text.to_string(),
+            rest: line[say.quoted.end..].to_string(),
+        })
+    }
+
+    /// Текст строки `old` со снятым экранированием.
+    pub fn old_text(line: &str) -> Option<String> {
+        RE_OLD
+            .captures(line)
+            .map(|caps| Self::unescape_renpy_string(caps.name("text").unwrap().as_str()))
+    }
+
+    /// Текст строки `new` со снятым экранированием.
+    pub fn new_text(line: &str) -> Option<String> {
+        RE_NEW
+            .captures(line)
+            .map(|caps| Self::unescape_renpy_string(caps.name("text").unwrap().as_str()))
     }
 
     /// Заменяет текст реплики или строки `new` в строке файла перевода.

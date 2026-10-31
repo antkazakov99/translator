@@ -1143,8 +1143,8 @@
   let decompileOutputRpyPath = $state("");
   let decompiledCodePreview = $state("");
 
-  // 1. Быстрая сборка RPA мода в один клик
-  async function quickPackMod() {
+  // 1. Сборка архива мода, который игрок кладёт в папку game/
+  async function exportMod(outputPath: string | null) {
     if (!gameDir.trim()) {
       showToast("Укажите путь к папке игры", "warning");
       return;
@@ -1152,13 +1152,14 @@
     if (!(await saveTranslations())) return;
     packingMod = true;
     try {
-      const msg = await invoke<string>("pack_mod_rpa", {
+      const result = await invoke<{ message: string; output_path: string }>("export_mod", {
         gameDir: gameDir.trim(),
-        outputRpaPath: null
+        outputPath
       });
-      showToast(msg, "success");
+      showToast(result.message, "success");
+      await revealCurrentInFolder(result.output_path);
     } catch (e) {
-      showToast(`Ошибка сборки мода: ${e}`, "error");
+      showToast(`Ошибка экспорта мода: ${e}`, "error");
     } finally {
       packingMod = false;
     }
@@ -1208,27 +1209,6 @@
       showToast(unpackResultMsg, "error");
     } finally {
       unpackingRpa = false;
-    }
-  }
-
-  // 4. Сборка RPA мода с кастомным путем
-  async function executePackCustomRpa() {
-    if (!gameDir.trim()) {
-      showToast("Укажите путь к папке игры", "warning");
-      return;
-    }
-    if (!(await saveTranslations())) return;
-    packingMod = true;
-    try {
-      const msg = await invoke<string>("pack_mod_rpa", {
-        gameDir: gameDir.trim(),
-        outputRpaPath: packModCustomPath.trim() || null
-      });
-      showToast(msg, "success");
-    } catch (e) {
-      showToast(`Ошибка сборки: ${e}`, "error");
-    } finally {
-      packingMod = false;
     }
   }
 
@@ -1601,11 +1581,11 @@
               disabled={packingMod || !gameDir}
               onclick={() => {
                 showToolsMenu = false;
-                quickPackMod();
+                exportMod(null);
               }}
             >
               {#if packingMod}<Loader2 size={16} class="spin text-amber-400" />{:else}<Package size={16} class="text-amber-400" />{/if}
-              <span><strong>Собрать RPA</strong><small>Упаковать перевод в архив</small></span>
+              <span><strong>Собрать мод</strong><small>Архив ru_lang.rpa для папки game</small></span>
             </button>
             <button
               class="tools-menu-item"
@@ -2575,17 +2555,17 @@
           {#if toolsActiveTab === 'rpa'}
             <!-- ВКЛАДКА RPA -->
             <div class="tools-cards-grid">
-              <!-- Карточка 1: Сборка RPA мода -->
+              <!-- Карточка 1: Экспорт мода -->
               <div class="tool-card">
                 <div class="tool-card-head">
                   <div class="tool-head-title">
                     <Package size={16} class="text-amber-400" />
-                    <h4>Экспорт мода перевода (RPA-3.0)</h4>
+                    <h4>Экспорт мода перевода</h4>
                   </div>
                   <span class="tool-badge">Для игроков</span>
                 </div>
                 <p class="tool-desc">
-                  Упаковывает папку <code>tl/russian</code> со всеми скриптами, шрифтами и графикой в единый <code>.rpa</code> файл. Игрокам нужно лишь скопировать его в папку <code>game/</code>.
+                  Собирает <code>tl/russian</code> и сохранённые правки в архив <code>ru_lang.rpa</code>, который кладут в папку <code>game/</code>. Скрипты компилируются прямо в приложении под версию Ren'Py этой игры, сама игра при этом не запускается и не меняется.
                 </p>
 
                 <div class="tool-form-group">
@@ -2594,7 +2574,7 @@
                 </div>
 
                 <div class="tool-form-group">
-                  <span class="tool-field-label">Путь к итоговому файлу RPA (по умолчанию в данных приложения; вне папки игры)</span>
+                  <span class="tool-field-label">Путь к файлу .rpa (по умолчанию в данных приложения; вне папки игры)</span>
                   <input 
                     type="text" 
                     bind:value={packModCustomPath} 
@@ -2605,15 +2585,15 @@
 
                 <button 
                   class="btn-tool-action btn-pack-action" 
-                  onclick={executePackCustomRpa} 
+                  onclick={() => exportMod(packModCustomPath.trim() || null)}
                   disabled={packingMod || !gameDir}
                 >
                   {#if packingMod}
                     <Loader2 size={15} class="spin" />
-                    <span>Упаковка файлов в RPA-3.0...</span>
+                    <span>Компиляция и сборка мода...</span>
                   {:else}
                     <Download size={15} />
-                    <span>Собрать и экспортировать RPA мод</span>
+                    <span>Собрать мод</span>
                   {/if}
                 </button>
               </div>
