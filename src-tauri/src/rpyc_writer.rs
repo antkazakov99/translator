@@ -148,6 +148,7 @@ impl NodeBuilder {
             ("who", say.who.map_or(PickleValue::None, text)),
             ("who_fast", PickleValue::Bool(say.who_fast)),
             ("what", text(say.what)),
+            ("with_", say.with_.map_or(PickleValue::None, text)),
         ];
         let attributes = if say.attributes.is_empty() {
             PickleValue::None
@@ -155,13 +156,15 @@ impl NodeBuilder {
             PickleValue::Tuple(say.attributes.into_iter().map(text).collect())
         };
         if self.format.layout == AstLayout::CompactNames {
+            if !say.interact {
+                fields.push(("interact", PickleValue::Bool(false)));
+            }
             if attributes != PickleValue::None {
                 fields.push(("attributes", attributes));
             }
         } else {
             fields.extend([
-                ("with_", PickleValue::None),
-                ("interact", PickleValue::Bool(true)),
+                ("interact", PickleValue::Bool(say.interact)),
                 ("attributes", attributes),
                 ("arguments", PickleValue::None),
                 ("temporary_attributes", PickleValue::None),
@@ -243,6 +246,8 @@ struct SayStatement {
     who_fast: bool,
     attributes: Vec<String>,
     what: String,
+    with_: Option<String>,
+    interact: bool,
 }
 
 fn unsupported(name: &str, line: usize, text: &str) -> String {
@@ -254,14 +259,69 @@ fn unsupported(name: &str, line: usize, text: &str) -> String {
     )
 }
 
-/// Разбирает реплику. Всё, что меняет её показ (`with`, аргументы, `@`), не поддерживается.
+/// Отделяет ключевое слово от начала строки: за ним не может идти продолжение имени.
+fn strip_keyword<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(keyword)?;
+    let is_name_char = |c: char| c.is_alphanumeric() || c == '_';
+    (!rest.starts_with(is_name_char)).then_some(rest)
+}
+
+/// Отделяет простое выражение после `with`: оно кончается на пробеле вне скобок и строк.
+fn split_simple_expression(text: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, c) in text.char_indices() {
+        if let Some(open) = quote {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                _ if c == open => quote = None,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.checked_sub(1)?,
+            '#' if depth == 0 => return Some(text.split_at(index)),
+            c if c.is_whitespace() && depth == 0 => return Some(text.split_at(index)),
+            _ => {}
+        }
+    }
+    (depth == 0 && quote.is_none()).then_some((text, ""))
+}
+
+/// Разбирает реплику. Аргументы, `id` и `@` меняют её показ и не поддерживаются.
 fn parse_say(name: &str, line_number: usize, line: &str) -> Result<SayStatement, String> {
     let fail = || unsupported(name, line_number, line);
     let say = RenpyParser::say_statement(line).ok_or_else(fail)?;
-    let tail = say.rest.trim();
-    if (!tail.is_empty() && !tail.starts_with('#')) || say.attributes.iter().any(|a| a == "@") {
+    if say.attributes.iter().any(|a| a == "@") {
         return Err(fail());
     }
+
+    let mut with_ = None;
+    let mut interact = true;
+    let mut tail = say.rest.trim();
+    while !tail.is_empty() && !tail.starts_with('#') {
+        if let Some(rest) = strip_keyword(tail, "nointeract") {
+            interact = false;
+            tail = rest.trim_start();
+        } else if let Some(rest) = strip_keyword(tail, "with")
+            && with_.is_none()
+        {
+            let (expression, rest) = split_simple_expression(rest.trim_start()).ok_or_else(fail)?;
+            if expression.is_empty() {
+                return Err(fail());
+            }
+            with_ = Some(expression.to_string());
+            tail = rest.trim_start();
+        } else {
+            return Err(fail());
+        }
+    }
+
     let (who, who_fast) = match (say.speaker, say.speaker_is_string) {
         (Some(speaker), true) => (Some(format!("\"{}\"", speaker)), false),
         (Some(speaker), false) => {
@@ -275,6 +335,8 @@ fn parse_say(name: &str, line_number: usize, line: &str) -> Result<SayStatement,
         who_fast,
         attributes: say.attributes,
         what: RenpyParser::unescape_renpy_string(&say.text),
+        with_,
+        interact,
     })
 }
 
@@ -541,10 +603,38 @@ mod tests {
     }
 
     #[test]
+    fn keeps_nointeract_and_with_on_dialogue() {
+        let source = concat!(
+            "translate russian a_1:\n",
+            "    e \"Вопрос\" nointeract\n",
+            "    e \"Удар\" with vpunch # комментарий\n",
+            "    e \"Всё\" nointeract with Fade(0.1, 0, color=\"#fff (\")\n",
+            "    e \"Обычная\"\n",
+        );
+        for layout in FORMATS {
+            let text = decoded(&compile(layout, source).unwrap());
+            for expected in ["\"vpunch\"", "Fade(0.1, 0, color=\\\"#fff (\\\")"] {
+                assert!(text.contains(expected), "{layout:?}: {expected} in {text}");
+            }
+            assert!(text.matches("Bool(false)").count() >= 2, "{layout:?}: {text}");
+            assert!(!text.contains("комментарий"), "{layout:?}: {text}");
+        }
+
+        // В новых версиях поле `with_` не имеет значения по умолчанию
+        let compact = decoded(&compile(AstLayout::CompactNames, "translate russian a_1:\n    e \"Hi\"\n").unwrap());
+        assert!(compact.contains("with_"), "{compact}");
+    }
+
+    #[test]
     fn rejects_statements_it_cannot_compile() {
         for (source, line) in [
             ("translate russian a_1:\n    voice \"a.ogg\"\n", 2),
-            ("translate russian a_1:\n    e \"Hi\" with dissolve\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" (multiple=2)\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" id custom\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" with\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" with fade with dissolve\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" with Fade(1\n", 2),
+            ("translate russian a_1:\n    e \"Hi\" nointeractive\n", 2),
             ("translate russian a_1:\n    e @ happy \"Hi\"\n", 2),
             ("translate russian python:\n    x = 1\n", 1),
             ("translate russian strings:\n    old \"a\"\n", 2),
@@ -553,6 +643,24 @@ mod tests {
             let error = compile(AstLayout::Python2, source).unwrap_err();
             assert!(error.contains(&format!("строка {line}:")), "{source}: {error}");
         }
+    }
+
+    #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
+    fn compiles_real_translation_folder() {
+        let Some(dir) = crate::local_test_game(crate::TEST_TL_DIR) else {
+            return;
+        };
+        let mut files = Vec::new();
+        crate::collect_rpy_files(Path::new(&dir), &mut files);
+        let failures: Vec<String> = files
+            .iter()
+            .filter_map(|file| compile(AstLayout::Python3, &fs::read_to_string(file).ok()?).err())
+            .collect();
+        for failure in &failures {
+            println!("{failure}");
+        }
+        assert!(failures.is_empty(), "не собрано {} из {}", failures.len(), files.len());
     }
 
     /// Пишет архивы для проверки настоящим движком: `TRANSLATOR_RPYC_PROBE_DIR=<папка>`

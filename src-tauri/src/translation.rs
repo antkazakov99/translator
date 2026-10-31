@@ -78,8 +78,28 @@ impl LegacyKey {
     fn parse(key: &str) -> Option<Self> {
         let (line, _, text, repeat) =
             serde_json::from_str::<(usize, String, String, usize)>(key).ok()?;
-        Some(Self { line, text, repeat })
+        Some(Self {
+            line,
+            text: RenpyParser::collapse_spaces(&text),
+            repeat,
+        })
     }
+}
+
+/// Новый ключ для правки, сохранённой до того, как разбор начал схлопывать пробелы.
+fn respaced_key(key: &str) -> Option<String> {
+    let mut line = serde_json::from_str::<LineKey>(key).ok()?;
+    match &mut line {
+        LineKey::Script { text, .. } | LineKey::Strings { old: text } => {
+            *text = RenpyParser::collapse_spaces(text);
+        }
+        LineKey::Block { .. } => return None,
+    }
+    line.encode().ok().filter(|encoded| encoded != key)
+}
+
+fn needs_migration(key: &str) -> bool {
+    LegacyKey::parse(key).is_some() || respaced_key(key).is_some()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -132,17 +152,36 @@ pub fn load_for_graph(
 ) -> Result<HashMap<String, String>, String> {
     let path = store_path(source);
     let store = read_store(source, &path)?;
-    if !store.entries.keys().any(|key| LegacyKey::parse(key).is_some()) {
+    if !store.entries.keys().any(|key| needs_migration(key)) {
         return Ok(store.entries);
     }
 
     let file_lock = path_lock(&path);
     let _guard = file_lock.lock();
     let mut store = read_store(source, &path)?;
-    if migrate_legacy_keys(&mut store, graph)? {
+    let respaced = respace_keys(&mut store);
+    if migrate_legacy_keys(&mut store, graph)? || respaced {
         write_store(&path, &store)?;
     }
     Ok(store.entries)
+}
+
+fn respace_keys(store: &mut TranslationOverrides) -> bool {
+    let renamed: Vec<(String, String)> = store
+        .entries
+        .keys()
+        .filter_map(|key| Some((key.clone(), respaced_key(key)?)))
+        .collect();
+    let mut changed = false;
+    for (old_key, new_key) in renamed {
+        if !store.entries.contains_key(&new_key)
+            && let Some(text) = store.entries.remove(&old_key)
+        {
+            store.entries.insert(new_key, text);
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn migrate_legacy_keys(
@@ -249,9 +288,7 @@ fn saved_sources(game_dir: &Path) -> Result<Vec<SavedSource>, String> {
 pub fn prepare_mod_export(game_dir: &Path, tl_dir: &Path) -> Result<ModExport, String> {
     // Файлы, которые ещё не открывались, тоже могут хранить ключи старого формата
     for saved in saved_sources(game_dir)? {
-        if saved.source.is_file()
-            && saved.entries.keys().any(|key| LegacyKey::parse(key).is_some())
-        {
+        if saved.source.is_file() && saved.entries.keys().any(|key| needs_migration(key)) {
             parse_project_file(saved.source.to_string_lossy().into_owned())?;
         }
     }

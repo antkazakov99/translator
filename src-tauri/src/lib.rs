@@ -1542,6 +1542,10 @@ pub(crate) const TEST_RPA2_ARCHIVE: &str = "TRANSLATOR_TEST_RPA2_ARCHIVE";
 #[cfg(test)]
 pub(crate) const TEST_FRAMED_ARCHIVE: &str = "TRANSLATOR_TEST_FRAMED_ARCHIVE";
 
+/// Папка `tl/<язык>` реальной игры для проверки компилятора.
+#[cfg(test)]
+pub(crate) const TEST_TL_DIR: &str = "TRANSLATOR_TEST_TL_DIR";
+
 /// Папка игры для тестов на реальных данных: `cargo test -- --ignored`
 /// с заданной переменной окружения. Без неё такие тесты ничего не проверяют.
 #[cfg(test)]
@@ -1859,6 +1863,38 @@ mod tests {
             &out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpyc"),
         );
         assert!(strings.contains("Hello") && strings.contains("Привет"), "{strings}");
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_saved_edit_with_repeated_spaces_matches_engine_text() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_spaces_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let story = game_dir.join("story.rpy");
+        std::fs::write(&story, "label start:\n    e \"One  two\"\n").unwrap();
+
+        // Ключ хранит текст со двумя пробелами: так правки сохранялись раньше
+        let key = translation::LineKey::Script {
+            label: "start".to_string(),
+            text: "One  two".to_string(),
+            repeat: 0,
+        };
+        let edit = translation::TranslationEdit { key: key.encode().unwrap(), text: "Раз два".into() };
+        translation::save(&story, &[edit]).unwrap();
+
+        // Без открытия файла правка тоже доходит до мода
+        let out_dir = temp_dir.join("unpacked");
+        let message = pack_and_unpack(&game_dir, &out_dir);
+        assert!(!message.contains("Не перенесено"), "{message}");
+        let strings = compiled_text(
+            &out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpyc"),
+        );
+        assert!(strings.contains("One two") && !strings.contains("One  two"), "{strings}");
+        assert_eq!(translated_text(&story, "One two").as_deref(), Some("Раз два"));
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
         let _ = std::fs::remove_dir_all(&temp_dir);

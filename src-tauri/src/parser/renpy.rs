@@ -70,6 +70,8 @@ const NON_DIALOGUE_STATEMENTS: &[&str] = &[
     "return", "pause", "window", "if", "elif", "while", "for",
 ];
 
+static RE_REPEATED_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(" {2,}").unwrap());
+
 static RE_SOURCE_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*#\s*(?:game[/\\])?(?P<file>.+?\.rpy):(?P<line>\d+)"#).unwrap()
 });
@@ -227,60 +229,52 @@ impl RenpyParser {
         map
     }
 
-    /// Разбирает кавычки и экранирование в стиле строк Ren'Py
+    /// Схлопывает повторы пробелов, как лексер Ren'Py в обычных строках.
+    pub fn collapse_spaces(s: &str) -> String {
+        RE_REPEATED_SPACES.replace_all(s, " ").into_owned()
+    }
+
+    /// Разбирает строку как `Lexer.string` в Ren'Py. Текст обязан совпадать с движком:
+    /// по нему игра ищет строковые переводы `old`.
     pub fn unescape_renpy_string(s: &str) -> String {
-        let mut result = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
+        let collapsed = Self::collapse_spaces(s);
+        let mut result = String::with_capacity(collapsed.len());
+        let mut chars = collapsed.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '\\' {
-                if let Some(&next) = chars.peek() {
-                    match next {
-                        'n' => {
-                            result.push('\n');
-                            chars.next();
-                        }
-                        't' => {
-                            result.push('\t');
-                            chars.next();
-                        }
-                        'r' => {
-                            result.push('\r');
-                            chars.next();
-                        }
-                        '"' => {
-                            result.push('"');
-                            chars.next();
-                        }
-                        '\\' => {
-                            result.push('\\');
-                            chars.next();
-                        }
-                        '\'' => {
-                            result.push('\'');
-                            chars.next();
-                        }
-                        _ => {
-                            result.push(c);
-                        }
-                    }
-                } else {
-                    result.push(c);
-                }
-            } else {
+            if c != '\\' {
                 result.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('{') => result.push_str("{{"),
+                Some('[') => result.push_str("[["),
+                Some('%') => result.push_str("%%"),
+                Some('n') => result.push('\n'),
+                Some('u') => {
+                    let mut code = 0;
+                    for _ in 0..4 {
+                        let Some(digit) = chars.peek().and_then(|next| next.to_digit(16)) else {
+                            break;
+                        };
+                        code = code * 16 + digit;
+                        chars.next();
+                    }
+                    result.extend(char::from_u32(code).filter(|c| *c != '\0'));
+                }
+                Some(other) => result.push(other),
+                None => result.push(c),
             }
         }
         result
     }
 
-    /// Экранирует текст для вставки в строку Ren'Py в двойных кавычках
+    /// Экранирует текст для вставки в строку Ren'Py в двойных кавычках.
+    /// Табуляция остаётся как есть: `\t` движок прочитал бы как букву `t`.
     pub fn escape_renpy_string(s: &str) -> String {
         let mut result = String::with_capacity(s.len());
         for c in s.chars() {
             match c {
                 '\n' => result.push_str("\\n"),
-                '\t' => result.push_str("\\t"),
-                '\r' => result.push_str("\\r"),
                 '"' => result.push_str("\\\""),
                 '\\' => result.push_str("\\\\"),
                 _ => result.push(c),
@@ -923,6 +917,18 @@ mod tests {
         let speakers = RenpyParser::extract_speakers(script);
         assert_eq!(speakers.get("mc").unwrap(), "Главный Герой");
         assert_eq!(speakers.get("e").unwrap(), "Erika");
+    }
+
+    #[test]
+    fn test_strings_are_read_like_the_engine_lexer() {
+        let unescape = RenpyParser::unescape_renpy_string;
+        assert_eq!(unescape("Hello.  World   again"), "Hello. World again");
+        assert_eq!(unescape(r"100\% \{b} \[name]"), "100%% {{b} [[name]");
+        assert_eq!(unescape(r#"\"a\" \\ \'b\'"#), "\"a\" \\ 'b'");
+        assert_eq!(unescape(r"one\ntwo \t \u0410"), "one\ntwo t А");
+
+        let text = "tab\there\nsecond \"line\" C:\\new %%";
+        assert_eq!(unescape(&RenpyParser::escape_renpy_string(text)), text);
     }
 
     fn dialogue_texts(rpy: &str) -> Vec<(Option<String>, String, Option<String>)> {

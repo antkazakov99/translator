@@ -14,5 +14,6 @@ version of the game, without running the game. Edits of `tl/russian` files are a
 compiled copies, and edits of other scripts become string translations. If the game has no
 action for this language, the archive also enables it at launch.
 
-The compiler covers string translations, `translate` blocks with plain dialogue and `init python`.
+The compiler covers string translations, `translate` blocks with dialogue, its `nointeract` and
+`with` clauses, and `init python`.
 Other statements, such as `voice`, stop the build unless the game already compiled that file.
