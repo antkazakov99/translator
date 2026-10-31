@@ -6,7 +6,9 @@ Built with Rust.
 The game directory is read-only for Translator. Extracted scripts, the glossary, and
 default exports are stored under `%LOCALAPPDATA%\TranslatorApp\projects_cache` on
 Windows. Custom export and extraction destinations must be outside the game directory.
-Refreshing the script cache does not delete the game's `.rpyc` files.
+Refreshing the script cache does not delete the game's `.rpyc` files. The stored data depends
+on the game's path, so after moving a game or unpacking a new version, copy the edits and the
+glossary from the old project with the transfer button in the project manager.
 
 The mod is built as `ru_lang.rpa`, which is placed into the game's `game` directory. Ren'Py loads
 only compiled `.rpyc` scripts from archives, so the app compiles them itself for the Ren'Py

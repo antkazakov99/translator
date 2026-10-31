@@ -115,8 +115,12 @@ struct TranslationOverrides {
 }
 
 fn store_path(source: &Path) -> PathBuf {
+    store_path_in(&find_game_root(source), source)
+}
+
+fn store_path_in(game_dir: &Path, source: &Path) -> PathBuf {
     let hash = stable_hash_str(&source.to_string_lossy().to_lowercase());
-    get_project_cache_dir(&find_game_root(source))
+    get_project_cache_dir(game_dir)
         .join("translations")
         .join(format!("{:016x}.json", hash))
 }
@@ -438,22 +442,24 @@ fn patch_translation_file(
         .map_err(|e| format!("Не удалось прочитать {:?}: {}", saved.source, e))?;
     let mut lines: Vec<String> = content.split_inclusive('\n').map(str::to_string).collect();
 
-    let mut applied = 0;
+    // Правка перенесена, только если её текст попал в файл: у реплик обычной
+    // метки нет строк перевода, а строку разбор мог не распознать
+    let mut applied = HashSet::new();
     for entry in parsed.scenes.iter().flat_map(|scene| &scene.entries) {
         let Some(text) = saved.entries.get(&entry.translation_key) else {
             continue;
         };
-        applied += 1;
         for line_number in &entry.target_lines {
             if let Some(line) = lines.get_mut(line_number - 1)
                 && let Some(updated) = RenpyParser::replace_dialogue_text(line, text)
             {
                 *line = updated;
+                applied.insert(&entry.translation_key);
             }
         }
     }
-    export.skipped += saved.entries.len() - applied;
-    if applied > 0 {
+    export.skipped += saved.entries.len() - applied.len();
+    if !applied.is_empty() {
         export.files.insert(name, lines.concat().into_bytes());
     }
     Ok(())
@@ -558,6 +564,81 @@ fn save_at(source: &Path, path: &Path, changes: &[TranslationEdit]) -> Result<()
     write_store(path, &store)
 }
 
+/// Итог копирования правок другого проекта.
+#[derive(Debug, Default)]
+pub struct TransferredEdits {
+    /// Скопированные правки.
+    pub added: usize,
+    /// Правки, которые не заменили другой текст, уже сохранённый в проекте.
+    pub kept: usize,
+    /// Скопированные правки файлов, которых нет в этой версии игры.
+    pub without_file: usize,
+    /// Правки файлов вне старого проекта: их некуда отнести.
+    pub lost: usize,
+}
+
+/// Путь без начала `root`. Регистр не важен: по нему не различаются и папки проектов.
+fn path_within(path: &Path, root: &Path) -> Option<PathBuf> {
+    let name = |part: std::path::Component| part.as_os_str().to_string_lossy().to_lowercase();
+    let mut parts = path.components();
+    for expected in root.components() {
+        if parts.next().map(name) != Some(name(expected)) {
+            return None;
+        }
+    }
+    Some(parts.collect())
+}
+
+/// Файл нового проекта для файла старого. Игра могла перейти с `.rpy` рядом с игрой
+/// на архивы или обратно, поэтому проверяются оба места.
+fn transferred_source(source: &Path, from: &Path, to: &Path) -> Option<(PathBuf, bool)> {
+    let (old_cache, new_cache) = (get_project_scripts_cache_dir(from), get_project_scripts_cache_dir(to));
+    let (relative, places) = match path_within(source, &old_cache) {
+        Some(relative) => (relative, [new_cache, to.to_path_buf()]),
+        None => (path_within(source, from)?, [to.to_path_buf(), new_cache]),
+    };
+    let candidates = places.map(|place| place.join(&relative));
+    match candidates.iter().find(|path| path.is_file()) {
+        Some(path) => Some((path.clone(), true)),
+        None => Some((candidates[0].clone(), false)),
+    }
+}
+
+/// Копирует правки проекта `from` в проект `to`: ключи строк не зависят от пути, поэтому
+/// меняется только привязка к файлу. Сохранённое в `to` важнее, а `from` не меняется.
+pub fn transfer_edits(from: &Path, to: &Path) -> Result<TransferredEdits, String> {
+    let mut result = TransferredEdits::default();
+    for saved in saved_sources(from)? {
+        let Some((target, found)) = transferred_source(&saved.source, from, to) else {
+            result.lost += saved.entries.len();
+            continue;
+        };
+        let path = store_path_in(to, &target);
+        let file_lock = path_lock(&path);
+        let _guard = file_lock.lock();
+        let mut store = read_store(&target, &path)?;
+        let mut added = 0;
+        for (key, text) in saved.entries {
+            match store.entries.get(&key) {
+                None => {
+                    store.entries.insert(key, text);
+                    added += 1;
+                }
+                Some(own) if *own != text => result.kept += 1,
+                Some(_) => {}
+            }
+        }
+        if added > 0 {
+            write_store(&path, &store)?;
+        }
+        result.added += added;
+        if !found {
+            result.without_file += added;
+        }
+    }
+    Ok(result)
+}
+
 fn write_store(path: &Path, store: &TranslationOverrides) -> Result<(), String> {
     let parent = path
         .parent()
@@ -582,6 +663,37 @@ fn write_store(path: &Path, store: &TranslationOverrides) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transferred_edits_follow_file_between_archive_and_disk() {
+        let root = std::env::temp_dir().join(format!("translator_move_{}", Uuid::new_v4()));
+        let (from, to) = (root.join("v1").join("game"), root.join("v2").join("game"));
+        let new_cache = get_project_scripts_cache_dir(&to);
+        fs::create_dir_all(&to).unwrap();
+        fs::create_dir_all(&new_cache).unwrap();
+        fs::write(to.join("loose.rpy"), "").unwrap();
+        fs::write(new_cache.join("packed.rpy"), "").unwrap();
+
+        let old_cache = get_project_scripts_cache_dir(&from);
+        assert_eq!(
+            transferred_source(&old_cache.join("loose.rpy"), &from, &to),
+            Some((to.join("loose.rpy"), true))
+        );
+        assert_eq!(
+            transferred_source(&from.join("packed.rpy"), &from, &to),
+            Some((new_cache.join("packed.rpy"), true))
+        );
+        // Регистр в пути старого проекта не важен, а файла может и не быть
+        let upper = PathBuf::from(from.to_string_lossy().to_uppercase()).join("tl").join("gone.rpy");
+        assert_eq!(
+            transferred_source(&upper, &from, &to),
+            Some((to.join("tl").join("gone.rpy"), false))
+        );
+        assert_eq!(transferred_source(&root.join("other.rpy"), &from, &to), None);
+
+        let _ = fs::remove_dir_all(get_project_cache_dir(&to));
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn saves_edits_outside_game_and_merges_repeated_saves() {
