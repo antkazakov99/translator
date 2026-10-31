@@ -181,8 +181,71 @@ fn original_scripts(game_dir: &Path) -> Vec<PathBuf> {
         .into_iter()
         .filter(|path| !is_translation_path(path, game_dir))
         .collect();
-    scripts.sort();
+    scripts.sort_by_cached_key(|path| natural_key(&path.to_string_lossy()));
     scripts
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum NaturalPart {
+    Number(u64),
+    Text(String),
+}
+
+/// Ключ сортировки, при котором `story_2` идёт раньше `story_10`.
+fn natural_key(text: &str) -> Vec<NaturalPart> {
+    let mut parts = Vec::new();
+    let mut chars = text.to_lowercase().chars().peekable().collect::<Vec<_>>().into_iter().peekable();
+    while let Some(&first) = chars.peek() {
+        let digits = first.is_ascii_digit();
+        let mut part = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() != digits {
+                break;
+            }
+            part.push(c);
+            chars.next();
+        }
+        parts.push(if digits {
+            NaturalPart::Number(part.parse().unwrap_or(u64::MAX))
+        } else {
+            NaturalPart::Text(part)
+        });
+    }
+    parts
+}
+
+/// Порядок сцен по сюжету: обход переходов от `start`. Сцены, до которых так не дойти,
+/// например при свободном перемещении, идут после них в порядке файлов.
+fn story_order(structures: &[ScriptStructure]) -> HashMap<String, usize> {
+    let screens = screen_targets(structures.iter());
+    let mut next: HashMap<String, Vec<String>> = HashMap::new();
+    for structure in structures {
+        for edge in structure.edges.iter().cloned().chain(screen_edges(structure, &screens)) {
+            next.entry(edge.from).or_default().push(edge.to);
+        }
+        // Сцена без перехода продолжается следующей меткой файла: этот шаг идёт последним
+        for pair in structure.labels.windows(2) {
+            next.entry(pair[0].name.clone()).or_default().push(pair[1].name.clone());
+        }
+    }
+
+    let mut order = HashMap::new();
+    let roots = std::iter::once("start")
+        .chain(structures.iter().flat_map(|s| s.labels.iter().map(|label| label.name.as_str())));
+    for root in roots {
+        let mut stack = vec![root.to_string()];
+        while let Some(scene) = stack.pop() {
+            if order.contains_key(&scene) {
+                continue;
+            }
+            if let Some(targets) = next.get(&scene) {
+                stack.extend(targets.iter().rev().cloned());
+            }
+            let rank = order.len();
+            order.insert(scene, rank);
+        }
+    }
+    order
 }
 
 /// Ограничение на количество сканируемых скриптов при быстром извлечении спикеров,
@@ -1590,9 +1653,13 @@ fn game_lines(base_path: &Path) -> Arc<scenes::GameLines> {
     if let Some(lines) = PROJECT_CACHE.lock().lines.get(base_path) {
         return lines.clone();
     }
-    let lines = scenes::load_lines(&original_scripts(base_path), |path| {
-        script_display_name(path, base_path)
-    });
+    let scripts = original_scripts(base_path);
+    let mut lines = scenes::load_lines(&scripts, |path| script_display_name(path, base_path));
+    let structures: Vec<ScriptStructure> =
+        scripts.par_iter().filter_map(|path| get_cached_script_structure(path)).collect();
+    let order = story_order(&structures);
+    // Сортировка устойчива: реплики внутри сцены и сцены без метки сохраняют порядок файлов
+    lines.sort_by_key(|line| order.get(&line.scene).copied().unwrap_or(usize::MAX));
     let game = Arc::new(scenes::GameLines::new(lines));
     PROJECT_CACHE.lock().lines.insert(base_path.to_path_buf(), game.clone());
     game
@@ -1671,6 +1738,51 @@ async fn autofill_glossary_characters(
 
     llm::autofill_characters(&api_url, &model, characters, only_empty, samples, &LLM_CANCEL, |progress| {
         send_progress(&on_batch, progress)
+    })
+    .await
+}
+
+/// Сколько частей дают включённые сцены персонажа.
+#[tauri::command]
+async fn count_character_chunks(
+    game_dir: String,
+    character: glossary::CharacterGlossaryEntry,
+) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let variables = llm::string_variables(&original_scripts(&base_path));
+        llm::scene_chunks(&game_lines(&base_path), &variables, &character).len()
+    })
+    .await
+    .map_err(|e| format!("Ошибка подсчёта сцен персонажа: {}", e))
+}
+
+/// Обновляет персонажа по `parts` частям его сцен. `None` значит, что запуск остановлен:
+/// готовые части сохранены, и следующий запуск продолжит с того же места.
+#[tauri::command]
+async fn summarize_glossary_character(
+    game_dir: String,
+    api_url: String,
+    model: String,
+    character: glossary::CharacterGlossaryEntry,
+    parts: usize,
+    on_progress: Channel<llm::SummaryProgress>,
+) -> Result<Option<glossary::CharacterGlossaryEntry>, String> {
+    LLM_CANCEL.store(false, Ordering::Relaxed);
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+    let selected = character.clone();
+    let chunks = tauri::async_runtime::spawn_blocking(move || {
+        let variables = llm::string_variables(&original_scripts(&base_path));
+        llm::pick_chunks(llm::scene_chunks(&game_lines(&base_path), &variables, &selected), parts)
+    })
+    .await
+    .map_err(|e| format!("Ошибка подготовки сцен персонажа: {}", e))?;
+
+    llm::summarize_character(&api_url, &model, character, chunks, &notes_file, &LLM_CANCEL, |progress| {
+        if let Err(error) = on_progress.send(progress) {
+            tracing::warn!(%error, "Ход обработки не передан в интерфейс");
+        }
     })
     .await
 }
@@ -1798,6 +1910,8 @@ pub fn run() {
             autofill_glossary_terms,
             extract_glossary_terms_from_game,
             cancel_llm_run,
+            summarize_glossary_character,
+            count_character_chunks,
             get_character_scenes
         ])
         .run(tauri::generate_context!())
@@ -2691,6 +2805,33 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scripts_sort_by_numbers_in_names() {
+        let mut names = vec!["story_10.rpy", "story_2.rpy", "Story_1.rpy", "a.rpy"];
+        names.sort_by_cached_key(|name| natural_key(name));
+        assert_eq!(names, ["a.rpy", "Story_1.rpy", "story_2.rpy", "story_10.rpy"]);
+    }
+
+    #[test]
+    fn test_scenes_follow_the_story() {
+        let structures = [
+            "label aside:\n    e \"Free roam.\"\n",
+            "label finale:\n    e \"End.\"\n",
+            concat!(
+                "label start:\n    jump intro\n",
+                "label chapter_two:\n    jump finale\n",
+                "label intro:\n    menu:\n        \"Go\":\n            jump chapter_two\n",
+            ),
+        ]
+        .map(RenpyParser::parse_script_structure);
+
+        let order = story_order(&structures);
+        let mut scenes: Vec<_> = order.iter().collect();
+        scenes.sort_by_key(|(_, rank)| **rank);
+        let scenes: Vec<&str> = scenes.into_iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(scenes, ["start", "intro", "chapter_two", "finale", "aside"]);
     }
 
     #[test]

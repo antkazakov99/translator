@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import SceneGraph from "../lib/SceneGraph.svelte";
   import SceneNodeIcon from "../lib/SceneNodeIcon.svelte";
   import SourceViewerModal from "../lib/SourceViewerModal.svelte";
@@ -715,6 +715,20 @@
     return () => clearTimeout(timer);
   });
   let characterUpdateMode = $state<"lines" | "scenes">("lines");
+  // Ползунок: одна часть это один запрос, иначе заметки по частям и итоговый запрос
+  let scenePartsWanted = $state(1);
+  let sceneChunkCount = $state<number | null>(null);
+  let sceneParts = $derived(Math.min(scenePartsWanted, sceneChunkCount ?? 1));
+  let sceneRequests = $derived(sceneParts > 1 ? sceneParts + 1 : 1);
+  let summaryRunning = $state(false);
+  const sceneChunkCache = new Map<string, number>();
+  let summaryProgress = $state<{ stage: string; done: number; total: number } | null>(null);
+  let summaryLabel = $derived.by(() => {
+    if (!summaryProgress) return "Подготовка сцен...";
+    if (summaryProgress.stage === "condense") return `Сжатие заметок: ${summaryProgress.done + 1} из ${summaryProgress.total}`;
+    if (summaryProgress.stage === "final") return "Пишу итоговое описание...";
+    return `Чтение сцен: часть ${summaryProgress.done + 1} из ${summaryProgress.total}`;
+  });
   let collapsedScenes = $state.raw(new Set<string>());
   let updatingCharacter = $state(false);
   const characterScenesCache = new Map<string, CharacterScene[]>();
@@ -785,6 +799,32 @@
       current = false;
       clearTimeout(timer);
       clearTimeout(skeletonTimer);
+    };
+  });
+
+  // Число частей зависит от сцен и выключенных галочек, поэтому считается при их смене
+  $effect(() => {
+    const char = selectedGlossaryChar;
+    if (characterUpdateMode !== "scenes" || !char || !scenesTarget) return;
+    const key = JSON.stringify([scenesTarget, char.excluded_scenes]);
+    const cached = sceneChunkCache.get(key);
+    if (cached !== undefined) {
+      sceneChunkCount = cached;
+      return;
+    }
+    let current = true;
+    const dir = gameDir;
+    const timer = setTimeout(() => {
+      invoke<number>("count_character_chunks", { gameDir: dir, character: untrack(() => $state.snapshot(char)) })
+        .then((count) => {
+          sceneChunkCache.set(key, count);
+          if (current) sceneChunkCount = count;
+        })
+        .catch(() => { if (current) sceneChunkCount = null; });
+    }, 100);
+    return () => {
+      current = false;
+      clearTimeout(timer);
     };
   });
 
@@ -890,6 +930,15 @@
     glossaryDirty = true;
   }
 
+  function applyCharacterUpdate(char: CharacterGlossaryEntry, updated: CharacterGlossaryEntry) {
+    char.gender = updated.gender;
+    char.notes = updated.notes;
+    char.speech = updated.speech;
+    if (!char.translated_name.trim()) char.translated_name = updated.translated_name;
+    glossaryDirty = true;
+    showToast(`Персонаж ${char.original_name} обновлён`, "success");
+  }
+
   /** Обновляет одного персонажа через модель. Готовый перевод имени остаётся: его мог задать пользователь. */
   async function updateCharacterWithLlm(char: CharacterGlossaryEntry) {
     const stored = (key: string, fallback: string) => {
@@ -901,11 +950,54 @@
     };
     updatingCharacter = true;
     try {
+      const apiUrl = stored("translator.llm_api_url", "http://127.0.0.1:1234/v1").trim();
+      const model = stored("translator.llm_model", "mistral-small").trim();
+      if (characterUpdateMode === "scenes" && sceneParts > 1) {
+        summaryRunning = true;
+        // Заметки частей сразу видны в описании, итог их заменит
+        const description = char.notes;
+        const draft: string[] = [];
+        const onProgress = new Channel<{ stage: string; done: number; total: number; note?: string }>();
+        onProgress.onmessage = (progress) => {
+          if (progress.note) {
+            draft.push(progress.note);
+            char.notes = draft.join("\n\n");
+          } else {
+            summaryProgress = progress;
+          }
+        };
+        const restoreDescription = () => {
+          // Прежнее описание важнее черновика: заметки сохранены и никуда не денутся
+          char.notes = description.trim() ? description : draft.join("\n\n");
+          if (!description.trim() && draft.length > 0) glossaryDirty = true;
+        };
+        try {
+          const summary = await invoke<CharacterGlossaryEntry | null>("summarize_glossary_character", {
+            gameDir,
+            apiUrl,
+            model,
+            character: $state.snapshot(char),
+            parts: sceneParts,
+            onProgress
+          });
+          if (summary) {
+            applyCharacterUpdate(char, summary);
+          } else {
+            restoreDescription();
+            showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
+          }
+        } catch (e) {
+          restoreDescription();
+          throw e;
+        }
+        return;
+      }
+
       const count = Number(stored("translator.llm_sample_count", "64"));
       const result = await invoke<{ items: CharacterGlossaryEntry[]; failed_batches: number }>("autofill_glossary_characters", {
         gameDir,
-        apiUrl: stored("translator.llm_api_url", "http://127.0.0.1:1234/v1").trim(),
-        model: stored("translator.llm_model", "mistral-small").trim(),
+        apiUrl,
+        model,
         characters: [$state.snapshot(char)],
         options: {
           onlyEmpty: false,
@@ -919,16 +1011,13 @@
         showToast("Модель не вернула данные о персонаже, попробуйте ещё раз", "warning");
         return;
       }
-      char.gender = updated.gender;
-      char.notes = updated.notes;
-      char.speech = updated.speech;
-      if (!char.translated_name.trim()) char.translated_name = updated.translated_name;
-      glossaryDirty = true;
-      showToast(`Персонаж ${char.original_name} обновлён`, "success");
+      applyCharacterUpdate(char, updated);
     } catch (e) {
       showToast(`Не удалось обновить персонажа: ${e}`, "error");
     } finally {
       updatingCharacter = false;
+      summaryRunning = false;
+      summaryProgress = null;
     }
   }
 
@@ -3491,6 +3580,34 @@
                       <option value={other.alias}>{other.original_name} [{other.alias}]</option>
                     {/each}
                   </select>
+                  {#if characterUpdateMode === "scenes" && selectedGlossaryChar}
+                    <div class="character-scene-depth">
+                      <div class="character-summary-line">
+                        <label for="scene-parts">Частей запроса</label>
+                        <span class="char-sub-label">
+                          {#if sceneChunkCount === null}
+                            подсчёт...
+                          {:else if sceneChunkCount === 0}
+                            нет реплик
+                          {:else}
+                            {sceneParts} из {sceneChunkCount} · запросов: {sceneRequests}
+                          {/if}
+                        </span>
+                      </div>
+                      <input
+                        id="scene-parts"
+                        type="range"
+                        min="1"
+                        max={Math.max(sceneChunkCount ?? 1, 1)}
+                        bind:value={scenePartsWanted}
+                        disabled={updatingCharacter || !sceneChunkCount || sceneChunkCount < 2}
+                      />
+                      <div class="character-depth-ends">
+                        <span>1 запрос, выборка</span>
+                        <span>весь текст, долго</span>
+                      </div>
+                    </div>
+                  {/if}
                   <div class="character-update-row">
                     <select bind:value={characterUpdateMode} class="sidebar-select" disabled={updatingCharacter} aria-label="Что передать модели">
                       <option value="lines">По отдельным репликам</option>
@@ -3509,6 +3626,20 @@
                       <span>Обновить через ИИ</span>
                     </button>
                   </div>
+                  {#if summaryRunning}
+                    <div class="character-summary-progress">
+                      <div class="character-summary-line">
+                        <Loader2 size={13} class="spin" />
+                        <span>{summaryLabel}</span>
+                        <button class="character-scene-link" onclick={() => invoke("cancel_llm_run")}>Остановить</button>
+                      </div>
+                      {#if summaryProgress && summaryProgress.total > 0}
+                        <div class="character-summary-track">
+                          <div class="character-summary-fill" style={`width: ${(summaryProgress.done / summaryProgress.total) * 100}%`}></div>
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
                 </div>
 
                 <div class="sidebar-edit-content">
@@ -3608,6 +3739,7 @@
                       id="character-notes"
                       bind:value={selectedGlossaryChar.notes} 
                       oninput={() => glossaryDirty = true}
+                      readonly={summaryRunning}
                       rows="8"
                       placeholder="напр. Младшая сестра героя, студентка. Дерзкая, за колкостями скрывает неуверенность..."
                       class="sidebar-textarea"
@@ -7125,6 +7257,64 @@
 
   .character-merge-select {
     margin-top: 10px;
+  }
+
+  .character-scene-depth {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 10px;
+    font-size: 12px;
+    color: #cbd5e1;
+  }
+
+  .character-scene-depth input {
+    width: 100%;
+    accent-color: #10b981;
+    cursor: pointer;
+  }
+
+  .character-scene-depth .char-sub-label {
+    margin-left: auto;
+  }
+
+  .character-depth-ends {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: #64748b;
+  }
+
+  .character-summary-progress {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+    font-size: 12px;
+    color: #cbd5e1;
+  }
+
+  .character-summary-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .character-summary-line .character-scene-link {
+    margin-left: auto;
+  }
+
+  .character-summary-track {
+    height: 4px;
+    border-radius: 2px;
+    background: #1e293b;
+    overflow: hidden;
+  }
+
+  .character-summary-fill {
+    height: 100%;
+    background: #10b981;
+    transition: width 0.3s;
   }
 
   .character-update-row {
