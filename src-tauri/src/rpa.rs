@@ -2,7 +2,7 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -422,24 +422,13 @@ impl RpaArchive {
     /// Извлекает ТОЛЬКО скрипты (.rpy и .rpyc) из архива в указанную папку кэша,
     /// и автоматически декомпилирует .rpyc в .rpy (если исходный .rpy отсутствует).
     /// Это гарантирует, что 2+ ГБ медиа-файлов НЕ распаковываются, а папка игры НЕ засоряется.
+    /// Скрипты из `on_disk` пропускаются: их копии в архиве игра не загружает.
     pub fn extract_and_decompile_scripts(
         rpa_path: &Path,
         target_cache_dir: &Path,
+        on_disk: &HashSet<&str>,
     ) -> Result<usize, String> {
         let archive = Self::open(rpa_path)?;
-
-        let version_marker = target_cache_dir.join(".cache_version");
-        let need_refresh = !version_marker.exists()
-            || std::fs::read_to_string(&version_marker).unwrap_or_default() != CACHE_VERSION;
-
-        if need_refresh && target_cache_dir.exists() {
-            fs::remove_dir_all(target_cache_dir).map_err(|e| {
-                format!(
-                    "Не удалось обновить кэш скриптов {:?}: {}",
-                    target_cache_dir, e
-                )
-            })?;
-        }
 
         fs::create_dir_all(target_cache_dir)
             .map_err(|e| format!("Ошибка создания папки кэша {:?}: {}", target_cache_dir, e))?;
@@ -449,7 +438,7 @@ impl RpaArchive {
             std::collections::HashSet::new();
 
         for (name, entry) in &archive.entries {
-            if name.ends_with(".rpy") {
+            if name.ends_with(".rpy") && !on_disk.contains(script_base(name)) {
                 let base = name.trim_end_matches(".rpy").to_string();
                 existing_rpy_basenames.insert(base);
                 script_entries.push(entry.clone());
@@ -458,7 +447,10 @@ impl RpaArchive {
 
         // Файлы перевода разбираются отдельно, когда известны реплики оригинала
         for (name, entry) in &archive.entries {
-            if name.ends_with(".rpyc") && translation_file_name(name).is_none() {
+            if name.ends_with(".rpyc")
+                && translation_file_name(name).is_none()
+                && !on_disk.contains(script_base(name))
+            {
                 let base = name.trim_end_matches(".rpyc").to_string();
                 if !existing_rpy_basenames.contains(&base) {
                     script_entries.push(entry.clone());
@@ -495,42 +487,58 @@ impl RpaArchive {
 
             if is_rpyc {
                 let payload = entry.read_compiled(&mut file, archive_size)?;
-                let stmts = match crate::rpyc::RpycParser::parse_rpyc_bytes(&payload) {
-                    Ok(stmts) => stmts,
-                    Err(error) => {
-                        tracing::warn!(file = %entry.name, %error, "RPYC не декомпилирован");
-                        continue;
-                    }
-                };
-                let rpy_code = crate::rpyc::RpycParser::decompile_to_rpy_text(&stmts);
-                write_atomic(&out_file, |out| {
-                    out.write_all(rpy_code.as_bytes())
-                        .map_err(|e| format!("Не удалось записать {:?}: {}", out_file, e))
-                })?;
+                if !write_decompiled(&payload, &entry.name, &out_file)? {
+                    continue;
+                }
             } else {
                 write_atomic(&out_file, |out| entry.copy_to(&mut file, archive_size, out))?;
             }
             processed += 1;
         }
+        Ok(processed)
+    }
 
-        fs::write(&version_marker, CACHE_VERSION).map_err(|e| {
-            format!(
-                "Не удалось сохранить версию кэша {:?}: {}",
-                version_marker, e
-            )
-        })?;
+    /// Декомпилирует в кэш скрипты, лежащие в папке игры без исходников.
+    fn decompile_loose_scripts(
+        compiled: &[&(String, PathBuf)],
+        target_cache_dir: &Path,
+    ) -> Result<usize, String> {
+        let mut processed = 0;
+        for (name, path) in compiled {
+            let out_file = safe_output_path(target_cache_dir, &format!("{}.rpy", script_base(name)))?;
+            if translation_file_name(name).is_some() || out_file.exists() {
+                continue;
+            }
+            if let Some(payload) = read_loose_script(name, path)
+                && write_decompiled(&payload, name, &out_file)?
+            {
+                processed += 1;
+            }
+        }
         Ok(processed)
     }
 
     /// Восстанавливает запакованные файлы перевода в кэше. Реплики оригинала читаются
     /// только при необходимости: это второй проход по всем скриптам игры.
     fn decompile_packed_translation(
-        game_dir: &Path,
+        loose: &[(String, PathBuf)],
         archives: &[PathBuf],
         target_cache_dir: &Path,
     ) -> Result<usize, String> {
-        // Движок перебирает архивы с конца алфавита и берёт первую найденную копию
+        let on_disk: HashSet<&str> = loose.iter().map(|(name, _)| script_base(name)).collect();
+        let cached = |name: &str| target_cache_dir.join(format!("{}.rpy", script_base(name))).exists();
+
         let mut pending: HashMap<String, Vec<u8>> = HashMap::new();
+        for (name, path) in compiled_without_source(loose) {
+            if translation_file_name(name).is_some()
+                && !cached(name)
+                && let Some(data) = read_loose_script(name, path)
+            {
+                pending.insert(name.clone(), data);
+            }
+        }
+
+        // Движок перебирает архивы с конца алфавита и берёт первую найденную копию
         let mut opened = Vec::new();
         for path in archives.iter().rev() {
             let archive = Self::open(path)?;
@@ -544,7 +552,8 @@ impl RpaArchive {
                 if name.ends_with(".rpyc")
                     && translation_file_name(name).is_some()
                     && !pending.contains_key(name)
-                    && !target_cache_dir.join(format!("{}.rpy", name.trim_end_matches(".rpyc"))).exists()
+                    && !on_disk.contains(script_base(name))
+                    && !cached(name)
                 {
                     pending.insert(name.clone(), entry.read_compiled(&mut file, archive_size)?);
                 }
@@ -566,22 +575,20 @@ impl RpaArchive {
             let mut entries: Vec<_> = archive.entries.iter().collect();
             entries.sort_by_key(|(name, _)| name.as_str());
             for (name, entry) in entries {
-                if name.ends_with(".rpyc") && !name.starts_with("tl/") {
+                if name.ends_with(".rpyc")
+                    && !name.starts_with("tl/")
+                    && !on_disk.contains(script_base(name))
+                {
                     collect(name, &entry.read_compiled(file, *archive_size)?);
                 }
             }
         }
-        let mut loose = Vec::new();
-        if let Err(error) = collect_folder_files_for_mod(game_dir, game_dir, 0, &mut loose) {
-            tracing::warn!(%error, "Скрипты рядом с игрой прочитаны не полностью");
-        }
-        loose.sort();
         for (name, path) in loose {
-            if name.ends_with(".rpyc") && !name.starts_with("tl/") {
-                match fs::read(&path) {
-                    Ok(data) => collect(&name, &data),
-                    Err(error) => tracing::warn!(file = %name, %error, "Скрипт не прочитан"),
-                }
+            if name.ends_with(".rpyc")
+                && !name.starts_with("tl/")
+                && let Some(data) = read_loose_script(name, path)
+            {
+                collect(name, &data);
             }
         }
 
@@ -631,8 +638,9 @@ impl RpaArchive {
         Ok(files)
     }
 
-    /// Проверяет наличие архивов .rpa в папке игры и извлекает/декомпилирует все скрипты в папку кэша
-    pub fn extract_scripts_from_game_archives(
+    /// Собирает в кэш скрипты, которые приложение не может прочитать прямо из папки игры:
+    /// содержимое архивов и `.rpyc` без `.rpy`. Как и в движке, файл с диска важнее архива.
+    pub fn refresh_script_cache(
         game_dir: &Path,
         target_cache_dir: &Path,
     ) -> Result<usize, String> {
@@ -641,6 +649,19 @@ impl RpaArchive {
         let _guard = cache_lock.lock();
 
         let archives = game_archives(game_dir)?;
+        let loose = loose_scripts(game_dir);
+        let compiled = compiled_without_source(&loose);
+        if archives.is_empty() && compiled.is_empty() {
+            if target_cache_dir.exists() {
+                fs::remove_dir_all(target_cache_dir).map_err(|e| {
+                    format!(
+                        "Не удалось удалить устаревший кэш скриптов {:?}: {}",
+                        target_cache_dir, e
+                    )
+                })?;
+            }
+            return Ok(0);
+        }
 
         let mut fingerprint = format!("{}\n", CACHE_VERSION);
         for path in &archives {
@@ -652,6 +673,15 @@ impl RpaArchive {
                 metadata.len(),
                 metadata.modified().ok()
             ));
+        }
+        // Появившийся исходник отменяет копию из архива, а изменения в нём кэша не касаются
+        for (name, path) in &loose {
+            let compiled_state = name
+                .ends_with(".rpyc")
+                .then(|| fs::metadata(path).ok())
+                .flatten()
+                .map(|metadata| (metadata.len(), metadata.modified().ok()));
+            fingerprint.push_str(&format!("{}|{:?}\n", name, compiled_state));
         }
         let fingerprint_file = target_cache_dir.join(".archive_fingerprint");
         if fs::read_to_string(&fingerprint_file).ok().as_deref() != Some(&fingerprint)
@@ -665,20 +695,20 @@ impl RpaArchive {
             })?;
         }
 
-        let mut total_extracted = 0;
+        fs::create_dir_all(target_cache_dir).map_err(|e| {
+            format!(
+                "Не удалось создать кэш скриптов {:?}: {}",
+                target_cache_dir, e
+            )
+        })?;
+
+        let on_disk: HashSet<&str> = loose.iter().map(|(name, _)| script_base(name)).collect();
+        let mut total_extracted = Self::decompile_loose_scripts(&compiled, target_cache_dir)?;
         // Движок перебирает архивы с конца алфавита, а готовый файл кэша не перезаписывается
         for path in archives.iter().rev() {
-            total_extracted += Self::extract_and_decompile_scripts(path, target_cache_dir)?;
+            total_extracted += Self::extract_and_decompile_scripts(path, target_cache_dir, &on_disk)?;
         }
-        total_extracted += Self::decompile_packed_translation(game_dir, &archives, target_cache_dir)?;
-        if !target_cache_dir.exists() {
-            fs::create_dir_all(target_cache_dir).map_err(|e| {
-                format!(
-                    "Не удалось создать кэш скриптов {:?}: {}",
-                    target_cache_dir, e
-                )
-            })?;
-        }
+        total_extracted += Self::decompile_packed_translation(&loose, &archives, target_cache_dir)?;
         fs::write(&fingerprint_file, fingerprint).map_err(|e| {
             format!(
                 "Не удалось сохранить состояние кэша {:?}: {}",
@@ -694,6 +724,68 @@ fn translation_file_name(name: &str) -> Option<&str> {
     name.strip_prefix("tl/")?
         .strip_prefix(crate::TL_LANG)?
         .strip_prefix('/')
+}
+
+/// Имя скрипта без расширения: так сравниваются его исходник и компиляция.
+fn script_base(name: &str) -> &str {
+    name.strip_suffix(".rpyc")
+        .or_else(|| name.strip_suffix(".rpy"))
+        .unwrap_or(name)
+}
+
+/// Скрипты в папке игры по имени относительно неё. Переводы на другие языки не нужны.
+fn loose_scripts(game_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut paths = Vec::new();
+    crate::collect_script_files(game_dir, &mut paths);
+    let mut scripts: Vec<_> = paths
+        .into_iter()
+        .filter_map(|path| {
+            let name = path.strip_prefix(game_dir).ok()?.to_string_lossy().replace('\\', "/");
+            Some((name, path))
+        })
+        .filter(|(name, _)| !name.starts_with("tl/") || translation_file_name(name).is_some())
+        .collect();
+    scripts.sort();
+    scripts
+}
+
+/// `.rpyc` без `.rpy` рядом: приложение прочитает их только после декомпиляции.
+fn compiled_without_source(loose: &[(String, PathBuf)]) -> Vec<&(String, PathBuf)> {
+    let sources: HashSet<&str> = loose.iter().filter_map(|(name, _)| name.strip_suffix(".rpy")).collect();
+    loose
+        .iter()
+        .filter(|(name, _)| name.strip_suffix(".rpyc").is_some_and(|base| !sources.contains(base)))
+        .collect()
+}
+
+fn read_loose_script(name: &str, path: &Path) -> Option<Vec<u8>> {
+    let data = File::open(path)
+        .map_err(|e| e.to_string())
+        .and_then(|file| read_limited(file, MAX_COMPILED_SCRIPT as usize, name));
+    match data {
+        Ok(data) => Some(data),
+        Err(error) => {
+            tracing::warn!(file = %name, %error, "Скрипт не прочитан");
+            None
+        }
+    }
+}
+
+/// Пишет текст скомпилированного скрипта. Файл, который не удалось разобрать, пропускается.
+fn write_decompiled(payload: &[u8], name: &str, out_file: &Path) -> Result<bool, String> {
+    let stmts = match crate::rpyc::RpycParser::parse_rpyc_bytes(payload) {
+        Ok(stmts) => stmts,
+        Err(error) => {
+            tracing::warn!(file = %name, %error, "RPYC не декомпилирован");
+            return Ok(false);
+        }
+    };
+    let rpy_code = crate::rpyc::RpycParser::decompile_to_rpy_text(&stmts);
+    write_atomic(out_file, |out| {
+        out.write_all(rpy_code.as_bytes())
+            .map_err(|e| format!("Не удалось записать {:?}: {}", out_file, e))
+    })?;
+    Ok(true)
 }
 
 /// Архивы игры в алфавитном порядке. Собственный архив мода не содержит её скриптов.
@@ -835,7 +927,7 @@ mod tests {
             let scans: Vec<_> = (0..4)
                 .map(|_| {
                     scope.spawn(|| {
-                        RpaArchive::extract_scripts_from_game_archives(&game_dir, &scripts_dir)
+                        RpaArchive::refresh_script_cache(&game_dir, &scripts_dir)
                     })
                 })
                 .collect();
@@ -967,7 +1059,7 @@ mod tests {
         RpaArchive::create_archive(&game_dir.join("patch.rpa"), &[("story.rpy".into(), b"new".to_vec())])
             .unwrap();
 
-        RpaArchive::extract_scripts_from_game_archives(&game_dir, &scripts_dir).unwrap();
+        RpaArchive::refresh_script_cache(&game_dir, &scripts_dir).unwrap();
 
         assert_eq!(fs::read(scripts_dir.join("story.rpy")).unwrap(), b"new");
         assert_eq!(fs::read(scripts_dir.join("extra.rpy")).unwrap(), b"only here");
@@ -987,7 +1079,7 @@ mod tests {
         let archive_path = game_dir.join("archive.rpa");
         RpaArchive::create_archive(&archive_path, &[("story.rpy".into(), b"first".to_vec())])
             .unwrap();
-        RpaArchive::extract_scripts_from_game_archives(&game_dir, &scripts_dir).unwrap();
+        RpaArchive::refresh_script_cache(&game_dir, &scripts_dir).unwrap();
         assert_eq!(fs::read(scripts_dir.join("story.rpy")).unwrap(), b"first");
 
         RpaArchive::create_archive(
@@ -995,7 +1087,7 @@ mod tests {
             &[("story.rpy".into(), b"second version".to_vec())],
         )
         .unwrap();
-        RpaArchive::extract_scripts_from_game_archives(&game_dir, &scripts_dir).unwrap();
+        RpaArchive::refresh_script_cache(&game_dir, &scripts_dir).unwrap();
         assert_eq!(
             fs::read(scripts_dir.join("story.rpy")).unwrap(),
             b"second version"
@@ -1105,7 +1197,7 @@ mod tests {
         // БЕНЧМАРК: извлечение и декомпиляция ВСЕХ 204 скриптов во временную папку
         let bench_dir = std::env::temp_dir().join("gow_scripts_bench");
         let bench_start = std::time::Instant::now();
-        let decompiled_count = RpaArchive::extract_and_decompile_scripts(path, &bench_dir)
+        let decompiled_count = RpaArchive::extract_and_decompile_scripts(path, &bench_dir, &HashSet::new())
             .expect("Ошибка пакетной декомпиляции");
         println!(
             "БЕНЧМАРК: извлечено и декомпилировано {} скриптов за {:?} в {:?}",
