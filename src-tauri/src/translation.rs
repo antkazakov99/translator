@@ -4,7 +4,7 @@ use crate::rpa::collect_folder_files_for_mod;
 use crate::rpyc_writer::{ScriptFormat, compile_script};
 use crate::{
     TL_LANG, collect_rpy_files, find_game_root, get_project_cache_dir,
-    get_project_scripts_cache_dir, parse_project_file, path_lock, stable_hash_str,
+    get_project_scripts_cache_dir, parse_project_file, path_lock, path_within, stable_hash_str,
     tl_relative_name,
 };
 use serde::{Deserialize, Serialize};
@@ -125,6 +125,10 @@ fn store_path_in(game_dir: &Path, source: &Path) -> PathBuf {
         .join(format!("{:016x}.json", hash))
 }
 
+pub fn has_saved_edits(source: &Path) -> bool {
+    store_path(source).exists()
+}
+
 fn read_store(source: &Path, path: &Path) -> Result<TranslationOverrides, String> {
     if !path.exists() {
         return Ok(TranslationOverrides {
@@ -136,10 +140,8 @@ fn read_store(source: &Path, path: &Path) -> Result<TranslationOverrides, String
         .map_err(|e| format!("Не удалось прочитать сохранённый перевод {:?}: {}", path, e))?;
     let store: TranslationOverrides = serde_json::from_slice(&bytes)
         .map_err(|e| format!("Повреждён файл перевода {:?}: {}", path, e))?;
-    if !store
-        .source_path
-        .eq_ignore_ascii_case(&source.to_string_lossy())
-    {
+    // Сравнение такое же, как при выборе имени файла: кириллица тоже без учёта регистра
+    if store.source_path.to_lowercase() != source.to_string_lossy().to_lowercase() {
         return Err(format!(
             "Файл перевода {:?} относится к другому источнику",
             path
@@ -304,7 +306,7 @@ pub fn prepare_mod_export(
     let mut export = ModExport::default();
     let mut strings = BTreeMap::new();
     for saved in saved_sources(game_dir)? {
-        match tl_relative_name(&saved.source) {
+        match tl_relative_name(&saved.source, game_dir) {
             Some(name) => patch_translation_file(&saved, name, &mut export)?,
             None => collect_string_edits(&saved, &mut strings, &mut export.skipped)?,
         }
@@ -575,18 +577,6 @@ pub struct TransferredEdits {
     pub without_file: usize,
     /// Правки файлов вне старого проекта: их некуда отнести.
     pub lost: usize,
-}
-
-/// Путь без начала `root`. Регистр не важен: по нему не различаются и папки проектов.
-fn path_within(path: &Path, root: &Path) -> Option<PathBuf> {
-    let name = |part: std::path::Component| part.as_os_str().to_string_lossy().to_lowercase();
-    let mut parts = path.components();
-    for expected in root.components() {
-        if parts.next().map(name) != Some(name(expected)) {
-            return None;
-        }
-    }
-    Some(parts.collect())
 }
 
 /// Файл нового проекта для файла старого. Игра могла перейти с `.rpy` рядом с игрой

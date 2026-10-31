@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Представление десериализованного объекта Python Pickle
 #[derive(Debug, Clone, PartialEq)]
@@ -93,14 +93,83 @@ impl PickleValue {
 /// Стек машины состояний Pickle
 enum StackItem {
     Mark,
-    Val(PickleValue),
+    Val(Slot),
+}
+
+struct Slot {
+    value: PickleValue,
+    depth: usize,
+    /// Индексы memo изменяемого объекта, на который поток ссылается позже: его заполняют
+    /// уже после записи в memo, поэтому копия обновляется, когда он уходит со стека.
+    memo_ids: Vec<usize>,
+}
+
+impl StackItem {
+    fn leaf(value: PickleValue) -> Self {
+        Self::built(value, 1)
+    }
+
+    fn built(value: PickleValue, depth: usize) -> Self {
+        StackItem::Val(Slot { value, depth, memo_ids: Vec::new() })
+    }
+}
+
+/// Глубина контейнера с содержимым глубины `inner`. Предел проверяется при разборе:
+/// слишком глубокое значение переполнит стек уже при освобождении памяти, а такое
+/// падение нельзя перехватить. Рекурсивные обходы результата тоже опираются на этот предел.
+fn nested_depth(inner: usize) -> Result<usize, String> {
+    let depth = inner + 1;
+    if depth > MAX_PICKLE_DEPTH {
+        return Err(format!("Слишком глубокая вложенность данных pickle: больше {}", MAX_PICKLE_DEPTH));
+    }
+    Ok(depth)
+}
+
+/// Изменяет объект на вершине стека, добавляя в него содержимое глубины `inner`.
+fn update_top(
+    stack: &mut [StackItem],
+    inner: usize,
+    update: impl FnOnce(&mut PickleValue),
+) -> Result<(), String> {
+    if let Some(StackItem::Val(slot)) = stack.last_mut() {
+        slot.depth = slot.depth.max(nested_depth(inner)?);
+        update(&mut slot.value);
+    }
+    Ok(())
+}
+
+/// Сколько узлов могут занять копии из memo: иначе несколько килобайт вложенных
+/// ссылок разворачиваются в миллиарды объектов и приложение падает без памяти.
+const MAX_MEMO_NODES: usize = 5_000_000;
+
+/// Самая глубокая из проверенных игр даёт 107.
+pub const MAX_PICKLE_DEPTH: usize = 256;
+
+fn node_count(value: &PickleValue) -> usize {
+    1 + match value {
+        PickleValue::List(items) | PickleValue::Tuple(items) | PickleValue::Set(items) => {
+            items.iter().map(node_count).sum()
+        }
+        PickleValue::Dict(entries) => {
+            entries.iter().map(|(key, value)| node_count(key) + node_count(value)).sum()
+        }
+        PickleValue::Object { state, args, .. } => {
+            state.as_deref().map_or(0, node_count) + args.iter().map(node_count).sum::<usize>()
+        }
+        _ => 0,
+    }
 }
 
 /// Декодер Python Pickle (поддерживает протоколы 0, 1, 2, 3, 4, 5)
 pub struct PickleDecoder<'a> {
     data: &'a [u8],
     pos: usize,
-    memo: HashMap<usize, PickleValue>,
+    memo: HashMap<usize, (PickleValue, usize)>,
+    /// Индексы memo, которые поток читает: только такие объекты нужно обновлять.
+    referenced: HashSet<usize>,
+    /// Индексы объектов, которые ещё на стеке.
+    on_stack: HashSet<usize>,
+    memo_nodes: usize,
 }
 
 impl<'a> PickleDecoder<'a> {
@@ -109,10 +178,68 @@ impl<'a> PickleDecoder<'a> {
             data,
             pos: 0,
             memo: HashMap::new(),
+            referenced: HashSet::new(),
+            on_stack: HashSet::new(),
+            memo_nodes: 0,
+        }
+    }
+
+    /// Проходит поток без построения объектов и запоминает индексы чтений из memo.
+    /// Ошибку не возвращает: тот же сбой покажет основной разбор.
+    fn collect_memo_reads(&mut self) -> Result<(), String> {
+        loop {
+            match self.read_byte()? {
+                b'.' => return Ok(()),
+                b'h' => {
+                    let idx = self.read_byte()? as usize;
+                    self.referenced.insert(idx);
+                }
+                b'j' => {
+                    let idx = self.read_u32_le()? as usize;
+                    self.referenced.insert(idx);
+                }
+                0x80 | b'K' | b'q' => {
+                    self.read_byte()?;
+                }
+                b'M' => {
+                    self.read_bytes(2)?;
+                }
+                b'J' | b'r' => {
+                    self.read_bytes(4)?;
+                }
+                b'G' | 0x95 => {
+                    self.read_bytes(8)?;
+                }
+                b'I' | b'F' | b'S' => {
+                    self.read_line()?;
+                }
+                b'c' => {
+                    self.read_line()?;
+                    self.read_line()?;
+                }
+                b'U' | b'C' | 0x8a | 0x8c => {
+                    let len = self.read_byte()? as usize;
+                    self.read_bytes(len)?;
+                }
+                b'T' | b'X' | b'B' | 0x8b => {
+                    let len = self.read_u32_le()? as usize;
+                    self.read_bytes(len)?;
+                }
+                0x8d => {
+                    let len = self.read_u64_le()? as usize;
+                    self.read_bytes(len)?;
+                }
+                _ => {}
+            }
         }
     }
 
     pub fn decode(&mut self) -> Result<PickleValue, String> {
+        let mut reader = PickleDecoder::new(self.data);
+        reader.pos = self.pos;
+        let _ = reader.collect_memo_reads();
+        self.referenced = reader.referenced;
+
         let mut stack: Vec<StackItem> = Vec::new();
 
         while self.pos < self.data.len() {
@@ -126,11 +253,10 @@ impl<'a> PickleDecoder<'a> {
 
                 // STOP
                 b'.' => {
-                    if let Some(StackItem::Val(val)) = stack.pop() {
-                        return Ok(val);
-                    } else {
-                        return Err("Стек пуст при выполнении STOP".to_string());
-                    }
+                    return match stack.pop().and_then(|item| self.settle(item)) {
+                        Some((val, _)) => Ok(val),
+                        None => Err("Стек пуст при выполнении STOP".to_string()),
+                    };
                 }
 
                 // MARK
@@ -140,7 +266,9 @@ impl<'a> PickleDecoder<'a> {
 
                 // POP
                 b'0' => {
-                    stack.pop();
+                    if let Some(item) = stack.pop() {
+                        self.settle(item);
+                    }
                 }
 
                 // POP_MARK
@@ -150,51 +278,51 @@ impl<'a> PickleDecoder<'a> {
 
                 // DUP
                 b'2' => {
-                    if let Some(StackItem::Val(val)) = stack.last() {
-                        let clone = val.clone();
-                        stack.push(StackItem::Val(clone));
+                    if let Some(StackItem::Val(slot)) = stack.last() {
+                        let clone = StackItem::built(slot.value.clone(), slot.depth);
+                        stack.push(clone);
                     }
                 }
 
                 // NONE
                 b'N' => {
-                    stack.push(StackItem::Val(PickleValue::None));
+                    stack.push(StackItem::leaf(PickleValue::None));
                 }
 
                 // NEWTRUE / NEWFALSE / BOOL
-                0x88 => stack.push(StackItem::Val(PickleValue::Bool(true))),
-                0x89 => stack.push(StackItem::Val(PickleValue::Bool(false))),
+                0x88 => stack.push(StackItem::leaf(PickleValue::Bool(true))),
+                0x89 => stack.push(StackItem::leaf(PickleValue::Bool(false))),
 
                 // INT (ASCII decimal)
                 b'I' => {
                     let line = self.read_line()?;
                     let trimmed = line.trim();
                     if trimmed == "01" {
-                        stack.push(StackItem::Val(PickleValue::Bool(true)));
+                        stack.push(StackItem::leaf(PickleValue::Bool(true)));
                     } else if trimmed == "00" {
-                        stack.push(StackItem::Val(PickleValue::Bool(false)));
+                        stack.push(StackItem::leaf(PickleValue::Bool(false)));
                     } else {
                         let val: i64 = trimmed.parse().unwrap_or(0);
-                        stack.push(StackItem::Val(PickleValue::Int(val)));
+                        stack.push(StackItem::leaf(PickleValue::Int(val)));
                     }
                 }
 
                 // BININT (4-byte i32 LE)
                 b'J' => {
                     let val = self.read_i32_le()? as i64;
-                    stack.push(StackItem::Val(PickleValue::Int(val)));
+                    stack.push(StackItem::leaf(PickleValue::Int(val)));
                 }
 
                 // BININT1 (1-byte u8)
                 b'K' => {
                     let val = self.read_byte()? as i64;
-                    stack.push(StackItem::Val(PickleValue::Int(val)));
+                    stack.push(StackItem::leaf(PickleValue::Int(val)));
                 }
 
                 // BININT2 (2-byte u16 LE)
                 b'M' => {
                     let val = self.read_u16_le()? as i64;
-                    stack.push(StackItem::Val(PickleValue::Int(val)));
+                    stack.push(StackItem::leaf(PickleValue::Int(val)));
                 }
 
                 // LONG1 (1-byte length followed by bytes)
@@ -202,7 +330,7 @@ impl<'a> PickleDecoder<'a> {
                     let len = self.read_byte()? as usize;
                     let bytes = self.read_bytes(len)?;
                     let val = parse_two_complement_i64(bytes);
-                    stack.push(StackItem::Val(PickleValue::Int(val)));
+                    stack.push(StackItem::leaf(PickleValue::Int(val)));
                 }
 
                 // LONG4 (4-byte length followed by bytes)
@@ -210,28 +338,28 @@ impl<'a> PickleDecoder<'a> {
                     let len = self.read_u32_le()? as usize;
                     let bytes = self.read_bytes(len)?;
                     let val = parse_two_complement_i64(bytes);
-                    stack.push(StackItem::Val(PickleValue::Int(val)));
+                    stack.push(StackItem::leaf(PickleValue::Int(val)));
                 }
 
                 // FLOAT (ASCII decimal)
                 b'F' => {
                     let line = self.read_line()?;
                     let val: f64 = line.trim().parse().unwrap_or(0.0);
-                    stack.push(StackItem::Val(PickleValue::Float(val)));
+                    stack.push(StackItem::leaf(PickleValue::Float(val)));
                 }
 
                 // BINFLOAT (8-byte f64 BE)
                 b'G' => {
                     let bytes = self.read_bytes(8)?;
                     let val = f64::from_be_bytes(bytes.try_into().unwrap());
-                    stack.push(StackItem::Val(PickleValue::Float(val)));
+                    stack.push(StackItem::leaf(PickleValue::Float(val)));
                 }
 
                 // STRING (ASCII string in quotes)
                 b'S' => {
                     let line = self.read_line()?;
                     let s = unescape_python_str(&line);
-                    stack.push(StackItem::Val(PickleValue::String(s)));
+                    stack.push(StackItem::leaf(PickleValue::String(s)));
                 }
 
                 // BINSTRING (4-byte len + bytes)
@@ -239,7 +367,7 @@ impl<'a> PickleDecoder<'a> {
                     let len = self.read_u32_le()? as usize;
                     let bytes = self.read_bytes(len)?;
                     let s = String::from_utf8_lossy(bytes).into_owned();
-                    stack.push(StackItem::Val(PickleValue::String(s)));
+                    stack.push(StackItem::leaf(PickleValue::String(s)));
                 }
 
                 // SHORT_BINSTRING (1-byte len + bytes)
@@ -247,7 +375,7 @@ impl<'a> PickleDecoder<'a> {
                     let len = self.read_byte()? as usize;
                     let bytes = self.read_bytes(len)?;
                     let s = String::from_utf8_lossy(bytes).into_owned();
-                    stack.push(StackItem::Val(PickleValue::String(s)));
+                    stack.push(StackItem::leaf(PickleValue::String(s)));
                 }
 
                 // BINUNICODE (4-byte len + utf8 bytes)
@@ -255,7 +383,7 @@ impl<'a> PickleDecoder<'a> {
                     let len = self.read_u32_le()? as usize;
                     let bytes = self.read_bytes(len)?;
                     let s = String::from_utf8_lossy(bytes).into_owned();
-                    stack.push(StackItem::Val(PickleValue::String(s)));
+                    stack.push(StackItem::leaf(PickleValue::String(s)));
                 }
 
                 // SHORT_BINUNICODE (1-byte len + utf8 bytes, Protocol 4)
@@ -263,7 +391,7 @@ impl<'a> PickleDecoder<'a> {
                     let len = self.read_byte()? as usize;
                     let bytes = self.read_bytes(len)?;
                     let s = String::from_utf8_lossy(bytes).into_owned();
-                    stack.push(StackItem::Val(PickleValue::String(s)));
+                    stack.push(StackItem::leaf(PickleValue::String(s)));
                 }
 
                 // BINUNICODE8 (8-byte len + utf8 bytes, Protocol 4)
@@ -271,91 +399,96 @@ impl<'a> PickleDecoder<'a> {
                     let len = self.read_u64_le()? as usize;
                     let bytes = self.read_bytes(len)?;
                     let s = String::from_utf8_lossy(bytes).into_owned();
-                    stack.push(StackItem::Val(PickleValue::String(s)));
+                    stack.push(StackItem::leaf(PickleValue::String(s)));
                 }
 
                 // BINBYTES (4-byte len + bytes)
                 b'B' => {
                     let len = self.read_u32_le()? as usize;
                     let bytes = self.read_bytes(len)?.to_vec();
-                    stack.push(StackItem::Val(PickleValue::Bytes(bytes)));
+                    stack.push(StackItem::leaf(PickleValue::Bytes(bytes)));
                 }
 
                 // SHORT_BINBYTES (1-byte len + bytes)
                 b'C' => {
                     let len = self.read_byte()? as usize;
                     let bytes = self.read_bytes(len)?.to_vec();
-                    stack.push(StackItem::Val(PickleValue::Bytes(bytes)));
+                    stack.push(StackItem::leaf(PickleValue::Bytes(bytes)));
                 }
 
                 // EMPTY_TUPLE
                 b')' => {
-                    stack.push(StackItem::Val(PickleValue::Tuple(Vec::new())));
+                    stack.push(StackItem::leaf(PickleValue::Tuple(Vec::new())));
                 }
 
                 // TUPLE (поглощает всё до MARK)
                 b't' => {
-                    let items = self.pop_to_mark(&mut stack);
-                    stack.push(StackItem::Val(PickleValue::Tuple(items)));
+                    let (items, depth) = self.pop_to_mark(&mut stack);
+                    stack.push(StackItem::built(PickleValue::Tuple(items), nested_depth(depth)?));
                 }
 
                 // TUPLE1
                 0x85 => {
-                    if let Some(StackItem::Val(v)) = stack.pop() {
-                        stack.push(StackItem::Val(PickleValue::Tuple(vec![v])));
-                    }
+                    let (v, depth) = self.pop_val(&mut stack)?;
+                    stack.push(StackItem::built(PickleValue::Tuple(vec![v]), nested_depth(depth)?));
                 }
 
                 // TUPLE2
                 0x86 => {
-                    let v2 = self.pop_val(&mut stack)?;
-                    let v1 = self.pop_val(&mut stack)?;
-                    stack.push(StackItem::Val(PickleValue::Tuple(vec![v1, v2])));
+                    let (v2, depth2) = self.pop_val(&mut stack)?;
+                    let (v1, depth1) = self.pop_val(&mut stack)?;
+                    let depth = nested_depth(depth1.max(depth2))?;
+                    stack.push(StackItem::built(PickleValue::Tuple(vec![v1, v2]), depth));
                 }
 
                 // TUPLE3
                 0x87 => {
-                    let v3 = self.pop_val(&mut stack)?;
-                    let v2 = self.pop_val(&mut stack)?;
-                    let v1 = self.pop_val(&mut stack)?;
-                    stack.push(StackItem::Val(PickleValue::Tuple(vec![v1, v2, v3])));
+                    let (v3, depth3) = self.pop_val(&mut stack)?;
+                    let (v2, depth2) = self.pop_val(&mut stack)?;
+                    let (v1, depth1) = self.pop_val(&mut stack)?;
+                    let depth = nested_depth(depth1.max(depth2).max(depth3))?;
+                    stack.push(StackItem::built(PickleValue::Tuple(vec![v1, v2, v3]), depth));
                 }
 
                 // EMPTY_LIST
                 b']' => {
-                    stack.push(StackItem::Val(PickleValue::List(Vec::new())));
+                    stack.push(StackItem::leaf(PickleValue::List(Vec::new())));
                 }
 
                 // LIST (поглощает всё до MARK)
                 b'l' => {
-                    let items = self.pop_to_mark(&mut stack);
-                    stack.push(StackItem::Val(PickleValue::List(items)));
+                    let (items, depth) = self.pop_to_mark(&mut stack);
+                    stack.push(StackItem::built(PickleValue::List(items), nested_depth(depth)?));
                 }
 
                 // APPEND
                 b'a' => {
-                    let item = self.pop_val(&mut stack)?;
-                    if let Some(StackItem::Val(PickleValue::List(list))) = stack.last_mut() {
-                        list.push(item);
-                    }
+                    let (item, depth) = self.pop_val(&mut stack)?;
+                    update_top(&mut stack, depth, |top| {
+                        if let PickleValue::List(list) = top {
+                            list.push(item);
+                        }
+                    })?;
                 }
 
                 // APPENDS (добавляет все элементы до MARK в список)
                 b'e' => {
-                    let items = self.pop_to_mark(&mut stack);
-                    if let Some(StackItem::Val(PickleValue::List(list))) = stack.last_mut() {
-                        list.extend(items);
-                    }
+                    let (items, depth) = self.pop_to_mark(&mut stack);
+                    update_top(&mut stack, depth, |top| {
+                        if let PickleValue::List(list) = top {
+                            list.extend(items);
+                        }
+                    })?;
                 }
 
                 // EMPTY_DICT
                 b'}' => {
-                    stack.push(StackItem::Val(PickleValue::Dict(Vec::new())));
+                    stack.push(StackItem::leaf(PickleValue::Dict(Vec::new())));
                 }
 
                 // DICT (поглощает пары ключ-значение до MARK)
                 b'd' => {
-                    let items = self.pop_to_mark(&mut stack);
+                    let (items, depth) = self.pop_to_mark(&mut stack);
                     let mut dict = Vec::new();
                     let mut iter = items.into_iter();
                     while let Some(k) = iter.next() {
@@ -363,114 +496,111 @@ impl<'a> PickleDecoder<'a> {
                             dict.push((k, v));
                         }
                     }
-                    stack.push(StackItem::Val(PickleValue::Dict(dict)));
+                    stack.push(StackItem::built(PickleValue::Dict(dict), nested_depth(depth)?));
                 }
 
                 // SETITEM (dict[k] = v)
                 b's' => {
-                    let val = self.pop_val(&mut stack)?;
-                    let key = self.pop_val(&mut stack)?;
-                    if let Some(StackItem::Val(PickleValue::Dict(dict))) = stack.last_mut() {
-                        dict.push((key, val));
-                    }
+                    let (val, val_depth) = self.pop_val(&mut stack)?;
+                    let (key, key_depth) = self.pop_val(&mut stack)?;
+                    update_top(&mut stack, val_depth.max(key_depth), |top| {
+                        if let PickleValue::Dict(dict) = top {
+                            dict.push((key, val));
+                        }
+                    })?;
                 }
 
                 // SETITEMS (поглощает пары ключ-значение до MARK и кладёт в dict)
                 b'u' => {
-                    let items = self.pop_to_mark(&mut stack);
-                    if let Some(StackItem::Val(PickleValue::Dict(dict))) = stack.last_mut() {
-                        let mut iter = items.into_iter();
-                        while let Some(k) = iter.next() {
-                            if let Some(v) = iter.next() {
-                                dict.push((k, v));
+                    let (items, depth) = self.pop_to_mark(&mut stack);
+                    update_top(&mut stack, depth, |top| {
+                        if let PickleValue::Dict(dict) = top {
+                            let mut iter = items.into_iter();
+                            while let Some(k) = iter.next() {
+                                if let Some(v) = iter.next() {
+                                    dict.push((k, v));
+                                }
                             }
                         }
-                    }
+                    })?;
                 }
 
                 // EMPTY_SET
                 0x8f => {
-                    stack.push(StackItem::Val(PickleValue::Set(Vec::new())));
+                    stack.push(StackItem::leaf(PickleValue::Set(Vec::new())));
                 }
 
                 // ADDITEMS
                 0x90 => {
-                    let items = self.pop_to_mark(&mut stack);
-                    if let Some(StackItem::Val(PickleValue::Set(set))) = stack.last_mut() {
-                        set.extend(items);
-                    }
+                    let (items, depth) = self.pop_to_mark(&mut stack);
+                    update_top(&mut stack, depth, |top| {
+                        if let PickleValue::Set(set) = top {
+                            set.extend(items);
+                        }
+                    })?;
                 }
 
                 // BINPUT (1-byte memo index)
                 b'q' => {
                     let idx = self.read_byte()? as usize;
-                    if let Some(StackItem::Val(v)) = stack.last() {
-                        self.memo.insert(idx, v.clone());
-                    }
+                    self.memo_put(&mut stack, idx);
                 }
 
                 // LONG_BINPUT (4-byte memo index)
                 b'r' => {
                     let idx = self.read_u32_le()? as usize;
-                    if let Some(StackItem::Val(v)) = stack.last() {
-                        self.memo.insert(idx, v.clone());
-                    }
+                    self.memo_put(&mut stack, idx);
                 }
 
                 // MEMOIZE (Protocol 4 auto memo index)
                 0x94 => {
                     let idx = self.memo.len();
-                    if let Some(StackItem::Val(v)) = stack.last() {
-                        self.memo.insert(idx, v.clone());
-                    }
+                    self.memo_put(&mut stack, idx);
                 }
 
                 // BINGET (1-byte memo get)
                 b'h' => {
                     let idx = self.read_byte()? as usize;
-                    if let Some(v) = self.memo.get(&idx) {
-                        stack.push(StackItem::Val(v.clone()));
-                    } else {
-                        stack.push(StackItem::Val(PickleValue::None));
-                    }
+                    let (value, depth) = self.memo_get(&stack, idx)?;
+                    stack.push(StackItem::built(value, depth));
                 }
 
                 // LONG_BINGET (4-byte memo get)
                 b'j' => {
                     let idx = self.read_u32_le()? as usize;
-                    if let Some(v) = self.memo.get(&idx) {
-                        stack.push(StackItem::Val(v.clone()));
-                    } else {
-                        stack.push(StackItem::Val(PickleValue::None));
-                    }
+                    let (value, depth) = self.memo_get(&stack, idx)?;
+                    stack.push(StackItem::built(value, depth));
                 }
 
                 // GLOBAL (module\n name\n)
                 b'c' => {
                     let module = self.read_line()?.trim().to_string();
                     let name = self.read_line()?.trim().to_string();
-                    stack.push(StackItem::Val(PickleValue::Global { module, name }));
+                    stack.push(StackItem::leaf(PickleValue::Global { module, name }));
                 }
 
                 // STACK_GLOBAL (Protocol 4: pops name, pops module)
                 0x93 => {
                     let name = self
                         .pop_val(&mut stack)?
+                        .0
                         .as_str()
                         .unwrap_or_default()
                         .to_string();
                     let module = self
                         .pop_val(&mut stack)?
+                        .0
                         .as_str()
                         .unwrap_or_default()
                         .to_string();
-                    stack.push(StackItem::Val(PickleValue::Global { module, name }));
+                    stack.push(StackItem::leaf(PickleValue::Global { module, name }));
                 }
 
                 // REDUCE (callable, args_tuple)
                 b'R' => {
-                    let args_val = self.pop_val(&mut stack)?;
-                    let callable = self.pop_val(&mut stack)?;
+                    let (args_val, args_depth) = self.pop_val(&mut stack)?;
+                    let (callable, _) = self.pop_val(&mut stack)?;
+                    let depth = nested_depth(args_depth)?;
                     let args = match args_val {
                         PickleValue::Tuple(t) => t,
                         PickleValue::List(l) => l,
@@ -479,52 +609,56 @@ impl<'a> PickleDecoder<'a> {
 
                     match callable {
                         PickleValue::Global { module, name } => {
-                            stack.push(StackItem::Val(PickleValue::Object {
+                            let object = PickleValue::Object {
                                 class_module: module,
                                 class_name: name,
                                 state: None,
                                 args,
-                            }));
+                            };
+                            stack.push(StackItem::built(object, depth));
                         }
                         other => {
-                            stack.push(StackItem::Val(PickleValue::Object {
+                            let object = PickleValue::Object {
                                 class_module: "unknown".to_string(),
                                 class_name: format!("{:?}", other),
                                 state: None,
                                 args,
-                            }));
+                            };
+                            stack.push(StackItem::built(object, depth));
                         }
                     }
                 }
 
                 // BUILD (inst, state)
                 b'b' => {
-                    let state = self.pop_val(&mut stack)?;
-                    if let Some(StackItem::Val(PickleValue::Object {
-                        state: obj_state, ..
-                    })) = stack.last_mut()
-                    {
-                        *obj_state = Some(Box::new(state));
-                    }
+                    let (state, depth) = self.pop_val(&mut stack)?;
+                    update_top(&mut stack, depth, |top| {
+                        if let PickleValue::Object { state: obj_state, .. } = top {
+                            *obj_state = Some(Box::new(state));
+                        }
+                    })?;
                 }
 
                 // NEWOBJ (Protocol 2: cls, args)
                 0x81 => {
-                    let args = match self.pop_val(&mut stack)? {
+                    let (args_val, args_depth) = self.pop_val(&mut stack)?;
+                    let args = match args_val {
                         PickleValue::Tuple(t) => t,
                         other => vec![other],
                     };
-                    let cls = self.pop_val(&mut stack)?;
+                    let depth = nested_depth(args_depth)?;
+                    let (cls, _) = self.pop_val(&mut stack)?;
                     let (module, name) = match cls {
                         PickleValue::Global { module, name } => (module, name),
                         _ => ("unknown".to_string(), "unknown".to_string()),
                     };
-                    stack.push(StackItem::Val(PickleValue::Object {
+                    let object = PickleValue::Object {
                         class_module: module,
                         class_name: name,
                         state: None,
                         args,
-                    }));
+                    };
+                    stack.push(StackItem::built(object, depth));
                 }
 
                 // FRAME (Protocol 4): длина блока, данные идут сразу за ней
@@ -544,32 +678,82 @@ impl<'a> PickleDecoder<'a> {
         }
 
         // Если файл закончился без опкода STOP, возвращаем верхний элемент стека
-        if let Some(StackItem::Val(val)) = stack.pop() {
-            Ok(val)
-        } else {
-            Err("Пустой поток pickle данных".to_string())
+        match stack.pop().and_then(|item| self.settle(item)) {
+            Some((val, _)) => Ok(val),
+            None => Err("Пустой поток pickle данных".to_string()),
         }
     }
 
-    fn pop_val(&mut self, stack: &mut Vec<StackItem>) -> Result<PickleValue, String> {
+    fn memo_put(&mut self, stack: &mut [StackItem], idx: usize) {
+        let Some(StackItem::Val(slot)) = stack.last_mut() else {
+            return;
+        };
+        self.memo.insert(idx, (slot.value.clone(), slot.depth));
+        let is_mutable = matches!(
+            slot.value,
+            PickleValue::List(_) | PickleValue::Dict(_) | PickleValue::Set(_) | PickleValue::Object { .. }
+        );
+        if is_mutable && self.referenced.contains(&idx) {
+            self.on_stack.insert(idx);
+            slot.memo_ids.push(idx);
+        }
+    }
+
+    /// Копия объекта из memo. Незавершённый объект ещё на стеке, там он полнее, чем в memo.
+    fn memo_get(&mut self, stack: &[StackItem], idx: usize) -> Result<(PickleValue, usize), String> {
+        let open = self.on_stack.contains(&idx).then(|| {
+            stack.iter().rev().find_map(|item| match item {
+                StackItem::Val(slot) if slot.memo_ids.contains(&idx) => Some((&slot.value, slot.depth)),
+                _ => None,
+            })
+        });
+        let found = open.flatten().or_else(|| self.memo.get(&idx).map(|(value, depth)| (value, *depth)));
+        let Some((value, depth)) = found else {
+            return Ok((PickleValue::None, 1));
+        };
+        self.memo_nodes += node_count(value);
+        if self.memo_nodes > MAX_MEMO_NODES {
+            return Err("Слишком много повторяющихся объектов в данных pickle".to_string());
+        }
+        Ok((value.clone(), depth))
+    }
+
+    /// Снимает значение со стека и обновляет его копии в memo.
+    fn settle(&mut self, item: StackItem) -> Option<(PickleValue, usize)> {
+        let StackItem::Val(slot) = item else {
+            return None;
+        };
+        for id in slot.memo_ids {
+            self.on_stack.remove(&id);
+            self.memo.insert(id, (slot.value.clone(), slot.depth));
+        }
+        Some((slot.value, slot.depth))
+    }
+
+    fn pop_val(&mut self, stack: &mut Vec<StackItem>) -> Result<(PickleValue, usize), String> {
         while let Some(item) = stack.pop() {
-            if let StackItem::Val(v) = item {
-                return Ok(v);
+            if let Some(value) = self.settle(item) {
+                return Ok(value);
             }
         }
         Err("Ожидалось значение в стеке pickle".to_string())
     }
 
-    fn pop_to_mark(&mut self, stack: &mut Vec<StackItem>) -> Vec<PickleValue> {
+    /// Значения до отметки и наибольшая глубина среди них.
+    fn pop_to_mark(&mut self, stack: &mut Vec<StackItem>) -> (Vec<PickleValue>, usize) {
         let mut items = Vec::new();
+        let mut depth = 0;
         while let Some(item) = stack.pop() {
-            match item {
-                StackItem::Mark => break,
-                StackItem::Val(v) => items.push(v),
+            match self.settle(item) {
+                None => break,
+                Some((value, item_depth)) => {
+                    items.push(value);
+                    depth = depth.max(item_depth);
+                }
             }
         }
         items.reverse();
-        items
+        (items, depth)
     }
 
     fn read_byte(&mut self) -> Result<u8, String> {
@@ -828,6 +1012,98 @@ impl Default for PickleEncoder {
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_PICKLE_DEPTH, PickleDecoder, PickleValue};
+
+    #[test]
+    fn test_shared_list_keeps_items_added_after_memo() {
+        let (one, two) = (PickleValue::Int(1), PickleValue::Int(2));
+        let filled = PickleValue::List(vec![one.clone(), two.clone()]);
+
+        // Ссылка, пока список ещё на стеке: как при записи пары `(items, items)`
+        let data = [0x80, 2, b'(', b']', b'q', 0, b'(', b'K', 1, b'K', 2, b'e', b'h', 0, b't', b'.'];
+        assert_eq!(
+            PickleDecoder::new(&data).decode().unwrap(),
+            PickleValue::Tuple(vec![filled.clone(), filled.clone()])
+        );
+
+        // Ссылка после того, как список ушёл со стека внутрь другого объекта
+        let data = [b'(', b']', b'q', 0, b'(', b'K', 1, b'K', 2, b'e', 0x85, b'h', 0, b't', b'.'];
+        assert_eq!(
+            PickleDecoder::new(&data).decode().unwrap(),
+            PickleValue::Tuple(vec![PickleValue::Tuple(vec![filled.clone()]), filled])
+        );
+    }
+
+    #[test]
+    fn test_shared_object_keeps_state_built_after_memo() {
+        let mut data = b"(cmod\nCls\n)\x81q\x00}b".to_vec();
+        data.extend_from_slice(&[0x85, b'h', 0, b't', b'.']);
+
+        let PickleValue::Tuple(items) = PickleDecoder::new(&data).decode().unwrap() else {
+            panic!("ожидался кортеж");
+        };
+        let PickleValue::Object { state, .. } = &items[1] else {
+            panic!("ожидался объект");
+        };
+        assert!(state.is_some());
+    }
+
+    #[test]
+    fn test_deep_nesting_is_rejected_without_stack_overflow() {
+        let mut wrapped = vec![b'K', 1];
+        wrapped.extend(std::iter::repeat_n(0x85, 2_000_000));
+        wrapped.push(b'.');
+
+        let mut listed = vec![b']'];
+        for _ in 0..100_000 {
+            listed.extend(*b"]a");
+        }
+        listed.push(b'.');
+
+        // Глубина растёт через memo: каждый кортеж содержит предыдущий
+        let mut rebuilt = b"K\x01q\x00".to_vec();
+        for _ in 0..100_000 {
+            rebuilt.extend(b"(h\x00tq\x00");
+        }
+        rebuilt.push(b'.');
+
+        for data in [wrapped, rebuilt] {
+            let error = PickleDecoder::new(&data).decode().unwrap_err();
+            assert!(error.contains("вложенность"), "{error}");
+        }
+        // Плоский список соседних списков не вложен и остаётся допустимым
+        assert!(PickleDecoder::new(&listed).decode().is_ok());
+    }
+
+    #[test]
+    fn test_deepest_allowed_value_survives_every_walk() {
+        let mut data = vec![b'K', 1];
+        data.extend(std::iter::repeat_n(0x85, MAX_PICKLE_DEPTH - 1));
+        data.push(b'.');
+
+        let run = move || {
+            let value = PickleDecoder::new(&data).decode().unwrap();
+            assert_eq!(value.clone(), value);
+            crate::rpyc::RpycParser::statements_of(&value).unwrap();
+        };
+        // Команды Tauri и rayon работают на потоках с небольшим стеком, память освобождается там же
+        std::thread::Builder::new().stack_size(1024 * 1024).spawn(run).unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn test_nested_references_cannot_exhaust_memory() {
+        let mut data = vec![b'K', 1, b'q', 0];
+        for _ in 0..30 {
+            data.push(b'(');
+            data.extend([b'h', 0].repeat(8));
+            data.extend([b't', b'q', 0]);
+        }
+        data.push(b'.');
+
+        let error = PickleDecoder::new(&data).decode().unwrap_err();
+        assert!(error.contains("повторяющихся"), "{error}");
+    }
+
     use super::*;
 
     #[test]

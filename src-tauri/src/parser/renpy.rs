@@ -44,6 +44,34 @@ static RE_STRUCT_JUMP: LazyLock<Regex> = LazyLock::new(|| {
 /// Слова после `jump` и `call`, которые не называют метку: `call screen inventory`.
 const NON_LABEL_TARGETS: &[&str] = &["screen", "expression"];
 
+/// Переход из кода Python и из действия кнопки: `Jump("map")`, `renpy.call("intro")`.
+static RE_ACTION_TARGET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r#"\b(?P<cmd>Jump|Call|renpy\.jump|renpy\.call|renpy\.jump_out_of_context|renpy\.call_in_new_context)"#,
+        r#"\(\s*["'](?P<target>[\w.]+)["']"#,
+    ))
+    .unwrap()
+});
+
+static RE_SCREEN_BLOCK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\s*screen\s+(\w+)\s*(?:\(.*\))?\s*:"#).unwrap());
+
+/// Показ экрана из сцены.
+static RE_SHOWN_SCREEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*(?:call|show)\s+screen\s+(\w+)|\brenpy\.(?:call|show)_screen\(\s*["'](\w+)["']"#)
+        .unwrap()
+});
+
+/// Экран, открытый из другого экрана.
+static RE_SCREEN_LINK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^\s*use\s+(\w+)|\b(?:Show|ToggleScreen)\(\s*["'](\w+)["']"#).unwrap()
+});
+
+/// Код этих блоков не выполняется внутри сцены, хотя стоит после её метки.
+static RE_INIT_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(?:\s*init\b|python\b).*:\s*(?:#.*)?$"#).unwrap()
+});
+
 static RE_STRUCT_IF: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"^\s*(?:elif|if)\s+(.+?)\s*:"#).unwrap());
 
@@ -128,6 +156,17 @@ pub struct ScriptStructure {
     pub scene_choices: HashMap<String, Vec<ChoiceBlockDto>>,
     pub scene_jumps: HashMap<String, Vec<(String, Option<String>)>>,
     pub edges: Vec<SceneEdgeDto>,
+    /// Переходы кнопок по именам экранов файла.
+    pub screens: HashMap<String, ScreenLinks>,
+    /// Какие экраны показывают сцены файла: сцена и имя экрана.
+    pub shown_screens: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScreenLinks {
+    pub targets: Vec<String>,
+    /// Экраны, вложенные через `use` и открытые кнопками.
+    pub screens: Vec<String>,
 }
 
 /// Блок `menu:`, в котором находится разбор. Меню могут быть вложенными.
@@ -150,6 +189,48 @@ impl ScriptStructure {
                     .push(ChoiceBlockDto { prompt: None, options });
             }
         }
+    }
+
+    /// Записывает переход сцены с учётом открытых меню и условий.
+    fn add_transition(
+        &mut self,
+        scene: &str,
+        target: &str,
+        is_call: bool,
+        inline_condition: Option<String>,
+        menus: &mut [OpenMenu],
+        conditions: &[(usize, String)],
+    ) {
+        let cond = inline_condition.or_else(|| conditions.last().map(|(_, cond)| cond.clone()));
+        let kind = if !menus.is_empty() {
+            "choice"
+        } else if cond.is_some() {
+            "branch"
+        } else if is_call {
+            "call"
+        } else {
+            "jump"
+        };
+
+        let option = menus.last_mut().and_then(|menu| menu.options.last_mut());
+        let condition_label = match option {
+            Some(opt) => {
+                opt.target_jump = Some(target.to_string());
+                Some(format!("Выбор: \"{}\"", opt.text))
+            }
+            None => cond.clone(),
+        };
+
+        self.edges.push(SceneEdgeDto {
+            from: scene.to_string(),
+            to: target.to_string(),
+            kind: kind.to_string(),
+            condition: condition_label,
+        });
+        self.scene_jumps
+            .entry(scene.to_string())
+            .or_default()
+            .push((target.to_string(), cond));
     }
 }
 
@@ -596,6 +677,8 @@ impl RenpyParser {
         let mut menus: Vec<OpenMenu> = Vec::new();
         // Условия открытых блоков if/elif/else с их отступами
         let mut conditions: Vec<(usize, String)> = Vec::new();
+        let mut open_screen: Option<(usize, String)> = None;
+        let mut init_indent: Option<usize> = None;
 
         for (idx, line) in content.lines().enumerate() {
             let line_num = idx + 1;
@@ -606,10 +689,34 @@ impl RenpyParser {
 
             let indent = line.len() - line.trim_start().len();
 
+            // Экран объявляют и внутри метки, поэтому он определяется по своему отступу
+            if let Some((screen_indent, screen)) = &open_screen {
+                if indent > *screen_indent {
+                    let links = structure.screens.entry(screen.clone()).or_default();
+                    links.targets.extend(
+                        RE_ACTION_TARGET
+                            .captures_iter(line)
+                            .map(|caps| caps.name("target").unwrap().as_str().to_string()),
+                    );
+                    links.screens.extend(RE_SCREEN_LINK.captures_iter(line).filter_map(|caps| {
+                        Some(caps.get(1).or_else(|| caps.get(2))?.as_str().to_string())
+                    }));
+                    continue;
+                }
+                open_screen = None;
+            }
+            if let Some(caps) = RE_SCREEN_BLOCK.captures(line) {
+                let screen = caps.get(1).unwrap().as_str().to_string();
+                structure.screens.entry(screen.clone()).or_default();
+                open_screen = Some((indent, screen));
+                continue;
+            }
+
             // 1. Проверяем объявление сцены (label)
             if let Some(caps) = RE_LABEL.captures(line) {
                 structure.close_menus(current_label.as_deref(), &mut menus, 0);
                 conditions.clear();
+                init_indent = None;
 
                 let label_name = caps.get(1).unwrap().as_str().to_string();
                 structure.labels.push(LabelInfoDto {
@@ -628,6 +735,12 @@ impl RenpyParser {
             // Отступ показывает, какие блоки уже закончились
             structure.close_menus(Some(&lbl), &mut menus, indent);
             conditions.retain(|(block_indent, _)| *block_indent < indent);
+            if init_indent.is_some_and(|block_indent| indent <= block_indent) {
+                init_indent = None;
+            }
+            if RE_INIT_BLOCK.is_match(line) {
+                init_indent.get_or_insert(indent);
+            }
 
             // 2. Проверяем начало блока menu:
             if RE_STRUCT_MENU.is_match(line) {
@@ -664,42 +777,37 @@ impl RenpyParser {
             if let Some(caps) = RE_STRUCT_JUMP.captures(line)
                 && !NON_LABEL_TARGETS.contains(&caps.name("target").unwrap().as_str())
             {
-                let cmd = caps.name("cmd").unwrap().as_str();
-                let target = caps.name("target").unwrap().as_str().to_string();
                 let inline_cond = caps.name("cond").map(|c| c.as_str().trim().to_string());
-                let cond = inline_cond.or_else(|| conditions.last().map(|(_, cond)| cond.clone()));
+                structure.add_transition(
+                    &lbl,
+                    caps.name("target").unwrap().as_str(),
+                    caps.name("cmd").unwrap().as_str() == "call",
+                    inline_cond,
+                    &mut menus,
+                    &conditions,
+                );
+            }
 
-                let kind = if !menus.is_empty() {
-                    "choice".to_string()
-                } else if cond.is_some() {
-                    "branch".to_string()
-                } else if cmd == "call" {
-                    "call".to_string()
-                } else {
-                    "jump".to_string()
-                };
+            // 6. Экраны, показанные сценой
+            if let Some(caps) = RE_SHOWN_SCREEN.captures(line)
+                && let Some(screen) = caps.get(1).or_else(|| caps.get(2))
+            {
+                structure.shown_screens.push((lbl.clone(), screen.as_str().to_string()));
+            }
 
-                let option = menus.last_mut().and_then(|menu| menu.options.last_mut());
-                let condition_label = match option {
-                    Some(opt) => {
-                        opt.target_jump = Some(target.clone());
-                        Some(format!("Выбор: \"{}\"", opt.text))
-                    }
-                    None => cond.clone(),
-                };
-
-                structure.edges.push(SceneEdgeDto {
-                    from: lbl.clone(),
-                    to: target.clone(),
-                    kind,
-                    condition: condition_label,
-                });
-
-                structure
-                    .scene_jumps
-                    .entry(lbl.clone())
-                    .or_default()
-                    .push((target, cond));
+            // 7. Переходы из кода Python. Объявления выполняются вне сцены
+            if init_indent.is_none() && !trimmed.starts_with("define ") && !trimmed.starts_with("default ") {
+                for caps in RE_ACTION_TARGET.captures_iter(line) {
+                    let cmd = caps.name("cmd").unwrap().as_str();
+                    structure.add_transition(
+                        &lbl,
+                        caps.name("target").unwrap().as_str(),
+                        cmd.to_lowercase().contains("call"),
+                        None,
+                        &mut menus,
+                        &conditions,
+                    );
+                }
             }
         }
 
@@ -1190,6 +1298,48 @@ label start:
                 ("five", "call", None),
             ]
         );
+    }
+
+    #[test]
+    fn test_screens_and_python_transitions() {
+        let script = concat!(
+            "label start:\n",
+            "    show screen hud\n",
+            "    $ renpy.show_screen(\"phone\")\n",
+            "    $ renpy.jump(\"second\")\n",
+            "    $ obj.action = Jump(\"third\")\n",
+            "    if flag:\n",
+            "        $ renpy.call(\"fourth\")\n",
+            "    # $ renpy.jump(\"commented\")\n",
+            "    define trap = Jump(\"defined\")\n",
+            "    screen inner():\n",
+            "        textbutton \"Go\" action Jump(\"from_inner\")\n",
+            "    jump after\n",
+            "screen hud:\n",
+            "    if flag:\n",
+            "        imagebutton auto \"a_%s\" action [Play(\"sound\", \"a\"), Show(\"phone\")]\n",
+            "    hotspot (0, 0, 1, 1) action Jump(\"from_hud\") alt \"x\"\n",
+            "init python:\n",
+            "    def helper():\n",
+            "        renpy.jump(\"from_init\")\n",
+        );
+
+        let structure = RenpyParser::parse_script_structure(script);
+
+        let edges: Vec<_> = structure
+            .edges
+            .iter()
+            .map(|edge| (edge.to.as_str(), edge.kind.as_str()))
+            .collect();
+        assert_eq!(
+            edges,
+            [("second", "jump"), ("third", "jump"), ("fourth", "branch"), ("after", "jump")]
+        );
+        assert_eq!(structure.screens["inner"].targets, ["from_inner"]);
+        assert_eq!(structure.screens["hud"].targets, ["from_hud"]);
+        assert_eq!(structure.screens["hud"].screens, ["phone"]);
+        let shown: Vec<_> = structure.shown_screens.iter().map(|(_, screen)| screen.as_str()).collect();
+        assert_eq!(shown, ["hud", "phone"]);
     }
 
     #[test]
