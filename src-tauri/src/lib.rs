@@ -1538,6 +1538,10 @@ pub(crate) const TEST_CHARACTERS_GAME: &str = "TRANSLATOR_TEST_CHARACTERS_GAME";
 #[cfg(test)]
 pub(crate) const TEST_RPA2_ARCHIVE: &str = "TRANSLATOR_TEST_RPA2_ARCHIVE";
 
+/// Путь к файлу архива с индексом в pickle протокола 4 или новее.
+#[cfg(test)]
+pub(crate) const TEST_FRAMED_ARCHIVE: &str = "TRANSLATOR_TEST_FRAMED_ARCHIVE";
+
 /// Папка игры для тестов на реальных данных: `cargo test -- --ignored`
 /// с заданной переменной окружения. Без неё такие тесты ничего не проверяют.
 #[cfg(test)]
