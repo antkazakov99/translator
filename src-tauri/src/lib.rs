@@ -1418,16 +1418,6 @@ async fn decompile_rpyc_file(
     .map_err(|e| format!("Ошибка декомпиляции: {}", e))?
 }
 
-/// Персонажи, объявленные строкой: `default cam = "Camila"`, а не `Character`. Движок показывает
-/// значение как имя. Переменная считается персонажем, только если у неё есть реплики.
-fn string_speakers(game: &scenes::GameLines) -> SpeakerMap {
-    game.lines
-        .iter()
-        .filter_map(|line| line.alias.as_deref())
-        .filter_map(|alias| Some((alias.to_string(), game.variables.get(alias)?.first()?.clone())))
-        .collect()
-}
-
 #[tauri::command]
 async fn get_project_glossary(
     game_dir: String,
@@ -1438,13 +1428,6 @@ async fn get_project_glossary(
         let mut gl = glossary::ProjectGlossary::load_for_project(&base_path)?;
         if let Some(ref chars) = scanned_characters {
             gl.merge_with_scanned_characters(chars);
-        }
-        let speakers = string_speakers(&game_lines(&base_path));
-        gl.merge_with_scanned_characters(&speakers.clone().into_iter().collect::<Vec<_>>());
-        if let Some(known) = PROJECT_CACHE.lock().speakers.get_mut(&base_path) {
-            for (alias, name) in speakers {
-                known.entry(alias).or_insert(name);
-            }
         }
         Ok(gl)
     })
@@ -3458,37 +3441,6 @@ mod tests {
                 "Emma должна быть найдена"
             );
         });
-    }
-
-    #[test]
-    fn test_characters_declared_as_strings_join_the_glossary() {
-        let game_dir = std::env::temp_dir().join(format!("translator_string_speakers_{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&game_dir).unwrap();
-        std::fs::write(
-            game_dir.join("script.rpy"),
-            concat!(
-                "default cam = \"Camila\"\n",
-                "default town = \"Sunnyvale\"\n",
-                "define e = Character(\"Erika\")\n",
-                "label start:\n",
-                "    cam \"Hello there.\"\n",
-                "    e \"Hi.\"\n",
-            ),
-        )
-        .unwrap();
-
-        let glossary = tauri::async_runtime::block_on(get_project_glossary(
-            game_dir.to_string_lossy().into_owned(),
-            Some(vec![("e".to_string(), "Erika".to_string())]),
-        ))
-        .unwrap();
-        let mut names: Vec<_> = glossary.characters.iter().map(|c| (c.alias.as_str(), c.original_name.as_str())).collect();
-        names.sort();
-        // Переменная без реплик персонажем не считается
-        assert_eq!(names, [("cam", "Camila"), ("e", "Erika")]);
-
-        let _ = std::fs::remove_dir_all(&game_dir);
-        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
     }
 
     #[test]
