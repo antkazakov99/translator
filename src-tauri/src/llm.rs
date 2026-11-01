@@ -860,13 +860,10 @@ pub fn pick_chunks(chunks: Vec<String>, count: usize, ready: &[bool]) -> Vec<Str
 /// Ход обработки сцен персонажа.
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryProgress {
-    /// `scenes`, `note`, `condense`, `final` или `single`, если всё делает один запрос.
+    /// `scenes`, `condense`, `final` или `single`, если всё делает один запрос.
     pub stage: String,
     pub done: usize,
     pub total: usize,
-    /// Заметка готовой части: окно показывает её сразу, не дожидаясь итога.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
 }
 
 fn note_key(model: &str, alias: &str, chunk: &str) -> String {
@@ -979,7 +976,7 @@ async fn condense_notes(
         let total = groups.len();
         let mut condensed = Vec::new();
         for (done, group) in groups.iter().enumerate() {
-            on_progress(SummaryProgress { stage: "condense".to_string(), done, total, note: None });
+            on_progress(SummaryProgress { stage: "condense".to_string(), done, total });
             let prompt = format!("Notes:\n\n{}\n\nMerge them:", group.join("\n\n"));
             condensed.push(call_chat_completion(api_url, model, system_prompt, &prompt, 0.2, CHARACTER_ANSWER_TOKENS).await?);
         }
@@ -1100,7 +1097,7 @@ pub async fn summarize_character(
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        on_progress(SummaryProgress { stage: "single".to_string(), done: 0, total, note: None });
+        on_progress(SummaryProgress { stage: "single".to_string(), done: 0, total });
         let lines = hint_for(&chunks[0]).into_iter().chain(chunks[0].lines().map(str::to_string)).collect();
         let updated = write_description(api_url, model, character, lines).await?;
         stored.insert(key, updated.notes.clone());
@@ -1110,7 +1107,7 @@ pub async fn summarize_character(
 
     let mut notes = Vec::new();
     for (done, chunk) in chunks.iter().enumerate() {
-        on_progress(SummaryProgress { stage: "scenes".to_string(), done, total, note: None });
+        on_progress(SummaryProgress { stage: "scenes".to_string(), done, total });
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -1127,11 +1124,8 @@ pub async fn summarize_character(
             }
         };
         let note = strip_old_marker(&note);
-        if is_blank_note(note) || character.excluded_notes.contains(&note_key(model, &character.alias, chunk)) {
-            continue;
-        }
-        on_progress(SummaryProgress { stage: "note".to_string(), done, total, note: Some(note.to_string()) });
-        if !is_refusal(note) {
+        let excluded = character.excluded_notes.contains(&note_key(model, &character.alias, chunk));
+        if !excluded && !is_blank_note(note) && !is_refusal(note) {
             notes.push(note.to_string());
         }
     }
@@ -1146,7 +1140,7 @@ pub async fn summarize_character(
     let mut notes = condense_notes(api_url, model, notes, &on_progress).await?;
     // В заметках имена уже по-русски, поэтому упомянутых ищем в самом тексте игры
     notes.splice(0..0, hint_for(&chunks.join("\n")));
-    on_progress(SummaryProgress { stage: "final".to_string(), done: total, total, note: None });
+    on_progress(SummaryProgress { stage: "final".to_string(), done: total, total });
     write_description(api_url, model, character, notes).await.map(Some)
 }
 
@@ -1634,8 +1628,14 @@ mod tests {
 
     /// Запускает сервер, который отвечает на запросы по порядку, и возвращает его адрес.
     fn serve_responses(responses: Vec<String>) -> String {
+        record_requests(responses).0
+    }
+
+    /// Как `serve_responses`, но ещё отдаёт текст полученных запросов.
+    fn record_requests(responses: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let (sender, requests) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             for response in responses {
                 let (mut stream, _) = listener.accept().unwrap();
@@ -1648,10 +1648,11 @@ mod tests {
                     }
                     request.extend_from_slice(&chunk[..read]);
                 }
+                let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
-        format!("http://{}", address)
+        (format!("http://{}", address), requests)
     }
 
     #[test]
@@ -2089,7 +2090,7 @@ mod tests {
         .unwrap();
         assert_eq!(updated.notes, "Итог");
         assert_eq!(updated.speech, "На 'ты'");
-        assert_eq!(stages.into_inner().unwrap(), ["scenes", "note", "scenes", "note", "final"]);
+        assert_eq!(stages.into_inner().unwrap(), ["scenes", "scenes", "final"]);
         assert_eq!(ready_chunks(&chunks, "model", &kate(&[]).alias, &notes_file), [true, true]);
         assert_eq!(ready_chunks(&chunks, "other", &kate(&[]).alias, &notes_file), [false, false]);
         let _ = fs::remove_dir_all(dir);
@@ -2178,18 +2179,19 @@ mod tests {
         write_scene_notes(&notes_file, &stored).unwrap();
 
         let content = r#"[{"alias":"k","translated_name":"Кейт","gender":"female","notes":"Итог","speech":"На 'ты'"}]"#;
-        let url = serve_responses(vec![completion(content)]);
+        let (url, requests) = record_requests(vec![completion(content)]);
         let character = CharacterGlossaryEntry { excluded_notes: vec![keys[0].clone()], ..kate(&[]) };
         let cancel = AtomicBool::new(false);
-        let shown = std::sync::Mutex::new(Vec::new());
         let updated = tauri::async_runtime::block_on(summarize_character(
             &chat(&url), character, chunks, &ModelHints::default(), &notes_file, &cancel,
-            |p| shown.lock().unwrap().extend(p.note),
+            |_| {},
         ))
         .unwrap()
         .unwrap();
         assert_eq!(updated.notes, "Итог");
-        assert_eq!(shown.into_inner().unwrap(), ["Вторая."]);
+        let description_request = requests.recv().unwrap();
+        assert!(description_request.contains("Вторая."));
+        assert!(!description_request.contains("Первая."));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2237,7 +2239,7 @@ mod tests {
         // Следующий запуск собирает описание из сохранённой части
         let stages = std::sync::Mutex::new(Vec::new());
         assert!(run(answer, &stages).unwrap().is_some());
-        assert_eq!(stages.into_inner().unwrap(), ["scenes", "note", "final"]);
+        assert_eq!(stages.into_inner().unwrap(), ["scenes", "final"]);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2256,9 +2258,8 @@ mod tests {
         let chunks = vec!["Kate: one".to_string(), "Kate: two".to_string(), "Kate: three".to_string()];
         let answer = r#"[{"alias":"k","notes":"Итог","speech":"На 'ты'"}]"#;
         let cancel = AtomicBool::new(false);
-        let shown = std::sync::Mutex::new(Vec::new());
 
-        let url = serve_responses(vec![
+        let (url, requests) = record_requests(vec![
             completion("Пустая строка"),
             completion("Заметка. NONE"),
             completion(NO_NOTE),
@@ -2266,12 +2267,14 @@ mod tests {
         ]);
         let updated = tauri::async_runtime::block_on(summarize_character(
             &chat(&url), kate(&[]), chunks, &ModelHints::default(), &notes_file, &cancel,
-            |p| shown.lock().unwrap().extend(p.note),
+            |_| {},
         ))
         .unwrap()
         .unwrap();
         assert_eq!(updated.notes, "Итог");
-        assert_eq!(shown.into_inner().unwrap(), ["Заметка.", NO_NOTE]);
+        let description_request = requests.iter().nth(3).unwrap();
+        assert!(description_request.contains("Заметка."));
+        assert!(!description_request.contains(NO_NOTE));
 
         // Заметок нет: описание нечему обновлять, модель не должна придумывать его по имени
         let url = serve_responses(vec![completion("NONE"), completion(NO_NOTE)]);

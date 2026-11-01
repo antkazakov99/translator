@@ -796,16 +796,24 @@
     mentioned: (characterScenes ?? []).reduce((sum, scene) => sum + scene.mentioned, 0)
   });
 
+  // Поиск панели: одно поле на реплики и заметки
+  let paneSearch = $state("");
+  let paneQuery = $derived(paneSearch.trim().toLocaleLowerCase());
+
   let visibleCharacterScenes = $derived(
     (characterScenes ?? [])
       .map((scene) => ({
         ...scene,
         lines: scene.lines.filter((line) =>
-          glossaryTab !== "characters" || sceneLineFilter === "all" || line.spoken === (sceneLineFilter === "spoken")
+          (glossaryTab !== "characters" || sceneLineFilter === "all" || line.spoken === (sceneLineFilter === "spoken"))
+          && line.text.toLocaleLowerCase().includes(paneQuery)
         )
       }))
       .filter((scene) => scene.lines.length > 0)
   );
+  let foundLines = $derived(visibleCharacterScenes.reduce((sum, scene) => sum + scene.lines.length, 0));
+  // Найденная реплика не должна остаться в свёрнутой сцене
+  let shownCollapsedScenes = $derived(paneQuery ? new Set<string>() : collapsedScenes);
 
   // Перезагрузка глоссария меняет объект персонажа, но не то, чьи сцены нужны
   let scenesTarget = $derived.by(() => {
@@ -916,6 +924,7 @@
     (currentParts ?? [])
       .map((part, index) => ({ ...part, index }))
       .filter((part) => showUnreadParts || part.note !== null)
+      .filter((part) => !paneQuery || (!part.empty && part.note?.toLocaleLowerCase().includes(paneQuery)))
   );
   let readParts = $derived((currentParts ?? []).filter((part) => part.note !== null));
   let emptyParts = $derived(readParts.filter((part) => part.empty));
@@ -1119,48 +1128,31 @@
       const model = storedLlmModel();
       if (characterUpdateMode === "scenes") {
         summaryRunning = true;
-        // Заметки частей сразу видны в описании, итог их заменит
-        const description = char.notes;
-        const draft: string[] = [];
-        const onProgress = new Channel<{ stage: string; done: number; total: number; note?: string }>();
+        const onProgress = new Channel<{ stage: string; done: number; total: number }>();
         onProgress.onmessage = (progress) => {
           // Новый шаг значит, что заметка прошлой части уже на диске
-          if (!progress.note) sceneNotesRevision += 1;
-          if (progress.note) {
-            draft.push(progress.note);
-            char.notes = draft.join("\n\n");
-          } else if (progress.stage === "scenes") {
+          sceneNotesRevision += 1;
+          if (progress.stage === "scenes") {
             summaryProgress = progress;
           } else {
             if (summaryProgress && !summaryStopping) summaryProgress = { ...summaryProgress, done: summaryProgress.total };
             summaryBuild = progress;
           }
         };
-        const restoreDescription = () => {
-          // Прежнее описание важнее черновика: заметки сохранены и никуда не денутся
-          char.notes = description.trim() ? description : draft.join("\n\n");
-          if (!description.trim() && draft.length > 0) glossaryDirty = true;
-        };
-        try {
-          const summary = await invoke<CharacterGlossaryEntry | null>("summarize_glossary_character", {
-            gameDir,
-            apiUrl,
-            model,
-            character: $state.snapshot(char),
-            hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
-            parts: sceneParts,
-            onProgress
-          });
-          if (summary) {
-            applyCharacterUpdate(char, summary);
-            if (summaryStopping) showToast("Описание собрано по прочитанным частям, следующий запуск дочитает остальные", "info");
-          } else {
-            restoreDescription();
-            showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
-          }
-        } catch (e) {
-          restoreDescription();
-          throw e;
+        const summary = await invoke<CharacterGlossaryEntry | null>("summarize_glossary_character", {
+          gameDir,
+          apiUrl,
+          model,
+          character: $state.snapshot(char),
+          hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
+          parts: sceneParts,
+          onProgress
+        });
+        if (summary) {
+          applyCharacterUpdate(char, summary);
+          if (summaryStopping) showToast("Описание собрано по прочитанным частям, следующий запуск дочитает остальные", "info");
+        } else {
+          showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
         }
         return;
       }
@@ -1605,6 +1597,7 @@
     glossary = { characters: [], terms: [], tokens: [] };
     textTokens = null;
     scenePartsByAlias = {};
+    paneSearch = "";
     glossaryProjectPath = null;
     glossaryDirty = false;
     selectedGlossaryChar = null;
@@ -4240,7 +4233,11 @@
                   <h4>Заметки модели</h4>
                   {#if currentParts}
                     <span class="char-sub-label">
-                      прочитано {readParts.length} из {currentParts.length} · пустых {emptyParts.length}
+                      {#if paneQuery}
+                        найдено заметок {visibleParts.length} из {readParts.length - emptyParts.length}
+                      {:else}
+                        прочитано {readParts.length} из {currentParts.length} · пустых {emptyParts.length}
+                      {/if}
                     </span>
                   {/if}
                 </div>
@@ -4261,7 +4258,9 @@
                   <h4>Сцены и реплики</h4>
                   {#if characterScenes}
                     <span class="char-sub-label">
-                      {#if glossaryTab === 'characters'}
+                      {#if paneQuery}
+                        найдено реплик {foundLines} · сцен {visibleCharacterScenes.length}
+                      {:else if glossaryTab === 'characters'}
                         {characterScenes.length} сцен · говорит {characterSceneTotals.spoken} · упомянут {characterSceneTotals.mentioned}
                       {:else}
                         {characterScenes.length} сцен · реплик {characterSceneTotals.mentioned}
@@ -4274,8 +4273,8 @@
                     <button class="character-scene-link" disabled={updatingCharacter} title="Передавать модели все сцены" onclick={() => { if (selectedGlossaryChar) setAllScenesForLlm(selectedGlossaryChar, true); }}>Выбрать все</button>
                     <button class="character-scene-link" disabled={updatingCharacter} title="Не передавать модели ни одной сцены" onclick={() => { if (selectedGlossaryChar) setAllScenesForLlm(selectedGlossaryChar, false); }}>Снять все</button>
                   {/if}
-                  <button class="character-scene-link" onclick={() => collapsedScenes = new Set()}>Развернуть все</button>
-                  <button class="character-scene-link" onclick={() => collapsedScenes = new Set((characterScenes ?? []).map((scene) => scene.key))}>Свернуть все</button>
+                  <button class="character-scene-link" disabled={!!paneQuery} onclick={() => collapsedScenes = new Set()}>Развернуть все</button>
+                  <button class="character-scene-link" disabled={!!paneQuery} onclick={() => collapsedScenes = new Set((characterScenes ?? []).map((scene) => scene.key))}>Свернуть все</button>
                 </div>
                 {#if glossaryTab === 'characters'}
                   <div class="gender-filter-group">
@@ -4284,6 +4283,22 @@
                     <button class="btn-filter-pill" class:active={sceneLineFilter === 'mentioned'} onclick={() => sceneLineFilter = 'mentioned'}>Упоминания</button>
                   </div>
                 {/if}
+                {/if}
+                {#if scenesTarget}
+                  <div class="glossary-search-box character-scenes-search">
+                    <Search size={14} class="search-box-icon text-slate-400" />
+                    <input
+                      type="text"
+                      bind:value={paneSearch}
+                      placeholder={showingNotes ? "Поиск по заметкам..." : "Поиск по репликам..."}
+                      class="glossary-search-input"
+                    />
+                    {#if paneSearch}
+                      <button class="btn-clear-search" title="Очистить поиск" onclick={() => paneSearch = ""}>
+                        <X size={12} />
+                      </button>
+                    {/if}
+                  </div>
                 {/if}
               </div>
 
@@ -4300,7 +4315,15 @@
                   {:else if !currentParts}
                     <p class="character-scenes-note">Загрузка заметок...</p>
                   {:else if visibleParts.length === 0}
-                    <p class="character-scenes-note">{currentParts.length === 0 ? "У персонажа нет реплик в выбранных сценах." : "Прочитанных частей пока нет."}</p>
+                    <p class="character-scenes-note">
+                      {#if currentParts.length === 0}
+                        У персонажа нет реплик в выбранных сценах.
+                      {:else if paneQuery}
+                        Заметки не найдены по запросу «{paneSearch.trim()}»
+                      {:else}
+                        Прочитанных частей пока нет.
+                      {/if}
+                    </p>
                   {:else}
                     {#each visibleParts as part (part.key)}
                       {@const included = !selectedGlossaryChar.excluded_notes.includes(part.key)}
@@ -4392,7 +4415,13 @@
                     {/each}
                   {/if}
                 {:else if visibleCharacterScenes.length === 0}
-                  <p class="character-scenes-note">{glossaryTab === 'characters' ? "В скриптах персонаж не найден." : "В репликах не встречается."}</p>
+                  <p class="character-scenes-note">
+                    {#if paneQuery}
+                      Реплики не найдены по запросу «{paneSearch.trim()}»
+                    {:else}
+                      {glossaryTab === 'characters' ? "В скриптах персонаж не найден." : "В репликах не встречается."}
+                    {/if}
+                  </p>
                 {:else}
                   {#each visibleCharacterScenes as scene (scene.key)}
                     {@const included = glossaryTab !== 'characters' || !selectedGlossaryChar?.excluded_scenes.includes(scene.key)}
@@ -4411,12 +4440,13 @@
                         {/if}
                         <button
                           class="character-scene-toggle"
-                          aria-expanded={!collapsedScenes.has(scene.key)}
+                          aria-expanded={!shownCollapsedScenes.has(scene.key)}
                           aria-label={`Свернуть или развернуть сцену ${scene.scene}`}
                           title="Свернуть или развернуть сцену"
+                          disabled={!!paneQuery}
                           onclick={() => toggleSceneCollapsed(scene.key)}
                         >
-                          {#if collapsedScenes.has(scene.key)}
+                          {#if shownCollapsedScenes.has(scene.key)}
                             <ChevronRight size={14} />
                           {:else}
                             <ChevronDown size={14} />
@@ -4436,7 +4466,7 @@
                           <span>Код</span>
                         </button>
                       </header>
-                      {#if !collapsedScenes.has(scene.key)}
+                      {#if !shownCollapsedScenes.has(scene.key)}
                         {#each scene.lines as line (line.line_number)}
                           <p class="character-line" class:character-line-own={line.spoken}>
                             {#if !line.spoken && line.speaker}<span class="character-line-speaker">{line.speaker}:</span>{/if}
@@ -7561,6 +7591,11 @@
     padding: 16px 18px 12px;
     border-bottom: 1px solid #1a2232;
     background: #111624;
+  }
+
+  .glossary-search-box.character-scenes-search {
+    flex-basis: 100%;
+    max-width: none;
   }
 
   .character-scenes-title h4 {
