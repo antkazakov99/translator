@@ -461,6 +461,8 @@
     category: string; // "general" | "location" | "title" | "item"
     notes: string;
     forms: NameForm[];
+    excluded_scenes: string[];
+    excluded_notes: string[];
   }
 
   interface TermCandidate {
@@ -762,6 +764,14 @@
   // Раздел «Персонажи»: другие имена персонажей, там одно название связывается с несколькими
   let termView = $state<"terms" | "archive" | "characters" | "trash">("terms");
   let selectedFormKey = $state("");
+  // Описание обновляется одинаково у персонажа и термина: различаются команды и то, что записывается в итоге
+  type DescribedEntry = CharacterGlossaryEntry | TermGlossaryEntry;
+  const isCharacter = (entry: DescribedEntry): entry is CharacterGlossaryEntry => "alias" in entry;
+  const entryId = (entry: DescribedEntry) => (isCharacter(entry) ? entry.alias : entry.id);
+  const entryTitle = (entry: DescribedEntry) => (isCharacter(entry) ? characterTitle(entry) : entry.source_term);
+  let describedEntry = $derived<DescribedEntry | null>(
+    glossaryTab === "characters" ? selectedGlossaryChar : glossaryTab === "terms" && termView === "terms" ? selectedGlossaryTerm : null
+  );
   let termCandidates = $state.raw<TermCandidate[]>([]);
   let termCandidatesLoading = $state(false);
   let singleWordsSkipped = $state(false);
@@ -782,7 +792,7 @@
   });
   // Ползунок: готовые части входят в запуск всегда, поэтому ниже их числа он не опускается
   let scenePartsByAlias = $state<Record<string, number>>({});
-  let scenePartsWanted = $derived(selectedGlossaryChar ? scenePartsByAlias[selectedGlossaryChar.alias] ?? 1 : 1);
+  let scenePartsWanted = $derived(describedEntry ? scenePartsByAlias[entryId(describedEntry)] ?? 1 : 1);
   let sceneChunkCount = $state<number | null>(null);
   let sceneReadyCount = $state(0);
   let sceneParts = $derived(partsToRead({ total: sceneChunkCount ?? 1, ready: sceneReadyCount }, scenePartsWanted));
@@ -817,13 +827,15 @@
   // Обновляется один персонаж за раз: остальные на это время недоступны
   let updatingAlias = $state<string | null>(null);
   let updatingCharacter = $derived(updatingAlias !== null);
-  let otherCharacterUpdating = $derived(updatingAlias !== null && selectedGlossaryChar?.alias !== updatingAlias);
-  let updatingCharacterEntry = $derived(glossary.characters.find((char) => char.alias === updatingAlias) ?? null);
+  let otherCharacterUpdating = $derived(updatingAlias !== null && (describedEntry ? entryId(describedEntry) : null) !== updatingAlias);
+  let updatingCharacterEntry = $derived([...glossary.characters, ...glossary.terms].find((entry) => entryId(entry) === updatingAlias) ?? null);
   const characterScenesCache = new Map<string, CharacterScene[]>();
 
-  // Обновление группы: персонажи идут по очереди тем же путём, что и отдельный персонаж
+  // Обновление группы: записи вкладки идут по очереди тем же путём, что и отдельная запись
   let descriptionsOpen = $state(false);
-  let groupUnselected = $state<string[] | null>(null);
+  let groupUnselectedByTab = $state<Record<string, string[] | null>>({});
+  let groupUnselected = $derived(groupUnselectedByTab[glossaryTab] ?? null);
+  let groupEntries = $derived<DescribedEntry[]>(glossaryTab === "terms" ? glossary.terms : glossary.characters);
   let groupChunks = $state.raw<Record<string, CharacterChunks>>({});
   let groupCounting = $state(false);
   let groupPartsWanted = $state(1);
@@ -831,15 +843,15 @@
   let groupStopping = $state(false);
   let groupResult = $state<{ updated: number; total: number; failed: string[] } | null>(null);
 
-  const needsCharacterWork = (c: CharacterGlossaryEntry) =>
-    !c.translated_name.trim() || c.gender === "unknown" || !c.gender.trim() || !c.notes.trim() || !c.speech.trim();
+  const needsWork = (c: DescribedEntry) =>
+    !c.notes.trim() || (isCharacter(c) && (!c.translated_name.trim() || c.gender === "unknown" || !c.gender.trim() || !c.speech.trim()));
 
   // Без явного выбора в группе незаполненные: готовые описания нельзя переписать случайно
-  let groupDeselected = $derived(groupUnselected ?? glossary.characters.filter((c) => !needsCharacterWork(c)).map((c) => c.alias));
-  let groupTargets = $derived(glossary.characters.filter((c) => !groupDeselected.includes(c.alias)));
-  // Персонажи без сцен читать нечего: они не входят в план
-  let groupReadable = $derived(groupTargets.filter((c) => (groupChunks[c.alias]?.total ?? 0) > 0));
-  let groupMaxParts = $derived(Math.max(...groupReadable.map((c) => groupChunks[c.alias].total), 1));
+  let groupDeselected = $derived(groupUnselected ?? groupEntries.filter((c) => !needsWork(c)).map(entryId));
+  let groupTargets = $derived(groupEntries.filter((c) => !groupDeselected.includes(entryId(c))));
+  // Записи без сцен читать нечего: они не входят в план
+  let groupReadable = $derived(groupTargets.filter((c) => (groupChunks[entryId(c)]?.total ?? 0) > 0));
+  let groupMaxParts = $derived(Math.max(...groupReadable.map((c) => groupChunks[entryId(c)].total), 1));
   let groupParts = $derived(Math.min(groupPartsWanted, groupMaxParts));
   let groupWithoutScenes = $derived(groupCounting ? 0 : groupTargets.length - groupReadable.length);
 
@@ -942,9 +954,14 @@
   // Число частей зависит от сцен и выключенных галочек, поэтому считается при их смене.
   // Пауза нужна только галочкам: так не копятся запросы, а новый персонаж нужен сразу
   let sceneChunkTarget: string | null = null;
+  const countChunks = (gameDir: string, model: string, entry: DescribedEntry, tokens: TokenGlossaryEntry[]) =>
+    isCharacter(entry)
+      ? invoke<CharacterChunks>("count_character_chunks", { gameDir, model, character: entry, tokens })
+      : invoke<CharacterChunks>("count_term_chunks", { gameDir, model, term: entry, tokens });
+
   $effect(() => {
-    const char = selectedGlossaryChar;
-    if (!char || !scenesTarget || glossaryTab !== "characters") return;
+    const char = describedEntry;
+    if (!char || !scenesTarget) return;
     const delay = sceneChunkTarget === scenesTarget ? 100 : 0;
     sceneChunkTarget = scenesTarget;
     const model = descriptionModel;
@@ -962,7 +979,7 @@
     let current = true;
     const dir = gameDir;
     const timer = setTimeout(() => {
-      invoke<{ total: number; ready: number }>("count_character_chunks", { gameDir: dir, model, character: untrack(() => $state.snapshot(char)), tokens })
+      countChunks(dir, model, untrack(() => $state.snapshot(char)) as DescribedEntry, tokens)
         .then((chunks) => {
           sceneChunkCache.set(key, chunks);
           if (current) show(chunks);
@@ -976,11 +993,11 @@
   });
 
   // Ключ не меняется при вводе текста в карточке персонажа, поэтому части не пересчитываются зря
-  let groupCountKey = $derived(JSON.stringify(groupTargets.map((c) => [c.alias, c.excluded_scenes])));
+  let groupCountKey = $derived(JSON.stringify(groupTargets.map((c) => [entryId(c), c.excluded_scenes, isCharacter(c) ? [] : formSources(c.forms)])));
   $effect(() => {
     if (!descriptionsOpen || !showGlossaryModal || groupRun) return;
     void [groupCountKey, sceneNotesRevision];
-    const targets = untrack(() => $state.snapshot(groupTargets));
+    const targets = untrack(() => $state.snapshot(groupTargets)) as DescribedEntry[];
     const model = descriptionModel;
     const tokens = $state.snapshot(glossary.tokens);
     const dir = gameDir;
@@ -989,8 +1006,8 @@
     const timer = setTimeout(() => {
       Promise.all(
         targets.map((character) =>
-          invoke<CharacterChunks>("count_character_chunks", { gameDir: dir, model, character, tokens })
-            .then((chunks) => [character.alias, chunks] as const)
+          countChunks(dir, model, character, tokens)
+            .then((chunks) => [entryId(character), chunks] as const)
         )
       )
         .then((entries) => { if (current) groupChunks = Object.fromEntries(entries); })
@@ -1005,7 +1022,7 @@
 
   // Режим панели: вместо сцен показывает, что модель записала по каждой части
   let characterPaneMode = $state<"scenes" | "notes">("scenes");
-  let showingNotes = $derived(glossaryTab === "characters" && characterPaneMode === "notes");
+  let showingNotes = $derived(describedEntry !== null && characterPaneMode === "notes");
   let characterParts = $state.raw<{ target: string; parts: CharacterPart[] } | null>(null);
   let characterPartsError = $state<string | null>(null);
   let showUnreadParts = $state(true);
@@ -1020,7 +1037,7 @@
   let emptyParts = $derived(readParts.filter((part) => part.empty));
 
   $effect(() => {
-    const char = selectedGlossaryChar;
+    const char = describedEntry;
     const target = scenesTarget;
     if (!showingNotes || !char || !target) return;
     void [char.excluded_scenes.length, sceneNotesRevision];
@@ -1029,12 +1046,11 @@
     const dir = gameDir;
     const timer = setTimeout(() => {
       characterPartsError = null;
-      invoke<CharacterPart[]>("list_character_parts", {
-        gameDir: dir,
-        model: descriptionModel,
-        character: untrack(() => $state.snapshot(char)),
-        hints
-      })
+      const entry = untrack(() => $state.snapshot(char)) as DescribedEntry;
+      const parts = isCharacter(entry)
+        ? invoke<CharacterPart[]>("list_character_parts", { gameDir: dir, model: descriptionModel, character: entry, hints })
+        : invoke<CharacterPart[]>("list_term_parts", { gameDir: dir, model: descriptionModel, term: entry, hints });
+      parts
         .then((parts) => { if (current) characterParts = { target, parts }; })
         .catch((e) => { if (current) characterPartsError = String(e); });
     }, 100);
@@ -1044,14 +1060,14 @@
     };
   });
 
-  function toggleNoteForDescription(char: CharacterGlossaryEntry, key: string, included: boolean) {
+  function toggleNoteForDescription(char: DescribedEntry, key: string, included: boolean) {
     char.excluded_notes = included
       ? char.excluded_notes.filter((own) => own !== key)
       : [...char.excluded_notes, key];
     glossaryDirty = true;
   }
 
-  async function resetNotes(char: CharacterGlossaryEntry, keys: string[]) {
+  async function resetNotes(char: DescribedEntry, keys: string[]) {
     try {
       await invoke("reset_character_notes", { gameDir, keys });
       if (char.excluded_notes.some((key) => keys.includes(key))) {
@@ -1244,7 +1260,9 @@
       translated_term: form.translated.trim(),
       category: "general",
       notes: "",
-      forms: []
+      forms: [],
+      excluded_scenes: [],
+      excluded_notes: []
     };
     glossary.terms = [term, ...glossary.terms];
     glossaryDirty = true;
@@ -1301,7 +1319,9 @@
       translated_term: "",
       category: "general",
       notes: "",
-      forms: []
+      forms: [],
+      excluded_scenes: [],
+      excluded_notes: []
     }, ...glossary.terms];
     glossaryDirty = true;
     showToast(`Термин "${archived.term}" добавлен в глоссарий`, "success");
@@ -1374,6 +1394,14 @@
     document.querySelector(".glossary-list-item.selected-row")?.scrollIntoView({ block: "nearest" });
   }
 
+  async function showEntry(entry: DescribedEntry) {
+    if (isCharacter(entry)) return showCharacter(entry);
+    glossarySearch = "";
+    glossaryCategoryFilter = "all";
+    openGlossaryTab("terms");
+    selectedGlossaryTerm = entry;
+  }
+
   /** Закрывает глоссарий и показывает сцену в таблице реплик. */
   async function openPartCharacter(original: string) {
     const char = glossary.characters.find((c) =>
@@ -1399,12 +1427,12 @@
     viewMode = "table";
   }
 
-  function setAllScenesForLlm(char: CharacterGlossaryEntry, included: boolean) {
+  function setAllScenesForLlm(char: DescribedEntry, included: boolean) {
     char.excluded_scenes = included ? [] : (characterScenes ?? []).map((scene) => scene.key);
     glossaryDirty = true;
   }
 
-  function toggleSceneForLlm(char: CharacterGlossaryEntry, key: string, included: boolean) {
+  function toggleSceneForLlm(char: DescribedEntry, key: string, included: boolean) {
     char.excluded_scenes = included
       ? char.excluded_scenes.filter((scene) => scene !== key)
       : [...char.excluded_scenes, key];
@@ -1428,9 +1456,9 @@
     sceneNotesRevision += 1;
   }
 
-  /** Читает `parts` частей сцен персонажа и пишет описание. Готовый перевод имени остаётся: его мог задать пользователь. */
-  async function summarizeCharacter(char: CharacterGlossaryEntry, parts: number, target: LlmTarget) {
-    updatingAlias = char.alias;
+  /** Читает `parts` частей сцен записи и пишет описание. Готовый перевод имени остаётся: его мог задать пользователь. */
+  async function summarizeEntry(entry: DescribedEntry, parts: number, target: LlmTarget) {
+    updatingAlias = entryId(entry);
     summaryRunning = true;
     try {
       const onProgress = new Channel<{ stage: string; done: number; total: number }>();
@@ -1444,43 +1472,46 @@
           summaryBuild = progress;
         }
       };
-      const summary = await invoke<CharacterGlossaryEntry | null>("summarize_glossary_character", {
-        gameDir,
-        target,
-        character: $state.snapshot(char),
-        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
-        parts,
-        onProgress
-      });
-      if (!summary) return "stopped";
-      applyCharacterUpdate(char, summary);
+      const hints = { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) };
+      if (isCharacter(entry)) {
+        const character = $state.snapshot(entry);
+        const summary = await invoke<CharacterGlossaryEntry | null>("summarize_glossary_character", { gameDir, target, character, hints, parts, onProgress });
+        if (!summary) return "stopped";
+        applyCharacterUpdate(entry, summary);
+      } else {
+        const term = $state.snapshot(entry);
+        const description = await invoke<string | null>("summarize_glossary_term", { gameDir, target, term, hints, parts, onProgress });
+        if (description === null) return "stopped";
+        entry.notes = description;
+        glossaryDirty = true;
+      }
       return summaryStopping ? "partial" : "updated";
     } finally {
       resetSummaryState();
     }
   }
 
-  async function updateCharacterWithLlm(char: CharacterGlossaryEntry) {
-    if (!beginLlmRun(`Обновляется ${characterTitle(char)}`)) return;
+  async function updateEntryWithLlm(entry: DescribedEntry) {
+    if (!beginLlmRun(`Обновляется ${entryTitle(entry)}`)) return;
     try {
-      const outcome = await summarizeCharacter(char, sceneParts, targetFor(llmSettings, "descriptions"));
+      const outcome = await summarizeEntry(entry, sceneParts, targetFor(llmSettings, "descriptions"));
       if (outcome === "stopped") {
         showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
       } else {
-        showToast(`Персонаж ${characterTitle(char)} обновлён`, "success");
+        showToast(`Обновлено: ${entryTitle(entry)}`, "success");
         if (outcome === "partial") showToast("Описание собрано по прочитанным частям, следующий запуск дочитает остальные", "info");
       }
     } catch (e) {
-      showToast(`Не удалось обновить персонажа: ${e}`, "error");
+      showToast(`Не удалось обновить запись: ${e}`, "error");
     } finally {
       endLlmRun();
     }
   }
 
-  /** Обновляет персонажей группы по очереди. Две ошибки подряд значат, что дело не в персонаже, а в сервере. */
+  /** Обновляет записи группы по очереди. Две ошибки подряд значат, что дело не в записи, а в сервере. */
   async function updateCharacterGroup() {
-    if (!beginLlmRun("Обновляется группа персонажей")) return;
-    const plan = groupReadable.map((char) => ({ char, parts: partsToRead(groupChunks[char.alias], groupParts) }));
+    if (!beginLlmRun("Обновляется группа записей")) return;
+    const plan = groupReadable.map((entry) => ({ entry, parts: partsToRead(groupChunks[entryId(entry)], groupParts) }));
     // Настройки LLM открываются и во время запуска, а вся группа идёт на одной модели
     const target = targetFor(llmSettings, "descriptions");
     const dir = gameDir;
@@ -1489,15 +1520,15 @@
     let failuresInRow = 0;
     groupResult = null;
     groupStopping = false;
-    for (const [index, { char, parts }] of plan.entries()) {
+    for (const [index, { entry, parts }] of plan.entries()) {
       if (groupStopping || gameDir !== dir || failuresInRow >= 2) break;
-      groupRun = { index, total: plan.length, name: characterTitle(char) };
-      llmRun.note = `Персонаж ${index + 1} из ${plan.length}: ${groupRun.name}`;
+      groupRun = { index, total: plan.length, name: entryTitle(entry) };
+      llmRun.note = `Запись ${index + 1} из ${plan.length}: ${groupRun.name}`;
       try {
-        if ((await summarizeCharacter(char, parts, target)) !== "stopped") updated += 1;
+        if ((await summarizeEntry(entry, parts, target)) !== "stopped") updated += 1;
         failuresInRow = 0;
       } catch (e) {
-        failed.push(`${characterTitle(char)}: ${e}`);
+        failed.push(`${entryTitle(entry)}: ${e}`);
         failuresInRow += 1;
       }
     }
@@ -1554,7 +1585,7 @@
   let glossaryCategoryFilter = $state<"all" | "general" | "location" | "title" | "item">("all");
 
   // Добавление термина
-  const emptyTerm = (): TermGlossaryEntry => ({ id: "", source_term: "", translated_term: "", category: "general", notes: "", forms: [] });
+  const emptyTerm = (): TermGlossaryEntry => ({ id: "", source_term: "", translated_term: "", category: "general", notes: "", forms: [], excluded_scenes: [], excluded_notes: [] });
   let termDraft = $state(emptyTerm());
 
   // Добавление персонажа вручную
@@ -2364,7 +2395,7 @@
       if (seq !== glossaryLoadSeq || gameDir.trim() !== path) return true;
       glossary = res;
       glossaryDirty = false;
-      if (glossaryProjectPath !== path) groupUnselected = null;
+      if (glossaryProjectPath !== path) groupUnselectedByTab = {};
       glossaryProjectPath = path;
       selectedGlossaryChar = glossary.characters[0] ?? null;
       selectedGlossaryTerm = glossary.terms[0] ?? null;
@@ -2475,7 +2506,9 @@
       translated_term: termDraft.translated_term.trim(),
       category: termDraft.category,
       notes: termDraft.notes.trim(),
-      forms: []
+      forms: [],
+      excluded_scenes: [],
+      excluded_notes: []
     };
     glossary.terms = [newEntry, ...glossary.terms];
     selectedGlossaryTerm = glossary.terms[0];
@@ -2612,6 +2645,93 @@
   </div>
 {/snippet}
 
+{#snippet descriptionLock()}
+  {#if otherCharacterUpdating}
+    <div class="character-locked-banner">
+      <Loader2 size={14} class="spin" />
+      <span>Сейчас обновляется {updatingCharacterEntry ? entryTitle(updatingCharacterEntry) : ""}. Остальные записи недоступны до конца обновления.</span>
+      <button class="character-scene-link" onclick={() => { if (updatingCharacterEntry) void showEntry(updatingCharacterEntry); }}>Перейти</button>
+    </div>
+  {/if}
+{/snippet}
+
+{#snippet descriptionBox(entry: DescribedEntry)}
+  <div class="character-update-box">
+    <div class="character-model-choice">
+      <LlmChoice action="descriptions" settings={llmSettings} onselect={selectLlmModel} />
+      {#if outsideNote(llmSettings, "descriptions")}
+        <p class="character-outside-note">{outsideNote(llmSettings, "descriptions")}</p>
+      {/if}
+    </div>
+    <RequestSlider
+      id="scene-parts"
+      label="Частей запроса"
+      status={scenePartsStatus}
+      max={Math.max(sceneChunkCount ?? 1, 1)}
+      value={sceneChunkCount ? sceneParts : 0}
+      floor={Math.max(sceneReadyCount, 1)}
+      ready={sceneReadyCount}
+      onchange={(value) => { scenePartsByAlias[entryId(entry)] = value; }}
+      disabled={llmRun.active || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
+    >
+      {#snippet ends()}
+        {#if sceneReadyCount > 0}
+          <span class="character-depth-ready">готово: {sceneReadyCount}</span>
+        {:else}
+          <span>1 часть</span>
+        {/if}
+        <span>{sceneAllRead ? "соберётся из заметок" : "весь текст, долго"}</span>
+      {/snippet}
+    </RequestSlider>
+    <div class="character-update-row">
+      <button
+        class="btn-modal-ai"
+        disabled={llmRun.active}
+        onclick={() => updateEntryWithLlm(entry)}
+      >
+        {#if updatingCharacter}
+          <Loader2 size={13} class="spin" />
+        {:else if sceneAllRead}
+          <RotateCcw size={13} />
+        {:else}
+          <Sparkles size={13} />
+        {/if}
+        <span>{updatingCharacter ? "Обновляется…" : sceneAllRead ? "Восстановить" : "Обновить описание"}</span>
+      </button>
+    </div>
+  </div>
+  {#if summaryRunning && !otherCharacterUpdating}
+    <div class="character-summary-progress">
+      {#if summaryBuild?.stage !== "single"}
+        <div class="character-summary-line">
+          {#if summaryBuild}
+            <CheckCircle2 size={13} />
+          {:else}
+            <Loader2 size={13} class="spin" />
+          {/if}
+          <span>{summaryLabel}</span>
+          {#if !summaryBuild && !summaryStopping}
+            <button class="character-scene-link" onclick={() => { summaryStopping = true; invoke("cancel_llm_run"); }}>Остановить</button>
+          {/if}
+        </div>
+        {#if summaryProgress && summaryProgress.total > 0}
+          <div class="character-summary-track">
+            <div class="character-summary-fill" style={`width: ${(summaryProgress.done / summaryProgress.total) * 100}%`}></div>
+          </div>
+        {/if}
+      {/if}
+      <div class="character-summary-line character-summary-build" class:waiting={!summaryBuild} class:single={summaryBuild?.stage === "single"}>
+        {#if summaryBuild}
+          <Loader2 size={13} class="spin" />
+        {:else}
+          <Sparkles size={13} />
+        {/if}
+        <span>{summaryBuildLabel}</span>
+      </div>
+    </div>
+  {/if}
+{/snippet}
+
 {#snippet ownerLink(title: string, suggested: FormOwner[], terms: FormOwner[], link: (choices: string[]) => void)}
   <div class="edit-group">
     <span class="edit-label">{title}</span>
@@ -2679,7 +2799,7 @@
                     </label>
                     <textarea 
                       id="term-notes"
-                      bind:value={term.notes} 
+                      bind:value={term.notes}
                       oninput={() => termEdited(term)}
                       rows="3" 
                       placeholder="Контекст употребления термина..."
@@ -4080,15 +4200,15 @@
 
         {#snippet groupUpdate()}
           <EntryPicker
-            items={glossary.characters.map((c) => ({ id: c.alias, name: characterTitle(c) }))}
+            items={groupEntries.map((c) => ({ id: entryId(c), name: entryTitle(c) }))}
             unselected={groupDeselected}
             disabled={llmRun.active}
-            onchange={(next) => groupUnselected = next}
-            onempty={() => groupUnselected = null}
+            onchange={(next) => groupUnselectedByTab[glossaryTab] = next}
+            onempty={() => groupUnselectedByTab[glossaryTab] = null}
           />
           <RequestSlider
             id="group-parts"
-            label="Частей на персонажа"
+            label={glossaryTab === "terms" ? "Частей на термин" : "Частей на персонажа"}
             status={groupCounting ? "подсчёт..." : groupReadable.length === 0 ? "нет сцен" : `${groupParts} из ${groupMaxParts}`}
             max={groupMaxParts}
             value={groupParts}
@@ -4107,7 +4227,7 @@
             <div class="character-summary-progress">
               <div class="character-summary-line">
                 <Loader2 size={13} class="spin" />
-                <span class="character-group-name">Персонаж {groupRun.index + 1} из {groupRun.total}: {groupRun.name}</span>
+                <span class="character-group-name">Запись {groupRun.index + 1} из {groupRun.total}: {groupRun.name}</span>
                 {#if !groupStopping}
                   <button class="character-scene-link" onclick={stopCharacterGroup}>Остановить</button>
                 {/if}
@@ -4115,7 +4235,7 @@
               <div class="character-summary-track">
                 <div class="character-summary-fill" style={`width: ${(groupRun.index / groupRun.total) * 100}%`}></div>
               </div>
-              <span class="character-group-note">{groupStopping ? "Останавливаю: заканчиваю текущего персонажа" : summaryBuild ? summaryBuildLabel : summaryLabel}</span>
+              <span class="character-group-note">{groupStopping ? "Останавливаю: заканчиваю текущую запись" : summaryBuild ? summaryBuildLabel : summaryLabel}</span>
             </div>
           {:else}
             <button
@@ -4517,13 +4637,7 @@
               </div>
             {:else if glossaryTab === 'characters'}
               {#if selectedGlossaryChar}
-                {#if otherCharacterUpdating}
-                  <div class="character-locked-banner">
-                    <Loader2 size={14} class="spin" />
-                    <span>Сейчас обновляется {updatingCharacterEntry ? characterTitle(updatingCharacterEntry) : ""}. Остальные персонажи недоступны до конца обновления.</span>
-                    <button class="character-scene-link" onclick={() => { if (updatingCharacterEntry) selectedGlossaryChar = updatingCharacterEntry; }}>Перейти</button>
-                  </div>
-                {/if}
+                {@render descriptionLock()}
                 <div class="sidebar-edit-header" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
                   <div class="sidebar-char-badge-row">
                     {#if hasScriptCode(selectedGlossaryChar.alias)}
@@ -4537,6 +4651,7 @@
                     </div>
                     <details
                       class="character-menu"
+                      inert={updatingCharacter}
                       bind:open={characterMenuOpen}
                       onfocusout={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) characterMenuOpen = false; }}
                     >
@@ -4574,7 +4689,7 @@
                     </details>
                   </div>
                   {#if selectedGlossaryChar.merged.length > 0}
-                    <div class="character-merged-row">
+                    <div class="character-merged-row" inert={updatingCharacter}>
                       <span class="char-sub-label">Объединён с:</span>
                       {#each selectedGlossaryChar.merged as part (part.alias)}
                         <span class="character-alias-chip">
@@ -4589,90 +4704,15 @@
                     </div>
                   {/if}
                   {#each characterTwins as twin (twin.alias)}
-                    <div class="character-twin-row">
-                      <span>Такое же имя у {hasScriptCode(twin.alias) ? `[${twin.alias}]` : "другой записи"}. Если это один персонаж, объедините их.</span>
+                    <div class="character-twin-row" inert={updatingCharacter}>
+                      <span>Такое же имя у{hasScriptCode(twin.alias) ? `[${twin.alias}]` : "другой записи"}. Если это один персонаж, объедините их.</span>
                       <button class="character-scene-run" onclick={() => { if (selectedGlossaryChar) mergeCharacter(selectedGlossaryChar, twin.alias); }}>Объединить</button>
                     </div>
                   {/each}
-                  <div class="character-update-box">
-                    <div class="character-model-choice">
-                      <LlmChoice action="descriptions" settings={llmSettings} onselect={selectLlmModel} />
-                      {#if outsideNote(llmSettings, "descriptions")}
-                        <p class="character-outside-note">{outsideNote(llmSettings, "descriptions")}</p>
-                      {/if}
-                    </div>
-                    {#if selectedGlossaryChar}
-                      <RequestSlider
-                        id="scene-parts"
-                        label="Частей запроса"
-                        status={scenePartsStatus}
-                        max={Math.max(sceneChunkCount ?? 1, 1)}
-                        value={sceneChunkCount ? sceneParts : 0}
-                        floor={Math.max(sceneReadyCount, 1)}
-                        ready={sceneReadyCount}
-                        onchange={(value) => { if (selectedGlossaryChar) scenePartsByAlias[selectedGlossaryChar.alias] = value; }}
-                        disabled={llmRun.active || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
-                      >
-                        {#snippet ends()}
-                          {#if sceneReadyCount > 0}
-                            <span class="character-depth-ready">готово: {sceneReadyCount}</span>
-                          {:else}
-                            <span>1 часть</span>
-                          {/if}
-                          <span>{sceneAllRead ? "соберётся из заметок" : "весь текст, долго"}</span>
-                        {/snippet}
-                      </RequestSlider>
-                    {/if}
-                    <div class="character-update-row">
-                      <button
-                        class="btn-modal-ai"
-                        disabled={llmRun.active}
-                        onclick={() => { if (selectedGlossaryChar) updateCharacterWithLlm(selectedGlossaryChar); }}
-                      >
-                        {#if updatingCharacter}
-                          <Loader2 size={13} class="spin" />
-                        {:else if sceneAllRead}
-                          <RotateCcw size={13} />
-                        {:else}
-                          <Sparkles size={13} />
-                        {/if}
-                        <span>{sceneAllRead ? "Восстановить" : "Обновить описание"}</span>
-                      </button>
-                    </div>
-                  </div>
-                  {#if summaryRunning && !otherCharacterUpdating}
-                    <div class="character-summary-progress">
-                      {#if summaryBuild?.stage !== "single"}
-                        <div class="character-summary-line">
-                          {#if summaryBuild}
-                            <CheckCircle2 size={13} />
-                          {:else}
-                            <Loader2 size={13} class="spin" />
-                          {/if}
-                          <span>{summaryLabel}</span>
-                          {#if !summaryBuild && !summaryStopping}
-                            <button class="character-scene-link" onclick={() => { summaryStopping = true; invoke("cancel_llm_run"); }}>Остановить</button>
-                          {/if}
-                        </div>
-                        {#if summaryProgress && summaryProgress.total > 0}
-                          <div class="character-summary-track">
-                            <div class="character-summary-fill" style={`width: ${(summaryProgress.done / summaryProgress.total) * 100}%`}></div>
-                          </div>
-                        {/if}
-                      {/if}
-                      <div class="character-summary-line character-summary-build" class:waiting={!summaryBuild} class:single={summaryBuild?.stage === "single"}>
-                        {#if summaryBuild}
-                          <Loader2 size={13} class="spin" />
-                        {:else}
-                          <Sparkles size={13} />
-                        {/if}
-                        <span>{summaryBuildLabel}</span>
-                      </div>
-                    </div>
-                  {/if}
+                  {@render descriptionBox(selectedGlossaryChar)}
                 </div>
 
-                <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
+                <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} class:character-card-busy={updatingCharacter && !otherCharacterUpdating} inert={updatingCharacter}>
                   <div class="edit-group">
                     <label class="edit-label" for="character-card-name">
                       <span>Имя карточки:</span>
@@ -4752,7 +4792,6 @@
                       id="character-notes"
                       bind:value={selectedGlossaryChar.notes} 
                       oninput={() => glossaryDirty = true}
-                      readonly={summaryRunning}
                       rows="8"
                       placeholder="напр. Младшая сестра героя, студентка. Дерзкая, за колкостями скрывает неуверенность..."
                       class="sidebar-textarea"
@@ -4951,22 +4990,25 @@
                   </div>
                 {/if}
               {:else if selectedGlossaryTerm}
-                <div class="sidebar-edit-header">
+                {@render descriptionLock()}
+                <div class="sidebar-edit-header" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
                   <div class="sidebar-char-headings">
                     <h4>Редактирование термина</h4>
                     <span class="char-sub-label">Словарь терминологии проекта</span>
                   </div>
+                  {@render descriptionBox(selectedGlossaryTerm)}
                 </div>
 
-                <div class="sidebar-edit-content">
+                <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} class:character-card-busy={updatingCharacter && !otherCharacterUpdating} inert={updatingCharacter}>
                   <div class="entry-toolbar">
                     <div class="entry-actions">
-                      <button class="btn-confirm-add" onclick={() => { if (selectedGlossaryTerm) termBecomesCharacter(selectedGlossaryTerm); }}>
+                      <button class="btn-confirm-add" disabled={updatingCharacter} onclick={() => { if (selectedGlossaryTerm) termBecomesCharacter(selectedGlossaryTerm); }}>
                         <UserPlus size={14} />
                         <span>Сделать персонажем</span>
                       </button>
                       <button
                         class="btn-delete-term"
+                        disabled={updatingCharacter}
                         onclick={() => { if (selectedGlossaryTerm) removeGlossaryTerm(selectedGlossaryTerm.id); }}
                       >
                         <Trash2 size={14} />
@@ -5002,7 +5044,7 @@
 
             <section class="character-scenes">
               <div class="character-scenes-header">
-                {#if glossaryTab === 'characters'}
+                {#if describedEntry}
                   <div class="gender-filter-group">
                     <button class="btn-filter-pill" class:active={characterPaneMode === 'scenes'} onclick={() => characterPaneMode = 'scenes'}>Сцены</button>
                     <button class="btn-filter-pill" class:active={characterPaneMode === 'notes'} onclick={() => characterPaneMode = 'notes'}>Заметки</button>
@@ -5026,7 +5068,7 @@
                     class="character-scene-link"
                     title="Сбросить заметки, в которых модель не нашла сведений. Эти части прочитаются заново"
                     disabled={updatingCharacter || emptyParts.length === 0}
-                    onclick={() => { if (selectedGlossaryChar) resetNotes(selectedGlossaryChar, emptyParts.map((part) => part.key)); }}
+                    onclick={() => { if (describedEntry) resetNotes(describedEntry, emptyParts.map((part) => part.key)); }}
                   >Сбросить пустые</button>
                 </div>
                 <div class="gender-filter-group">
@@ -5049,9 +5091,9 @@
                   {/if}
                 </div>
                 <div class="character-scenes-tools">
-                  {#if glossaryTab === 'characters'}
-                    <button class="character-scene-link" disabled={updatingCharacter} title="Передавать модели все сцены" onclick={() => { if (selectedGlossaryChar) setAllScenesForLlm(selectedGlossaryChar, true); }}>Выбрать все</button>
-                    <button class="character-scene-link" disabled={updatingCharacter} title="Не передавать модели ни одной сцены" onclick={() => { if (selectedGlossaryChar) setAllScenesForLlm(selectedGlossaryChar, false); }}>Снять все</button>
+                  {#if describedEntry}
+                    <button class="character-scene-link" disabled={updatingCharacter} title="Передавать модели все сцены" onclick={() => { if (describedEntry) setAllScenesForLlm(describedEntry, true); }}>Выбрать все</button>
+                    <button class="character-scene-link" disabled={updatingCharacter} title="Не передавать модели ни одной сцены" onclick={() => { if (describedEntry) setAllScenesForLlm(describedEntry, false); }}>Снять все</button>
                   {/if}
                   <button class="character-scene-link" disabled={!!paneQuery} onclick={() => collapsedScenes = new Set()}>Развернуть все</button>
                   <button class="character-scene-link" disabled={!!paneQuery} onclick={() => collapsedScenes = new Set((characterScenes ?? []).map((scene) => scene.key))}>Свернуть все</button>
@@ -5089,7 +5131,7 @@
                   {#if !loadingGlossary}
                     <p class="character-scenes-note">Выберите запись, чтобы увидеть её сцены.</p>
                   {/if}
-                {:else if showingNotes && selectedGlossaryChar}
+                {:else if showingNotes && describedEntry}
                   {#if characterPartsError}
                     <p class="character-scenes-note">{characterPartsError}</p>
                   {:else if !currentParts}
@@ -5097,7 +5139,7 @@
                   {:else if visibleParts.length === 0}
                     <p class="character-scenes-note">
                       {#if currentParts.length === 0}
-                        У персонажа нет реплик в выбранных сценах.
+                        В выбранных сценах нет реплик.
                       {:else if paneQuery}
                         Заметки не найдены по запросу «{paneSearch.trim()}»
                       {:else}
@@ -5106,7 +5148,7 @@
                     </p>
                   {:else}
                     {#each visibleParts as part (part.key)}
-                      {@const included = !selectedGlossaryChar.excluded_notes.includes(part.key)}
+                      {@const included = !describedEntry.excluded_notes.includes(part.key)}
                       <article class="character-part" class:character-part-off={part.note === null || part.empty || !included}>
                         <header class="character-part-head">
                           <input
@@ -5116,7 +5158,7 @@
                             disabled={updatingCharacter || part.note === null || part.empty}
                             title="Учитывать заметку в итоговом описании"
                             aria-label={`Учитывать заметку части ${part.index + 1} в итоговом описании`}
-                            onchange={(e) => { if (selectedGlossaryChar) toggleNoteForDescription(selectedGlossaryChar, part.key, e.currentTarget.checked); }}
+                            onchange={(e) => { if (describedEntry) toggleNoteForDescription(describedEntry, part.key, e.currentTarget.checked); }}
                           />
                           <strong>Часть {part.index + 1}</strong>
                           {#if part.note === null}
@@ -5131,7 +5173,7 @@
                               class="character-scene-link"
                               title="Забыть заметку. Часть прочитается заново при следующем запуске"
                               disabled={updatingCharacter}
-                              onclick={() => { if (selectedGlossaryChar) resetNotes(selectedGlossaryChar, [part.key]); }}
+                              onclick={() => { if (describedEntry) resetNotes(describedEntry, [part.key]); }}
                             >Сбросить</button>
                           {/if}
                         </header>
@@ -5204,10 +5246,10 @@
                   </p>
                 {:else}
                   {#each visibleCharacterScenes as scene (scene.key)}
-                    {@const included = glossaryTab !== 'characters' || !selectedGlossaryChar?.excluded_scenes.includes(scene.key)}
+                    {@const included = !describedEntry?.excluded_scenes.includes(scene.key)}
                     <article class="character-scene" class:character-scene-off={!included}>
                       <header class="character-scene-head">
-                        {#if glossaryTab === 'characters'}
+                        {#if describedEntry}
                           <input
                             type="checkbox"
                             class="character-scene-check"
@@ -5215,7 +5257,7 @@
                             disabled={updatingCharacter}
                             title="Передавать эту сцену модели"
                             aria-label={`Передавать модели сцену ${scene.scene}`}
-                            onchange={(e) => { if (selectedGlossaryChar) toggleSceneForLlm(selectedGlossaryChar, scene.key, e.currentTarget.checked); }}
+                            onchange={(e) => { if (describedEntry) toggleSceneForLlm(describedEntry, scene.key, e.currentTarget.checked); }}
                           />
                         {/if}
                         <button
@@ -8672,6 +8714,11 @@
     margin-left: auto;
   }
 
+  /* Запись во время обновления видна, но её поля перепишет итог модели */
+  .character-card-busy {
+    opacity: 0.7;
+  }
+
   .character-card-locked {
     opacity: 0.45;
   }
@@ -9168,9 +9215,14 @@
     white-space: nowrap;
   }
 
-  .btn-confirm-add:hover {
+  .btn-confirm-add:hover:not(:disabled) {
     background: #10b981;
     color: #ffffff;
+  }
+
+  .btn-confirm-add:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   /* Кнопки делят строку поровну, а в узком окне встают друг под другом */

@@ -1841,10 +1841,81 @@ async fn list_character_parts(
         let base_path = effective_game_directory(Path::new(&game_dir));
         let parts = llm::scene_parts(&game_lines(&base_path), &llm::token_notes(&hints.tokens), &character);
         let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
-        llm::character_parts(parts, &model, &character, &notes_file, &hints)
+        llm::character_parts(parts, &model, &character.alias, &character.original_name, &notes_file, &hints)
     })
     .await
     .map_err(|e| format!("Ошибка чтения заметок персонажа: {}", e))
+}
+
+/// Сколько частей дают включённые сцены термина и сколько из них уже прочитано.
+#[tauri::command]
+async fn count_term_chunks(
+    game_dir: String,
+    model: String,
+    term: glossary::TermGlossaryEntry,
+    tokens: Vec<glossary::TokenGlossaryEntry>,
+) -> Result<CharacterChunks, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let chunks = llm::term_scene_chunks(&game_lines(&base_path), &llm::token_notes(&tokens), &term);
+        let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+        let ready = llm::ready_chunks(&chunks, &model, &term.note_owner(), &notes_file);
+        CharacterChunks { total: chunks.len(), ready: ready.iter().filter(|ready| **ready).count() }
+    })
+    .await
+    .map_err(|e| format!("Ошибка подсчёта сцен термина: {}", e))
+}
+
+/// Все части сцен термина с заметками от этой модели.
+#[tauri::command]
+async fn list_term_parts(
+    game_dir: String,
+    model: String,
+    term: glossary::TermGlossaryEntry,
+    hints: llm::ModelHints,
+) -> Result<Vec<llm::CharacterPart>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let parts = llm::term_scene_parts(&game_lines(&base_path), &llm::token_notes(&hints.tokens), &term);
+        let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+        llm::character_parts(parts, &model, &term.note_owner(), &term.source_term, &notes_file, &hints)
+    })
+    .await
+    .map_err(|e| format!("Ошибка чтения заметок термина: {}", e))
+}
+
+/// Пишет описание термина по `parts` частям его сцен. Готовые части сохранены, и следующий запуск
+/// продолжит с того же места. `None` значит, что запуск остановлен раньше первой заметки.
+#[tauri::command]
+async fn summarize_glossary_term(
+    game_dir: String,
+    target: llm::ChatTarget,
+    term: glossary::TermGlossaryEntry,
+    hints: llm::ModelHints,
+    parts: usize,
+    on_progress: Channel<llm::SummaryProgress>,
+) -> Result<Option<String>, String> {
+    let run = LlmRun::begin()?;
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+    let selected = term.clone();
+    let notes = notes_file.clone();
+    let chosen_model = target.model.clone();
+    let tokens = hints.tokens.clone();
+    let chunks = tauri::async_runtime::spawn_blocking(move || {
+        let chunks = llm::term_scene_chunks(&game_lines(&base_path), &llm::token_notes(&tokens), &selected);
+        let ready = llm::ready_chunks(&chunks, &chosen_model, &selected.note_owner(), &notes);
+        llm::pick_chunks(chunks, parts, &ready)
+    })
+    .await
+    .map_err(|e| format!("Ошибка подготовки сцен термина: {}", e))?;
+
+    llm::summarize_term(&target, &term, chunks, &hints, &notes_file, run.cancel(), |progress| {
+        if let Err(error) = on_progress.send(progress) {
+            tracing::warn!(%error, "Ход обработки не передан в интерфейс");
+        }
+    })
+    .await
 }
 
 /// Сбрасывает заметки частей: следующий запуск прочитает их заново.
@@ -1988,6 +2059,9 @@ pub fn run() {
             suggest_glossary_tokens,
             autofill_glossary_terms,
             list_term_candidates,
+            count_term_chunks,
+            list_term_parts,
+            summarize_glossary_term,
             cancel_llm_run,
             summarize_glossary_character,
             count_character_chunks,
@@ -3356,7 +3430,7 @@ mod tests {
                 translated_term: "Клинок демона".to_string(),
                 category: "item".to_string(),
                 notes: "Реликвия".to_string(),
-                forms: Vec::new(),
+                ..Default::default()
             });
 
             let save_msg = save_project_glossary(temp_game_dir.to_string_lossy().to_string(), gl)

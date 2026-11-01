@@ -72,6 +72,24 @@ pub struct TermGlossaryEntry {
     pub notes: String,       // Контекст / комментарий
     #[serde(default)]
     pub forms: Vec<NameForm>, // Сокращения и короткие формы ("PPF", "Academy")
+    #[serde(default)]
+    pub excluded_scenes: Vec<String>, // Сцены, которые не передаются модели
+    #[serde(default)]
+    pub excluded_notes: Vec<String>, // Заметки частей, которые не идут в итоговое описание
+}
+
+impl TermGlossaryEntry {
+    pub fn names(&self) -> Vec<String> {
+        std::iter::once(&self.source_term)
+            .chain(self.forms.iter().map(|form| &form.source))
+            .cloned()
+            .collect()
+    }
+
+    /// Чьи заметки: в общем файле они не должны совпасть с заметками персонажа.
+    pub fn note_owner(&self) -> String {
+        format!("term:{}", self.id)
+    }
 }
 
 /// Подстановка в репликах вроде `[landlady]`

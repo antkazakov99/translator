@@ -90,7 +90,7 @@
 
   const SECTIONS: Record<GlossaryTab, LlmAction[]> = {
     characters: ["descriptions", "names"],
-    terms: ["terms"],
+    terms: ["terms", "descriptions"],
     tokens: ["tokens"]
   };
 
@@ -107,7 +107,7 @@
   let errorMessage = $state<string | null>(null);
   let doneMessage = $state("");
 
-  $effect(() => { descriptionsOpen = panelOpen && sectionByTab.characters === "descriptions"; });
+  $effect(() => { descriptionsOpen = panelOpen && openSection === "descriptions"; });
   // Сообщение относится к разделу, в котором появилось
   $effect(() => {
     void openSection;
