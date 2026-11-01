@@ -640,6 +640,9 @@ const SCENE_BREAK: &str = "---\n";
 /// Сколько следующих сцен просматривается, чтобы заполнить часть до конца.
 const SCENE_WINDOW: usize = 8;
 
+/// Меньше этого в конце длинной сцены модели не хватает контекста.
+const MIN_SCENE_TAIL: usize = 3000;
+
 /// Раскладывает сцены по частям и возвращает их номера. Часть дополняется подходящими сценами
 /// из ближайших: так частей меньше, а порядок сюжета нарушается только в пределах окна.
 pub fn pack_scenes(sizes: &[usize], window: usize) -> Vec<Vec<usize>> {
@@ -667,6 +670,35 @@ pub fn pack_scenes(sizes: &[usize], window: usize) -> Vec<Vec<usize>> {
     parts
 }
 
+/// Режет сцену на куски по репликам, если она не помещается в запрос. Короткий последний кусок
+/// начинается с конца предыдущего: без начала разговора модель видела бы обрывок.
+fn split_scene(lines: &[String]) -> Vec<String> {
+    let length = |line: &String| line.chars().count() + 1;
+    let mut parts: Vec<Vec<&String>> = vec![Vec::new()];
+    let mut size = 0;
+    for line in lines {
+        if size > 0 && size + length(line) > MAX_SAMPLE_TEXT {
+            parts.push(Vec::new());
+            size = 0;
+        }
+        parts.last_mut().expect("список кусков не пуст").push(line);
+        size += length(line);
+    }
+    if let [.., previous, tail] = parts.as_mut_slice() {
+        let mut start = previous.len();
+        while start > 0 && size < MIN_SCENE_TAIL {
+            start -= 1;
+            size += length(previous[start]);
+        }
+        tail.splice(0..0, previous[start..].iter().copied());
+    }
+    parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .map(|part| part.iter().map(|line| format!("{line}\n")).collect())
+        .collect()
+}
+
 /// Делит все включённые сцены персонажа на части, каждая из которых помещается в запрос.
 /// Части состоят из целых сцен. По репликам режется только сцена, которая сама не помещается.
 /// Пояснения к токенам лежат в самой части: с новым пояснением её заметка считается устаревшей.
@@ -677,24 +709,7 @@ pub fn scene_chunks(game: &GameLines, tokens: &TokenNotes, character: &Character
         .filter(|key| !character.excluded_scenes.contains(key))
         .collect();
     let transcripts = scene_transcripts(game, std::slice::from_ref(character), &keys.iter().cloned().collect(), tokens);
-    let mut pieces: Vec<String> = Vec::new();
-    for lines in keys.iter().filter_map(|key| transcripts.get(key)) {
-        let mut current = String::new();
-        let mut size = 0;
-        for line in lines {
-            let length = line.chars().count() + 1;
-            if size > 0 && size + length > MAX_SAMPLE_TEXT {
-                pieces.push(std::mem::take(&mut current));
-                size = 0;
-            }
-            current.push_str(line);
-            current.push('\n');
-            size += length;
-        }
-        if size > 0 {
-            pieces.push(current);
-        }
-    }
+    let pieces: Vec<String> = keys.iter().filter_map(|key| transcripts.get(key)).flat_map(|lines| split_scene(lines)).collect();
     let sizes: Vec<usize> = pieces.iter().map(|piece| piece.chars().count()).collect();
     let chunks = pack_scenes(&sizes, SCENE_WINDOW)
         .into_iter()
@@ -1720,6 +1735,28 @@ mod tests {
         assert_eq!(pack_scenes(&[7000, 6000, 5500, 4900], 8), [vec![0, 3], vec![1, 2]]);
         // Подходящая сцена за пределами окна не трогается
         assert_eq!(pack_scenes(&[7000, 6000, 5500, 4900], 1), [vec![0], vec![1, 2], vec![3]]);
+    }
+
+    #[test]
+    fn test_short_scene_tail_starts_with_previous_lines() {
+        let line = |index: usize| format!("Kate: {index:03} {}", "word ".repeat(19));
+        let lines: Vec<String> = (0..120).map(line).collect();
+        let pieces = split_scene(&lines);
+        assert_eq!(pieces.len(), 2);
+        assert!(pieces.iter().all(|piece| piece.chars().count() <= MAX_SAMPLE_TEXT));
+        assert!(pieces[1].chars().count() >= MIN_SCENE_TAIL);
+        assert!(pieces[1].contains("Kate: 119 "));
+        // Начало дополненного куска уже есть в предыдущем, а реплики не теряются
+        let first_line = pieces[1].lines().next().unwrap();
+        assert!(pieces[0].contains(first_line));
+        assert!(lines.iter().all(|line| pieces.iter().any(|piece| piece.contains(line.as_str()))));
+
+        // Длинный хвост и короткая сцена не меняются
+        let long_tail: Vec<String> = (0..150).map(line).collect();
+        let pieces = split_scene(&long_tail);
+        assert!(!pieces[0].contains(pieces[1].lines().next().unwrap()));
+        assert_eq!(split_scene(&lines[..2]), [format!("{}\n{}\n", lines[0], lines[1])]);
+        assert!(split_scene(&[]).is_empty());
     }
 
     #[test]
