@@ -1682,6 +1682,26 @@ async fn get_character_scenes(
     .map_err(|e| format!("Ошибка поиска сцен персонажа: {}", e))
 }
 
+/// Сцены, в репликах которых есть токен.
+#[tauri::command]
+async fn get_token_scenes(game_dir: String, name: String) -> Result<Vec<scenes::CharacterScene>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scenes::token_scenes(&game_lines(&effective_game_directory(Path::new(&game_dir))), &name)
+    })
+    .await
+    .map_err(|e| format!("Ошибка поиска сцен токена: {}", e))
+}
+
+/// Сцены, в репликах которых встречается термин.
+#[tauri::command]
+async fn get_term_scenes(game_dir: String, term: String) -> Result<Vec<scenes::CharacterScene>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scenes::term_scenes(&game_lines(&effective_game_directory(Path::new(&game_dir))), &term)
+    })
+    .await
+    .map_err(|e| format!("Ошибка поиска сцен термина: {}", e))
+}
+
 /// Просьба остановить пакетную обработку. Запуски в окне идут по одному.
 static LLM_CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -1976,7 +1996,9 @@ pub fn run() {
             list_text_tokens,
             list_character_parts,
             reset_character_notes,
-            get_character_scenes
+            get_character_scenes,
+            get_token_scenes,
+            get_term_scenes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

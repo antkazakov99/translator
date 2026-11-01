@@ -129,17 +129,45 @@ fn mention_pattern(names: &[&str], lowercase: &HashSet<String>) -> Option<Regex>
 /// Сцены персонажа в порядке файлов и строк.
 pub fn character_scenes(game: &GameLines, aliases: &[&str], names: &[&str]) -> Vec<CharacterScene> {
     let mention = mention_pattern(names, &game.lowercase);
-
-    let mut positions: HashMap<(&str, &str), usize> = HashMap::new();
-    let mut scenes: Vec<CharacterScene> = Vec::new();
-    for line in &game.lines {
+    scenes_with(game, |line| {
         let spoken = line
             .alias
             .as_deref()
             .is_some_and(|own| aliases.iter().any(|alias| own.eq_ignore_ascii_case(alias)));
-        if !spoken && !mention.as_ref().is_some_and(|pattern| pattern.is_match(&line.text)) {
+        (spoken || mention.as_ref().is_some_and(|pattern| pattern.is_match(&line.text))).then_some(spoken)
+    })
+}
+
+/// Сцены, в репликах которых есть токен `[name]`, в том числе с флагом вроде `[name!c]`.
+pub fn token_scenes(game: &GameLines, name: &str) -> Vec<CharacterScene> {
+    matching_scenes(game, &format!(r"\[{}(?:![a-z]+)?\]", regex::escape(name)))
+}
+
+/// Сцены, в репликах которых встречается термин. Регистр не важен, термин ищется целым словом.
+pub fn term_scenes(game: &GameLines, term: &str) -> Vec<CharacterScene> {
+    let term = term.trim();
+    if term.is_empty() {
+        return Vec::new();
+    }
+    matching_scenes(game, &format!(r"(?i)(?:^|\W){}(?:$|\W)", regex::escape(term)))
+}
+
+fn matching_scenes(game: &GameLines, pattern: &str) -> Vec<CharacterScene> {
+    let Ok(pattern) = Regex::new(pattern) else {
+        return Vec::new();
+    };
+    scenes_with(game, |line| pattern.is_match(&line.text).then_some(false))
+}
+
+/// Собирает сцены с подходящими строками. `classify` возвращает `None` для лишней строки,
+/// а для подходящей говорит, это реплика самого персонажа или упоминание.
+fn scenes_with(game: &GameLines, classify: impl Fn(&ScriptLine) -> Option<bool>) -> Vec<CharacterScene> {
+    let mut positions: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut scenes: Vec<CharacterScene> = Vec::new();
+    for line in &game.lines {
+        let Some(spoken) = classify(line) else {
             continue;
-        }
+        };
         let position = *positions.entry((&line.file, &line.scene)).or_insert_with(|| {
             scenes.push(CharacterScene {
                 key: line.key(),
@@ -181,6 +209,48 @@ mod tests {
         let found = character_scenes(&game, &[alias], &[name]);
         let _ = fs::remove_dir_all(dir);
         found
+    }
+
+    fn game_of(content: &str) -> GameLines {
+        let dir = std::env::temp_dir().join(format!("translator_scenes_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("story.rpy");
+        fs::write(&path, content).unwrap();
+        let game = GameLines::new(load_lines(&[path], |_| "story.rpy".to_string()), HashMap::new());
+        let _ = fs::remove_dir_all(dir);
+        game
+    }
+
+    #[test]
+    fn tokens_are_found_with_their_flags() {
+        let game = game_of(concat!(
+            "label home:\n",
+            "    m \"Ask [landlady].\"\n",
+            "    m \"[landlady!c] is out.\"\n",
+            "    m \"The landlady left and [landlady_2] stayed.\"\n",
+            "label bar:\n",
+            "    m \"Nothing.\"\n",
+        ));
+        let found = token_scenes(&game, "landlady");
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].scene.as_str(), found[0].spoken, found[0].mentioned), ("home", 0, 2));
+        assert!(token_scenes(&game, "nick").is_empty());
+    }
+
+    #[test]
+    fn terms_are_found_as_whole_words_in_any_case() {
+        let game = game_of(concat!(
+            "label home:\n",
+            "    m \"Back to the ppf hq now.\"\n",
+            "label bar:\n",
+            "    m \"The PPF HQs are closed.\"\n",
+            "label end:\n",
+            "    m \"PPF HQ\"\n",
+        ));
+        let found = term_scenes(&game, " PPF HQ ");
+        let names: Vec<&str> = found.iter().map(|scene| scene.scene.as_str()).collect();
+        assert_eq!(names, ["home", "end"]);
+        assert!(term_scenes(&game, " ").is_empty());
     }
 
     #[test]
