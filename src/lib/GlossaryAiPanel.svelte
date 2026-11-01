@@ -4,7 +4,20 @@
   import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, Sparkles, Square } from "lucide-svelte";
   import CharacterPicker from "./CharacterPicker.svelte";
   import RequestSlider from "./RequestSlider.svelte";
-  import { actionLabel, targetFor, type LlmAction, type LlmSettings } from "./llm-settings";
+  import ModelCombobox from "./ModelCombobox.svelte";
+  import {
+    LLM_ACTIONS,
+    apiProvider,
+    connectionFor,
+    defaultConnectionOf,
+    readyToCheck,
+    targetFor,
+    textModels,
+    type LlmAction,
+    type LlmActionSettings,
+    type LlmConnection,
+    type LlmSettings
+  } from "./llm-settings";
 
   interface PanelCharacter {
     alias: string;
@@ -79,6 +92,7 @@
     busy = $bindable(false),
     descriptionsOpen = $bindable(false),
     descriptions,
+    onselect,
     onnames,
     onterms,
     onaddterms,
@@ -96,6 +110,7 @@
     busy?: boolean;
     descriptionsOpen?: boolean;
     descriptions: Snippet;
+    onselect: (action: LlmAction, choice: LlmActionSettings) => void;
     onnames: (rows: { alias: string; translated: string }[]) => void;
     onterms: (rows: { id: string; translated: string; category: string; notes: string }[]) => void;
     onaddterms: (terms: PanelTerm[]) => void;
@@ -121,6 +136,36 @@
   let panelOpen = $state(false);
   let sectionByTab = $state<Record<GlossaryTab, LlmAction>>({ characters: "descriptions", terms: "terms", tokens: "tokens" });
   let openSection = $derived(sectionByTab[tab]);
+
+  // Выбор подключения и модели для раздела. Список моделей подключения запрашивается один раз
+  let activeChoice = $derived(settings.actions[openSection]);
+  let activeConnection = $derived(connectionFor(settings, openSection));
+  let activeAction = $derived(LLM_ACTIONS.find((action) => action.id === openSection));
+  let sendsOutside = $derived(activeConnection.provider !== "local" && !!activeAction?.gameText);
+  let modelsByConnection = $state<Record<string, string[]>>({});
+  const requestedModels = new Set<string>();
+
+  async function loadModels(connection: LlmConnection) {
+    const key = JSON.stringify([connection.provider, connection.url, connection.key]);
+    if (requestedModels.has(key) || !readyToCheck(connection)) return;
+    requestedModels.add(key);
+    try {
+      const models = await invoke<string[]>("check_llm_models", {
+        apiUrl: connection.url.trim(),
+        apiKey: connection.key.trim() || null,
+        provider: apiProvider(connection.provider)
+      });
+      modelsByConnection[connection.id] = textModels(models);
+    } catch {
+      // Модель можно вписать вручную, а следующий выбор подключения спросит список заново
+      requestedModels.delete(key);
+      modelsByConnection[connection.id] = [];
+    }
+  }
+
+  $effect(() => {
+    if (panelOpen) void loadModels(activeConnection);
+  });
 
   let isProcessing = $state(false);
   let progressStep = $state("");
@@ -435,9 +480,32 @@
           onclick={() => { sectionByTab[tab] = section.id; }}
         >{section.label}</button>
       {/each}
-      <span class="ai-model">Модель: {actionLabel(settings, openSection)}</span>
+      <div class="ai-choice">
+        <select
+          class="input ai-connection"
+          value={activeChoice.connection}
+          disabled={isProcessing || locked}
+          aria-label="Подключение"
+          onchange={(event) => onselect(openSection, { connection: event.currentTarget.value, model: "" })}
+        >
+          <option value="">По умолчанию: {defaultConnectionOf(settings).name}</option>
+          {#each settings.connections as connection (connection.id)}
+            <option value={connection.id}>{connection.name}</option>
+          {/each}
+        </select>
+        <ModelCombobox
+          bind:value={() => activeChoice.model, (model) => onselect(openSection, { connection: activeChoice.connection, model })}
+          models={modelsByConnection[activeConnection.id] ?? []}
+          label="Модель"
+          placeholder={activeConnection.model.trim() || "Имя модели"}
+          disabled={isProcessing || locked}
+        />
+      </div>
     </div>
     <div class="ai-body">
+      {#if sendsOutside}
+        <p class="ai-outside">Наружу, в {activeConnection.name}, уйдут: {activeAction?.sends}</p>
+      {/if}
       {#if errorMessage}
         <div class="ai-error">
           <AlertCircle size={14} />
@@ -623,6 +691,7 @@
     flex-shrink: 0;
     margin: 10px 16px;
     overflow: hidden;
+    color-scheme: dark;
     border: 1px solid rgba(99, 102, 241, 0.4);
     border-left: 3px solid #6366f1;
     border-radius: 8px;
@@ -739,24 +808,31 @@
     margin-top: 0;
   }
 
-  .ai-model,
-  .ai-note {
+  .ai-choice {
+    display: grid;
+    flex: 1;
+    grid-template-columns: minmax(0, 11rem) minmax(0, 15rem);
+    justify-content: end;
+    gap: 6px;
+    min-width: 0;
+    margin-left: 12px;
+    padding-bottom: 5px;
+  }
+
+  .ai-connection:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .ai-note,
+  .ai-outside {
     margin: 0;
     font-size: 11px;
-    color: #818cf8;
-  }
-
-  .ai-model {
-    min-width: 0;
-    margin-left: auto;
-    padding-bottom: 7px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .ai-note {
     color: #94a3b8;
+  }
+
+  .ai-outside {
+    color: #fbbf24;
   }
 
   .ai-done {

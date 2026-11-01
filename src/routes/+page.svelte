@@ -8,7 +8,7 @@
   import LlmSettingsModal from "../lib/LlmSettingsModal.svelte";
   import RequestSlider from "../lib/RequestSlider.svelte";
   import { partsToRead, type CharacterChunks } from "../lib/character-parts";
-  import { saveLlmSettings, loadLlmSettings, targetFor, type LlmSettings } from "../lib/llm-settings";
+  import { saveLlmSettings, loadLlmSettings, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "../lib/llm-settings";
   import { progressLabel, progressPercent } from "../lib/progress";
   import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -56,7 +56,8 @@
     BookMarked,
     ExternalLink,
     RotateCcw,
-    Braces
+    Braces,
+    MoreHorizontal
   } from "lucide-svelte";
 
   // Стейт проекта на Svelte 5 (Runes)
@@ -728,7 +729,7 @@
   let showLlmSettings = $state(false);
   let llmSettings = $state<LlmSettings>(loadLlmSettings());
   // Заметки по сценам привязаны к модели, поэтому от неё зависит и подсчёт готовых частей
-  let descriptionModel = $derived(llmSettings.actions.descriptions.model.trim());
+  let descriptionModel = $derived(targetFor(llmSettings, "descriptions").model);
   // Остановка общая на все запросы, поэтому запуски идут по одному
   let aiPanelBusy = $state(false);
   let glossaryTab = $state<'characters' | 'terms' | 'tokens'>('characters');
@@ -755,7 +756,6 @@
     const timer = setTimeout(() => { showGlossarySkeleton = true; }, 180);
     return () => clearTimeout(timer);
   });
-  let characterUpdateMode = $state<"lines" | "scenes">("scenes");
   // Ползунок: готовые части входят в запуск всегда, поэтому ниже их числа он не опускается
   let scenePartsByAlias = $state<Record<string, number>>({});
   let scenePartsWanted = $derived(selectedGlossaryChar ? scenePartsByAlias[selectedGlossaryChar.alias] ?? 1 : 1);
@@ -763,7 +763,7 @@
   let sceneReadyCount = $state(0);
   let sceneParts = $derived(partsToRead({ total: sceneChunkCount ?? 1, ready: sceneReadyCount }, scenePartsWanted));
   // Всё прочитано: читать нечего, остаётся собрать описание из заметок
-  let sceneAllRead = $derived(characterUpdateMode === "scenes" && !!sceneChunkCount && sceneReadyCount >= sceneChunkCount);
+  let sceneAllRead = $derived(!!sceneChunkCount && sceneReadyCount >= sceneChunkCount);
   let scenePartsStatus = $derived.by(() => {
     if (sceneChunkCount === null) return "подсчёт...";
     if (sceneChunkCount === 0) return "нет реплик";
@@ -800,6 +800,7 @@
     return "Пишу итоговое описание...";
   });
   let collapsedScenes = $state.raw(new Set<string>());
+  let characterMenuOpen = $state(false);
   // Обновляется один персонаж за раз: остальные на это время недоступны
   let updatingAlias = $state<string | null>(null);
   let updatingCharacter = $derived(updatingAlias !== null);
@@ -920,7 +921,7 @@
   let sceneChunkTarget: string | null = null;
   $effect(() => {
     const char = selectedGlossaryChar;
-    if (characterUpdateMode !== "scenes" || !char || !scenesTarget || glossaryTab !== "characters") return;
+    if (!char || !scenesTarget || glossaryTab !== "characters") return;
     const delay = sceneChunkTarget === scenesTarget ? 100 : 0;
     sceneChunkTarget = scenesTarget;
     const model = descriptionModel;
@@ -1213,35 +1214,15 @@
 
   async function updateCharacterWithLlm(char: CharacterGlossaryEntry) {
     try {
-      if (characterUpdateMode === "scenes") {
-        const outcome = await summarizeCharacter(char, sceneParts);
-        if (outcome === "stopped") {
-          showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
-        } else {
-          showToast(`Персонаж ${char.original_name} обновлён`, "success");
-          if (outcome === "partial") showToast("Описание собрано по прочитанным частям, следующий запуск дочитает остальные", "info");
-        }
-        return;
+      const outcome = await summarizeCharacter(char, sceneParts);
+      if (outcome === "stopped") {
+        showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
+      } else {
+        showToast(`Персонаж ${char.original_name} обновлён`, "success");
+        if (outcome === "partial") showToast("Описание собрано по прочитанным частям, следующий запуск дочитает остальные", "info");
       }
-
-      updatingAlias = char.alias;
-      const result = await invoke<{ items: CharacterGlossaryEntry[]; failed_batches: number }>("autofill_glossary_characters", {
-        gameDir,
-        target: targetFor(llmSettings, "descriptions"),
-        characters: [$state.snapshot(char)],
-        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) }
-      });
-      const updated = result.items[0];
-      if (result.failed_batches > 0 || !updated) {
-        showToast("Модель не вернула данные о персонаже, попробуйте ещё раз", "warning");
-        return;
-      }
-      applyCharacterUpdate(char, updated);
-      showToast(`Персонаж ${char.original_name} обновлён`, "success");
     } catch (e) {
       showToast(`Не удалось обновить персонажа: ${e}`, "error");
-    } finally {
-      resetSummaryState();
     }
   }
 
@@ -1278,6 +1259,11 @@
   function saveLlmConnections(settings: LlmSettings) {
     llmSettings = settings;
     saveLlmSettings(settings);
+  }
+
+  function selectLlmModel(action: LlmAction, choice: LlmActionSettings) {
+    llmSettings.actions[action] = choice;
+    saveLlmSettings($state.snapshot(llmSettings));
   }
 
   function applyPanelNames(rows: { alias: string; translated: string }[]) {
@@ -1327,7 +1313,7 @@
   const GENDER_OPTIONS: { value: CharacterGender; letter: string; title: string; example: string }[] = [
     { value: "male", letter: "М", title: "Мужской", example: "он сказал, красивый" },
     { value: "female", letter: "Ж", title: "Женский", example: "она сказала, красивая" },
-    { value: "neuter", letter: "Ср", title: "Средний", example: "оно / существо, чудовище" },
+    { value: "neuter", letter: "Ср", title: "Средний", example: "оно сказало, красивое" },
     { value: "unknown", letter: "—", title: "Не указан", example: "нейтрально" }
   ];
   const emptyCharacter = () => ({ alias: "", name: "", translated: "", gender: "unknown" as CharacterGender });
@@ -3808,6 +3794,7 @@
           bind:busy={aiPanelBusy}
           bind:descriptionsOpen
           descriptions={groupUpdate}
+          onselect={selectLlmModel}
           onnames={applyPanelNames}
           onterms={applyPanelTerms}
           onaddterms={addPanelTerms}
@@ -4115,8 +4102,33 @@
                     <span class="char-alias-badge-lg">[{selectedGlossaryChar.alias}]</span>
                     <div class="sidebar-char-headings">
                       <h4>{selectedGlossaryChar.original_name}</h4>
-                      <span class="char-sub-label">Код и оригинальное имя</span>
                     </div>
+                    <details
+                      class="character-menu"
+                      bind:open={characterMenuOpen}
+                      onfocusout={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) characterMenuOpen = false; }}
+                    >
+                      <summary aria-label="Другие действия с персонажем" title="Другие действия"><MoreHorizontal size={16} /></summary>
+                      <div class="character-menu-body">
+                        <label class="char-sub-label" for="character-merge">Объединить с другим персонажем</label>
+                        <select
+                          id="character-merge"
+                          class="sidebar-select"
+                          value=""
+                          onchange={(e) => {
+                            const alias = e.currentTarget.value;
+                            e.currentTarget.value = "";
+                            characterMenuOpen = false;
+                            if (alias && selectedGlossaryChar) mergeCharacter(selectedGlossaryChar, alias);
+                          }}
+                        >
+                          <option value="">Выберите персонажа…</option>
+                          {#each glossary.characters.filter((c) => c.alias !== selectedGlossaryChar?.alias) as other (other.alias)}
+                            <option value={other.alias}>{other.original_name} [{other.alias}]</option>
+                          {/each}
+                        </select>
+                      </div>
+                    </details>
                   </div>
                   {#if selectedGlossaryChar.merged.length > 0}
                     <div class="character-merged-row">
@@ -4139,68 +4151,51 @@
                       <button class="character-scene-run" onclick={() => { if (selectedGlossaryChar) mergeCharacter(selectedGlossaryChar, twin.alias); }}>Объединить</button>
                     </div>
                   {/each}
-                  <select
-                    class="sidebar-select character-merge-select"
-                    aria-label="Объединить с другим персонажем"
-                    value=""
-                    onchange={(e) => {
-                      const alias = e.currentTarget.value;
-                      e.currentTarget.value = "";
-                      if (alias && selectedGlossaryChar) mergeCharacter(selectedGlossaryChar, alias);
-                    }}
-                  >
-                    <option value="">Объединить с другим персонажем…</option>
-                    {#each glossary.characters.filter((c) => c.alias !== selectedGlossaryChar?.alias) as other (other.alias)}
-                      <option value={other.alias}>{other.original_name} [{other.alias}]</option>
-                    {/each}
-                  </select>
-                  <div class="character-update-row">
-                    <select bind:value={characterUpdateMode} class="sidebar-select" disabled={updatingCharacter} aria-label="Что передать модели">
-                      <option value="lines">По отдельным репликам</option>
-                      <option value="scenes">По сценам</option>
-                    </select>
-                    <button
-                      class="btn-modal-ai"
-                      disabled={updatingCharacter || aiPanelBusy}
-                      onclick={() => { if (selectedGlossaryChar) updateCharacterWithLlm(selectedGlossaryChar); }}
-                    >
-                      {#if updatingCharacter}
-                        <Loader2 size={13} class="spin" />
-                      {:else if sceneAllRead}
-                        <RotateCcw size={13} />
-                      {:else}
-                        <Sparkles size={13} />
-                      {/if}
-                      <span>{sceneAllRead ? "Восстановить" : "Обновить через ИИ"}</span>
-                    </button>
-                  </div>
-                  {#if characterUpdateMode === "scenes" && selectedGlossaryChar}
-                    <RequestSlider
-                      id="scene-parts"
-                      label="Частей запроса"
-                      status={scenePartsStatus}
-                      min={0}
-                      max={Math.max(sceneChunkCount ?? 1, 1)}
-                      value={sceneParts}
-                      trackStyle={sceneTrackStyle}
-                      segmented={(sceneChunkCount ?? 0) <= MAX_SEGMENTS_WITH_GAPS}
-                      oninput={(event) => {
-                        const wanted = Math.max(event.currentTarget.valueAsNumber, sceneReadyCount, 1);
-                        if (selectedGlossaryChar) scenePartsByAlias[selectedGlossaryChar.alias] = wanted;
-                        event.currentTarget.value = String(wanted);
-                      }}
-                      disabled={updatingCharacter || aiPanelBusy || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
-                    >
-                      {#snippet ends()}
-                        {#if sceneReadyCount > 0}
-                          <span class="character-depth-ready">готово: {sceneReadyCount}</span>
+                  <div class="character-update-box">
+                    {#if selectedGlossaryChar}
+                      <RequestSlider
+                        id="scene-parts"
+                        label="Частей запроса"
+                        status={scenePartsStatus}
+                        min={0}
+                        max={Math.max(sceneChunkCount ?? 1, 1)}
+                        value={sceneParts}
+                        trackStyle={sceneTrackStyle}
+                        segmented={(sceneChunkCount ?? 0) <= MAX_SEGMENTS_WITH_GAPS}
+                        oninput={(event) => {
+                          const wanted = Math.max(event.currentTarget.valueAsNumber, sceneReadyCount, 1);
+                          if (selectedGlossaryChar) scenePartsByAlias[selectedGlossaryChar.alias] = wanted;
+                          event.currentTarget.value = String(wanted);
+                        }}
+                        disabled={updatingCharacter || aiPanelBusy || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
+                      >
+                        {#snippet ends()}
+                          {#if sceneReadyCount > 0}
+                            <span class="character-depth-ready">готово: {sceneReadyCount}</span>
+                          {:else}
+                            <span>1 часть</span>
+                          {/if}
+                          <span>{sceneAllRead ? "соберётся из заметок" : "весь текст, долго"}</span>
+                        {/snippet}
+                      </RequestSlider>
+                    {/if}
+                    <div class="character-update-row">
+                      <button
+                        class="btn-modal-ai"
+                        disabled={updatingCharacter || aiPanelBusy}
+                        onclick={() => { if (selectedGlossaryChar) updateCharacterWithLlm(selectedGlossaryChar); }}
+                      >
+                        {#if updatingCharacter}
+                          <Loader2 size={13} class="spin" />
+                        {:else if sceneAllRead}
+                          <RotateCcw size={13} />
                         {:else}
-                          <span>1 часть</span>
+                          <Sparkles size={13} />
                         {/if}
-                        <span>{sceneAllRead ? "соберётся из заметок" : "весь текст, долго"}</span>
-                      {/snippet}
-                    </RequestSlider>
-                  {/if}
+                        <span>{sceneAllRead ? "Восстановить" : "Обновить через ИИ"}</span>
+                      </button>
+                    </div>
+                  </div>
                   {#if summaryRunning && !otherCharacterUpdating}
                     <div class="character-summary-progress">
                       {#if summaryBuild?.stage !== "single"}
@@ -8089,8 +8084,45 @@
     color: #a5b4fc;
   }
 
-  .character-merge-select {
-    margin-top: 10px;
+  .character-menu {
+    position: relative;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  .character-menu summary {
+    display: flex;
+    padding: 4px;
+    border-radius: 6px;
+    color: #94a3b8;
+    list-style: none;
+    cursor: pointer;
+  }
+
+  .character-menu summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .character-menu summary:hover,
+  .character-menu[open] summary {
+    color: #f8fafc;
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .character-menu-body {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 250px;
+    padding: 10px;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    background: #141824;
+    box-shadow: 0 12px 28px -8px rgba(0, 0, 0, 0.8);
   }
 
   .character-depth-ready {
@@ -8145,11 +8177,27 @@
     transition: width 0.3s;
   }
 
+  /* Запуск обновления отделён от названия: это отдельное действие, а не часть заголовка */
+  .character-update-box {
+    margin-top: 14px;
+    padding: 10px 12px 12px;
+    border: 1px solid #1e2638;
+    border-radius: 8px;
+    background: #11151f;
+  }
+
+  .character-update-box :global(.slider) {
+    margin-top: 0;
+  }
+
   .character-update-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 8px;
+    display: flex;
     margin-top: 10px;
+  }
+
+  .character-update-row .btn-modal-ai {
+    flex: 1;
+    justify-content: center;
   }
 
   .character-group-name {

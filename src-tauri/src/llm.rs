@@ -1,6 +1,6 @@
 use crate::glossary::{CharacterGlossaryEntry, TermGlossaryEntry, TokenGlossaryEntry};
 use crate::scenes::{self, GameLines, ScriptLine};
-use crate::terms::{TermCandidate, is_stuttering};
+use crate::terms::TermCandidate;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -13,8 +13,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Сколько реплик персонажа получает модель при обновлении по отдельным репликам.
-pub const CHARACTER_SAMPLES: usize = 64;
 /// Предел текста реплик на персонажа и на запрос: окно контекста модели не бесконечно.
 const MAX_SAMPLE_TEXT: usize = 12_000;
 /// Подробные описания длинные: больше персонажей в ответе не успевают и не помещаются.
@@ -32,16 +30,11 @@ const TOKEN_ANSWER_TOKENS: u32 = 1536;
 const TOKEN_GAP: &str = "[___]";
 /// Локальная модель пишет подробный ответ минутами.
 const REQUEST_TIMEOUT_SECS: u64 = 300;
+/// Запас для облачных моделей: рассуждения считаются в том же лимите, что и ответ, и могут съесть его целиком.
+const REASONING_TOKENS: u32 = 8192;
+const CLAUDE_API_VERSION: &str = "2026-10-21";
 const SCENE_NOTE_TOKENS: u32 = 768;
 const MAX_CONDENSE_ROUNDS: usize = 3;
-const MAX_SAMPLE_CHARS: usize = 200;
-const MIN_SAMPLE_WORDS: usize = 4;
-const EXPLICIT_WORDS: &[&str] = &[
-    "anal", "ass", "balls", "blowjob", "boobs", "breasts", "clit", "cock", "cum", "cumming", "dick",
-    "fuck", "fucking", "horny", "moan", "nipples", "orgasm", "pussy", "slut", "suck", "tits", "wet",
-    "whore", "киска", "киску", "киски", "кончаю", "кончи", "член", "члена", "члену", "сиськи",
-    "сиски", "соси", "трахни", "трахай",
-];
 
 /// Теги оформления вроде `{i}`. Подстановки `[name]` остаются: без них фраза теряет смысл.
 static RE_TEXT_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{[^}]*\}").unwrap());
@@ -115,9 +108,40 @@ struct ChatMessage {
 struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaudeRequest {
+    model: String,
+    max_tokens: u32,
+    system: String,
+    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<ClaudeOutputConfig>,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaudeOutputConfig {
+    effort: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeBlock {
+    #[serde(rename = "type")]
+    kind: String,
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeResponse {
+    content: Vec<ClaudeBlock>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,24 +234,43 @@ fn normalize_api_url(raw: &str) -> String {
     trimmed
 }
 
-/// Проверяет доступность сервера и возвращает список доступных моделей
-pub async fn check_models(api_url: &str, api_key: Option<&str>) -> Result<Vec<String>, String> {
+/// Адрес с версией API: сервер можно указать и без неё, а у Gemini путь свой (`/v1beta/openai`).
+fn versioned_url(api_url: &str) -> String {
     let base_url = normalize_api_url(api_url);
+    if base_url.ends_with("/v1") || base_url.ends_with("/openai") {
+        base_url
+    } else {
+        format!("{}/v1", base_url)
+    }
+}
+
+/// Подписывает запрос ключом так, как принято у сервиса.
+fn authorize(request: reqwest::RequestBuilder, provider: Provider, key: Option<&str>) -> reqwest::RequestBuilder {
+    match (provider, key) {
+        (_, None) => request,
+        (Provider::Claude, Some(key)) => {
+            request.header("x-api-key", key).header("anthropic-version", CLAUDE_API_VERSION)
+        }
+        (_, Some(key)) => request.bearer_auth(key),
+    }
+}
+
+/// Адрес списка моделей. Claude отдаёт его постранично, а нужен весь.
+fn models_url(api_url: &str, provider: Provider) -> String {
+    let base_url = versioned_url(api_url);
+    match provider {
+        Provider::Claude => format!("{}/models?limit=1000", base_url),
+        _ => format!("{}/models", base_url),
+    }
+}
+
+/// Проверяет доступность сервера и возвращает список доступных моделей
+pub async fn check_models(api_url: &str, api_key: Option<&str>, provider: Provider) -> Result<Vec<String>, String> {
     let api_key = api_key.map(str::trim).filter(|key| !key.is_empty());
     let client = if api_key.is_some() { make_external_client(6)? } else { make_client(6)? };
+    let models_url = models_url(api_url, provider);
 
-    // Если в URL уже есть /v1, то /models, если нет — пробуем /v1/models
-    let models_url = if base_url.ends_with("/v1") {
-        format!("{}/models", base_url)
-    } else {
-        format!("{}/v1/models", base_url)
-    };
-
-    let mut request = client.get(&models_url);
-    if let Some(key) = api_key {
-        request = request.bearer_auth(key);
-    }
-    let resp = request
+    let resp = authorize(client.get(&models_url), provider, api_key)
         .send()
         .await
         .map_err(|e| format!("Ошибка подключения к {}: {}", models_url, e))?;
@@ -245,43 +288,26 @@ pub async fn check_models(api_url: &str, api_key: Option<&str>) -> Result<Vec<St
         .await
         .map_err(|e| format!("Не удалось разобрать список моделей: {}", e))?;
 
-    let mut models: Vec<String> = parsed.data.into_iter().map(|m| m.id).collect();
+    // Gemini может вернуть полное имя ресурса, а в запросе ждёт короткое
+    let mut models: Vec<String> = parsed
+        .data
+        .into_iter()
+        .map(|m| m.id.trim_start_matches("models/").to_string())
+        .collect();
     models.sort();
     Ok(models)
 }
 
-/// Выполняет один запрос в OpenAI-совместимый chat completions endpoint
-async fn call_chat_completion(
-    target: &ChatTarget,
-    system_prompt: &str,
-    user_prompt: &str,
-    temperature: f32,
-    max_tokens: u32,
-) -> Result<String, String> {
-    if target.api_url.trim().is_empty() {
-        return Err("Адрес сервера не задан в настройках LLM".to_string());
-    }
-    if target.model.trim().is_empty() {
-        return Err("Модель не выбрана в настройках LLM".to_string());
-    }
-    let model = target.model.as_str();
-    let api_key = target.key();
-    let base_url = normalize_api_url(&target.api_url);
-    let endpoint = if base_url.ends_with("/chat/completions") {
-        base_url.clone()
-    } else if base_url.ends_with("/v1") {
-        format!("{}/chat/completions", base_url)
-    } else {
-        format!("{}/v1/chat/completions", base_url)
+/// Тело запроса chat completions. ChatGPT не принимает у новых моделей `max_tokens`, а `temperature`
+/// поддерживают не все его модели, поэтому там остаётся значение по умолчанию.
+fn chat_request(target: &ChatTarget, system_prompt: &str, user_prompt: &str, temperature: f32, max_tokens: u32) -> ChatCompletionRequest {
+    let (temperature, max_tokens, max_completion_tokens) = match target.provider {
+        Provider::Openai => (None, None, Some(max_tokens + REASONING_TOKENS)),
+        Provider::Gemini => (Some(temperature), Some(max_tokens + REASONING_TOKENS), None),
+        _ => (Some(temperature), Some(max_tokens), None),
     };
-
-    let client = if api_key.is_some() {
-        make_external_client(REQUEST_TIMEOUT_SECS)?
-    } else {
-        make_client(REQUEST_TIMEOUT_SECS)?
-    };
-    let request_body = ChatCompletionRequest {
-        model: model.to_string(),
+    ChatCompletionRequest {
+        model: target.model.clone(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -293,13 +319,45 @@ async fn call_chat_completion(
             },
         ],
         temperature,
-        max_tokens: Some(max_tokens),
-    };
-
-    let mut request = client.post(&endpoint).json(&request_body);
-    if let Some(key) = api_key {
-        request = request.bearer_auth(key);
+        max_tokens,
+        max_completion_tokens,
     }
+}
+
+/// Тело запроса к Claude. Параметры выборки API больше не принимает. Модели разбирают текст, а не решают
+/// задачи, поэтому глубина размышления низкая; старые модели этот параметр отвергают.
+fn claude_request(target: &ChatTarget, system_prompt: &str, user_prompt: &str, max_tokens: u32) -> ClaudeRequest {
+    let takes_effort = !["claude-3", "haiku-4", "sonnet-4-5", "sonnet-4-2", "opus-4-1", "opus-4-2"]
+        .iter()
+        .any(|old| target.model.contains(old));
+    ClaudeRequest {
+        model: target.model.clone(),
+        max_tokens: max_tokens + REASONING_TOKENS,
+        system: system_prompt.to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: user_prompt.to_string(),
+        }],
+        output_config: takes_effort.then_some(ClaudeOutputConfig { effort: "low" }),
+    }
+}
+
+/// Текст ответа Claude: блоки рассуждений в него не входят.
+fn claude_text(response: ClaudeResponse) -> Result<String, String> {
+    if response.stop_reason.as_deref() == Some("refusal") {
+        return Err("Модель отказалась обрабатывать этот текст".to_string());
+    }
+    let text: String = response
+        .content
+        .into_iter()
+        .filter(|block| block.kind == "text")
+        .filter_map(|block| block.text)
+        .collect();
+    Ok(text.trim().to_string())
+}
+
+/// Отправляет запрос к модели и превращает сбой сети или ответ с ошибкой в сообщение.
+async fn send_to_model(request: reqwest::RequestBuilder, endpoint: &str) -> Result<reqwest::Response, String> {
     let response = request
         .send()
         .await
@@ -317,6 +375,51 @@ async fn call_chat_completion(
         let err_text = response.text().await.unwrap_or_default();
         return Err(format!("LLM API вернул ошибку: {}", err_text));
     }
+    Ok(response)
+}
+
+/// Выполняет один запрос к модели: Claude напрямую, остальные через chat completions
+async fn call_chat_completion(
+    target: &ChatTarget,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f32,
+    max_tokens: u32,
+) -> Result<String, String> {
+    if target.api_url.trim().is_empty() {
+        return Err("Адрес сервера не задан в настройках LLM".to_string());
+    }
+    if target.model.trim().is_empty() {
+        return Err("Модель не выбрана в настройках LLM".to_string());
+    }
+    let api_key = target.key();
+    let client = if api_key.is_some() {
+        make_external_client(REQUEST_TIMEOUT_SECS)?
+    } else {
+        make_client(REQUEST_TIMEOUT_SECS)?
+    };
+
+    if target.provider == Provider::Claude {
+        let endpoint = format!("{}/messages", versioned_url(&target.api_url));
+        let request = authorize(client.post(&endpoint), target.provider, api_key)
+            .json(&claude_request(target, system_prompt, user_prompt, max_tokens));
+        let answer: ClaudeResponse = send_to_model(request, &endpoint)
+            .await?
+            .json()
+            .await
+            .map_err(|e| format!("Не удалось прочитать ответ LLM: {}", e))?;
+        return claude_text(answer);
+    }
+
+    let base_url = normalize_api_url(&target.api_url);
+    let endpoint = if base_url.ends_with("/chat/completions") {
+        base_url
+    } else {
+        format!("{}/chat/completions", versioned_url(&target.api_url))
+    };
+    let request = authorize(client.post(&endpoint), target.provider, api_key)
+        .json(&chat_request(target, system_prompt, user_prompt, temperature, max_tokens));
+    let response = send_to_model(request, &endpoint).await?;
 
     let completion: ChatCompletionResponse = response
         .json()
@@ -364,18 +467,6 @@ fn extract_json_content(raw: &str) -> &str {
         }
     }
     trimmed
-}
-
-/// Подходит ли строка для понимания персонажа: короткие возгласы и стоны о нём не говорят.
-fn is_informative(text: &str) -> bool {
-    text.split_whitespace().count() >= MIN_SAMPLE_WORDS && !is_stuttering(text)
-}
-
-/// Откровенная реплика мало говорит о характере, поэтому берётся только при нехватке других.
-fn is_explicit(text: &str) -> bool {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphabetic())
-        .any(|word| EXPLICIT_WORDS.contains(&word))
 }
 
 /// Берёт строки равномерно по списку, чтобы они оказались из разных частей игры.
@@ -506,27 +597,6 @@ fn resolve_variables(text: &str, variables: &HashMap<String, Vec<String>>, token
         .into_owned()
 }
 
-/// Выбирает реплики персонажа: сначала полезные и обычные, затем остальные.
-fn pick_samples(lines: &[String], count: usize) -> Vec<String> {
-    let usable = |line: &&String| is_informative(line);
-    let plain: Vec<&String> = lines.iter().filter(usable).filter(|line| !is_explicit(line)).collect();
-    let explicit: Vec<&String> = lines.iter().filter(usable).filter(|line| is_explicit(line)).collect();
-    let rest: Vec<&String> = lines.iter().filter(|line| !is_informative(line)).collect();
-
-    let mut picked = spread(&plain, count);
-    for pool in [explicit, rest] {
-        let missing = count - picked.len();
-        picked.extend(spread(&pool, missing));
-    }
-
-    let text: usize = picked.iter().map(|line| line.chars().count()).sum();
-    if text > MAX_SAMPLE_TEXT {
-        let keep = (picked.len() * MAX_SAMPLE_TEXT / text).max(1);
-        return spread(&picked.iter().collect::<Vec<_>>(), keep);
-    }
-    picked
-}
-
 /// Делит персонажей на запросы так, чтобы их реплики уместились в окно контекста.
 fn character_batches(
     indices: &[usize],
@@ -628,57 +698,10 @@ fn glossary_hints(text: &str, hints: &ModelHints) -> Vec<String> {
     name_hint(text, &hints.names).into_iter().chain(term_hint(text, &hints.terms)).collect()
 }
 
-/// Добавляет к материалам каждого персонажа подсказки из глоссария.
-pub fn add_glossary_hints(samples: &mut HashMap<String, Vec<String>>, hints: &ModelHints) {
-    for lines in samples.values_mut() {
-        lines.splice(0..0, glossary_hints(&lines.join("\n"), hints));
-    }
-}
-
 /// Текст реплики в том виде, в каком его видит модель.
 fn sample_text(text: &str, variables: &HashMap<String, Vec<String>>, tokens: &TokenNotes) -> String {
     let text = RE_TEXT_TAG.replace_all(text, "").replace('\n', " ");
     resolve_variables(text.trim(), variables, tokens)
-}
-
-/// Собирает реплики каждого персонажа из разных частей игры, кроме исключённых сцен
-pub fn collect_character_dialogue_samples(
-    script_lines: &[ScriptLine],
-    variables: &HashMap<String, Vec<String>>,
-    tokens: &TokenNotes,
-    characters: &[CharacterGlossaryEntry],
-    count: usize,
-) -> HashMap<String, Vec<String>> {
-    // Реплики всех кодов персонажа копятся под основным
-    let mut owners: HashMap<String, (String, HashSet<&str>)> = HashMap::new();
-    for character in characters {
-        let excluded: HashSet<&str> = character.excluded_scenes.iter().map(String::as_str).collect();
-        for alias in character.aliases() {
-            owners.insert(alias.to_lowercase(), (character.alias.to_lowercase(), excluded.clone()));
-        }
-    }
-    let mut lines: HashMap<String, Vec<String>> = HashMap::new();
-
-    for line in script_lines {
-        let Some((owner, skipped)) = line.alias.as_ref().and_then(|s| owners.get(&s.to_lowercase())) else {
-            continue;
-        };
-        if skipped.contains(line.key().as_str()) {
-            continue;
-        }
-        let text = sample_text(&line.text, variables, tokens);
-        if (3..=MAX_SAMPLE_CHARS).contains(&text.chars().count()) {
-            let list = lines.entry(owner.clone()).or_default();
-            if !list.contains(&text) {
-                list.push(text);
-            }
-        }
-    }
-
-    lines
-        .into_iter()
-        .map(|(speaker, list)| (speaker, pick_samples(&list, count)))
-        .collect()
 }
 
 /// Тексты сцен в виде «Говорящий: реплика».
@@ -1061,6 +1084,17 @@ async fn write_description(
     }
 }
 
+/// Чем сервис отличается от обычного OpenAI-совместимого сервера: у локальных серверов и прочих совместимых всё стандартно.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Compatible,
+    Openai,
+    Claude,
+    Gemini,
+}
+
 /// Куда идёт запрос. У каждого действия своя цель из настроек LLM, а ключ нужен только внешним сервисам.
 /// `Debug` не выводится намеренно: ключ не должен попасть в журнал.
 #[derive(Clone, Deserialize)]
@@ -1070,6 +1104,8 @@ pub struct ChatTarget {
     pub model: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub provider: Provider,
 }
 
 impl ChatTarget {
@@ -2063,14 +2099,76 @@ mod tests {
         assert!(request.to_lowercase().contains("authorization: bearer secret"), "{request}");
     }
 
-    /// Реплики персонажей из скрипта теми же шагами, что и в команде.
-    fn samples_from(scripts: &[PathBuf], aliases: &[&str], count: usize) -> HashMap<String, Vec<String>> {
-        let lines = scenes::load_lines(scripts, |_| "story.rpy".to_string());
-        let characters: Vec<CharacterGlossaryEntry> = aliases
-            .iter()
-            .map(|alias| CharacterGlossaryEntry { alias: alias.to_string(), ..Default::default() })
-            .collect();
-        collect_character_dialogue_samples(&lines, &string_variables(scripts), &TokenNotes::new(), &characters, count)
+    #[test]
+    fn test_claude_is_called_directly() {
+        let answer = r#"{"content":[{"type":"thinking","thinking":""},{"type":"text","text":"[]"}],"stop_reason":"end_turn"}"#;
+        let (url, requests) = record_requests(vec![http_response("200 OK", answer)]);
+        let cancel = AtomicBool::new(false);
+        let target = ChatTarget { api_key: Some("secret".to_string()), provider: Provider::Claude, ..chat(&url) };
+        let names = strings(&["Anja"]);
+
+        tauri::async_runtime::block_on(translate_names(&target, &names, &names, &cancel, |_| {})).unwrap();
+        let request = requests.recv().unwrap();
+        let lowered = request.to_lowercase();
+        assert!(request.starts_with("POST /v1/messages "), "{request}");
+        assert!(lowered.contains("x-api-key: secret"), "{request}");
+        assert!(lowered.contains("anthropic-version:"), "{request}");
+        assert!(!lowered.contains("authorization:"), "{request}");
+    }
+
+    #[test]
+    fn test_claude_request_has_no_sampling_and_a_top_level_system() {
+        let target = ChatTarget { model: "claude-haiku-5-5".to_string(), ..chat("https://api.anthropic.com") };
+        let body = serde_json::to_value(claude_request(&target, "system", "user", 100)).unwrap();
+        assert_eq!(body["system"], "system");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["output_config"]["effort"], "low");
+        assert_eq!(body["max_tokens"], 100 + REASONING_TOKENS);
+        assert!(body.get("temperature").is_none());
+
+        let old = ChatTarget { model: "claude-haiku-4-5-20251001".to_string(), ..target };
+        let body = serde_json::to_value(claude_request(&old, "system", "user", 100)).unwrap();
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn test_claude_text_skips_thinking_and_reports_a_refusal() {
+        let answer = |json: &str| claude_text(serde_json::from_str(json).unwrap());
+        let text = answer(r#"{"content":[{"type":"thinking"},{"type":"text","text":" ответ "}],"stop_reason":"end_turn"}"#);
+        assert_eq!(text.unwrap(), "ответ");
+        assert!(answer(r#"{"content":[],"stop_reason":"refusal"}"#).unwrap_err().contains("отказалась"));
+    }
+
+    #[test]
+    fn test_each_service_gets_its_token_limit() {
+        let body = |provider| {
+            let target = ChatTarget { provider, ..chat("http://server") };
+            serde_json::to_value(chat_request(&target, "system", "user", 0.2, 100)).unwrap()
+        };
+
+        let local = body(Provider::Compatible);
+        assert_eq!(local["max_tokens"], 100);
+        assert!(local.get("temperature").is_some());
+        assert!(local.get("max_completion_tokens").is_none());
+
+        let openai = body(Provider::Openai);
+        assert_eq!(openai["max_completion_tokens"], 100 + REASONING_TOKENS);
+        assert!(openai.get("max_tokens").is_none());
+        assert!(openai.get("temperature").is_none());
+
+        assert_eq!(body(Provider::Gemini)["max_tokens"], 100 + REASONING_TOKENS);
+    }
+
+    #[test]
+    fn test_service_addresses() {
+        assert_eq!(versioned_url("http://127.0.0.1:1234"), "http://127.0.0.1:1234/v1");
+        assert_eq!(versioned_url("https://api.openai.com/v1/"), "https://api.openai.com/v1");
+        assert_eq!(
+            versioned_url("https://generativelanguage.googleapis.com/v1beta/openai/"),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+        assert_eq!(models_url("https://api.anthropic.com", Provider::Claude), "https://api.anthropic.com/v1/models?limit=1000");
+        assert_eq!(models_url("https://api.openai.com/v1", Provider::Openai), "https://api.openai.com/v1/models");
     }
 
     fn script_with(content: &str) -> (PathBuf, Vec<PathBuf>) {
@@ -2079,57 +2177,6 @@ mod tests {
         let path = dir.join("story.rpy");
         fs::write(&path, content).unwrap();
         (dir, vec![path])
-    }
-
-    #[test]
-    fn test_character_samples_keep_whole_lines() {
-        let (dir, scripts) = script_with(concat!(
-            "label start:\n",
-            "    # e \"Commented out here for now\"\n",
-            "    e \"Don't go to Jack's Bar tonight\"\n",
-            "    m \"Hi\"\n",
-            "    e \"{i}She said \\\"no\\\" to me twice{/i}\"\n",
-        ));
-        let samples = samples_from(&scripts, &["e", "m"], 5);
-        assert_eq!(samples["e"], ["Don't go to Jack's Bar tonight", "She said \"no\" to me twice"]);
-        assert!(!samples.contains_key("m"), "короткая реплика не даёт контекста");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn test_samples_come_from_whole_game() {
-        let lines: Vec<String> = (0..100).map(|i| format!("Line number {i} of the story")).collect();
-        let samples = pick_samples(&lines, 5);
-        assert_eq!(samples.len(), 5);
-        assert_eq!(samples[0], "Line number 0 of the story");
-        assert_eq!(samples[4], "Line number 80 of the story");
-    }
-
-    #[test]
-    fn test_samples_prefer_lines_about_the_character() {
-        let plain = "I was the best student in my class";
-        let lines: Vec<String> = [
-            "Aaaah... mmmmh...",
-            "Oh!",
-            "Please fuck me harder right now",
-            plain,
-        ]
-        .map(String::from)
-        .to_vec();
-        assert_eq!(
-            pick_samples(&lines, 5),
-            [plain, "Please fuck me harder right now", "Aaaah... mmmmh...", "Oh!"]
-        );
-    }
-
-    #[test]
-    fn test_samples_fit_context_window() {
-        let lines: Vec<String> = (0..300).map(|i| format!("{i} {}", "word ".repeat(30))).collect();
-        let samples = pick_samples(&lines, 256);
-        let text: usize = samples.iter().map(|line| line.chars().count()).sum();
-        assert!(text <= MAX_SAMPLE_TEXT, "{text}");
-        assert!(samples.len() > 50);
-        assert!(samples.last().unwrap().starts_with("29") || samples.last().unwrap().starts_with("2"));
     }
 
     #[test]
@@ -2158,11 +2205,10 @@ mod tests {
             "    k \"I am your [houselady], [nick!c].\"\n",
             "    k \"Going to the [place] with [friend.name] now.\"\n",
         ));
-        let samples = samples_from(&scripts, &["k"], 5);
-        assert_eq!(
-            samples["k"],
-            ["I am your mom, sis.", "Going to the bar/club with [friend.name] now."]
-        );
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), string_variables(&scripts));
+        assert_eq!(scene_chunks(&game, &TokenNotes::new(), &kate(&[])), [
+            "Kate: I am your mom, sis.\nKate: Going to the bar/club with [friend.name] now.\n"
+        ]);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2199,8 +2245,6 @@ mod tests {
             "Kate: Ask [Кем она приходится] about the rent.\nKate: Ask [Кем она приходится] again, and [nick] too, at the bar.\n"
         );
 
-        let samples = collect_character_dialogue_samples(&game.lines, &game.variables, &notes, &[kate(&[])], 5);
-        assert_eq!(samples["k"][0], "Ask мать about the rent.");
         assert!(scene_chunks(&game, &notes, &kate(&[]))[0].starts_with("Kate: Ask мать about the rent."));
         let _ = fs::remove_dir_all(dir);
     }
@@ -2235,9 +2279,7 @@ mod tests {
             terms: vec![term("Rune", "Руна", "")],
             ..Default::default()
         };
-        let mut samples = HashMap::from([("k".to_string(), vec!["Kate has a Rune".to_string()])]);
-        add_glossary_hints(&mut samples, &hints);
-        assert_eq!(samples["k"], ["Russian names: Kate = Кейт\nGender: Kate female", "Known terms: Rune = Руна", "Kate has a Rune"]);
+        assert_eq!(glossary_hints("Kate has a Rune", &hints), ["Russian names: Kate = Кейт\nGender: Kate female", "Known terms: Rune = Руна"]);
     }
 
     #[test]
@@ -2265,13 +2307,9 @@ mod tests {
         );
         assert_eq!(name_hint("Banana and Celiac.", &names), None);
 
-        let mut samples = HashMap::from([
-            ("ce".to_string(), vec!["Vera is here".to_string()]),
-            ("x".to_string(), vec!["Nobody".to_string()]),
-        ]);
-        add_glossary_hints(&mut samples, &ModelHints { names: names.to_vec(), ..Default::default() });
-        assert_eq!(samples["ce"], ["Russian names: Vera = Вера", "Vera is here"]);
-        assert_eq!(samples["x"], ["Nobody"]);
+        let hints = ModelHints { names: names.to_vec(), ..Default::default() };
+        assert_eq!(glossary_hints("Vera is here", &hints), ["Russian names: Vera = Вера"]);
+        assert!(glossary_hints("Nobody", &hints).is_empty());
     }
 
     #[test]
@@ -2370,17 +2408,17 @@ mod tests {
     #[test]
     fn test_excluded_scene_is_not_sent_to_model() {
         let (dir, scripts) = script_with(TWO_SCENES);
-        let lines = scenes::load_lines(&scripts, |_| "story.rpy".to_string());
-        let samples =
-            collect_character_dialogue_samples(&lines, &HashMap::new(), &TokenNotes::new(), &[kate(&["story.rpy::bar"])], 5);
-        assert_eq!(samples["k"], ["I am staying home tonight."]);
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), HashMap::new());
+        let chunks = scene_chunks(&game, &TokenNotes::new(), &kate(&["story.rpy::bar"])).concat();
+        assert!(chunks.contains("I am staying home tonight."), "{chunks}");
+        assert!(!chunks.contains("One more drink"), "{chunks}");
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn test_samples_join_merged_codes() {
+    fn test_scenes_join_merged_codes() {
         let (dir, scripts) = script_with("label one:\n    hil \"First line of her.\"\n    hi \"Second line of her.\"\n");
-        let lines = scenes::load_lines(&scripts, |_| "story.rpy".to_string());
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), HashMap::new());
         let hilde = CharacterGlossaryEntry {
             alias: "hil".to_string(),
             original_name: "Hilde".to_string(),
@@ -2390,9 +2428,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let samples = collect_character_dialogue_samples(&lines, &HashMap::new(), &TokenNotes::new(), &[hilde], 5);
-        assert_eq!(samples["hil"], ["First line of her.", "Second line of her."]);
-        assert!(!samples.contains_key("hi"));
+        assert_eq!(scene_chunks(&game, &TokenNotes::new(), &hilde), ["Hilde: First line of her.\nHilde: Second line of her.\n"]);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2430,7 +2466,7 @@ mod tests {
     }
 
     fn chat(url: &str) -> ChatTarget {
-        ChatTarget { api_url: url.to_string(), model: "model".to_string(), api_key: None }
+        ChatTarget { api_url: url.to_string(), model: "model".to_string(), api_key: None, provider: Provider::Compatible }
     }
 
     fn completion(content: &str) -> String {

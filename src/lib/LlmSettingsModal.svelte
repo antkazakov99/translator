@@ -1,8 +1,19 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { AlertCircle, Check, Loader2, RefreshCw, Settings2, X } from "lucide-svelte";
-  import { LLM_ACTIONS, type LlmServer, type LlmSettings } from "./llm-settings";
+  import { AlertCircle, Check, Loader2, Plus, RefreshCw, Settings2, Trash2, X } from "lucide-svelte";
+  import ModelCombobox from "./ModelCombobox.svelte";
+  import {
+    LLM_PROVIDERS,
+    apiProvider,
+    newConnection,
+    readyToCheck,
+    textModels,
+    withoutConnection,
+    type LlmConnection,
+    type LlmProvider,
+    type LlmSettings
+  } from "./llm-settings";
 
   let {
     show = false,
@@ -20,29 +31,36 @@
   const idleCheck = (): ServerCheck => ({ running: false, ok: null, message: "", models: [] });
 
   let draft = $state<LlmSettings>({
-    localUrl: "",
-    externalUrl: "",
-    externalKey: "",
+    connections: [],
+    defaultConnection: "",
     actions: {
-      descriptions: { server: "local", model: "" },
-      names: { server: "local", model: "" },
-      terms: { server: "local", model: "" },
-      termSearch: { server: "local", model: "" },
-      tokens: { server: "local", model: "" }
+      descriptions: { connection: "", model: "" },
+      names: { connection: "", model: "" },
+      terms: { connection: "", model: "" },
+      termSearch: { connection: "", model: "" },
+      tokens: { connection: "", model: "" }
     }
   });
-  let checks = $state<Record<LlmServer, ServerCheck>>({ local: idleCheck(), external: idleCheck() });
+  let checks = $state<Record<string, ServerCheck>>({});
 
-  async function checkServer(server: LlmServer) {
-    const check = checks[server];
+  const providerOf = (id: LlmProvider) => LLM_PROVIDERS.find((provider) => provider.id === id)!;
+
+  async function checkServer(connection: LlmConnection) {
+    checks[connection.id] ??= idleCheck();
+    const check = checks[connection.id];
     check.running = true;
     try {
-      check.models = await invoke<string[]>("check_llm_models", {
-        apiUrl: (server === "local" ? draft.localUrl : draft.externalUrl).trim(),
-        apiKey: server === "external" ? draft.externalKey.trim() || null : null
+      const models = await invoke<string[]>("check_llm_models", {
+        apiUrl: connection.url.trim(),
+        apiKey: connection.key.trim() || null,
+        provider: apiProvider(connection.provider)
       });
+      check.models = textModels(models);
+      const hidden = models.length - check.models.length;
       check.ok = true;
-      check.message = check.models.length > 0 ? `Найдено моделей: ${check.models.length}` : "Сервер доступен, список моделей пуст";
+      check.message = models.length > 0
+        ? `Найдено моделей: ${check.models.length}${hidden > 0 ? `, скрыто нетекстовых: ${hidden}` : ""}`
+        : "Сервер доступен, список моделей пуст";
     } catch (e) {
       check.ok = false;
       check.models = [];
@@ -52,16 +70,29 @@
     }
   }
 
-  // Ключ и адрес внешнего сервера проверяются только по кнопке: запрос уходит из приложения наружу
+  function checkIfReady(connection: LlmConnection) {
+    if (readyToCheck(connection)) void checkServer(connection);
+  }
+
+  // Список моделей нужен сразу: ключ при этом уходит только на адрес своего подключения
   $effect(() => {
     if (!show) return;
     // Проверка читает и пишет черновик: без untrack окно перезапускало бы её по кругу
     untrack(() => {
       draft = JSON.parse(JSON.stringify(settings));
-      checks = { local: idleCheck(), external: idleCheck() };
-      void checkServer("local");
+      checks = {};
+      draft.connections.forEach(checkIfReady);
     });
   });
+
+  function addConnection(provider: LlmProvider) {
+    draft.connections.push(newConnection(provider, draft.connections));
+  }
+
+  function removeConnection(id: string) {
+    draft = withoutConnection($state.snapshot(draft), id);
+    delete checks[id];
+  }
 
   function save() {
     onsave($state.snapshot(draft));
@@ -69,16 +100,16 @@
   }
 </script>
 
-{#snippet checkRow(server: LlmServer)}
-  {@const check = checks[server]}
+{#snippet checkRow(connection: LlmConnection)}
+  {@const check = checks[connection.id] ?? idleCheck()}
   <div class="check-row">
-    <button class="btn-check" onclick={() => checkServer(server)} disabled={check.running}>
+    <button class="btn-check" onclick={() => checkServer(connection)} disabled={check.running}>
       {#if check.running}
         <Loader2 size={13} class="spin" />
       {:else}
         <RefreshCw size={13} />
       {/if}
-      <span>Проверить сервер</span>
+      <span>Проверить</span>
     </button>
     {#if check.ok === true}
       <span class="check-status ok"><Check size={13} /> {check.message}</span>
@@ -109,64 +140,74 @@
 
       <div class="settings-body">
         <section>
-          <h4>Локальный сервер</h4>
-          <label class="field">
-            <span>Адрес (LM Studio, Ollama)</span>
-            <input type="text" class="input mono" bind:value={draft.localUrl} placeholder="http://127.0.0.1:1234/v1" />
-          </label>
-          {@render checkRow("local")}
-        </section>
-
-        <section>
-          <h4>Внешний сервер</h4>
-          <div class="field-pair">
-            <label class="field">
-              <span>Адрес (OpenAI-совместимый API или сервер по IP)</span>
-              <input type="text" class="input mono" bind:value={draft.externalUrl} placeholder="https://openrouter.ai/api/v1" />
-            </label>
-            <label class="field">
-              <span>Ключ API</span>
-              <input type="password" class="input" autocomplete="off" bind:value={draft.externalKey} />
-            </label>
-          </div>
-          {@render checkRow("external")}
-          <p class="note">Ключ хранится на этом компьютере без шифрования. По адресу http:// он передаётся открытым текстом.</p>
-        </section>
-
-        <section>
-          <h4>Модель для каждого действия</h4>
-          <div class="actions-grid">
-            {#each LLM_ACTIONS as action (action.id)}
-              {@const chosen = draft.actions[action.id]}
-              <div class="action-name">
-                <span>{action.label}</span>
-                <span class="note" class:warn={chosen.server === "external" && action.gameText}>
-                  {chosen.server === "external" ? "Наружу уйдут" : "Модель получит"}: {action.sends}
-                </span>
+          <h4>Подключения</h4>
+          {#each draft.connections as connection (connection.id)}
+            {@const provider = providerOf(connection.provider)}
+            <div class="connection">
+              <div class="connection-head">
+                <span class="connection-kind">{provider.label}</span>
+                <input type="text" class="input connection-name" bind:value={connection.name} aria-label="Название подключения" />
+                <label class="connection-default" title="Это подключение получают действия, у которых не выбрано своё">
+                  <input type="radio" name="llm-default-connection" value={connection.id} bind:group={draft.defaultConnection} />
+                  <span>По умолчанию</span>
+                </label>
+                <button
+                  class="btn-remove"
+                  onclick={() => removeConnection(connection.id)}
+                  disabled={draft.connections.length < 2}
+                  aria-label={`Удалить подключение ${connection.name}`}
+                  title="Удалить подключение"
+                ><Trash2 size={14} /></button>
               </div>
-              <select class="input" bind:value={chosen.server} aria-label={`Сервер: ${action.label}`}>
-                <option value="local">Локальный</option>
-                <option value="external">Внешний</option>
-              </select>
-              <input
-                type="text"
-                class="input"
-                list={`llm-models-${chosen.server}`}
-                bind:value={chosen.model}
-                placeholder="Имя модели"
-                aria-label={`Модель: ${action.label}`}
-              />
+              <div class="field-pair" class:single={connection.provider === "local"}>
+                <label class="field">
+                  <span>{provider.urlHint}</span>
+                  <input
+                    type="text"
+                    class="input mono"
+                    bind:value={connection.url}
+                    onchange={() => checkIfReady(connection)}
+                    placeholder="https://openrouter.ai/api/v1"
+                  />
+                </label>
+                {#if connection.provider !== "local"}
+                  <label class="field">
+                    <span>Ключ API</span>
+                    <input
+                      type="password"
+                      class="input"
+                      autocomplete="off"
+                      bind:value={connection.key}
+                      onchange={() => checkIfReady(connection)}
+                    />
+                  </label>
+                {/if}
+              </div>
+              {#if provider.keyHint}
+                <p class="note">{provider.keyHint}</p>
+              {/if}
+              <div class="field">
+                <span>Модель по умолчанию</span>
+                <ModelCombobox
+                  bind:value={connection.model}
+                  models={checks[connection.id]?.models ?? []}
+                  label={`Модель по умолчанию: ${connection.name}`}
+                  placeholder="Имя модели"
+                />
+              </div>
+              {@render checkRow(connection)}
+            </div>
+          {/each}
+          <div class="add-row">
+            <span class="note">Добавить:</span>
+            {#each LLM_PROVIDERS as provider (provider.id)}
+              <button class="btn-check" onclick={() => addConnection(provider.id)}><Plus size={12} /><span>{provider.label}</span></button>
             {/each}
           </div>
-          {#each ["local", "external"] as const as server (server)}
-            <datalist id={`llm-models-${server}`}>
-              {#each checks[server].models as model (model)}
-                <option value={model}></option>
-              {/each}
-            </datalist>
-          {/each}
-          <p class="note">Заметки по сценам привязаны к модели: после её смены части читаются заново.</p>
+          <p class="note">Ключи хранятся на этом компьютере без шифрования. По адресу http:// они передаются открытым текстом.</p>
+          <p class="note">Для отдельного действия подключение и модель меняются в панели «Обработка через LLM». Заметки по сценам привязаны к модели: после её смены части читаются заново.</p>
         </section>
+
       </div>
 
       <div class="settings-footer">
@@ -197,6 +238,7 @@
     max-width: 760px;
     max-height: 90vh;
     overflow: hidden;
+    color-scheme: dark;
     background: #0f172a;
     border: 1px solid #1e2638;
     border-radius: 14px;
@@ -289,6 +331,76 @@
     gap: 10px;
   }
 
+  .field-pair.single {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .connection {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px solid #1e2638;
+    border-radius: 8px;
+    background: #141824;
+  }
+
+  .connection-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .connection-kind {
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.18);
+    font-size: 11px;
+    color: #c7d2fe;
+    white-space: nowrap;
+  }
+
+  .connection-name {
+    flex: 1;
+  }
+
+  .connection-default {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: #94a3b8;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .btn-remove {
+    display: flex;
+    padding: 5px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #94a3b8;
+    cursor: pointer;
+  }
+
+  .btn-remove:hover:not(:disabled) {
+    color: #fb7185;
+    background: rgba(244, 63, 94, 0.1);
+  }
+
+  .btn-remove:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .add-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+
   .input {
     min-width: 0;
     padding: 6px 10px;
@@ -355,28 +467,10 @@
     color: #fb7185;
   }
 
-  .actions-grid {
-    display: grid;
-    grid-template-columns: minmax(0, 1.3fr) 7.5rem minmax(0, 1.2fr);
-    gap: 8px 10px;
-    align-items: center;
-  }
-
-  .action-name {
-    display: flex;
-    flex-direction: column;
-    font-size: 13px;
-    color: #e2e8f0;
-  }
-
   .note {
     margin: 0;
     font-size: 11px;
     color: #64748b;
-  }
-
-  .note.warn {
-    color: #fbbf24;
   }
 
   .btn-primary {

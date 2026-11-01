@@ -1636,8 +1636,8 @@ async fn reveal_in_system_explorer(file_path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn check_llm_models(api_url: String, api_key: Option<String>) -> Result<Vec<String>, String> {
-    llm::check_models(&api_url, api_key.as_deref()).await
+async fn check_llm_models(api_url: String, api_key: Option<String>, provider: llm::Provider) -> Result<Vec<String>, String> {
+    llm::check_models(&api_url, api_key.as_deref(), provider).await
 }
 
 /// Имя скрипта относительно игры: одинаковое для файла на диске и в кэше.
@@ -1715,36 +1715,6 @@ fn send_progress<T: Serialize + Clone>(channel: &Channel<llm::BatchProgress<T>>,
     if let Err(error) = channel.send(progress) {
         tracing::warn!(%error, "Итог пакета не передан в интерфейс");
     }
-}
-
-/// Обновляет персонажа по отдельным репликам. По сценам работает `summarize_glossary_character`.
-#[tauri::command]
-async fn autofill_glossary_characters(
-    game_dir: String,
-    target: llm::ChatTarget,
-    characters: Vec<glossary::CharacterGlossaryEntry>,
-    hints: llm::ModelHints,
-) -> Result<llm::AutofillResult<glossary::CharacterGlossaryEntry>, String> {
-    LLM_CANCEL.store(false, Ordering::Relaxed);
-    let base_path = effective_game_directory(Path::new(&game_dir));
-    let selected = characters.clone();
-    let samples = tauri::async_runtime::spawn_blocking(move || {
-        let game = game_lines(&base_path);
-        let notes = llm::token_notes(&hints.tokens);
-        let mut samples = llm::collect_character_dialogue_samples(
-            &game.lines,
-            &game.variables,
-            &notes,
-            &selected,
-            llm::CHARACTER_SAMPLES,
-        );
-        llm::add_glossary_hints(&mut samples, &hints);
-        samples
-    })
-    .await
-    .map_err(|e| format!("Ошибка сбора контекста персонажей: {}", e))?;
-
-    llm::autofill_characters(&target, characters, false, samples, &LLM_CANCEL, |_| {}).await
 }
 
 /// Предлагает написание имён по всему составу игры. Какие из них попадут в глоссарий, решает пользователь.
@@ -2004,7 +1974,6 @@ pub fn run() {
             open_in_system_editor,
             reveal_in_system_explorer,
             check_llm_models,
-            autofill_glossary_characters,
             translate_character_names,
             suggest_glossary_tokens,
             autofill_glossary_terms,
