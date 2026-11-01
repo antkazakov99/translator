@@ -58,11 +58,13 @@ pub struct TermGlossaryEntry {
     pub notes: String,       // Контекст / комментарий
 }
 
-/// Пояснение к подстановке в репликах вроде `[landlady]`
+/// Подстановка в репликах вроде `[landlady]`
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TokenGlossaryEntry {
     pub name: String, // Имя переменной без скобок и флагов ("landlady", "friend.name")
-    pub note: String, // Что она значит
+    pub note: String, // Что она значит: при переводе токен останется в тексте, и модели нужно это знать
+    #[serde(default)]
+    pub value: String, // Что подставить вместо токена при чтении сцен ("мать")
 }
 
 /// Единый глоссарий проекта
@@ -257,7 +259,7 @@ mod tests {
         let old: ProjectGlossary = serde_json::from_str(r#"{"characters": [], "terms": []}"#).unwrap();
         assert!(old.tokens.is_empty());
 
-        let token = |name: &str, note: &str| TokenGlossaryEntry { name: name.to_string(), note: note.to_string() };
+        let token = |name: &str, note: &str| TokenGlossaryEntry { name: name.to_string(), note: note.to_string(), ..Default::default() };
         let mut own = ProjectGlossary { tokens: vec![token("landlady", "своё")], ..Default::default() };
         let other = ProjectGlossary { tokens: vec![token("landlady", "чужое"), token("nick", "прозвище")], ..Default::default() };
         assert_eq!(own.merge_from(other), 1);

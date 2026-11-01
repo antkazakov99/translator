@@ -345,7 +345,7 @@ pub fn string_variables(scripts: &[PathBuf]) -> HashMap<String, Vec<String>> {
     variables
 }
 
-/// Пояснения пользователя к токенам по именам.
+/// Что модель увидит вместо токенов при чтении сцен, по именам.
 pub type TokenNotes = HashMap<String, String>;
 
 /// Имя персонажа из глоссария.
@@ -376,11 +376,16 @@ pub struct ModelHints {
     pub terms: Vec<TermGlossaryEntry>,
 }
 
+/// Значение подставляется как есть, а описание идёт в скобках, как поясняющий текст.
+/// Имени токена здесь нет в обоих случаях: модель верит ему больше, чем пояснению.
 pub fn token_notes(tokens: &[TokenGlossaryEntry]) -> TokenNotes {
     tokens
         .iter()
-        .filter(|token| !token.note.trim().is_empty())
-        .map(|token| (token.name.clone(), token.note.trim().to_string()))
+        .filter_map(|token| match (token.value.trim(), token.note.trim()) {
+            ("", "") => None,
+            ("", note) => Some((token.name.clone(), format!("[{note}]"))),
+            (value, _) => Some((token.name.clone(), value.to_string())),
+        })
         .collect()
 }
 
@@ -420,34 +425,21 @@ pub fn text_tokens(game: &GameLines) -> Vec<TextToken> {
     tokens
 }
 
-/// Подставляет значения переменных. Переменная с неясным значением остаётся как есть:
-/// модели сказано не делать выводов из её имени. Токен с пояснением тоже остаётся, чтобы
-/// модель видела, к чему оно относится.
+/// Подставляет значения переменных. Значение из глоссария важнее скриптов и заменяет токен
+/// целиком, как в игре: если модель видит имя `[landlady]`, она верит ему больше, чем пояснению.
+/// Переменная с неясным значением остаётся как есть: модели сказано не делать выводов из её имени.
 fn resolve_variables(text: &str, variables: &HashMap<String, Vec<String>>, tokens: &TokenNotes) -> String {
     RE_TEXT_VARIABLE
-        .replace_all(text, |caps: &regex::Captures| match variables.get(&caps[1]) {
-            Some(values) if values.len() <= MAX_VARIABLE_VALUES && !tokens.contains_key(&caps[1]) => values.join("/"),
-            _ => caps[0].to_string(),
+        .replace_all(text, |caps: &regex::Captures| {
+            if let Some(value) = tokens.get(&caps[1]) {
+                return value.clone();
+            }
+            match variables.get(&caps[1]) {
+                Some(values) if values.len() <= MAX_VARIABLE_VALUES => values.join("/"),
+                _ => caps[0].to_string(),
+            }
         })
         .into_owned()
-}
-
-/// Пояснения к токенам, которые есть в тексте.
-fn token_hints(text: &str, tokens: &TokenNotes) -> Vec<String> {
-    let mut seen = HashSet::new();
-    RE_TEXT_VARIABLE
-        .captures_iter(text)
-        .filter_map(|caps| caps.get(1))
-        .map(|name| name.as_str())
-        .filter(|name| seen.insert(*name))
-        .filter_map(|name| tokens.get(name).map(|note| format!("[{name}] means: {note}")))
-        .collect()
-}
-
-/// Пояснения идут после текста: прочитав их перед ним, модель приписывала героям чужое родство.
-fn with_token_hints(mut lines: Vec<String>, tokens: &TokenNotes) -> Vec<String> {
-    lines.extend(token_hints(&lines.join("\n"), tokens));
-    lines
 }
 
 /// Выбирает реплики персонажа: сначала полезные и обычные, затем остальные.
@@ -621,7 +613,7 @@ pub fn collect_character_dialogue_samples(
 
     lines
         .into_iter()
-        .map(|(speaker, list)| (speaker, with_token_hints(pick_samples(&list, count), tokens)))
+        .map(|(speaker, list)| (speaker, pick_samples(&list, count)))
         .collect()
 }
 
@@ -697,7 +689,7 @@ pub fn collect_scene_samples(
             }
         }
         if !picked.is_empty() {
-            samples.insert(character.alias.to_lowercase(), with_token_hints(picked, tokens));
+            samples.insert(character.alias.to_lowercase(), picked);
         }
     }
     samples
@@ -776,10 +768,35 @@ pub struct PartScene {
     pub path: String,
 }
 
-/// Часть сцен персонажа: текст для модели и сцены, из которых он собран.
+/// Часть сцен персонажа: текст для модели, сцены, из которых он собран, и токены этих сцен.
 pub struct ScenePart {
     pub text: String,
     pub scenes: Vec<PartScene>,
+    pub tokens: Vec<TokenGlossaryEntry>,
+}
+
+/// Токены реплик по сценам. Пустое значение у тех, что модель увидит как есть.
+fn scene_tokens(
+    game: &GameLines,
+    tokens: &TokenNotes,
+    scenes: &HashSet<String>,
+) -> HashMap<String, Vec<TokenGlossaryEntry>> {
+    let mut found: HashMap<String, Vec<TokenGlossaryEntry>> = HashMap::new();
+    for line in &game.lines {
+        let key = line.key();
+        if !scenes.contains(&key) {
+            continue;
+        }
+        for caps in RE_TEXT_VARIABLE.captures_iter(&line.text) {
+            let name = &caps[1];
+            let note = tokens.get(name).cloned().unwrap_or_default();
+            let resolved = game.variables.get(name).is_some_and(|values| values.len() <= MAX_VARIABLE_VALUES);
+            if !note.is_empty() || !resolved {
+                found.entry(key.clone()).or_default().push(TokenGlossaryEntry { name: name.to_string(), note, ..Default::default() });
+            }
+        }
+    }
+    found
 }
 
 /// Делит все включённые сцены персонажа на части, каждая из которых помещается в запрос.
@@ -792,6 +809,7 @@ pub fn scene_parts(game: &GameLines, tokens: &TokenNotes, character: &CharacterG
         .collect();
     let keys = included.iter().map(|scene| scene.key.clone()).collect();
     let transcripts = scene_transcripts(game, std::slice::from_ref(character), &keys, tokens);
+    let by_scene = scene_tokens(game, tokens, &keys);
     let pieces: Vec<(String, &scenes::CharacterScene)> = included
         .iter()
         .filter_map(|scene| transcripts.get(&scene.key).map(|lines| (lines, scene)))
@@ -803,8 +821,10 @@ pub fn scene_parts(game: &GameLines, tokens: &TokenNotes, character: &CharacterG
         .map(|part| {
             let text = part.iter().map(|&index| pieces[index].0.as_str()).collect::<Vec<_>>().join(SCENE_BREAK);
             let mut scenes: Vec<PartScene> = Vec::new();
+            let mut part_tokens: Vec<TokenGlossaryEntry> = Vec::new();
             for &index in &part {
                 let source = pieces[index].1;
+                part_tokens.extend(by_scene.get(&source.key).into_iter().flatten().cloned());
                 let scene = PartScene {
                     scene: source.scene.clone(),
                     file: source.file.clone(),
@@ -814,11 +834,9 @@ pub fn scene_parts(game: &GameLines, tokens: &TokenNotes, character: &CharacterG
                     scenes.push(scene);
                 }
             }
-            let text = match token_hints(&text, tokens).join("\n") {
-                hints if hints.is_empty() => text,
-                hints => format!("{text}\n{hints}"),
-            };
-            ScenePart { text, scenes }
+            part_tokens.sort_by(|a, b| a.name.cmp(&b.name));
+            part_tokens.dedup();
+            ScenePart { text, scenes, tokens: part_tokens }
         })
         .collect()
 }
@@ -868,6 +886,8 @@ pub struct CharacterPart {
     /// Персонажи, чьи имена получит модель.
     pub names: Vec<KnownName>,
     pub terms: Vec<String>,
+    /// Токены части. Пустое значение: модель увидит токен как есть и не узнает, что за ним стоит.
+    pub tokens: Vec<TokenGlossaryEntry>,
 }
 
 /// Части персонажа с их заметками от этой модели.
@@ -889,7 +909,7 @@ pub fn character_parts(
             let sent = format!("{}\n{}", character.original_name, part.text);
             let names = mentioned_names(&sent, &hints.names).into_iter().cloned().collect();
             let terms = mentioned_terms(&sent, &hints.terms);
-            CharacterPart { key, start, note, empty, scenes: part.scenes, names, terms }
+            CharacterPart { key, start, note, empty, scenes: part.scenes, names, terms, tokens: part.tokens }
         })
         .collect()
 }
@@ -1057,7 +1077,7 @@ pub async fn summarize_character(
         If the character is neither named nor speaks anywhere in the text, answer only with: {NO_NOTE} \
         Otherwise always write notes, even if the character appears only briefly. \
         Text in [square brackets] is an in-game variable: never infer anything from its name. \
-        If a line says what a variable means, rely on that line. \
+        A whole sentence in brackets explains such a variable: rely on it, but never copy it word for word. \
         A line starting with \"Russian names:\" gives the exact spelling of names: always use it, \
         declining the name as Russian grammar requires. \
         A line starting with \"Gender:\" tells who is male or female. \
@@ -1188,7 +1208,7 @@ For each character provided, you must output:
 4. "notes": Detailed description in Russian, 3 to 6 sentences, based only on the provided lines: occupation and place in the story, who they are to the protagonist (lines addressed to "you" are usually addressed to the protagonist), character and motives, how they speak, how they treat others, and what happens to them in the story. A translator will rely on it to keep the voice consistent. Do not invent facts. If there are few lines, write less.
 5. "speech": Required separate field, 1 to 2 sentences in Russian on the manner of speech: tone, vocabulary or slang, and whether they use "ты" or "вы" with others. Fill it for every character, even with few lines. It may repeat what "notes" says: do not shorten "notes" because of it.
 
-Text in [square brackets] is an in-game variable whose value is unknown. Never infer an occupation, kinship or name from the variable's own name. If a line says what a variable means, rely on that line.
+Text in [square brackets] is an in-game variable whose value is unknown. Never infer an occupation, kinship or name from the variable's own name. A whole sentence in brackets explains such a variable: rely on it, but never copy it word for word.
 A line starting with "Russian names:" gives the exact spelling of names: always use it in "notes" and "speech", declining the name as Russian grammar requires, even if other lines spell it differently.
 A line starting with "Gender:" tells who is male or female.
 A line starting with "Known terms:" gives established translations of game terms: use them in "notes" and "speech".
@@ -1763,32 +1783,42 @@ mod tests {
     }
 
     #[test]
-    fn test_token_note_goes_with_the_text_that_uses_it() {
+    fn test_token_value_replaces_the_token() {
         let (dir, scripts) = script_with(concat!(
             "default landlady = \"landlady\"\n",
+            "default place = \"bar\"\n",
             "label home:\n",
             "    k \"Ask [landlady!c] about the rent.\"\n",
-            "    k \"Ask [landlady] again, and [nick] too.\"\n",
+            "    k \"Ask [landlady] again, and [nick] too, at the [place].\"\n",
         ));
         let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), string_variables(&scripts));
         assert_eq!(scene_chunks(&game, &TokenNotes::new(), &kate(&[])), [
-            "Kate: Ask landlady about the rent.\nKate: Ask landlady again, and [nick] too.\n"
+            "Kate: Ask landlady about the rent.\nKate: Ask landlady again, and [nick] too, at the bar.\n"
         ]);
 
         let notes = token_notes(&[
-            TokenGlossaryEntry { name: "landlady".to_string(), note: " мать героя ".to_string() },
-            TokenGlossaryEntry { name: "nick".to_string(), note: " ".to_string() },
-            TokenGlossaryEntry { name: "absent".to_string(), note: "нет в тексте".to_string() },
+            TokenGlossaryEntry { name: "landlady".to_string(), value: " мать ".to_string(), note: "Кем она приходится".to_string() },
+            TokenGlossaryEntry { name: "nick".to_string(), note: " ".to_string(), ..Default::default() },
+            TokenGlossaryEntry { name: "absent".to_string(), note: "нет в тексте".to_string(), ..Default::default() },
         ]);
-        let chunks = scene_chunks(&game, &notes, &kate(&[]));
-        assert_eq!(chunks, [concat!(
-            "Kate: Ask [landlady!c] about the rent.\nKate: Ask [landlady] again, and [nick] too.\n",
-            "\n[landlady] means: мать героя"
-        )]);
+        let parts = scene_parts(&game, &notes, &kate(&[]));
+        assert_eq!(parts[0].text, "Kate: Ask мать about the rent.\nKate: Ask мать again, and [nick] too, at the bar.\n");
+        assert_eq!(parts[0].tokens, [
+            TokenGlossaryEntry { name: "landlady".to_string(), note: "мать".to_string(), ..Default::default() },
+            TokenGlossaryEntry { name: "nick".to_string(), note: String::new(), ..Default::default() },
+        ]);
+
+        // Без значения модель видит описание, но не имя токена
+        let described = token_notes(&[TokenGlossaryEntry { name: "landlady".to_string(), note: " Кем она приходится ".to_string(), ..Default::default() }]);
+        assert_eq!(
+            scene_parts(&game, &described, &kate(&[]))[0].text,
+            "Kate: Ask [Кем она приходится] about the rent.\nKate: Ask [Кем она приходится] again, and [nick] too, at the bar.\n"
+        );
 
         let samples = collect_character_dialogue_samples(&game.lines, &game.variables, &notes, &[kate(&[])], 5);
-        assert_eq!(samples["k"].last().unwrap(), "[landlady] means: мать героя");
-        assert_eq!(collect_scene_samples(&game, &notes, &[kate(&[])])["k"].last().unwrap(), "[landlady] means: мать героя");
+        assert_eq!(samples["k"][0], "Ask мать about the rent.");
+        let scenes = collect_scene_samples(&game, &notes, &[kate(&[])]);
+        assert_eq!(scenes["k"][0], "Kate: Ask мать about the rent.");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2107,6 +2137,7 @@ mod tests {
         let source = |text: &String| ScenePart {
             text: text.clone(),
             scenes: vec![PartScene { scene: "home".to_string(), ..Default::default() }],
+            tokens: vec![TokenGlossaryEntry { name: "nick".to_string(), ..Default::default() }],
         };
         let hints = ModelHints {
             names: vec![KnownName { original: "Kate".to_string(), translated: "Кейт".to_string(), gender: "female".to_string() }],
@@ -2121,6 +2152,7 @@ mod tests {
         assert_eq!(parts[1].scenes[0].scene, "home");
         assert_eq!(parts[1].names[0].translated, "Кейт");
         assert_eq!(parts[1].terms, ["Three = Три"]);
+        assert_eq!(parts[1].tokens[0].name, "nick");
         assert!(parts[0].terms.is_empty());
         assert_eq!(parts[0].start, "Kate: one");
         assert_eq!((parts[0].note.as_deref(), parts[0].empty), (Some("Кейт смеётся."), false));

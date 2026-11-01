@@ -435,6 +435,7 @@
     scenes: { scene: string; file: string; path: string }[];
     names: { original: string; translated: string }[];
     terms: string[];
+    tokens: TokenGlossaryEntry[];
   }
 
   interface TermGlossaryEntry {
@@ -448,6 +449,7 @@
   interface TokenGlossaryEntry {
     name: string;
     note: string;
+    value?: string;
   }
 
   interface TextToken {
@@ -719,6 +721,8 @@
   let showGlossaryModal = $state(false);
   let showGlossaryAiModal = $state(false);
   let glossaryTab = $state<'characters' | 'terms' | 'tokens'>('characters');
+  // Пустая карточка новой записи на текущей вкладке
+  let addingEntry = $state(false);
   let glossary = $state<ProjectGlossary>({ characters: [], terms: [], tokens: [] });
   let loadingGlossary = $state(false);
   let savingGlossary = $state(false);
@@ -742,7 +746,8 @@
   });
   let characterUpdateMode = $state<"lines" | "scenes">("scenes");
   // Ползунок: готовые части входят в запуск всегда, поэтому ниже их числа он не опускается
-  let scenePartsWanted = $state(1);
+  let scenePartsByAlias = $state<Record<string, number>>({});
+  let scenePartsWanted = $derived(selectedGlossaryChar ? scenePartsByAlias[selectedGlossaryChar.alias] ?? 1 : 1);
   let sceneChunkCount = $state<number | null>(null);
   let sceneReadyCount = $state(0);
   let sceneParts = $derived(Math.min(Math.max(scenePartsWanted, sceneReadyCount), sceneChunkCount ?? 1));
@@ -779,7 +784,11 @@
     return "Пишу итоговое описание...";
   });
   let collapsedScenes = $state.raw(new Set<string>());
-  let updatingCharacter = $state(false);
+  // Обновляется один персонаж за раз: остальные на это время недоступны
+  let updatingAlias = $state<string | null>(null);
+  let updatingCharacter = $derived(updatingAlias !== null);
+  let otherCharacterUpdating = $derived(updatingAlias !== null && selectedGlossaryChar?.alias !== updatingAlias);
+  let updatingCharacterEntry = $derived(glossary.characters.find((char) => char.alias === updatingAlias) ?? null);
   const characterScenesCache = new Map<string, CharacterScene[]>();
 
   let characterSceneTotals = $derived({
@@ -792,27 +801,32 @@
       .map((scene) => ({
         ...scene,
         lines: scene.lines.filter((line) =>
-          sceneLineFilter === "all" || line.spoken === (sceneLineFilter === "spoken")
+          glossaryTab !== "characters" || sceneLineFilter === "all" || line.spoken === (sceneLineFilter === "spoken")
         )
       }))
       .filter((scene) => scene.lines.length > 0)
   );
 
   // Перезагрузка глоссария меняет объект персонажа, но не то, чьи сцены нужны
-  let scenesTarget = $derived(
-    showGlossaryModal && selectedGlossaryChar
-      ? JSON.stringify([
-          gameDir,
-          [selectedGlossaryChar.alias, ...selectedGlossaryChar.merged.map((m) => m.alias)],
-          [selectedGlossaryChar.original_name, ...selectedGlossaryChar.merged.map((m) => m.original_name)]
-        ])
-      : null
-  );
+  let scenesTarget = $derived.by(() => {
+    if (!showGlossaryModal || addingEntry) return null;
+    if (glossaryTab === "tokens") return selectedToken ? JSON.stringify([gameDir, "token", selectedToken.name]) : null;
+    if (glossaryTab === "terms") {
+      const term = selectedGlossaryTerm?.source_term.trim();
+      return term ? JSON.stringify([gameDir, "term", term]) : null;
+    }
+    if (!selectedGlossaryChar) return null;
+    return JSON.stringify([
+      gameDir,
+      [selectedGlossaryChar.alias, ...selectedGlossaryChar.merged.map((m) => m.alias)],
+      [selectedGlossaryChar.original_name, ...selectedGlossaryChar.merged.map((m) => m.original_name)]
+    ]);
+  });
 
   // Поиск идёт по всем скриптам: пауза не даёт копить запросы при быстром переборе списка
   $effect(() => {
     const key = scenesTarget;
-    const [targetDir, aliases, names] = key ? JSON.parse(key) : [];
+    const [targetDir, target, value] = key ? JSON.parse(key) : [];
     const cached = key ? characterScenesCache.get(key) : undefined;
     characterScenesError = null;
     characterScenes = cached ?? null;
@@ -837,7 +851,11 @@
       apply();
     };
     const timer = setTimeout(() => {
-      invoke<CharacterScene[]>("get_character_scenes", { gameDir: targetDir, aliases, names })
+      const search =
+        target === "token" ? invoke<CharacterScene[]>("get_token_scenes", { gameDir: targetDir, name: value })
+        : target === "term" ? invoke<CharacterScene[]>("get_term_scenes", { gameDir: targetDir, term: value })
+        : invoke<CharacterScene[]>("get_character_scenes", { gameDir: targetDir, aliases: target, names: value });
+      search
         .then((scenes) => {
           characterScenesCache.set(key, scenes);
           return finish(() => { characterScenes = scenes; });
@@ -856,7 +874,7 @@
   let sceneChunkTarget: string | null = null;
   $effect(() => {
     const char = selectedGlossaryChar;
-    if (characterUpdateMode !== "scenes" || !char || !scenesTarget || glossaryTab === "tokens") return;
+    if (characterUpdateMode !== "scenes" || !char || !scenesTarget || glossaryTab !== "characters") return;
     const delay = sceneChunkTarget === scenesTarget ? 100 : 0;
     sceneChunkTarget = scenesTarget;
     const model = storedLlmModel();
@@ -889,6 +907,7 @@
 
   // Режим панели: вместо сцен показывает, что модель записала по каждой части
   let characterPaneMode = $state<"scenes" | "notes">("scenes");
+  let showingNotes = $derived(glossaryTab === "characters" && characterPaneMode === "notes");
   let characterParts = $state.raw<{ target: string; parts: CharacterPart[] } | null>(null);
   let characterPartsError = $state<string | null>(null);
   let showUnreadParts = $state(true);
@@ -904,7 +923,7 @@
   $effect(() => {
     const char = selectedGlossaryChar;
     const target = scenesTarget;
-    if (characterPaneMode !== "notes" || !char || !target) return;
+    if (!showingNotes || !char || !target) return;
     void [char.excluded_scenes.length, sceneNotesRevision];
     const hints = { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) };
     let current = true;
@@ -955,6 +974,7 @@
   }
 
   function sceneCountLabel(scene: CharacterScene) {
+    if (glossaryTab !== "characters") return `реплик: ${scene.mentioned}`;
     return [
       scene.spoken ? `говорит ${scene.spoken}` : "",
       scene.mentioned ? `упомянут ${scene.mentioned}` : ""
@@ -1046,6 +1066,12 @@
     document.querySelector(".glossary-list-item.selected-row")?.scrollIntoView({ block: "nearest" });
   }
 
+  function openPartToken(name: string) {
+    glossarySearch = "";
+    selectedTokenName = name;
+    openGlossaryTab("tokens");
+  }
+
   async function openCharacterScene(scene: Pick<CharacterScene, "scene" | "file" | "path">) {
     await closeGlossary();
     if (showGlossaryModal) return;
@@ -1087,7 +1113,7 @@
         return fallback;
       }
     };
-    updatingCharacter = true;
+    updatingAlias = char.alias;
     try {
       const apiUrl = stored("translator.llm_api_url", "http://127.0.0.1:1234/v1").trim();
       const model = storedLlmModel();
@@ -1098,6 +1124,8 @@
         const draft: string[] = [];
         const onProgress = new Channel<{ stage: string; done: number; total: number; note?: string }>();
         onProgress.onmessage = (progress) => {
+          // Новый шаг значит, что заметка прошлой части уже на диске
+          if (!progress.note) sceneNotesRevision += 1;
           if (progress.note) {
             draft.push(progress.note);
             char.notes = draft.join("\n\n");
@@ -1160,7 +1188,7 @@
     } catch (e) {
       showToast(`Не удалось обновить персонажа: ${e}`, "error");
     } finally {
-      updatingCharacter = false;
+      updatingAlias = null;
       summaryRunning = false;
       summaryProgress = null;
       summaryBuild = null;
@@ -1187,17 +1215,23 @@
   let glossaryCategoryFilter = $state<"all" | "general" | "location" | "title" | "item">("all");
 
   // Добавление термина
-  let newTermSource = $state("");
-  let newTermTranslation = $state("");
-  let newTermCategory = $state("general");
-  let newTermNotes = $state("");
+  const emptyTerm = (): TermGlossaryEntry => ({ id: "", source_term: "", translated_term: "", category: "general", notes: "" });
+  let termDraft = $state(emptyTerm());
 
   // Добавление персонажа вручную
-  let showAddChar = $state(false);
-  let newCharAlias = $state("");
-  let newCharName = $state("");
-  let newCharTranslation = $state("");
-  let newCharGender = $state("unknown");
+  type CharacterGender = "male" | "female" | "neuter" | "unknown";
+  const GENDER_OPTIONS: { value: CharacterGender; letter: string; title: string; example: string }[] = [
+    { value: "male", letter: "М", title: "Мужской", example: "он сказал, красивый" },
+    { value: "female", letter: "Ж", title: "Женский", example: "она сказала, красивая" },
+    { value: "neuter", letter: "Ср", title: "Средний", example: "оно / существо, чудовище" },
+    { value: "unknown", letter: "—", title: "Не указан", example: "нейтрально" }
+  ];
+  const emptyCharacter = () => ({ alias: "", name: "", translated: "", gender: "unknown" as CharacterGender });
+  let characterDraft = $state(emptyCharacter());
+
+  // Добавление токена
+  const emptyToken = () => ({ name: "", value: "", note: "" });
+  let tokenDraft = $state(emptyToken());
 
   // Быстрый кэш маппинга персонажей глоссария
   let glossaryCharByAlias = $derived.by(() => {
@@ -1570,6 +1604,7 @@
     selectedSceneId = "all";
     glossary = { characters: [], terms: [], tokens: [] };
     textTokens = null;
+    scenePartsByAlias = {};
     glossaryProjectPath = null;
     glossaryDirty = false;
     selectedGlossaryChar = null;
@@ -1862,7 +1897,7 @@
     const names = new Set(found.map((token) => token.name));
     const missing = glossary.tokens
       .filter((token) => !names.has(token.name))
-      .map((token) => ({ name: token.name, lines: 0, values: [], example: "" }));
+      .map((token): TextToken => ({ name: token.name, lines: 0, values: [], example: "" }));
     return [...found, ...missing];
   });
   let filteredTokenRows = $derived.by(() => {
@@ -1871,7 +1906,7 @@
     return tokenRows.filter((token) =>
       token.name.toLowerCase().includes(q) ||
       token.example.toLowerCase().includes(q) ||
-      tokenNote(token.name).toLowerCase().includes(q)
+      tokenLabel(token.name).toLowerCase().includes(q)
     );
   });
 
@@ -1883,15 +1918,28 @@
       .catch((e) => showToast(`Не удалось найти токены: ${e}`, "error"));
   });
 
-  function tokenNote(name: string) {
-    return glossary.tokens.find((token) => token.name === name)?.note ?? "";
+  let selectedTokenName = $state<string | null>(null);
+  let selectedToken = $derived(tokenRows.find((token) => token.name === selectedTokenName) ?? tokenRows[0] ?? null);
+
+  function tokenEntry(name: string) {
+    return glossary.tokens.find((token) => token.name === name);
   }
 
-  function setTokenNote(name: string, note: string) {
-    const own = glossary.tokens.find((token) => token.name === name);
-    if (!note) glossary.tokens = glossary.tokens.filter((token) => token.name !== name);
-    else if (own) own.note = note;
-    else glossary.tokens.push({ name, note });
+  function tokenLabel(name: string) {
+    const token = tokenEntry(name);
+    return token?.value || token?.note || "";
+  }
+
+  function setTokenField(name: string, field: "value" | "note", text: string) {
+    const own = tokenEntry(name);
+    if (own) own[field] = text;
+    else glossary.tokens.push({ name, note: "", value: "", [field]: text });
+    glossary.tokens = glossary.tokens.filter((token) => token.note || token.value);
+    glossaryDirty = true;
+  }
+
+  function removeToken(name: string) {
+    glossary.tokens = glossary.tokens.filter((token) => token.name !== name);
     glossaryDirty = true;
   }
 
@@ -1956,6 +2004,7 @@
       if (match) {
         selectedGlossaryChar = match;
         glossaryTab = 'characters';
+        addingEntry = false;
         glossarySearch = "";
         await tick();
         document.querySelector(".glossary-list-item.selected-row")?.scrollIntoView({ block: "center" });
@@ -1999,9 +2048,25 @@
     glossaryDirty = true;
   }
 
+  function openGlossaryTab(tab: typeof glossaryTab) {
+    glossaryTab = tab;
+    addingEntry = false;
+  }
+
+  function startAddingEntry() {
+    characterDraft = emptyCharacter();
+    termDraft = emptyTerm();
+    tokenDraft = emptyToken();
+    addingEntry = true;
+  }
+
+  // Правка в карточке новой записи ещё не меняет глоссарий
+  function termEdited(term: TermGlossaryEntry) {
+    if (term !== termDraft) glossaryDirty = true;
+  }
+
   function addGlossaryTerm() {
-    const src = newTermSource.trim();
-    const tr = newTermTranslation.trim();
+    const src = termDraft.source_term.trim();
     if (!src) {
       showToast("Введите исходный термин", "warning");
       return;
@@ -2009,17 +2074,42 @@
     const newEntry: TermGlossaryEntry = {
       id: `term_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       source_term: src,
-      translated_term: tr,
-      category: newTermCategory,
-      notes: newTermNotes.trim()
+      translated_term: termDraft.translated_term.trim(),
+      category: termDraft.category,
+      notes: termDraft.notes.trim()
     };
     glossary.terms = [newEntry, ...glossary.terms];
     selectedGlossaryTerm = glossary.terms[0];
-    newTermSource = "";
-    newTermTranslation = "";
-    newTermNotes = "";
+    glossarySearch = "";
+    glossaryCategoryFilter = "all";
+    addingEntry = false;
     glossaryDirty = true;
     showToast(`Термин "${src}" добавлен в глоссарий`, "success");
+  }
+
+  function addToken() {
+    // Токен часто копируют из реплики вместе со скобками и флагом
+    const name = tokenDraft.name.trim().replace(/^\[/, "").replace(/\]$/, "").replace(/![a-z]+$/, "");
+    const value = tokenDraft.value.trim();
+    const note = tokenDraft.note.trim();
+    if (!/^[A-Za-z_][\w.]*$/.test(name)) {
+      showToast("Токен записывается как имя переменной, например landlady", "warning");
+      return;
+    }
+    if (!value && !note) {
+      showToast("Напишите значение или описание токена", "warning");
+      return;
+    }
+    if (tokenEntry(name)) {
+      showToast(`Токен [${name}] уже есть в глоссарии`, "warning");
+      return;
+    }
+    glossary.tokens.push({ name, note, value });
+    glossaryDirty = true;
+    selectedTokenName = name;
+    glossarySearch = "";
+    addingEntry = false;
+    showToast(`Токен [${name}] добавлен в глоссарий`, "success");
   }
 
   function removeGlossaryTerm(id: string) {
@@ -2032,8 +2122,8 @@
   }
 
   function addCustomCharacter() {
-    const alias = newCharAlias.trim().toLowerCase();
-    const name = newCharName.trim();
+    const alias = characterDraft.alias.trim().toLowerCase();
+    const name = characterDraft.name.trim();
     if (!alias || !name) {
       showToast("Укажите алиас и оригинальное имя персонажа", "warning");
       return;
@@ -2045,8 +2135,8 @@
     const newChar: CharacterGlossaryEntry = {
       alias,
       original_name: name,
-      translated_name: newCharTranslation.trim(),
-      gender: newCharGender,
+      translated_name: characterDraft.translated.trim(),
+      gender: characterDraft.gender,
       notes: "",
       speech: "",
       excluded_scenes: [],
@@ -2056,15 +2146,92 @@
     glossary.characters.push(newChar);
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
     selectedGlossaryChar = glossary.characters.find(c => c.alias === alias) ?? null;
-    newCharAlias = "";
-    newCharName = "";
-    newCharTranslation = "";
-    newCharGender = "unknown";
-    showAddChar = false;
+    glossarySearch = "";
+    glossaryGenderFilter = "all";
+    addingEntry = false;
     glossaryDirty = true;
     showToast(`Персонаж [${alias}] ${name} добавлен в глоссарий`, "success");
   }
 </script>
+
+{#snippet genderPicker(current: string, pick: (gender: CharacterGender) => void)}
+  <div class="gender-cards-grid" role="group" aria-label="Грамматический род">
+    {#each GENDER_OPTIONS as option (option.value)}
+      <button
+        type="button"
+        class={`gender-card gender-card-${option.value}`}
+        class:active={current === option.value || (option.value === "unknown" && !current)}
+        onclick={() => pick(option.value)}
+      >
+        <div class="gender-card-top">
+          <span class="gender-letter">{option.letter}</span>
+          <span class="gender-title">{option.title}</span>
+        </div>
+        <span class="gender-example">{option.example}</span>
+      </button>
+    {/each}
+  </div>
+{/snippet}
+
+{#snippet termFields(term: TermGlossaryEntry)}
+                  <div class="edit-group">
+                    <label class="edit-label" for="term-source">
+                      <span>Исходный термин (EN):</span>
+                    </label>
+                    <input 
+                      id="term-source"
+                      type="text" 
+                      bind:value={term.source_term} 
+                      oninput={() => termEdited(term)}
+                      class="sidebar-input"
+                    />
+                  </div>
+
+                  <div class="edit-group">
+                    <label class="edit-label" for="term-translation">
+                      <span>Русский перевод (RU):</span>
+                    </label>
+                    <input 
+                      id="term-translation"
+                      type="text" 
+                      bind:value={term.translated_term} 
+                      oninput={() => termEdited(term)}
+                      placeholder="Перевод на русский..."
+                      class="sidebar-input sidebar-input-primary"
+                    />
+                  </div>
+
+                  <div class="edit-group">
+                    <label class="edit-label" for="term-category">
+                      <span>Категория термина:</span>
+                    </label>
+                    <select 
+                      id="term-category"
+                      bind:value={term.category} 
+                      onchange={() => termEdited(term)}
+                      class="sidebar-select"
+                    >
+                      <option value="general">Общий термин</option>
+                      <option value="location">Локация / Место</option>
+                      <option value="title">Титул / Звание</option>
+                      <option value="item">Предмет / Артефакт</option>
+                    </select>
+                  </div>
+
+                  <div class="edit-group">
+                    <label class="edit-label" for="term-notes">
+                      <span>Заметки / Контекст:</span>
+                    </label>
+                    <textarea 
+                      id="term-notes"
+                      bind:value={term.notes} 
+                      oninput={() => termEdited(term)}
+                      rows="3" 
+                      placeholder="Контекст употребления термина..."
+                      class="sidebar-textarea"
+                    ></textarea>
+                  </div>
+{/snippet}
 
 <!-- Горячая клавиша Ctrl+S для сохранения текущих правок -->
 <svelte:window onkeydown={(e) => {
@@ -3399,6 +3566,7 @@
           <div class="modal-header-actions">
             <button 
               class="btn-modal-ai"
+              disabled={updatingCharacter}
               onclick={() => showGlossaryAiModal = true}
               title="Автозаполнение через нейросеть (LM Studio / Ollama)"
             >
@@ -3430,7 +3598,7 @@
           <button 
             class="tools-tab" 
             class:tab-active={glossaryTab === 'characters'}
-            onclick={() => glossaryTab = 'characters'}
+            onclick={() => openGlossaryTab('characters')}
           >
             <Users size={15} />
             <span>Персонажи ({glossaryStats.totalChars})</span>
@@ -3441,7 +3609,7 @@
           <button 
             class="tools-tab" 
             class:tab-active={glossaryTab === 'terms'}
-            onclick={() => glossaryTab = 'terms'}
+            onclick={() => openGlossaryTab('terms')}
           >
             <BookMarked size={15} />
             <span>Термины и локации ({glossaryStats.totalTerms})</span>
@@ -3449,174 +3617,13 @@
           <button
             class="tools-tab"
             class:tab-active={glossaryTab === 'tokens'}
-            onclick={() => glossaryTab = 'tokens'}
+            onclick={() => openGlossaryTab('tokens')}
           >
             <Braces size={15} />
             <span>Токены ({glossary.tokens.length})</span>
           </button>
         </div>
 
-        <!-- Тулбар фильтрации и поиска внутри глоссария -->
-        {#if glossaryTab === 'characters' && showAddChar}
-          <div class="add-char-panel">
-            <div class="add-char-row">
-              <div class="field-item">
-                <span class="field-label">Алиас (код в script.rpy):</span>
-                <input type="text" bind:value={newCharAlias} placeholder="напр. cr" class="glossary-input" />
-              </div>
-              <div class="field-item">
-                <span class="field-label">Имя в игре (EN):</span>
-                <input type="text" bind:value={newCharName} placeholder="Shadow Creature" class="glossary-input" />
-              </div>
-              <div class="field-item">
-                <span class="field-label">Перевод имени (RU):</span>
-                <input type="text" bind:value={newCharTranslation} placeholder="Теневое существо" class="glossary-input" />
-              </div>
-              <div class="field-item">
-                <span class="field-label">Грамматический род:</span>
-                <div class="gender-toggle-group">
-                  <button 
-                    type="button"
-                    class="btn-gender-toggle gender-male" 
-                    class:active={newCharGender === 'male'} 
-                    onclick={() => newCharGender = 'male'}
-                  >М</button>
-                  <button 
-                    type="button"
-                    class="btn-gender-toggle gender-female" 
-                    class:active={newCharGender === 'female'} 
-                    onclick={() => newCharGender = 'female'}
-                  >Ж</button>
-                  <button 
-                    type="button"
-                    class="btn-gender-toggle gender-neuter" 
-                    class:active={newCharGender === 'neuter'} 
-                    onclick={() => newCharGender = 'neuter'}
-                  >Ср</button>
-                  <button 
-                    type="button"
-                    class="btn-gender-toggle gender-unknown" 
-                    class:active={newCharGender === 'unknown'} 
-                    onclick={() => newCharGender = 'unknown'}
-                  >—</button>
-                </div>
-              </div>
-              <button class="btn-confirm-add" onclick={addCustomCharacter}>
-                <Plus size={14} />
-                <span>Добавить</span>
-              </button>
-            </div>
-          </div>
-        {/if}
-
-        <!-- Форма добавления нового термина (всегда доступна во вкладке терминов) -->
-        {#if glossaryTab === 'terms'}
-          <div class="add-term-panel">
-            <div class="add-term-row">
-              <div class="field-item flex-2">
-                <span class="field-label">Исходный термин (EN):</span>
-                <input 
-                  type="text" 
-                  bind:value={newTermSource} 
-                  placeholder="напр. Demon Blade, Ancient Ruins" 
-                  class="glossary-input" 
-                  onkeydown={(e) => { if (e.key === 'Enter') addGlossaryTerm(); }}
-                />
-              </div>
-              <div class="field-item flex-2">
-                <span class="field-label">Русский перевод (RU):</span>
-                <input 
-                  type="text" 
-                  bind:value={newTermTranslation} 
-                  placeholder="Клинок демона, Древние руины" 
-                  class="glossary-input" 
-                  onkeydown={(e) => { if (e.key === 'Enter') addGlossaryTerm(); }}
-                />
-              </div>
-              <div class="field-item flex-1">
-                <span class="field-label">Категория:</span>
-                <select bind:value={newTermCategory} class="glossary-select">
-                  <option value="general">Общий термин</option>
-                  <option value="location">Локация / Место</option>
-                  <option value="title">Титул / Звание</option>
-                  <option value="item">Предмет / Артефакт</option>
-                </select>
-              </div>
-              <div class="field-item flex-2">
-                <span class="field-label">Заметки / Контекст:</span>
-                <input 
-                  type="text" 
-                  bind:value={newTermNotes} 
-                  placeholder="напр. магический артефакт" 
-                  class="glossary-input" 
-                  onkeydown={(e) => { if (e.key === 'Enter') addGlossaryTerm(); }}
-                />
-              </div>
-              <button class="btn-confirm-add" onclick={addGlossaryTerm}>
-                <Plus size={14} />
-                <span>Добавить</span>
-              </button>
-            </div>
-          </div>
-        {/if}
-
-        {#if glossaryTab === 'tokens'}
-          <div class="token-pane">
-            <div class="glossary-toolbar">
-              <div class="glossary-search-box">
-                <Search size={14} class="search-box-icon text-slate-400" />
-                <input
-                  type="text"
-                  bind:value={glossarySearch}
-                  placeholder="Поиск по токену, реплике, пояснению..."
-                  class="glossary-search-input"
-                />
-                {#if glossarySearch}
-                  <button class="btn-clear-search" onclick={() => glossarySearch = ""}>
-                    <X size={12} />
-                  </button>
-                {/if}
-              </div>
-              <span class="char-sub-label">Пояснение модель получает вместе с текстом, где встречается токен. Части с этим токеном прочитаются заново.</span>
-            </div>
-            <div class="token-list">
-              {#if textTokens?.dir !== gameDir}
-                <div class="glossary-empty-state">
-                  <Loader2 size={24} class="spin" />
-                </div>
-              {:else if filteredTokenRows.length === 0}
-                <div class="glossary-empty-state">
-                  <Braces size={32} class="text-slate-600" />
-                  <p>{glossarySearch ? `Токены не найдены по запросу «${glossarySearch}»` : "В репликах игры нет токенов"}</p>
-                </div>
-              {:else}
-                {#each filteredTokenRows as token (token.name)}
-                  <div class="token-row">
-                    <div class="token-info">
-                      <div class="token-head">
-                        <code class="char-alias-badge-lg">[{token.name}]</code>
-                        <span class="char-sub-label">{token.lines > 0 ? `реплик: ${token.lines}` : "нет в репликах"}</span>
-                        {#if token.values.length > 0}
-                          <span class="char-sub-label">в скриптах: {token.values.slice(0, 4).join(" / ")}{token.values.length > 4 ? " ..." : ""}</span>
-                        {/if}
-                      </div>
-                      {#if token.example}
-                        <p class="token-example" title={token.example}>{token.example}</p>
-                      {/if}
-                    </div>
-                    <input
-                      class="token-note"
-                      value={tokenNote(token.name)}
-                      placeholder="Что это значит, например: мать героя"
-                      aria-label={`Пояснение к токену ${token.name}`}
-                      oninput={(event) => setTokenNote(token.name, event.currentTarget.value)}
-                    />
-                  </div>
-                {/each}
-              {/if}
-            </div>
-          </div>
-        {:else}
         <!-- СПИСОК СЛЕВА, ОСНОВНОЕ МЕСТО ОТДАНО ВЫБРАННОЙ ЗАПИСИ -->
         <div class="glossary-split-container">
           <div class="glossary-list-pane">
@@ -3626,7 +3633,7 @@
                 <input 
                   type="text" 
                   bind:value={glossarySearch} 
-                  placeholder={glossaryTab === 'characters' ? "Поиск по коду, имени, переводу..." : "Поиск по термину, переводу..."}
+                  placeholder={glossaryTab === 'characters' ? "Поиск по коду, имени, переводу..." : glossaryTab === 'terms' ? "Поиск по термину, переводу..." : "Поиск по токену, реплике, значению..."}
                   class="glossary-search-input"
                 />
                 {#if glossarySearch}
@@ -3677,15 +3684,7 @@
                   </button>
                 </div>
 
-                <button 
-                  class="btn-toggle-add-char" 
-                  onclick={() => showAddChar = !showAddChar}
-                  title="Добавить вручную нового персонажа"
-                >
-                  <Plus size={14} />
-                  <span>{showAddChar ? 'Отмена' : '+ Персонаж'}</span>
-                </button>
-              {:else}
+              {:else if glossaryTab === 'terms'}
                 <!-- Фильтр по категории терминов -->
                 <div class="category-filter-group">
                   <span class="filter-label">Категория:</span>
@@ -3726,9 +3725,12 @@
                   </button>
                 </div>
               {/if}
-            </div>
 
-            <!-- Форма быстрого добавления нового персонажа (если раскрыта) -->
+              <button class="btn-toggle-add-char" class:active={addingEntry} onclick={() => addingEntry ? addingEntry = false : startAddingEntry()}>
+                <Plus size={14} />
+                <span>{addingEntry ? 'Отмена' : glossaryTab === 'characters' ? 'Персонаж' : glossaryTab === 'terms' ? 'Термин' : 'Токен'}</span>
+              </button>
+            </div>
 
             <div class="glossary-list-scroll">
               {#if loadingGlossary && glossary.characters.length === 0 && glossary.terms.length === 0}
@@ -3751,7 +3753,8 @@
                     <button
                       class="glossary-list-item"
                       class:selected-row={selectedGlossaryChar?.alias === char.alias}
-                      onclick={() => selectedGlossaryChar = char}
+                      class:character-updating={updatingAlias === char.alias}
+                      onclick={() => { selectedGlossaryChar = char; addingEntry = false; }}
                     >
                       <span class="glossary-item-text">
                         <span class="char-name-en">{char.original_name}</span>
@@ -3764,6 +3767,9 @@
                       {#if duplicateNames.has(char.original_name.trim().toLowerCase())}
                         <span class="character-twin-mark" title="Есть другой персонаж с таким же именем">дубль</span>
                       {/if}
+                      {#if updatingAlias === char.alias}
+                        <span class="character-updating-mark" title="Персонаж обновляется"><Loader2 size={13} class="spin" /></span>
+                      {/if}
                       {#if char.gender === 'male'}
                         <span class="gender-pill gender-male" title="Мужской род (он)">М</span>
                       {:else if char.gender === 'female'}
@@ -3773,6 +3779,35 @@
                       {:else}
                         <span class="gender-pill gender-unknown" title="Не указан">—</span>
                       {/if}
+                    </button>
+                  {/each}
+                {/if}
+              {:else if glossaryTab === 'tokens'}
+                {#if textTokens?.dir !== gameDir}
+                  <div class="glossary-empty-state">
+                    <Loader2 size={24} class="spin" />
+                  </div>
+                {:else if filteredTokenRows.length === 0}
+                  <div class="glossary-empty-state">
+                    <Braces size={32} class="text-slate-600" />
+                    <p>{glossarySearch ? `Токены не найдены по запросу «${glossarySearch}»` : "В репликах игры нет токенов"}</p>
+                  </div>
+                {:else}
+                  {#each filteredTokenRows as token (token.name)}
+                    <button
+                      class="glossary-list-item"
+                      class:selected-row={selectedToken?.name === token.name}
+                      onclick={() => { selectedTokenName = token.name; addingEntry = false; }}
+                    >
+                      <span class="glossary-item-text">
+                        <span class="char-name-en">[{token.name}]</span>
+                        {#if tokenLabel(token.name)}
+                          <span class="char-name-ru token-list-note">{tokenLabel(token.name)}</span>
+                        {:else}
+                          <span class="char-name-empty">без значения</span>
+                        {/if}
+                      </span>
+                      <span class="category-badge category-general" title="Реплик с токеном">{token.lines}</span>
                     </button>
                   {/each}
                 {/if}
@@ -3788,7 +3823,7 @@
                     <button
                       class="glossary-list-item"
                       class:selected-row={selectedGlossaryTerm?.id === term.id}
-                      onclick={() => selectedGlossaryTerm = term}
+                      onclick={() => { selectedGlossaryTerm = term; addingEntry = false; }}
                     >
                       <span class="glossary-item-text">
                         <span class="char-name-en">{term.source_term}</span>
@@ -3808,11 +3843,84 @@
             </div>
           </div>
 
-          <!-- ПРОФИЛЬ ПЕРСОНАЖА ИЛИ ФОРМА ТЕРМИНА -->
-          <section class="glossary-edit-sidebar" class:glossary-edit-wide={glossaryTab === 'terms'}>
-            {#if glossaryTab === 'characters'}
+          <!-- КАРТОЧКА ЗАПИСИ -->
+          <section class="glossary-edit-sidebar">
+            {#if addingEntry}
+              <div class="sidebar-edit-header">
+                <div class="sidebar-char-headings">
+                  <h4>{glossaryTab === 'characters' ? 'Новый персонаж' : glossaryTab === 'terms' ? 'Новый термин' : 'Новый токен'}</h4>
+                  <span class="char-sub-label">Запись появится в глоссарии после добавления</span>
+                </div>
+              </div>
+
+              <div class="sidebar-edit-content">
+                {#if glossaryTab === 'characters'}
+                  <div class="edit-group">
+                    <label class="edit-label" for="new-character-alias">
+                      <span>Код в скриптах:</span>
+                    </label>
+                    <input id="new-character-alias" type="text" bind:value={characterDraft.alias} placeholder="напр. cr" class="sidebar-input" />
+                  </div>
+                  <div class="edit-group">
+                    <label class="edit-label" for="new-character-name">
+                      <span>Имя в игре (EN):</span>
+                    </label>
+                    <input id="new-character-name" type="text" bind:value={characterDraft.name} placeholder="Shadow Creature" class="sidebar-input" />
+                  </div>
+                  <div class="edit-group">
+                    <label class="edit-label" for="new-character-translation">
+                      <span>Русский перевод имени:</span>
+                    </label>
+                    <input id="new-character-translation" type="text" bind:value={characterDraft.translated} placeholder="Теневое существо" class="sidebar-input sidebar-input-primary" />
+                  </div>
+                  <div class="edit-group">
+                    <div class="edit-label">
+                      <span>Грамматический род (для согласования окончаний):</span>
+                    </div>
+                    {@render genderPicker(characterDraft.gender, (gender) => { characterDraft.gender = gender; })}
+                  </div>
+                {:else if glossaryTab === 'terms'}
+                  {@render termFields(termDraft)}
+                {:else}
+                  <div class="edit-group">
+                    <label class="edit-label" for="new-token-name">
+                      <span>Токен:</span>
+                    </label>
+                    <input id="new-token-name" type="text" bind:value={tokenDraft.name} placeholder="напр. landlady" class="sidebar-input" />
+                  </div>
+                  <div class="edit-group">
+                    <label class="edit-label" for="new-token-value">
+                      <span>Что подставить вместо токена:</span>
+                    </label>
+                    <input id="new-token-value" type="text" bind:value={tokenDraft.value} placeholder="напр. mother" class="sidebar-input sidebar-input-primary" />
+                    <span class="edit-hint">То, что показала бы игра, на языке её текста: mother, sister.</span>
+                  </div>
+                  <div class="edit-group">
+                    <label class="edit-label" for="new-token-note">
+                      <span>Описание:</span>
+                    </label>
+                    <textarea id="new-token-note" bind:value={tokenDraft.note} rows="3" placeholder="напр. Кем Селия приходится главному герою" class="sidebar-textarea"></textarea>
+                  </div>
+                {/if}
+
+                <div class="edit-sidebar-footer-actions">
+                  <button class="btn-confirm-add" onclick={() => glossaryTab === 'characters' ? addCustomCharacter() : glossaryTab === 'terms' ? addGlossaryTerm() : addToken()}>
+                    <Plus size={14} />
+                    <span>Добавить</span>
+                  </button>
+                  <button class="btn-secondary" onclick={() => addingEntry = false}>Отмена</button>
+                </div>
+              </div>
+            {:else if glossaryTab === 'characters'}
               {#if selectedGlossaryChar}
-                <div class="sidebar-edit-header">
+                {#if otherCharacterUpdating}
+                  <div class="character-locked-banner">
+                    <Loader2 size={14} class="spin" />
+                    <span>Сейчас обновляется {updatingCharacterEntry?.original_name}. Остальные персонажи недоступны до конца обновления.</span>
+                    <button class="character-scene-link" onclick={() => { if (updatingCharacterEntry) selectedGlossaryChar = updatingCharacterEntry; }}>Перейти</button>
+                  </div>
+                {/if}
+                <div class="sidebar-edit-header" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
                   <div class="sidebar-char-badge-row">
                     <span class="char-alias-badge-lg">[{selectedGlossaryChar.alias}]</span>
                     <div class="sidebar-char-headings">
@@ -3901,8 +4009,9 @@
                         style={sceneTrackStyle}
                         class:segmented={(sceneChunkCount ?? 0) <= MAX_SEGMENTS_WITH_GAPS}
                         oninput={(event) => {
-                          scenePartsWanted = Math.max(event.currentTarget.valueAsNumber, sceneReadyCount, 1);
-                          event.currentTarget.value = String(scenePartsWanted);
+                          const wanted = Math.max(event.currentTarget.valueAsNumber, sceneReadyCount, 1);
+                          if (selectedGlossaryChar) scenePartsByAlias[selectedGlossaryChar.alias] = wanted;
+                          event.currentTarget.value = String(wanted);
                         }}
                         disabled={updatingCharacter || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
                       />
@@ -3916,7 +4025,7 @@
                       </div>
                     </div>
                   {/if}
-                  {#if summaryRunning}
+                  {#if summaryRunning && !otherCharacterUpdating}
                     <div class="character-summary-progress">
                       {#if summaryBuild?.stage !== "single"}
                         <div class="character-summary-line">
@@ -3948,7 +4057,7 @@
                   {/if}
                 </div>
 
-                <div class="sidebar-edit-content">
+                <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
                   <div class="edit-group">
                     <label class="edit-label" for="character-translation">
                       <span>Русский перевод имени:</span>
@@ -3968,59 +4077,7 @@
                     <div class="edit-label" id="character-gender-label">
                       <span>Грамматический род (для согласования окончаний):</span>
                     </div>
-                    <div class="gender-cards-grid" role="group" aria-labelledby="character-gender-label">
-                      <button 
-                        type="button" 
-                        class="gender-card gender-card-male"
-                        class:active={selectedGlossaryChar.gender === 'male'}
-                        onclick={() => { if (selectedGlossaryChar) updateCharacterGender(selectedGlossaryChar, 'male'); }}
-                      >
-                        <div class="gender-card-top">
-                          <span class="gender-letter">М</span>
-                          <span class="gender-title">Мужской</span>
-                        </div>
-                        <span class="gender-example">он сказал, красивый</span>
-                      </button>
-
-                      <button 
-                        type="button" 
-                        class="gender-card gender-card-female"
-                        class:active={selectedGlossaryChar.gender === 'female'}
-                        onclick={() => { if (selectedGlossaryChar) updateCharacterGender(selectedGlossaryChar, 'female'); }}
-                      >
-                        <div class="gender-card-top">
-                          <span class="gender-letter">Ж</span>
-                          <span class="gender-title">Женский</span>
-                        </div>
-                        <span class="gender-example">она сказала, красивая</span>
-                      </button>
-
-                      <button 
-                        type="button" 
-                        class="gender-card gender-card-neuter"
-                        class:active={selectedGlossaryChar.gender === 'neuter'}
-                        onclick={() => { if (selectedGlossaryChar) updateCharacterGender(selectedGlossaryChar, 'neuter'); }}
-                      >
-                        <div class="gender-card-top">
-                          <span class="gender-letter">Ср</span>
-                          <span class="gender-title">Средний</span>
-                        </div>
-                        <span class="gender-example">оно / существо, чудовище</span>
-                      </button>
-
-                      <button 
-                        type="button" 
-                        class="gender-card gender-card-unknown"
-                        class:active={selectedGlossaryChar.gender === 'unknown' || !selectedGlossaryChar.gender}
-                        onclick={() => { if (selectedGlossaryChar) updateCharacterGender(selectedGlossaryChar, 'unknown'); }}
-                      >
-                        <div class="gender-card-top">
-                          <span class="gender-letter">—</span>
-                          <span class="gender-title">Не указан</span>
-                        </div>
-                        <span class="gender-example">нейтрально</span>
-                      </button>
-                    </div>
+                    {@render genderPicker(selectedGlossaryChar.gender, (gender) => { if (selectedGlossaryChar) updateCharacterGender(selectedGlossaryChar, gender); })}
                   </div>
 
                   <div class="edit-group">
@@ -4062,6 +4119,83 @@
                   <p>Выберите персонажа из списка слева</p>
                 </div>
               {/if}
+            {:else if glossaryTab === 'tokens'}
+              {#if selectedToken}
+                {@const token = tokenEntry(selectedToken.name)}
+                <div class="sidebar-edit-header">
+                  <div class="sidebar-char-badge-row">
+                    <span class="char-alias-badge-lg">[{selectedToken.name}]</span>
+                    <div class="sidebar-char-headings">
+                      <h4>{selectedToken.lines > 0 ? `Реплик: ${selectedToken.lines}` : "Нет в репликах"}</h4>
+                      <span class="char-sub-label">Подстановка в тексте игры</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="sidebar-edit-content">
+                  {#if selectedToken.values.length > 0}
+                    <div class="edit-group">
+                      <div class="edit-label">
+                        <span>Значения в скриптах:</span>
+                      </div>
+                      <p class="token-card-text">{selectedToken.values.join(" / ")}</p>
+                    </div>
+                  {/if}
+
+                  {#if selectedToken.example}
+                    <div class="edit-group">
+                      <div class="edit-label">
+                        <span>Пример реплики:</span>
+                      </div>
+                      <p class="token-card-text">{selectedToken.example}</p>
+                    </div>
+                  {/if}
+
+                  <div class="edit-group">
+                    <label class="edit-label" for="token-value">
+                      <span>Что подставить вместо токена:</span>
+                    </label>
+                    <input
+                      id="token-value"
+                      type="text"
+                      value={token?.value ?? ""}
+                      oninput={(event) => { if (selectedToken) setTokenField(selectedToken.name, "value", event.currentTarget.value); }}
+                      placeholder="напр. mother"
+                      class="sidebar-input sidebar-input-primary"
+                    />
+                    <span class="edit-hint">То, что показала бы игра, на языке её текста: mother, sister. Только для чтения сцен: при переводе токен останется в тексте.</span>
+                  </div>
+
+                  <div class="edit-group">
+                    <label class="edit-label" for="token-note">
+                      <span>Описание:</span>
+                    </label>
+                    <textarea
+                      id="token-note"
+                      value={token?.note ?? ""}
+                      oninput={(event) => { if (selectedToken) setTokenField(selectedToken.name, "note", event.currentTarget.value); }}
+                      rows="3"
+                      placeholder="напр. Кем Селия приходится главному герою"
+                      class="sidebar-textarea"
+                    ></textarea>
+                    <span class="edit-hint">Что стоит за токеном. Пока значения нет, модель видит описание. Части с токеном прочитаются заново.</span>
+                  </div>
+
+                  {#if token}
+                    <div class="edit-sidebar-footer-actions">
+                      <button class="btn-delete-term" onclick={() => { if (selectedToken) removeToken(selectedToken.name); }}>
+                        <Trash2 size={13} />
+                        <span>Очистить токен</span>
+                      </button>
+                    </div>
+                  {/if}
+                </div>
+              {:else}
+                <div class="sidebar-edit-empty">
+                  <Braces size={36} class="text-slate-600" />
+                  <p>Выберите токен из списка слева</p>
+                </div>
+              {/if}
             {:else}
               <!-- Редактирование термина -->
               {#if selectedGlossaryTerm}
@@ -4073,64 +4207,7 @@
                 </div>
 
                 <div class="sidebar-edit-content">
-                  <div class="edit-group">
-                    <label class="edit-label" for="term-source">
-                      <span>Исходный термин (EN):</span>
-                    </label>
-                    <input 
-                      id="term-source"
-                      type="text" 
-                      bind:value={selectedGlossaryTerm.source_term} 
-                      oninput={() => glossaryDirty = true}
-                      class="sidebar-input"
-                    />
-                  </div>
-
-                  <div class="edit-group">
-                    <label class="edit-label" for="term-translation">
-                      <span>Русский перевод (RU):</span>
-                    </label>
-                    <input 
-                      id="term-translation"
-                      type="text" 
-                      bind:value={selectedGlossaryTerm.translated_term} 
-                      oninput={() => glossaryDirty = true}
-                      placeholder="Перевод на русский..."
-                      class="sidebar-input sidebar-input-primary"
-                    />
-                  </div>
-
-                  <div class="edit-group">
-                    <label class="edit-label" for="term-category">
-                      <span>Категория термина:</span>
-                    </label>
-                    <select 
-                      id="term-category"
-                      bind:value={selectedGlossaryTerm.category} 
-                      onchange={() => glossaryDirty = true}
-                      class="sidebar-select"
-                    >
-                      <option value="general">Общий термин</option>
-                      <option value="location">Локация / Место</option>
-                      <option value="title">Титул / Звание</option>
-                      <option value="item">Предмет / Артефакт</option>
-                    </select>
-                  </div>
-
-                  <div class="edit-group">
-                    <label class="edit-label" for="term-notes">
-                      <span>Заметки / Контекст:</span>
-                    </label>
-                    <textarea 
-                      id="term-notes"
-                      bind:value={selectedGlossaryTerm.notes} 
-                      oninput={() => glossaryDirty = true}
-                      rows="3" 
-                      placeholder="Контекст употребления термина..."
-                      class="sidebar-textarea"
-                    ></textarea>
-                  </div>
-
+                  {@render termFields(selectedGlossaryTerm)}
                   <div class="edit-sidebar-footer-actions">
                     <button 
                       class="btn-delete-term" 
@@ -4150,14 +4227,15 @@
             {/if}
           </section>
 
-          {#if glossaryTab === 'characters'}
             <section class="character-scenes">
               <div class="character-scenes-header">
-                <div class="gender-filter-group">
-                  <button class="btn-filter-pill" class:active={characterPaneMode === 'scenes'} onclick={() => characterPaneMode = 'scenes'}>Сцены</button>
-                  <button class="btn-filter-pill" class:active={characterPaneMode === 'notes'} onclick={() => characterPaneMode = 'notes'}>Заметки</button>
-                </div>
-                {#if characterPaneMode === 'notes'}
+                {#if glossaryTab === 'characters'}
+                  <div class="gender-filter-group">
+                    <button class="btn-filter-pill" class:active={characterPaneMode === 'scenes'} onclick={() => characterPaneMode = 'scenes'}>Сцены</button>
+                    <button class="btn-filter-pill" class:active={characterPaneMode === 'notes'} onclick={() => characterPaneMode = 'notes'}>Заметки</button>
+                  </div>
+                {/if}
+                {#if showingNotes}
                 <div class="character-scenes-title">
                   <h4>Заметки модели</h4>
                   {#if currentParts}
@@ -4183,30 +4261,40 @@
                   <h4>Сцены и реплики</h4>
                   {#if characterScenes}
                     <span class="char-sub-label">
-                      {characterScenes.length} сцен · говорит {characterSceneTotals.spoken} · упомянут {characterSceneTotals.mentioned}
+                      {#if glossaryTab === 'characters'}
+                        {characterScenes.length} сцен · говорит {characterSceneTotals.spoken} · упомянут {characterSceneTotals.mentioned}
+                      {:else}
+                        {characterScenes.length} сцен · реплик {characterSceneTotals.mentioned}
+                      {/if}
                     </span>
                   {/if}
                 </div>
                 <div class="character-scenes-tools">
-                  <button class="character-scene-link" title="Передавать модели все сцены" onclick={() => { if (selectedGlossaryChar) setAllScenesForLlm(selectedGlossaryChar, true); }}>Выбрать все</button>
-                  <button class="character-scene-link" title="Не передавать модели ни одной сцены" onclick={() => { if (selectedGlossaryChar) setAllScenesForLlm(selectedGlossaryChar, false); }}>Снять все</button>
+                  {#if glossaryTab === 'characters'}
+                    <button class="character-scene-link" disabled={updatingCharacter} title="Передавать модели все сцены" onclick={() => { if (selectedGlossaryChar) setAllScenesForLlm(selectedGlossaryChar, true); }}>Выбрать все</button>
+                    <button class="character-scene-link" disabled={updatingCharacter} title="Не передавать модели ни одной сцены" onclick={() => { if (selectedGlossaryChar) setAllScenesForLlm(selectedGlossaryChar, false); }}>Снять все</button>
+                  {/if}
                   <button class="character-scene-link" onclick={() => collapsedScenes = new Set()}>Развернуть все</button>
                   <button class="character-scene-link" onclick={() => collapsedScenes = new Set((characterScenes ?? []).map((scene) => scene.key))}>Свернуть все</button>
                 </div>
-                <div class="gender-filter-group">
-                  <button class="btn-filter-pill" class:active={sceneLineFilter === 'all'} onclick={() => sceneLineFilter = 'all'}>Все</button>
-                  <button class="btn-filter-pill" class:active={sceneLineFilter === 'spoken'} onclick={() => sceneLineFilter = 'spoken'}>Реплики</button>
-                  <button class="btn-filter-pill" class:active={sceneLineFilter === 'mentioned'} onclick={() => sceneLineFilter = 'mentioned'}>Упоминания</button>
-                </div>
+                {#if glossaryTab === 'characters'}
+                  <div class="gender-filter-group">
+                    <button class="btn-filter-pill" class:active={sceneLineFilter === 'all'} onclick={() => sceneLineFilter = 'all'}>Все</button>
+                    <button class="btn-filter-pill" class:active={sceneLineFilter === 'spoken'} onclick={() => sceneLineFilter = 'spoken'}>Реплики</button>
+                    <button class="btn-filter-pill" class:active={sceneLineFilter === 'mentioned'} onclick={() => sceneLineFilter = 'mentioned'}>Упоминания</button>
+                  </div>
+                {/if}
                 {/if}
               </div>
 
               <div class="character-scenes-list">
-                {#if !selectedGlossaryChar}
+                {#if addingEntry}
+                  <p class="character-scenes-note">Сцены появятся после добавления записи.</p>
+                {:else if !scenesTarget}
                   {#if !loadingGlossary}
-                    <p class="character-scenes-note">Выберите персонажа, чтобы увидеть его сцены.</p>
+                    <p class="character-scenes-note">Выберите запись, чтобы увидеть её сцены.</p>
                   {/if}
-                {:else if characterPaneMode === 'notes'}
+                {:else if showingNotes && selectedGlossaryChar}
                   {#if characterPartsError}
                     <p class="character-scenes-note">{characterPartsError}</p>
                   {:else if !currentParts}
@@ -4222,7 +4310,7 @@
                             type="checkbox"
                             class="character-scene-check"
                             checked={included && !part.empty && part.note !== null}
-                            disabled={part.note === null || part.empty}
+                            disabled={updatingCharacter || part.note === null || part.empty}
                             title="Учитывать заметку в итоговом описании"
                             aria-label={`Учитывать заметку части ${part.index + 1} в итоговом описании`}
                             onchange={(e) => { if (selectedGlossaryChar) toggleNoteForDescription(selectedGlossaryChar, part.key, e.currentTarget.checked); }}
@@ -4266,6 +4354,21 @@
                               {/each}
                             </dd>
                           {/if}
+                          {#if part.tokens.length > 0}
+                            <dt>Токены</dt>
+                            <dd class="character-part-links">
+                              {#each part.tokens as token (token.name)}
+                                <button
+                                  class="character-part-link"
+                                  class:character-part-unexplained={!token.note}
+                                  title={token.note ? `Открыть токен [${token.name}]` : "Модель не знает, что значит этот токен. Открыть и задать значение"}
+                                  onclick={() => openPartToken(token.name)}
+                                >
+                                  [{token.name}]{token.note ? `: ${token.note}` : ""}
+                                </button>
+                              {/each}
+                            </dd>
+                          {/if}
                           {#if part.terms.length > 0}
                             <dt>Термины</dt>
                             <dd>{part.terms.join(", ")}</dd>
@@ -4289,20 +4392,23 @@
                     {/each}
                   {/if}
                 {:else if visibleCharacterScenes.length === 0}
-                  <p class="character-scenes-note">В скриптах персонаж не найден.</p>
+                  <p class="character-scenes-note">{glossaryTab === 'characters' ? "В скриптах персонаж не найден." : "В репликах не встречается."}</p>
                 {:else}
                   {#each visibleCharacterScenes as scene (scene.key)}
-                    {@const included = !selectedGlossaryChar?.excluded_scenes.includes(scene.key)}
+                    {@const included = glossaryTab !== 'characters' || !selectedGlossaryChar?.excluded_scenes.includes(scene.key)}
                     <article class="character-scene" class:character-scene-off={!included}>
                       <header class="character-scene-head">
-                        <input
-                          type="checkbox"
-                          class="character-scene-check"
-                          checked={included}
-                          title="Передавать эту сцену модели"
-                          aria-label={`Передавать модели сцену ${scene.scene}`}
-                          onchange={(e) => { if (selectedGlossaryChar) toggleSceneForLlm(selectedGlossaryChar, scene.key, e.currentTarget.checked); }}
-                        />
+                        {#if glossaryTab === 'characters'}
+                          <input
+                            type="checkbox"
+                            class="character-scene-check"
+                            checked={included}
+                            disabled={updatingCharacter}
+                            title="Передавать эту сцену модели"
+                            aria-label={`Передавать модели сцену ${scene.scene}`}
+                            onchange={(e) => { if (selectedGlossaryChar) toggleSceneForLlm(selectedGlossaryChar, scene.key, e.currentTarget.checked); }}
+                          />
+                        {/if}
                         <button
                           class="character-scene-toggle"
                           aria-expanded={!collapsedScenes.has(scene.key)}
@@ -4343,9 +4449,7 @@
                 {/if}
               </div>
             </section>
-          {/if}
         </div>
-        {/if}
 
         <!-- Подвал модального окна глоссария -->
         <div class="glossary-modal-footer">
@@ -7533,6 +7637,10 @@
     cursor: pointer;
   }
 
+  .character-part-unexplained {
+    color: #fbbf24;
+  }
+
   .character-part-link:hover {
     text-decoration: underline;
   }
@@ -7736,6 +7844,36 @@
     flex-shrink: 0;
     font-size: 10px;
     color: #fbbf24;
+  }
+
+  .character-locked-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    border-bottom: 1px solid #4338ca;
+    background: #1e1b4b;
+    font-size: 12px;
+    color: #c7d2fe;
+  }
+
+  .character-locked-banner button {
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+
+  .character-card-locked {
+    opacity: 0.45;
+  }
+
+  .character-updating {
+    box-shadow: inset 2px 0 0 #818cf8;
+  }
+
+  .character-updating-mark {
+    display: inline-flex;
+    flex-shrink: 0;
+    color: #a5b4fc;
   }
 
   .character-merge-select {
@@ -8199,40 +8337,6 @@
     border-color: #38bdf8;
   }
 
-  .add-char-panel,
-  .add-term-panel {
-    background: #0d111a;
-    border-bottom: 1px solid #1a2232;
-    padding: 10px 18px;
-  }
-
-  .add-char-row,
-  .add-term-row {
-    display: flex;
-    align-items: flex-end;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-
-  .field-item {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    flex: 1;
-    min-width: 130px;
-  }
-
-  .field-item.flex-2 {
-    flex: 2;
-    min-width: 180px;
-  }
-
-  .field-label {
-    font-size: 11px;
-    font-weight: 500;
-    color: #64748b;
-  }
-
   .btn-confirm-add {
     display: inline-flex;
     align-items: center;
@@ -8359,12 +8463,6 @@
     overflow-y: auto;
     flex-shrink: 0;
     border-right: 1px solid #1a2232;
-  }
-
-  .glossary-edit-wide {
-    flex: 1;
-    width: auto;
-    border-right: none;
   }
 
   .sidebar-edit-header {
@@ -8670,63 +8768,18 @@
     box-shadow: 0 0 8px rgba(168, 85, 247, 0.35);
   }
 
-  .token-pane {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-    background: #0a0d14;
-  }
-
-  .token-list {
-    flex: 1;
-    overflow-y: auto;
-    min-height: 0;
-  }
-
-  .token-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    align-items: center;
-    gap: 14px;
-    padding: 10px 18px;
-    border-bottom: 1px solid #1a2232;
-  }
-
-  .token-info {
-    min-width: 0;
-  }
-
-  .token-head {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 4px 10px;
-  }
-
-  .token-example {
-    margin: 6px 0 0;
+  .token-list-note {
     overflow: hidden;
-    font-size: 12px;
-    color: #94a3b8;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .token-note {
-    width: 100%;
-    box-sizing: border-box;
-    padding: 8px 10px;
-    border: 1px solid #1e293b;
-    border-radius: 6px;
-    background: #0f172a;
-    color: #e2e8f0;
+  .token-card-text {
+    margin: 0;
     font-size: 13px;
-  }
-
-  .token-note:focus {
-    outline: none;
-    border-color: #10b981;
+    line-height: 1.5;
+    color: #94a3b8;
+    overflow-wrap: anywhere;
   }
 
   .glossary-empty-state {
