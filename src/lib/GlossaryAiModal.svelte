@@ -28,6 +28,7 @@
     speech: string;
     excluded_scenes: string[];
     merged: { alias: string; original_name: string }[];
+    excluded_notes: string[];
   }
 
   export interface TermGlossaryEntry {
@@ -78,6 +79,7 @@
     characters = [],
     terms = [],
     tokens = [],
+    names = [],
     initialTab = "characters",
     onapply = () => {},
     onclose = () => {}
@@ -87,6 +89,7 @@
     characters: CharacterGlossaryEntry[];
     terms: TermGlossaryEntry[];
     tokens: { name: string; note: string }[];
+    names: [string, string][];
     initialTab?: "characters" | "terms";
     onapply: (updatedChars: CharacterGlossaryEntry[], updatedTerms: TermGlossaryEntry[]) => void;
     onclose: () => void;
@@ -279,7 +282,7 @@
         apiUrl: apiUrl.trim(),
         model: selectedModel.trim(),
         characters: rows.map((row) => previewChars[row.index]),
-        tokens: $state.snapshot(tokens),
+        hints: { tokens: $state.snapshot(tokens), names },
         options: { onlyEmpty, sampleCount, wholeScenes },
         onBatch: batchChannel<CharacterResult>((items) => {
           for (const { samples, ...character } of items) {

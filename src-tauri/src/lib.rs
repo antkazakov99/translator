@@ -1713,7 +1713,7 @@ async fn autofill_glossary_characters(
     api_url: String,
     model: String,
     characters: Vec<glossary::CharacterGlossaryEntry>,
-    tokens: Vec<glossary::TokenGlossaryEntry>,
+    hints: llm::ModelHints,
     options: CharacterRunOptions,
     on_batch: Channel<llm::BatchProgress<llm::CharacterResult>>,
 ) -> Result<llm::AutofillResult<glossary::CharacterGlossaryEntry>, String> {
@@ -1727,12 +1727,14 @@ async fn autofill_glossary_characters(
     let selected = characters.clone();
     let samples = tauri::async_runtime::spawn_blocking(move || {
         let game = game_lines(&base_path);
-        let notes = llm::token_notes(&tokens);
-        if options.whole_scenes {
+        let notes = llm::token_notes(&hints.tokens);
+        let mut samples = if options.whole_scenes {
             llm::collect_scene_samples(&game, &notes, &selected)
         } else {
             llm::collect_character_dialogue_samples(&game.lines, &game.variables, &notes, &selected, sample_count)
-        }
+        };
+        llm::add_name_hints(&mut samples, &hints.names);
+        samples
     })
     .await
     .map_err(|e| format!("Ошибка сбора контекста персонажей: {}", e))?;
@@ -1778,6 +1780,38 @@ async fn count_character_chunks(
     .map_err(|e| format!("Ошибка подсчёта сцен персонажа: {}", e))
 }
 
+/// Все части сцен персонажа с заметками от этой модели.
+#[tauri::command]
+async fn list_character_parts(
+    game_dir: String,
+    model: String,
+    character: glossary::CharacterGlossaryEntry,
+    tokens: Vec<glossary::TokenGlossaryEntry>,
+) -> Result<Vec<llm::CharacterPart>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let chunks = llm::scene_chunks(&game_lines(&base_path), &llm::token_notes(&tokens), &character);
+        let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+        llm::character_parts(&chunks, &model, &character.alias, &notes_file)
+    })
+    .await
+    .map_err(|e| format!("Ошибка чтения заметок персонажа: {}", e))
+}
+
+/// Сбрасывает заметки частей: следующий запуск прочитает их заново.
+#[tauri::command]
+async fn reset_character_notes(game_dir: String, keys: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+        let file_lock = path_lock(&notes_file);
+        let _guard = file_lock.lock();
+        llm::forget_notes(&notes_file, &keys)
+    })
+    .await
+    .map_err(|e| format!("Ошибка сброса заметок: {}", e))?
+}
+
 /// Обновляет персонажа по `parts` частям его сцен. Готовые части сохранены, и следующий запуск
 /// продолжит с того же места. `None` значит, что запуск остановлен раньше первой заметки.
 #[tauri::command]
@@ -1786,7 +1820,7 @@ async fn summarize_glossary_character(
     api_url: String,
     model: String,
     character: glossary::CharacterGlossaryEntry,
-    tokens: Vec<glossary::TokenGlossaryEntry>,
+    hints: llm::ModelHints,
     parts: usize,
     on_progress: Channel<llm::SummaryProgress>,
 ) -> Result<Option<glossary::CharacterGlossaryEntry>, String> {
@@ -1796,6 +1830,7 @@ async fn summarize_glossary_character(
     let selected = character.clone();
     let notes = notes_file.clone();
     let chosen_model = model.clone();
+    let tokens = hints.tokens;
     let chunks = tauri::async_runtime::spawn_blocking(move || {
         let chunks = llm::scene_chunks(&game_lines(&base_path), &llm::token_notes(&tokens), &selected);
         let ready = llm::ready_chunks(&chunks, &chosen_model, &selected.alias, &notes);
@@ -1804,7 +1839,8 @@ async fn summarize_glossary_character(
     .await
     .map_err(|e| format!("Ошибка подготовки сцен персонажа: {}", e))?;
 
-    llm::summarize_character(&api_url, &model, character, chunks, &notes_file, &LLM_CANCEL, |progress| {
+    let target = llm::ChatTarget { api_url: &api_url, model: &model };
+    llm::summarize_character(&target, character, chunks, &hints.names, &notes_file, &LLM_CANCEL, |progress| {
         if let Err(error) = on_progress.send(progress) {
             tracing::warn!(%error, "Ход обработки не передан в интерфейс");
         }
@@ -1938,6 +1974,8 @@ pub fn run() {
             summarize_glossary_character,
             count_character_chunks,
             list_text_tokens,
+            list_character_parts,
+            reset_character_notes,
             get_character_scenes
         ])
         .run(tauri::generate_context!())
