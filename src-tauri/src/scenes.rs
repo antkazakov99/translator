@@ -86,12 +86,14 @@ pub fn load_lines(scripts: &[PathBuf], file_name: impl Fn(&Path) -> String + Syn
 /// Реплики игры с тем, что считается один раз на все запросы.
 pub struct GameLines {
     pub lines: Vec<ScriptLine>,
+    /// Значения строковых переменных из скриптов.
+    pub variables: HashMap<String, Vec<String>>,
     /// Слова, которые встречаются со строчной буквы.
     lowercase: HashSet<String>,
 }
 
 impl GameLines {
-    pub fn new(lines: Vec<ScriptLine>) -> Self {
+    pub fn new(lines: Vec<ScriptLine>, variables: HashMap<String, Vec<String>>) -> Self {
         let lowercase = lines
             .iter()
             .flat_map(|line| RE_WORD.find_iter(&line.text))
@@ -99,7 +101,7 @@ impl GameLines {
             .filter(|word| word.starts_with(char::is_lowercase))
             .map(str::to_string)
             .collect();
-        Self { lines, lowercase }
+        Self { lines, variables, lowercase }
     }
 }
 
@@ -175,7 +177,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("story.rpy");
         fs::write(&path, content).unwrap();
-        let game = GameLines::new(load_lines(&[path], |_| "story.rpy".to_string()));
+        let game = GameLines::new(load_lines(&[path], |_| "story.rpy".to_string()), HashMap::new());
         let found = character_scenes(&game, &[alias], &[name]);
         let _ = fs::remove_dir_all(dir);
         found
@@ -233,7 +235,7 @@ mod tests {
             "label one:\n    hi \"First.\"\nlabel two:\n    hil \"Second.\"\n    m \"Bye, Hilde.\"\n",
         )
         .unwrap();
-        let game = GameLines::new(load_lines(&[path], |_| "story.rpy".to_string()));
+        let game = GameLines::new(load_lines(&[path], |_| "story.rpy".to_string()), HashMap::new());
         let found = character_scenes(&game, &["hil", "hi"], &["Hilde", "Hilde"]);
         let _ = fs::remove_dir_all(dir);
         assert_eq!(found.len(), 2);

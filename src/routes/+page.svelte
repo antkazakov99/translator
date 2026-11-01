@@ -714,20 +714,43 @@
     const timer = setTimeout(() => { showGlossarySkeleton = true; }, 180);
     return () => clearTimeout(timer);
   });
-  let characterUpdateMode = $state<"lines" | "scenes">("lines");
-  // Ползунок: одна часть это один запрос, иначе заметки по частям и итоговый запрос
+  let characterUpdateMode = $state<"lines" | "scenes">("scenes");
+  // Ползунок: одна новая часть это один запрос, иначе заметки по частям и итоговый запрос.
+  // Готовые части входят в запуск всегда, поэтому ниже их числа он не опускается
   let scenePartsWanted = $state(1);
   let sceneChunkCount = $state<number | null>(null);
-  let sceneParts = $derived(Math.min(scenePartsWanted, sceneChunkCount ?? 1));
-  let sceneRequests = $derived(sceneParts > 1 ? sceneParts + 1 : 1);
+  let sceneReadyCount = $state(0);
+  let sceneParts = $derived(Math.min(Math.max(scenePartsWanted, sceneReadyCount), sceneChunkCount ?? 1));
+  let sceneRequests = $derived(sceneParts > 1 || sceneReadyCount > 0 ? sceneParts - sceneReadyCount + 1 : 1);
+  let sceneNotesRevision = $state(0);
+  // Шкала делится на части. Если частей слишком много, зазоры съели бы сами сегменты
+  const MAX_SEGMENTS_WITH_GAPS = 80;
+  let sceneTrackStyle = $derived.by(() => {
+    const total = sceneChunkCount || 1;
+    // Центр бегунка ходит между половинами его ширины по краям шкалы
+    const stop = (parts: number) => {
+      if (parts <= 0) return "0px";
+      return parts >= total ? "100%" : `calc(7px + (100% - 14px) * ${parts / total})`;
+    };
+    return `--ready-stop: ${stop(sceneReadyCount)}; --parts-stop: ${stop(sceneChunkCount ? sceneParts : 0)}; --segment: ${100 / total}%`;
+  });
   let summaryRunning = $state(false);
-  const sceneChunkCache = new Map<string, number>();
+  const sceneChunkCache = new Map<string, { total: number; ready: number }>();
+  // Чтение частей и сборка описания это разные шаги: сборка идёт и после остановки чтения
   let summaryProgress = $state<{ stage: string; done: number; total: number } | null>(null);
+  let summaryBuild = $state<{ stage: string; done: number; total: number } | null>(null);
+  let summaryStopping = $state(false);
   let summaryLabel = $derived.by(() => {
+    if (summaryBuild) return summaryStopping ? "Чтение остановлено" : "Чтение сцен завершено";
+    if (summaryStopping) return "Останавливаю чтение: дочитываю текущую часть";
     if (!summaryProgress) return "Подготовка сцен...";
-    if (summaryProgress.stage === "condense") return `Сжатие заметок: ${summaryProgress.done + 1} из ${summaryProgress.total}`;
-    if (summaryProgress.stage === "final") return "Пишу итоговое описание...";
     return `Чтение сцен: часть ${summaryProgress.done + 1} из ${summaryProgress.total}`;
+  });
+  let summaryBuildLabel = $derived.by(() => {
+    if (!summaryBuild) return "Затем сборка описания";
+    if (summaryBuild.stage === "single") return "Читаю часть и пишу описание...";
+    if (summaryBuild.stage === "condense") return `Сжатие заметок: ${summaryBuild.done + 1} из ${summaryBuild.total}`;
+    return "Пишу итоговое описание...";
   });
   let collapsedScenes = $state.raw(new Set<string>());
   let updatingCharacter = $state(false);
@@ -802,31 +825,48 @@
     };
   });
 
-  // Число частей зависит от сцен и выключенных галочек, поэтому считается при их смене
+  // Число частей зависит от сцен и выключенных галочек, поэтому считается при их смене.
+  // Пауза нужна только галочкам: так не копятся запросы, а новый персонаж нужен сразу
+  let sceneChunkTarget: string | null = null;
   $effect(() => {
     const char = selectedGlossaryChar;
     if (characterUpdateMode !== "scenes" || !char || !scenesTarget) return;
-    const key = JSON.stringify([scenesTarget, char.excluded_scenes]);
+    const delay = sceneChunkTarget === scenesTarget ? 100 : 0;
+    sceneChunkTarget = scenesTarget;
+    const model = storedLlmModel();
+    const key = JSON.stringify([scenesTarget, char.excluded_scenes, model, sceneNotesRevision]);
+    const show = (chunks: { total: number; ready: number } | null) => {
+      sceneChunkCount = chunks?.total ?? null;
+      sceneReadyCount = chunks?.ready ?? 0;
+    };
     const cached = sceneChunkCache.get(key);
     if (cached !== undefined) {
-      sceneChunkCount = cached;
+      show(cached);
       return;
     }
     let current = true;
     const dir = gameDir;
     const timer = setTimeout(() => {
-      invoke<number>("count_character_chunks", { gameDir: dir, character: untrack(() => $state.snapshot(char)) })
-        .then((count) => {
-          sceneChunkCache.set(key, count);
-          if (current) sceneChunkCount = count;
+      invoke<{ total: number; ready: number }>("count_character_chunks", { gameDir: dir, model, character: untrack(() => $state.snapshot(char)) })
+        .then((chunks) => {
+          sceneChunkCache.set(key, chunks);
+          if (current) show(chunks);
         })
-        .catch(() => { if (current) sceneChunkCount = null; });
-    }, 100);
+        .catch(() => { if (current) show(null); });
+    }, delay);
     return () => {
       current = false;
       clearTimeout(timer);
     };
   });
+
+  function storedLlmModel() {
+    try {
+      return (localStorage.getItem("translator.llm_model") || "mistral-small").trim();
+    } catch {
+      return "mistral-small";
+    }
+  }
 
   function sceneCountLabel(scene: CharacterScene) {
     return [
@@ -951,8 +991,8 @@
     updatingCharacter = true;
     try {
       const apiUrl = stored("translator.llm_api_url", "http://127.0.0.1:1234/v1").trim();
-      const model = stored("translator.llm_model", "mistral-small").trim();
-      if (characterUpdateMode === "scenes" && sceneParts > 1) {
+      const model = storedLlmModel();
+      if (characterUpdateMode === "scenes") {
         summaryRunning = true;
         // Заметки частей сразу видны в описании, итог их заменит
         const description = char.notes;
@@ -962,8 +1002,11 @@
           if (progress.note) {
             draft.push(progress.note);
             char.notes = draft.join("\n\n");
-          } else {
+          } else if (progress.stage === "scenes") {
             summaryProgress = progress;
+          } else {
+            if (summaryProgress && !summaryStopping) summaryProgress = { ...summaryProgress, done: summaryProgress.total };
+            summaryBuild = progress;
           }
         };
         const restoreDescription = () => {
@@ -982,6 +1025,7 @@
           });
           if (summary) {
             applyCharacterUpdate(char, summary);
+            if (summaryStopping) showToast("Описание собрано по прочитанным частям, следующий запуск дочитает остальные", "info");
           } else {
             restoreDescription();
             showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
@@ -1002,7 +1046,7 @@
         options: {
           onlyEmpty: false,
           sampleCount: count > 0 ? count : 64,
-          wholeScenes: characterUpdateMode === "scenes"
+          wholeScenes: false
         },
         onBatch: new Channel()
       });
@@ -1018,6 +1062,9 @@
       updatingCharacter = false;
       summaryRunning = false;
       summaryProgress = null;
+      summaryBuild = null;
+      summaryStopping = false;
+      sceneNotesRevision += 1;
     }
   }
 
@@ -1293,9 +1340,17 @@
       : []
   );
 
+  // Правленые строки остаются на месте, иначе строка пропадала бы из «Без перевода» с первой же буквы
+  let editedEntries = $state.raw(new Set<string>());
+  $effect(() => {
+    void [filterStatus, searchQuery, selectedSceneId, currentFile?.file_path];
+    editedEntries = new Set();
+  });
+
   // Отфильтрованные реплики с учетом поиска и статуса
   function filterSceneEntries(entries: DialogueEntry[]) {
     return entries.filter(e => {
+      if (editedEntries.has(e.translation_key)) return true;
       const matchSearch = searchQuery === "" || 
         e.original_text.toLowerCase().includes(searchQuery.toLowerCase()) ||
         (e.translated_text && e.translated_text.toLowerCase().includes(searchQuery.toLowerCase())) ||
@@ -1348,6 +1403,7 @@
   }
 
   function recordTranslationEdit(entry: DialogueEntry, text: string) {
+    if (!editedEntries.has(entry.translation_key)) editedEntries = new Set(editedEntries).add(entry.translation_key);
     entry.translated_text = text;
     translationEdits[entry.translation_key] = text;
     updateTranslationStats();
@@ -2671,7 +2727,7 @@
                               <div class="inline-trans-field">
                                 <textarea
                                   class="table-trans-textarea"
-                                  bind:value={entry.translated_text}
+                                  value={entry.translated_text ?? ""}
                                   oninput={(event) => recordTranslationEdit(entry, event.currentTarget.value)}
                                   disabled={loadingFile || loadingProject || savingTranslations}
                                   placeholder="Введите перевод..."
@@ -3580,34 +3636,6 @@
                       <option value={other.alias}>{other.original_name} [{other.alias}]</option>
                     {/each}
                   </select>
-                  {#if characterUpdateMode === "scenes" && selectedGlossaryChar}
-                    <div class="character-scene-depth">
-                      <div class="character-summary-line">
-                        <label for="scene-parts">Частей запроса</label>
-                        <span class="char-sub-label">
-                          {#if sceneChunkCount === null}
-                            подсчёт...
-                          {:else if sceneChunkCount === 0}
-                            нет реплик
-                          {:else}
-                            {sceneParts} из {sceneChunkCount} · запросов: {sceneRequests}
-                          {/if}
-                        </span>
-                      </div>
-                      <input
-                        id="scene-parts"
-                        type="range"
-                        min="1"
-                        max={Math.max(sceneChunkCount ?? 1, 1)}
-                        bind:value={scenePartsWanted}
-                        disabled={updatingCharacter || !sceneChunkCount || sceneChunkCount < 2}
-                      />
-                      <div class="character-depth-ends">
-                        <span>1 запрос, выборка</span>
-                        <span>весь текст, долго</span>
-                      </div>
-                    </div>
-                  {/if}
                   <div class="character-update-row">
                     <select bind:value={characterUpdateMode} class="sidebar-select" disabled={updatingCharacter} aria-label="Что передать модели">
                       <option value="lines">По отдельным репликам</option>
@@ -3626,18 +3654,72 @@
                       <span>Обновить через ИИ</span>
                     </button>
                   </div>
+                  {#if characterUpdateMode === "scenes" && selectedGlossaryChar}
+                    <div class="character-scene-depth">
+                      <div class="character-summary-line">
+                        <label for="scene-parts">Частей запроса</label>
+                        <span class="char-sub-label">
+                          {#if sceneChunkCount === null}
+                            подсчёт...
+                          {:else if sceneChunkCount === 0}
+                            нет реплик
+                          {:else}
+                            {sceneParts} из {sceneChunkCount} · запросов: {sceneRequests}
+                          {/if}
+                        </span>
+                      </div>
+                      <input
+                        id="scene-parts"
+                        type="range"
+                        min="0"
+                        max={Math.max(sceneChunkCount ?? 1, 1)}
+                        value={sceneParts}
+                        style={sceneTrackStyle}
+                        class:segmented={(sceneChunkCount ?? 0) <= MAX_SEGMENTS_WITH_GAPS}
+                        oninput={(event) => {
+                          scenePartsWanted = Math.max(event.currentTarget.valueAsNumber, sceneReadyCount, 1);
+                          event.currentTarget.value = String(scenePartsWanted);
+                        }}
+                        disabled={updatingCharacter || !sceneChunkCount || sceneChunkCount < 2 || sceneReadyCount >= sceneChunkCount}
+                      />
+                      <div class="character-depth-ends">
+                        {#if sceneReadyCount > 0}
+                          <span class="character-depth-ready">готово: {sceneReadyCount}</span>
+                        {:else}
+                          <span>1 часть, 1 запрос</span>
+                        {/if}
+                        <span>весь текст, долго</span>
+                      </div>
+                    </div>
+                  {/if}
                   {#if summaryRunning}
                     <div class="character-summary-progress">
-                      <div class="character-summary-line">
-                        <Loader2 size={13} class="spin" />
-                        <span>{summaryLabel}</span>
-                        <button class="character-scene-link" onclick={() => invoke("cancel_llm_run")}>Остановить</button>
-                      </div>
-                      {#if summaryProgress && summaryProgress.total > 0}
-                        <div class="character-summary-track">
-                          <div class="character-summary-fill" style={`width: ${(summaryProgress.done / summaryProgress.total) * 100}%`}></div>
+                      {#if summaryBuild?.stage !== "single"}
+                        <div class="character-summary-line">
+                          {#if summaryBuild}
+                            <CheckCircle2 size={13} />
+                          {:else}
+                            <Loader2 size={13} class="spin" />
+                          {/if}
+                          <span>{summaryLabel}</span>
+                          {#if !summaryBuild && !summaryStopping}
+                            <button class="character-scene-link" onclick={() => { summaryStopping = true; invoke("cancel_llm_run"); }}>Остановить</button>
+                          {/if}
                         </div>
+                        {#if summaryProgress && summaryProgress.total > 0}
+                          <div class="character-summary-track">
+                            <div class="character-summary-fill" style={`width: ${(summaryProgress.done / summaryProgress.total) * 100}%`}></div>
+                          </div>
+                        {/if}
                       {/if}
+                      <div class="character-summary-line character-summary-build" class:waiting={!summaryBuild} class:single={summaryBuild?.stage === "single"}>
+                        {#if summaryBuild}
+                          <Loader2 size={13} class="spin" />
+                        {:else}
+                          <Sparkles size={13} />
+                        {/if}
+                        <span>{summaryBuildLabel}</span>
+                      </div>
                     </div>
                   {/if}
                 </div>
@@ -7269,9 +7351,66 @@
   }
 
   .character-scene-depth input {
+    --track: linear-gradient(
+      to right,
+      #38bdf8 var(--ready-stop),
+      #10b981 var(--ready-stop) var(--parts-stop),
+      #1e293b var(--parts-stop)
+    );
+    appearance: none;
     width: 100%;
-    accent-color: #10b981;
+    height: 16px;
+    margin: 0;
+    background: transparent;
     cursor: pointer;
+  }
+
+  .character-scene-depth input:disabled {
+    cursor: default;
+  }
+
+  .character-scene-depth input::-webkit-slider-runnable-track {
+    height: 8px;
+    border-radius: 4px;
+    background-image: var(--track);
+  }
+
+  /* Зазоры уже шкалы на ширину бегунка: его центр ходит ровно по границам сегментов */
+  .character-scene-depth input.segmented::-webkit-slider-runnable-track {
+    background-image:
+      repeating-linear-gradient(
+        to right,
+        transparent 0 calc(var(--segment) - 2px),
+        #0f172a calc(var(--segment) - 2px) var(--segment)
+      ),
+      var(--track);
+    background-position: center;
+    background-repeat: no-repeat;
+    background-size: calc(100% - 14px) 100%, 100% 100%;
+  }
+
+  .character-scene-depth input::-webkit-slider-thumb {
+    appearance: none;
+    width: 14px;
+    height: 14px;
+    margin-top: -3px;
+    border: 2px solid #0f172a;
+    border-radius: 50%;
+    background: #f8fafc;
+  }
+
+  .character-scene-depth input:disabled::-webkit-slider-thumb {
+    background: #64748b;
+  }
+
+  .character-scene-depth input:focus-visible {
+    outline: 1px solid #10b981;
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  .character-depth-ready {
+    color: #38bdf8;
   }
 
   .character-scene-depth .char-sub-label {
@@ -7302,6 +7441,22 @@
 
   .character-summary-line .character-scene-link {
     margin-left: auto;
+  }
+
+  .character-summary-build {
+    margin-top: 2px;
+    padding-top: 8px;
+    border-top: 1px solid #1e293b;
+  }
+
+  .character-summary-build.waiting {
+    color: #64748b;
+  }
+
+  .character-summary-build.single {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: none;
   }
 
   .character-summary-track {

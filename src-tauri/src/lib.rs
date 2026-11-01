@@ -1660,7 +1660,7 @@ fn game_lines(base_path: &Path) -> Arc<scenes::GameLines> {
     let order = story_order(&structures);
     // Сортировка устойчива: реплики внутри сцены и сцены без метки сохраняют порядок файлов
     lines.sort_by_key(|line| order.get(&line.scene).copied().unwrap_or(usize::MAX));
-    let game = Arc::new(scenes::GameLines::new(lines));
+    let game = Arc::new(scenes::GameLines::new(lines, llm::string_variables(&scripts)));
     PROJECT_CACHE.lock().lines.insert(base_path.to_path_buf(), game.clone());
     game
 }
@@ -1725,12 +1725,11 @@ async fn autofill_glossary_characters(
         .clamp(1, llm::MAX_CHARACTER_SAMPLES);
     let selected = characters.clone();
     let samples = tauri::async_runtime::spawn_blocking(move || {
-        let variables = llm::string_variables(&original_scripts(&base_path));
         let game = game_lines(&base_path);
         if options.whole_scenes {
-            llm::collect_scene_samples(&game, &variables, &selected)
+            llm::collect_scene_samples(&game, &selected)
         } else {
-            llm::collect_character_dialogue_samples(&game.lines, &variables, &selected, sample_count)
+            llm::collect_character_dialogue_samples(&game.lines, &game.variables, &selected, sample_count)
         }
     })
     .await
@@ -1742,23 +1741,32 @@ async fn autofill_glossary_characters(
     .await
 }
 
-/// Сколько частей дают включённые сцены персонажа.
+#[derive(Debug, Serialize)]
+struct CharacterChunks {
+    total: usize,
+    ready: usize,
+}
+
+/// Сколько частей дают включённые сцены персонажа и сколько из них уже прочитано.
 #[tauri::command]
 async fn count_character_chunks(
     game_dir: String,
+    model: String,
     character: glossary::CharacterGlossaryEntry,
-) -> Result<usize, String> {
+) -> Result<CharacterChunks, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
-        let variables = llm::string_variables(&original_scripts(&base_path));
-        llm::scene_chunks(&game_lines(&base_path), &variables, &character).len()
+        let chunks = llm::scene_chunks(&game_lines(&base_path), &character);
+        let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+        let ready = llm::ready_chunks(&chunks, &model, &character.alias, &notes_file);
+        CharacterChunks { total: chunks.len(), ready: ready.iter().filter(|ready| **ready).count() }
     })
     .await
     .map_err(|e| format!("Ошибка подсчёта сцен персонажа: {}", e))
 }
 
-/// Обновляет персонажа по `parts` частям его сцен. `None` значит, что запуск остановлен:
-/// готовые части сохранены, и следующий запуск продолжит с того же места.
+/// Обновляет персонажа по `parts` частям его сцен. Готовые части сохранены, и следующий запуск
+/// продолжит с того же места. `None` значит, что запуск остановлен раньше первой заметки.
 #[tauri::command]
 async fn summarize_glossary_character(
     game_dir: String,
@@ -1772,9 +1780,12 @@ async fn summarize_glossary_character(
     let base_path = effective_game_directory(Path::new(&game_dir));
     let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
     let selected = character.clone();
+    let notes = notes_file.clone();
+    let chosen_model = model.clone();
     let chunks = tauri::async_runtime::spawn_blocking(move || {
-        let variables = llm::string_variables(&original_scripts(&base_path));
-        llm::pick_chunks(llm::scene_chunks(&game_lines(&base_path), &variables, &selected), parts)
+        let chunks = llm::scene_chunks(&game_lines(&base_path), &selected);
+        let ready = llm::ready_chunks(&chunks, &chosen_model, &selected.alias, &notes);
+        llm::pick_chunks(chunks, parts, &ready)
     })
     .await
     .map_err(|e| format!("Ошибка подготовки сцен персонажа: {}", e))?;
