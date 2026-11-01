@@ -44,6 +44,7 @@ static RE_STRING_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
 const MAX_VARIABLE_VALUES: usize = 3;
 const MAX_VARIABLE_CHARS: usize = 40;
 const MAX_PART_START: usize = 140;
+const MAX_TERM_HINT_CHARS: usize = 1500;
 
 /// Результат пакетного автозаполнения. Сбой отдельного пакета не отменяет
 /// уже полученные переводы, поэтому число сбоев передаётся интерфейсу.
@@ -347,12 +348,32 @@ pub fn string_variables(scripts: &[PathBuf]) -> HashMap<String, Vec<String>> {
 /// Пояснения пользователя к токенам по именам.
 pub type TokenNotes = HashMap<String, String>;
 
+/// Имя персонажа из глоссария.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KnownName {
+    pub original: String,
+    pub translated: String,
+    pub gender: String,
+}
+
+impl KnownName {
+    fn gender_word(&self) -> Option<&'static str> {
+        match self.gender.as_str() {
+            "male" => Some("male"),
+            "female" => Some("female"),
+            "neuter" => Some("neuter"),
+            _ => None,
+        }
+    }
+}
+
 /// Что модель получает сверх текста игры.
 #[derive(Debug, Default, Deserialize)]
 pub struct ModelHints {
     pub tokens: Vec<TokenGlossaryEntry>,
-    /// Пары из оригинала имени и его перевода.
-    pub names: Vec<(String, String)>,
+    pub names: Vec<KnownName>,
+    #[serde(default)]
+    pub terms: Vec<TermGlossaryEntry>,
 }
 
 pub fn token_notes(tokens: &[TokenGlossaryEntry]) -> TokenNotes {
@@ -489,24 +510,72 @@ fn mentions(text: &str, name: &str) -> bool {
         })
 }
 
-/// Переводы имён из глоссария для тех, кто упомянут в тексте. Строка не входит в части сцен:
-/// с уточнённым переводом имени готовые заметки остаются действительными.
-fn name_hint(text: &str, names: &[(String, String)]) -> Option<String> {
+/// Персонажи глоссария, упомянутые в тексте.
+fn mentioned_names<'a>(text: &str, names: &'a [KnownName]) -> Vec<&'a KnownName> {
     let mut seen = HashSet::new();
-    let pairs: Vec<String> = names
+    names
         .iter()
-        .filter(|(original, _)| seen.insert(original.as_str()) && mentions(text, original))
-        .map(|(original, translated)| format!("{original} = {translated}"))
-        .collect();
-    (!pairs.is_empty()).then(|| format!("Russian names: {}", pairs.join(", ")))
+        .filter(|name| seen.insert(name.original.as_str()) && mentions(text, &name.original))
+        .collect()
 }
 
-/// Добавляет к материалам каждого персонажа переводы имён из них.
-pub fn add_name_hints(samples: &mut HashMap<String, Vec<String>>, names: &[(String, String)]) {
+/// Переводы имён из глоссария для тех, кто упомянут в тексте. Строка не входит в части сцен:
+/// с уточнённым переводом имени готовые заметки остаются действительными. Пол идёт отдельной
+/// строкой: пометку рядом с именем модель переписывала в ответ.
+fn name_hint(text: &str, names: &[KnownName]) -> Option<String> {
+    let named = mentioned_names(text, names);
+    if named.is_empty() {
+        return None;
+    }
+    let pairs: Vec<String> = named.iter().map(|name| format!("{} = {}", name.original, name.translated)).collect();
+    let genders: Vec<String> = named
+        .iter()
+        .filter_map(|name| name.gender_word().map(|gender| format!("{} {gender}", name.original)))
+        .collect();
+    let mut hint = format!("Russian names: {}", pairs.join(", "));
+    if !genders.is_empty() {
+        hint.push_str(&format!("\nGender: {}", genders.join(", ")));
+    }
+    Some(hint)
+}
+
+/// Заполненные термины глоссария, которые встречаются в тексте. Как и имена, в части сцен они
+/// не входят. Объём ограничен: итоговому запросу достаются термины со всего текста персонажа.
+fn mentioned_terms(text: &str, terms: &[TermGlossaryEntry]) -> Vec<String> {
+    let text = text.to_lowercase();
+    let mut size = 0;
+    terms
+        .iter()
+        .filter(|term| !term.translated_term.trim().is_empty())
+        .filter(|term| mentions(&text, &term.source_term.trim().to_lowercase()))
+        .map(|term| {
+            let pair = format!("{} = {}", term.source_term.trim(), term.translated_term.trim());
+            match term.notes.trim() {
+                "" => pair,
+                notes => format!("{pair} ({notes})"),
+            }
+        })
+        .take_while(|pair| {
+            size += pair.chars().count() + 2;
+            size <= MAX_TERM_HINT_CHARS
+        })
+        .collect()
+}
+
+fn term_hint(text: &str, terms: &[TermGlossaryEntry]) -> Option<String> {
+    let pairs = mentioned_terms(text, terms);
+    (!pairs.is_empty()).then(|| format!("Known terms: {}", pairs.join(", ")))
+}
+
+/// Подсказки из глоссария для этого текста.
+fn glossary_hints(text: &str, hints: &ModelHints) -> Vec<String> {
+    name_hint(text, &hints.names).into_iter().chain(term_hint(text, &hints.terms)).collect()
+}
+
+/// Добавляет к материалам каждого персонажа подсказки из глоссария.
+pub fn add_glossary_hints(samples: &mut HashMap<String, Vec<String>>, hints: &ModelHints) {
     for lines in samples.values_mut() {
-        if let Some(hint) = name_hint(&lines.join("\n"), names) {
-            lines.insert(0, hint);
-        }
+        lines.splice(0..0, glossary_hints(&lines.join("\n"), hints));
     }
 }
 
@@ -699,27 +768,63 @@ fn split_scene(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Сцена внутри части. Файл и путь нужны, чтобы открыть её в редакторе.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PartScene {
+    pub scene: String,
+    pub file: String,
+    pub path: String,
+}
+
+/// Часть сцен персонажа: текст для модели и сцены, из которых он собран.
+pub struct ScenePart {
+    pub text: String,
+    pub scenes: Vec<PartScene>,
+}
+
 /// Делит все включённые сцены персонажа на части, каждая из которых помещается в запрос.
 /// Части состоят из целых сцен. По репликам режется только сцена, которая сама не помещается.
 /// Пояснения к токенам лежат в самой части: с новым пояснением её заметка считается устаревшей.
-pub fn scene_chunks(game: &GameLines, tokens: &TokenNotes, character: &CharacterGlossaryEntry) -> Vec<String> {
-    let keys: Vec<String> = scenes::character_scenes(game, &character.aliases(), &character.names())
+pub fn scene_parts(game: &GameLines, tokens: &TokenNotes, character: &CharacterGlossaryEntry) -> Vec<ScenePart> {
+    let included: Vec<_> = scenes::character_scenes(game, &character.aliases(), &character.names())
         .into_iter()
-        .map(|scene| scene.key)
-        .filter(|key| !character.excluded_scenes.contains(key))
+        .filter(|scene| !character.excluded_scenes.contains(&scene.key))
         .collect();
-    let transcripts = scene_transcripts(game, std::slice::from_ref(character), &keys.iter().cloned().collect(), tokens);
-    let pieces: Vec<String> = keys.iter().filter_map(|key| transcripts.get(key)).flat_map(|lines| split_scene(lines)).collect();
-    let sizes: Vec<usize> = pieces.iter().map(|piece| piece.chars().count()).collect();
-    let chunks = pack_scenes(&sizes, SCENE_WINDOW)
+    let keys = included.iter().map(|scene| scene.key.clone()).collect();
+    let transcripts = scene_transcripts(game, std::slice::from_ref(character), &keys, tokens);
+    let pieces: Vec<(String, &scenes::CharacterScene)> = included
+        .iter()
+        .filter_map(|scene| transcripts.get(&scene.key).map(|lines| (lines, scene)))
+        .flat_map(|(lines, scene)| split_scene(lines).into_iter().map(move |piece| (piece, scene)))
+        .collect();
+    let sizes: Vec<usize> = pieces.iter().map(|(piece, _)| piece.chars().count()).collect();
+    pack_scenes(&sizes, SCENE_WINDOW)
         .into_iter()
-        .map(|part| part.iter().map(|&index| pieces[index].as_str()).collect::<Vec<_>>().join(SCENE_BREAK));
-    chunks
-        .map(|chunk| match token_hints(&chunk, tokens).join("\n") {
-            hints if hints.is_empty() => chunk,
-            hints => format!("{chunk}\n{hints}"),
+        .map(|part| {
+            let text = part.iter().map(|&index| pieces[index].0.as_str()).collect::<Vec<_>>().join(SCENE_BREAK);
+            let mut scenes: Vec<PartScene> = Vec::new();
+            for &index in &part {
+                let source = pieces[index].1;
+                let scene = PartScene {
+                    scene: source.scene.clone(),
+                    file: source.file.clone(),
+                    path: source.path.clone(),
+                };
+                if !scenes.contains(&scene) {
+                    scenes.push(scene);
+                }
+            }
+            let text = match token_hints(&text, tokens).join("\n") {
+                hints if hints.is_empty() => text,
+                hints => format!("{text}\n{hints}"),
+            };
+            ScenePart { text, scenes }
         })
         .collect()
+}
+
+pub fn scene_chunks(game: &GameLines, tokens: &TokenNotes, character: &CharacterGlossaryEntry) -> Vec<String> {
+    scene_parts(game, tokens, character).into_iter().map(|part| part.text).collect()
 }
 
 /// Оставляет `count` частей, равномерно по игре, но не меньше готовых: прочитанное не пропадает.
@@ -750,7 +855,7 @@ fn note_key(model: &str, alias: &str, chunk: &str) -> String {
     format!("{:016x}", crate::stable_hash_str(&format!("{model}\n{alias}\n{chunk}")))
 }
 
-/// Часть сцен персонажа с заметкой модели.
+/// Часть сцен персонажа с заметкой модели и тем, что уйдёт вместе с ней в запрос.
 #[derive(Debug, Clone, Serialize)]
 pub struct CharacterPart {
     pub key: String,
@@ -759,19 +864,32 @@ pub struct CharacterPart {
     pub note: Option<String>,
     /// Модель не нашла в части сведений, в итог такая заметка не попадает.
     pub empty: bool,
+    pub scenes: Vec<PartScene>,
+    /// Персонажи, чьи имена получит модель.
+    pub names: Vec<KnownName>,
+    pub terms: Vec<String>,
 }
 
 /// Части персонажа с их заметками от этой модели.
-pub fn character_parts(chunks: &[String], model: &str, alias: &str, notes_file: &Path) -> Vec<CharacterPart> {
+pub fn character_parts(
+    parts: Vec<ScenePart>,
+    model: &str,
+    character: &CharacterGlossaryEntry,
+    notes_file: &Path,
+    hints: &ModelHints,
+) -> Vec<CharacterPart> {
     let stored = read_scene_notes(notes_file);
-    chunks
-        .iter()
-        .map(|chunk| {
-            let key = note_key(model, alias, chunk);
+    parts
+        .into_iter()
+        .map(|part| {
+            let key = note_key(model, &character.alias, &part.text);
             let note = stored.get(&key).map(|note| strip_old_marker(note).to_string());
             let empty = note.as_deref().is_some_and(|note| is_blank_note(note) || is_refusal(note));
-            let start = chunk.lines().next().unwrap_or_default().chars().take(MAX_PART_START).collect();
-            CharacterPart { key, start, note, empty }
+            let start = part.text.lines().next().unwrap_or_default().chars().take(MAX_PART_START).collect();
+            let sent = format!("{}\n{}", character.original_name, part.text);
+            let names = mentioned_names(&sent, &hints.names).into_iter().cloned().collect();
+            let terms = mentioned_terms(&sent, &hints.terms);
+            CharacterPart { key, start, note, empty, scenes: part.scenes, names, terms }
         })
         .collect()
 }
@@ -924,7 +1042,7 @@ pub async fn summarize_character(
     target: &ChatTarget<'_>,
     character: CharacterGlossaryEntry,
     chunks: Vec<String>,
-    names: &[(String, String)],
+    hints: &ModelHints,
     notes_file: &Path,
     cancel: &AtomicBool,
     on_progress: impl Fn(SummaryProgress) + Send + Sync,
@@ -942,6 +1060,8 @@ pub async fn summarize_character(
         If a line says what a variable means, rely on that line. \
         A line starting with \"Russian names:\" gives the exact spelling of names: always use it, \
         declining the name as Russian grammar requires. \
+        A line starting with \"Gender:\" tells who is male or female. \
+        A line starting with \"Known terms:\" gives established translations: use them. \
         Respond with plain text only.",
         character.original_name
     );
@@ -949,7 +1069,7 @@ pub async fn summarize_character(
     let mut stored = read_scene_notes(notes_file);
     let total = chunks.len();
     let own_name = character.original_name.clone();
-    let hint_for = |text: &str| name_hint(&format!("{own_name}\n{text}"), names);
+    let hint_for = |text: &str| glossary_hints(&format!("{own_name}\n{text}"), hints);
 
     // Одна новая часть: запрос сразу пишет описание по её тексту, и оно же становится заметкой
     let new_single_part = match chunks.as_slice() {
@@ -978,7 +1098,7 @@ pub async fn summarize_character(
         let note = match stored.get(&key) {
             Some(note) => note.clone(),
             None => {
-                let hint = hint_for(chunk).map(|hint| format!("{hint}\n\n")).unwrap_or_default();
+                let hint: String = hint_for(chunk).iter().map(|hint| format!("{hint}\n\n")).collect();
                 let prompt = format!("{hint}Script:\n\n{chunk}\n\nNotes about {}:", character.original_name);
                 let note = call_chat_completion(api_url, model, &system_prompt, &prompt, 0.2, SCENE_NOTE_TOKENS).await?;
                 stored.insert(key, note.clone());
@@ -1005,9 +1125,7 @@ pub async fn summarize_character(
     }
     let mut notes = condense_notes(api_url, model, notes, &on_progress).await?;
     // В заметках имена уже по-русски, поэтому упомянутых ищем в самом тексте игры
-    if let Some(hint) = hint_for(&chunks.join("\n")) {
-        notes.insert(0, hint);
-    }
+    notes.splice(0..0, hint_for(&chunks.join("\n")));
     on_progress(SummaryProgress { stage: "final".to_string(), done: total, total, note: None });
     write_description(api_url, model, character, notes).await.map(Some)
 }
@@ -1072,6 +1190,8 @@ For each character provided, you must output:
 
 Text in [square brackets] is an in-game variable whose value is unknown. Never infer an occupation, kinship or name from the variable's own name. If a line says what a variable means, rely on that line.
 A line starting with "Russian names:" gives the exact spelling of names: always use it in "notes" and "speech", declining the name as Russian grammar requires, even if other lines spell it differently.
+A line starting with "Gender:" tells who is male or female.
+A line starting with "Known terms:" gives established translations of game terms: use them in "notes" and "speech".
 Lines may come as a scene transcript in the form "Speaker: text". Only lines of that speaker show their own manner; lines of others show how they see the character.
 Lines may also be notes collected from every scene of the game: treat them as reliable and use all of them.
 
@@ -1673,16 +1793,62 @@ mod tests {
     }
 
     #[test]
+    fn test_term_hint_covers_filled_terms_in_the_text() {
+        let term = |source: &str, translated: &str, notes: &str| TermGlossaryEntry {
+            source_term: source.to_string(),
+            translated_term: translated.to_string(),
+            notes: notes.to_string(),
+            ..Default::default()
+        };
+        let terms = [
+            term("PPF HQ", "Штаб ППФ", "главная база"),
+            term("Rune", "Руна", ""),
+            term("Blade", "", "без перевода"),
+            term("Absent", "Нет в тексте", ""),
+        ];
+        assert_eq!(
+            term_hint("Back to the ppf hq with a RUNE, a blade and runes.", &terms).as_deref(),
+            Some("Known terms: PPF HQ = Штаб ППФ (главная база), Rune = Руна")
+        );
+        assert_eq!(term_hint("Only runes here.", &terms), None);
+
+        // Запрос не раздувается, сколько бы терминов ни нашлось
+        let many: Vec<TermGlossaryEntry> = (0..400).map(|i| term(&format!("Term{i}"), &format!("Термин {i}"), "")).collect();
+        let text = many.iter().map(|term| term.source_term.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(term_hint(&text, &many).unwrap().chars().count() <= MAX_TERM_HINT_CHARS + "Known terms: ".len());
+
+        let hints = ModelHints {
+            names: vec![KnownName { original: "Kate".to_string(), translated: "Кейт".to_string(), gender: "female".to_string() }],
+            terms: vec![term("Rune", "Руна", "")],
+            ..Default::default()
+        };
+        let mut samples = HashMap::from([("k".to_string(), vec!["Kate has a Rune".to_string()])]);
+        add_glossary_hints(&mut samples, &hints);
+        assert_eq!(samples["k"], ["Russian names: Kate = Кейт\nGender: Kate female", "Known terms: Rune = Руна", "Kate has a Rune"]);
+    }
+
+    #[test]
     fn test_name_hint_covers_only_names_in_the_text() {
+        let name = |original: &str, translated: &str, gender: &str| KnownName {
+            original: original.to_string(),
+            translated: translated.to_string(),
+            gender: gender.to_string(),
+        };
         let names = [
-            ("Celia".to_string(), "Селия".to_string()),
-            ("Ana".to_string(), "Ана".to_string()),
-            ("Celia".to_string(), "Селия".to_string()),
-            ("Vera".to_string(), "Вера".to_string()),
+            name("Celia", "Селия", "female"),
+            name("Ana", "Ана", "unknown"),
+            name("Celia", "Селия", "female"),
+            name("Vera", "Вера", ""),
+            name("Vlado", "Владо", "male"),
+            name("Thing", "Нечто", "neuter"),
         ];
         assert_eq!(
             name_hint("Celia: Ask Ana, not the banana.\nCelia: Bye.", &names).as_deref(),
-            Some("Russian names: Celia = Селия, Ana = Ана")
+            Some("Russian names: Celia = Селия, Ana = Ана\nGender: Celia female")
+        );
+        assert_eq!(
+            name_hint("Vlado saw the Thing.", &names).as_deref(),
+            Some("Russian names: Vlado = Владо, Thing = Нечто\nGender: Vlado male, Thing neuter")
         );
         assert_eq!(name_hint("Banana and Celiac.", &names), None);
 
@@ -1690,7 +1856,7 @@ mod tests {
             ("ce".to_string(), vec!["Vera is here".to_string()]),
             ("x".to_string(), vec!["Nobody".to_string()]),
         ]);
-        add_name_hints(&mut samples, &names);
+        add_glossary_hints(&mut samples, &ModelHints { names: names.to_vec(), ..Default::default() });
         assert_eq!(samples["ce"], ["Russian names: Vera = Вера", "Vera is here"]);
         assert_eq!(samples["x"], ["Nobody"]);
     }
@@ -1773,6 +1939,10 @@ mod tests {
         let (dir, scripts) = script_with(&script);
         let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), HashMap::new());
 
+        let parts = scene_parts(&game, &TokenNotes::new(), &kate(&[]));
+        let listed: Vec<&str> = parts.iter().flat_map(|part| &part.scenes).map(|scene| scene.scene.as_str()).collect();
+        assert!(parts.iter().flat_map(|part| &part.scenes).all(|scene| scene.file == "story.rpy" && !scene.path.is_empty()));
+        assert!(["first", "second", "third"].iter().all(|scene| listed.contains(scene)));
         let chunks = scene_chunks(&game, &TokenNotes::new(), &kate(&[]));
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= MAX_SAMPLE_TEXT));
         let whole = |name: &str, last: usize| {
@@ -1868,7 +2038,7 @@ mod tests {
         // Первая часть готова, на второй запуск остановлен: описание собирается из неё
         let url = serve_responses(vec![completion("Заметка 1"), completion(answer)]);
         let stopped = tauri::async_runtime::block_on(summarize_character(
-            &chat(&url), kate(&[]), chunks.clone(), &[], &notes_file, &cancel,
+            &chat(&url), kate(&[]), chunks.clone(), &ModelHints::default(), &notes_file, &cancel,
             |p| {
                 if p.done == 1 {
                     cancel.store(true, Ordering::Relaxed);
@@ -1882,7 +2052,7 @@ mod tests {
         cancel.store(false, Ordering::Relaxed);
         let url = serve_responses(vec![completion("Заметка 2"), completion(answer)]);
         let updated = tauri::async_runtime::block_on(summarize_character(
-            &chat(&url), kate(&[]), chunks.clone(), &[], &notes_file, &cancel,
+            &chat(&url), kate(&[]), chunks.clone(), &ModelHints::default(), &notes_file, &cancel,
             |p| stages.lock().unwrap().push(p.stage),
         ))
         .unwrap()
@@ -1934,7 +2104,24 @@ mod tests {
         ]);
         write_scene_notes(&notes_file, &stored).unwrap();
 
-        let parts = character_parts(&chunks, "model", "k", &notes_file);
+        let source = |text: &String| ScenePart {
+            text: text.clone(),
+            scenes: vec![PartScene { scene: "home".to_string(), ..Default::default() }],
+        };
+        let hints = ModelHints {
+            names: vec![KnownName { original: "Kate".to_string(), translated: "Кейт".to_string(), gender: "female".to_string() }],
+            terms: vec![TermGlossaryEntry {
+                source_term: "Three".to_string(),
+                translated_term: "Три".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let parts = character_parts(chunks.iter().map(source).collect(), "model", &kate(&[]), &notes_file, &hints);
+        assert_eq!(parts[1].scenes[0].scene, "home");
+        assert_eq!(parts[1].names[0].translated, "Кейт");
+        assert_eq!(parts[1].terms, ["Three = Три"]);
+        assert!(parts[0].terms.is_empty());
         assert_eq!(parts[0].start, "Kate: one");
         assert_eq!((parts[0].note.as_deref(), parts[0].empty), (Some("Кейт смеётся."), false));
         assert_eq!((parts[1].note.as_deref(), parts[1].empty), (Some(NO_NOTE), true));
@@ -1964,7 +2151,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let shown = std::sync::Mutex::new(Vec::new());
         let updated = tauri::async_runtime::block_on(summarize_character(
-            &chat(&url), character, chunks, &[], &notes_file, &cancel,
+            &chat(&url), character, chunks, &ModelHints::default(), &notes_file, &cancel,
             |p| shown.lock().unwrap().extend(p.note),
         ))
         .unwrap()
@@ -2000,7 +2187,7 @@ mod tests {
         let run = |response: &str, stages: &std::sync::Mutex<Vec<String>>| {
             let url = serve_responses(vec![completion(response)]);
             tauri::async_runtime::block_on(summarize_character(
-                &chat(&url), kate(&[]), chunks.clone(), &[], &notes_file, &cancel,
+                &chat(&url), kate(&[]), chunks.clone(), &ModelHints::default(), &notes_file, &cancel,
                 |p| stages.lock().unwrap().push(p.stage),
             ))
         };
@@ -2046,7 +2233,7 @@ mod tests {
             completion(answer),
         ]);
         let updated = tauri::async_runtime::block_on(summarize_character(
-            &chat(&url), kate(&[]), chunks, &[], &notes_file, &cancel,
+            &chat(&url), kate(&[]), chunks, &ModelHints::default(), &notes_file, &cancel,
             |p| shown.lock().unwrap().extend(p.note),
         ))
         .unwrap()
@@ -2057,7 +2244,7 @@ mod tests {
         // Заметок нет: описание нечему обновлять, модель не должна придумывать его по имени
         let url = serve_responses(vec![completion("NONE"), completion(NO_NOTE)]);
         let result = tauri::async_runtime::block_on(summarize_character(
-            &chat(&url), kate(&[]), vec!["Kate: four".to_string(), "Kate: six".to_string()], &[], &notes_file, &cancel,
+            &chat(&url), kate(&[]), vec!["Kate: four".to_string(), "Kate: six".to_string()], &ModelHints::default(), &notes_file, &cancel,
             |_| {},
         ));
         assert!(result.is_err());
@@ -2065,7 +2252,7 @@ mod tests {
         // Остановка до первой заметки: собирать нечего, и это не ошибка
         cancel.store(true, Ordering::Relaxed);
         let stopped = tauri::async_runtime::block_on(summarize_character(
-            &chat("http://127.0.0.1:1"), kate(&[]), vec!["Kate: five".to_string()], &[], &notes_file, &cancel,
+            &chat("http://127.0.0.1:1"), kate(&[]), vec!["Kate: five".to_string()], &ModelHints::default(), &notes_file, &cancel,
             |_| {},
         ));
         assert_eq!(stopped, Ok(None));
