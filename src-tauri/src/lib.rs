@@ -1759,7 +1759,7 @@ fn send_progress<T: Serialize + Clone>(channel: &Channel<llm::BatchProgress<T>>,
 #[tauri::command]
 async fn translate_character_names(
     target: llm::ChatTarget,
-    names: Vec<String>,
+    names: Vec<llm::NameRequest>,
     cast: Vec<String>,
     on_batch: Channel<llm::BatchProgress<llm::NameSuggestion>>,
 ) -> Result<llm::AutofillResult<llm::NameSuggestion>, String> {

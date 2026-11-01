@@ -7,7 +7,7 @@
   import FormsEditor from "../lib/FormsEditor.svelte";
   import FormOwnerPicker from "../lib/FormOwnerPicker.svelte";
   import OwnerSelect from "../lib/OwnerSelect.svelte";
-  import { characterForms, characterTitle, formOwners, formTranslation, hasScriptCode, knownNames, newCharacterAlias, ownerKey, type FormOwner, type NameForm } from "../lib/name-forms";
+  import { canonicalForms, characterForms, characterTitle, defaultCanonicalName, followsCanonical, formOwners, formTranslation, fullName, hasScriptCode, knownNames, mainTranslation, newCharacterAlias, ownerKey, type CanonicalName, type FormOwner, type NameField, type NameForm } from "../lib/name-forms";
   import GlossaryAiPanel from "../lib/GlossaryAiPanel.svelte";
   import LlmSettingsModal from "../lib/LlmSettingsModal.svelte";
   import RequestSlider from "../lib/RequestSlider.svelte";
@@ -429,7 +429,7 @@
     lines: { line_number: number; speaker: string | null; text: string; spoken: boolean }[];
   }
 
-  interface CharacterGlossaryEntry {
+  interface CharacterGlossaryEntry extends CanonicalName {
     alias: string;
     original_name: string;
     translated_name: string;
@@ -440,7 +440,6 @@
     merged: { alias: string; original_name: string }[];
     excluded_notes: string[];
     forms: NameForm[];
-    card_name: string; // Подпись записи, например полное имя. Реплики и запросы к модели идут с original_name
   }
 
   interface CharacterPart {
@@ -900,7 +899,7 @@
         selectedGlossaryChar.original_name,
         ...selectedGlossaryChar.merged.map((m) => m.original_name),
         ...formSources(selectedGlossaryChar.forms),
-        ...(selectedGlossaryChar.card_name.trim() ? [selectedGlossaryChar.card_name.trim()] : [])
+        ...canonicalForms(selectedGlossaryChar).map((form) => form.source)
       ]
     ]);
   });
@@ -1118,7 +1117,11 @@
     target.excluded_scenes = [...new Set([...target.excluded_scenes, ...other.excluded_scenes])];
     target.forms = [...target.forms, ...other.forms];
     if (!target.translated_name.trim()) target.translated_name = other.translated_name;
-    if (!target.card_name.trim()) target.card_name = other.card_name;
+    if (!target.translated_first_name.trim()) target.translated_first_name = other.translated_first_name;
+    if (!target.last_name.trim()) {
+      target.last_name = other.last_name;
+      target.translated_last_name = other.translated_last_name;
+    }
     if (!target.notes.trim()) target.notes = other.notes;
     if (!target.speech.trim()) target.speech = other.speech;
     if (target.gender === "unknown" || !target.gender) target.gender = other.gender;
@@ -1143,7 +1146,7 @@
       merged: [],
       excluded_notes: [],
       forms: [],
-      card_name: ""
+      ...defaultCanonicalName(part.original_name, target.translated_name)
     });
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
     selectedGlossaryChar = glossary.characters.find((c) => c.alias === target.alias) ?? null;
@@ -1162,8 +1165,8 @@
     ...glossary.characters.map((char) => ({
       kind: "character" as const,
       id: char.alias,
-      names: [characterTitle(char), char.original_name, ...char.merged.map((m) => m.original_name)],
-      linked: [char.translated_name, ...formTexts(char.forms)]
+      names: [characterTitle(char), char.original_name, ...char.merged.map((m) => m.original_name), ...canonicalForms(char).map((form) => form.source)],
+      linked: [char.translated_name, char.translated_first_name, char.translated_last_name, ...formTexts(char.forms)]
     }))
   ]);
   let characterFormOwners = $derived(glossaryFormOwners.filter((owner) => owner.kind === "character"));
@@ -1229,7 +1232,7 @@
       merged: [],
       excluded_notes: [],
       forms: [],
-      card_name: "",
+      ...defaultCanonicalName(name, translated),
       ...details
     });
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
@@ -1342,9 +1345,18 @@
     const char = glossary.characters.find((own) => ownerKey({ kind: "character", id: own.alias }) === id);
     if (!char) return;
     const position = linkedForms.findIndex((own) => own.key === form.key);
-    char.forms = linked
-      ? [...char.forms, { source: form.source, translated: form.translations.length === 1 ? form.translations[0] : "" }]
-      : char.forms.filter((own) => own.source.trim().toLowerCase() !== form.key);
+    const isForm = (name: string) => name.trim().toLowerCase() === form.key;
+    const family = glossary.characters.find((own) => isForm(own.last_name));
+    if (!linked) {
+      char.forms = char.forms.filter((own) => !isForm(own.source));
+      if (isForm(char.first_name)) Object.assign(char, { first_name: "", translated_first_name: "" });
+      if (isForm(char.last_name)) Object.assign(char, { last_name: "", translated_last_name: "" });
+    } else if (family && !char.last_name.trim()) {
+      // Фамилия остаётся фамилией: из неё складывается подпись карточки
+      Object.assign(char, { last_name: family.last_name, translated_last_name: family.translated_last_name });
+    } else {
+      char.forms = [...char.forms, { source: form.source, translated: form.translations.length === 1 ? form.translations[0] : "" }];
+    }
     glossaryDirty = true;
     if (linkedForms.some((own) => own.key === form.key)) return;
     selectedFormKey = (linkedForms[position] ?? linkedForms.at(-1))?.key ?? "";
@@ -1352,10 +1364,14 @@
 
   /** Перевод общий: для подсказки модели он должен совпадать у всех, кто связан с формой. */
   function setFormTranslation(form: LinkedForm, translated: string) {
+    const isForm = (name: string) => name.trim().toLowerCase() === form.key;
     for (const char of glossary.characters) {
       for (const own of char.forms) {
-        if (own.source.trim().toLowerCase() === form.key) own.translated = translated;
+        if (isForm(own.source)) own.translated = translated;
       }
+      if (isForm(char.first_name)) char.translated_first_name = translated;
+      if (isForm(char.last_name)) char.translated_last_name = translated;
+      if (isForm(char.first_name) || isForm(char.last_name)) canonicalNameEdited(char);
     }
     glossaryDirty = true;
   }
@@ -1443,7 +1459,10 @@
     char.gender = updated.gender;
     char.notes = updated.notes;
     char.speech = updated.speech;
-    if (!char.translated_name.trim()) char.translated_name = updated.translated_name;
+    if (!char.translated_name.trim() && updated.translated_name.trim()) {
+      char.translated_name = updated.translated_name;
+      if (char.first_name.trim().toLowerCase() === char.original_name.trim().toLowerCase()) char.translated_first_name = updated.translated_name;
+    }
     glossaryDirty = true;
   }
 
@@ -1552,10 +1571,25 @@
     llmSettings.actions[action] = choice;
   }
 
-  function applyPanelNames(rows: { alias: string; translated: string }[]) {
-    for (const row of rows) {
-      const char = glossary.characters.find((c) => c.alias === row.alias);
-      if (char) char.translated_name = row.translated;
+  /** Имя из игры, совпавшее с каноничным, переводится вместе с ним: иначе подсказки модели разойдутся. */
+  function canonicalNameEdited(char: CharacterGlossaryEntry) {
+    if (followsCanonical(char)) char.translated_name = mainTranslation(char);
+    glossaryDirty = true;
+  }
+
+  function applyPanelNames(rows: { alias: string; field: NameField; source: string; translated: string }[]) {
+    for (const { alias, field, source, translated } of rows) {
+      const char = glossary.characters.find((c) => c.alias === alias);
+      if (!char) continue;
+      if (field === "main") char.translated_name = translated;
+      if (field === "first") char.translated_first_name = translated;
+      if (field === "last") char.translated_last_name = translated;
+      if (field === "form") {
+        for (const form of char.forms) {
+          if (form.source.trim().toLowerCase() === source.toLowerCase()) form.translated = translated;
+        }
+      }
+      canonicalNameEdited(char);
     }
     glossaryDirty = true;
   }
@@ -2246,7 +2280,7 @@
         c.alias.toLowerCase().includes(q) ||
         c.merged.some((m) => `${m.alias} ${m.original_name}`.toLowerCase().includes(q)) ||
         c.original_name.toLowerCase().includes(q) ||
-        c.card_name.toLowerCase().includes(q) ||
+        canonicalForms(c).some((form) => `${form.source} ${form.translated}`.toLowerCase().includes(q)) ||
         c.translated_name.toLowerCase().includes(q) ||
         c.forms.some((form) => `${form.source} ${form.translated}`.toLowerCase().includes(q)) ||
         c.notes.toLowerCase().includes(q)
@@ -2258,7 +2292,8 @@
     ...glossary.terms.flatMap((term) => [term.source_term, ...term.forms.map((form) => form.source)]),
     ...glossary.characters.flatMap((char) => [
       char.original_name,
-      char.card_name,
+      fullName(char),
+      ...canonicalForms(char).map((form) => form.source),
       ...char.merged.map((m) => m.original_name),
       ...char.forms.map((form) => form.source)
     ])
@@ -2306,20 +2341,18 @@
 
   // Модель пишет имена так же, как они записаны в глоссарии
   let characterNames = $derived(knownNames(
-    glossary.characters
-      .filter((char) => char.translated_name.trim())
-      .flatMap((char) => [
-        ...[char, ...char.merged].map((part) => ({
-          original: part.original_name,
-          translated: char.translated_name.trim(),
-          gender: char.gender
-        })),
+    glossary.characters.flatMap((char) => {
+      const main = char.translated_name.trim();
+      return [
+        ...[char, ...char.merged].map((part) => ({ original: part.original_name, translated: main, gender: char.gender })),
+        ...canonicalForms(char).map((form) => ({ original: form.source, translated: form.translated, gender: char.gender })),
         ...char.forms.filter((form) => form.source.trim()).map((form) => ({
           original: form.source.trim(),
-          translated: formTranslation(form, char.translated_name),
+          translated: formTranslation(form, main),
           gender: char.gender
         }))
-      ])
+      ].filter((name) => name.translated);
+    })
   ));
 
   // Токены ищутся в репликах, а в глоссарии лежат только пояснения. Пояснение остаётся,
@@ -2591,7 +2624,7 @@
         merged: [],
         excluded_notes: [],
         forms: [],
-        card_name: ""
+        ...defaultCanonicalName(original_name, "")
       });
     }
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
@@ -2631,7 +2664,7 @@
       merged: [],
       excluded_notes: [],
       forms: [],
-      card_name: ""
+      ...defaultCanonicalName(name, characterDraft.translated)
     };
     glossary.characters.push(newChar);
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
@@ -4647,7 +4680,7 @@
                     {/if}
                     <div class="sidebar-char-headings">
                       <h4>{characterTitle(selectedGlossaryChar)}</h4>
-                      {#if selectedGlossaryChar.card_name.trim()}
+                      {#if fullName(selectedGlossaryChar) && fullName(selectedGlossaryChar) !== selectedGlossaryChar.original_name.trim()}
                         <span class="char-sub-label">В игре: {selectedGlossaryChar.original_name}</span>
                       {/if}
                     </div>
@@ -4716,34 +4749,66 @@
 
                 <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} class:character-card-busy={updatingCharacter && !otherCharacterUpdating} inert={updatingCharacter}>
                   <div class="edit-group">
-                    <label class="edit-label" for="character-card-name">
-                      <span>Имя карточки:</span>
-                    </label>
-                    <input
-                      id="character-card-name"
-                      type="text"
-                      bind:value={selectedGlossaryChar.card_name}
-                      oninput={() => glossaryDirty = true}
-                      placeholder={selectedGlossaryChar.original_name}
-                      class="sidebar-input"
-                    />
-                    <span class="edit-hint">Например, полное имя с фамилией. Видно в глоссарии и учитывается при поиске упоминаний. Имя из игры в репликах и запросах к модели не меняется.</span>
+                    <div class="edit-label">
+                      <span>Имя и фамилия:</span>
+                    </div>
+                    <div class="canonical-name-grid">
+                      <input
+                        id="character-first-name"
+                        type="text"
+                        bind:value={selectedGlossaryChar.first_name}
+                        oninput={() => { if (selectedGlossaryChar) canonicalNameEdited(selectedGlossaryChar); }}
+                        placeholder={selectedGlossaryChar.original_name || "Имя"}
+                        aria-label="Имя в оригинале"
+                        class="sidebar-input"
+                      />
+                      <input
+                        id="character-last-name"
+                        type="text"
+                        bind:value={selectedGlossaryChar.last_name}
+                        oninput={() => { if (selectedGlossaryChar) canonicalNameEdited(selectedGlossaryChar); }}
+                        placeholder="Фамилия"
+                        aria-label="Фамилия в оригинале"
+                        class="sidebar-input"
+                      />
+                      <input
+                        id="character-translated-first-name"
+                        type="text"
+                        bind:value={selectedGlossaryChar.translated_first_name}
+                        oninput={() => { if (selectedGlossaryChar) canonicalNameEdited(selectedGlossaryChar); }}
+                        placeholder="Перевод имени"
+                        aria-label="Перевод имени"
+                        class="sidebar-input sidebar-input-primary"
+                      />
+                      <input
+                        id="character-translated-last-name"
+                        type="text"
+                        bind:value={selectedGlossaryChar.translated_last_name}
+                        oninput={() => { if (selectedGlossaryChar) canonicalNameEdited(selectedGlossaryChar); }}
+                        placeholder="Перевод фамилии"
+                        aria-label="Перевод фамилии"
+                        class="sidebar-input sidebar-input-primary"
+                      />
+                    </div>
+                    <span class="edit-hint">Имя берётся из игры, фамилию внесите сами. Из них складывается название карточки, а модель строит от них остальные формы. Перевод отображается в диалогах, сюжетном графе и инспекторе.</span>
                   </div>
 
-                  <div class="edit-group">
-                    <label class="edit-label" for="character-translation">
-                      <span>Русский перевод имени:</span>
-                    </label>
-                    <input 
-                      id="character-translation"
-                      type="text" 
-                      bind:value={selectedGlossaryChar.translated_name} 
-                      oninput={() => glossaryDirty = true}
-                      placeholder={selectedGlossaryChar.original_name}
-                      class="sidebar-input sidebar-input-primary"
-                    />
-                    <span class="edit-hint">Отображается в диалогах, сюжетном графе и инспекторе</span>
-                  </div>
+                  {#if !followsCanonical(selectedGlossaryChar)}
+                    <div class="edit-group">
+                      <label class="edit-label" for="character-translation">
+                        <span>Перевод имени из игры ({selectedGlossaryChar.original_name}):</span>
+                      </label>
+                      <input
+                        id="character-translation"
+                        type="text"
+                        bind:value={selectedGlossaryChar.translated_name}
+                        oninput={() => glossaryDirty = true}
+                        placeholder={selectedGlossaryChar.original_name}
+                        class="sidebar-input sidebar-input-primary"
+                      />
+                      <span class="edit-hint">Отображается в диалогах, сюжетном графе и инспекторе</span>
+                    </div>
+                  {/if}
 
                   <FormsEditor
                     forms={selectedGlossaryChar.forms}
@@ -9414,6 +9479,12 @@
     color: #475569;
     font-style: italic;
     font-size: 11px;
+  }
+
+  .canonical-name-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
   }
 
   .category-badge {

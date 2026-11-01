@@ -4,16 +4,17 @@
   import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, Sparkles, Square } from "lucide-svelte";
   import EntryPicker from "./EntryPicker.svelte";
   import LlmChoice from "./LlmChoice.svelte";
-  import { characterTitle, type NameForm } from "./name-forms";
+  import { baseNames, characterTitle, formNames, nameTargetKey, type CanonicalName, type NameBatch, type NameField, type NameForm, type NameTarget } from "./name-forms";
   import { beginLlmRun, endLlmRun, llmRun } from "./llm-run.svelte";
   import { LLM_ACTIONS, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "./llm-settings";
 
-  interface PanelCharacter {
+  interface PanelCharacter extends CanonicalName {
     alias: string;
     original_name: string;
     translated_name: string;
+    gender: string;
     merged: { alias: string; original_name: string }[];
-    card_name: string;
+    forms: NameForm[];
   }
 
   interface PanelTerm {
@@ -45,7 +46,7 @@
   }
 
   interface NameSuggestion {
-    original: string;
+    id: string;
     translated: string;
     origin: string;
   }
@@ -83,7 +84,7 @@
     descriptionsOpen?: boolean;
     descriptions: Snippet;
     onselect: (action: LlmAction, choice: LlmActionSettings) => void;
-    onnames: (rows: { alias: string; translated: string }[]) => void;
+    onnames: (rows: { alias: string; field: NameField; source: string; translated: string }[]) => void;
     onterms: (rows: { id: string; translated: string; category: string; notes: string }[]) => void;
     ontokens: (rows: { name: string; value: string; note: string }[]) => void;
   } = $props();
@@ -117,7 +118,9 @@
 
   // Панель закрывается вместе с глоссарием: результат запроса показать будет негде
   onDestroy(() => {
-    if (isProcessing) void invoke("cancel_llm_run");
+    if (!isProcessing) return;
+    stopRequested = true;
+    void invoke("cancel_llm_run");
   });
 
   function beginRun(step: string) {
@@ -160,7 +163,13 @@
   const characterName = (c: PanelCharacter) => c.original_name.trim() || c.alias;
   let unselectedAliases = $state<string[]>([]);
   let nameTargets = $derived(characters.filter((c) => !unselectedAliases.includes(c.alias)));
-  let reviewNames = $state<{ alias: string; original: string; current: string; translated: string; origin: string; selected: boolean }[]>([]);
+  let reviewNames = $state<(NameTarget & { key: string; translated: string; origin: string; selected: boolean })[]>([]);
+  const FIELD_LABELS: Record<NameField, string> = { main: "Имя из игры", first: "Имя", last: "Фамилия", form: "Другая форма" };
+  // Формы показываются рядом со своим именем, в какой бы момент ни пришёл ответ
+  let reviewGroups = $derived(characters.flatMap((character) => {
+    const rows = reviewNames.filter((row) => row.alias === character.alias);
+    return rows.length > 0 ? [{ alias: character.alias, title: characterTitle(character), rows }] : [];
+  }));
   let unchangedNames = $state(0);
   let namesRequested = $state(0);
   let namesFinished = $state(false);
@@ -173,53 +182,65 @@
     return missing > 0 ? `${note}, не получено ответов: ${missing}.` : `${note}.`;
   });
 
-  /** Модель пишет имена выбранных персонажей, видя весь состав игры. Заполненные имена тоже участвуют. */
+  /**
+   * Модель пишет имена выбранных персонажей, видя весь состав игры, а затем от них их формы.
+   * Заполненные тоже участвуют, но заменятся, только если их отметить.
+   */
   async function startNames() {
     const chosen = nameTargets;
-    if (!beginRun("Модель определяет происхождение имён...")) return;
+    if (!beginRun("Модель пишет имена и фамилии...")) return;
     reviewNames = [];
     unchangedNames = 0;
-    namesRequested = chosen.length;
+    namesRequested = 0;
     namesFinished = false;
+    const spelled = new Map<string, string>();
+    let failedBatches = 0;
 
-    try {
+    const spell = async ({ requests, targets }: NameBatch) => {
+      if (requests.length === 0) return;
+      namesRequested += [...targets.values()].flat().length;
       const result = await invoke<AutofillResult<NameSuggestion>>("translate_character_names", {
         target: targetFor(settings, "names"),
-        names: chosen.map(characterName),
-        cast: characters.flatMap((c) => [characterName(c), ...c.merged.map((m) => m.original_name)]),
+        names: requests,
+        cast: characters.flatMap((c) => [characterTitle(c), characterName(c), ...c.merged.map((m) => m.original_name)]),
         onBatch: batchChannel<NameSuggestion>((items) => {
           for (const item of items) {
-            // Модель получает повторы один раз, а написание нужно каждому коду с этим именем
-            for (const character of chosen.filter((c) => characterName(c).toLowerCase() === item.original.toLowerCase())) {
-              const current = character.translated_name.trim();
-              if (current === item.translated) {
+            // Модель получает повторы один раз, а написание нужно каждому их владельцу
+            for (const target of targets.get(item.id) ?? []) {
+              if (item.translated === (target.current || target.base)) {
                 unchangedNames += 1;
               } else {
-                reviewNames.push({
-                  alias: character.alias,
-                  original: characterName(character),
-                  current,
-                  translated: item.translated,
-                  origin: item.origin,
-                  selected: true
-                });
+                reviewNames.push({ ...target, key: nameTargetKey(target), translated: item.translated, origin: item.origin, selected: !target.current });
               }
             }
           }
         })
       });
-      namesFinished = true;
-      if (result.failed_batches > 0) errorMessage = failedBatchesMessage(result.failed_batches);
+      failedBatches += result.failed_batches;
+      // Итог команды полный, а сообщения канала могут отстать от него
+      for (const item of result.items) {
+        for (const target of targets.get(item.id) ?? []) spelled.set(nameTargetKey(target), item.translated);
+      }
+    };
+
+    try {
+      await spell(baseNames(chosen));
+      if (!stopRequested) {
+        progressStep = "Модель пишет другие формы имён...";
+        await spell(formNames(chosen, spelled));
+      }
+      if (failedBatches > 0) errorMessage = failedBatchesMessage(failedBatches);
     } catch (e) {
-      namesRequested = 0;
+      if (reviewNames.length === 0) namesRequested = 0;
       errorMessage = `Не удалось перевести имена: ${String(e)}`;
     } finally {
+      namesFinished = true;
       endRun();
     }
   }
 
   function applyNames() {
-    onnames(chosenNames.map(({ alias, translated }) => ({ alias, translated: translated.trim() })));
+    onnames(chosenNames.map(({ alias, field, source, translated }) => ({ alias, field, source, translated: translated.trim() })));
     doneMessage = `Обновлено имён: ${chosenNames.length}. Описания сохранят старое написание, пока их не обновить.`;
     reviewNames = [];
     namesRequested = 0;
@@ -394,7 +415,7 @@
       {#if openSection === "descriptions"}
         {@render descriptions()}
       {:else if openSection === "names"}
-        <p class="ai-note">Модель увидит все имена игры, определит их происхождение и заново напишет имена выбранных персонажей, включая заполненные. Что заменить, выберете вы.</p>
+        <p class="ai-note">Модель увидит все имена игры, определит их происхождение и напишет имена и фамилии выбранных персонажей, а от них остальные формы. Заполненные тоже участвуют, но заменятся, только если их отметить.</p>
         <EntryPicker
           items={characters.map((c) => ({ id: c.alias, name: characterTitle(c) }))}
           unselected={unselectedAliases}
@@ -415,15 +436,18 @@
                 </div>
               {/if}
             </div>
-            {#each reviewNames as row (row.alias)}
-              <div class="ai-row" class:off={!row.selected}>
-                <input type="checkbox" bind:checked={row.selected} aria-label={`Заменить имя ${row.original}`} />
-                <div class="ai-source">
-                  <span class="ai-term">{row.original} <span class="ai-count">{row.origin}</span></span>
-                  <span class="ai-example">Сейчас: {row.current || "нет перевода"}</span>
+            {#each reviewGroups as group (group.alias)}
+              <span class="ai-group">{group.title}</span>
+              {#each group.rows as row (row.key)}
+                <div class="ai-row" class:off={!row.selected}>
+                  <input type="checkbox" bind:checked={row.selected} aria-label={`Заменить имя ${row.source}`} />
+                  <div class="ai-source">
+                    <span class="ai-term">{row.source} <span class="ai-count">{FIELD_LABELS[row.field]}{row.origin ? `, ${row.origin}` : ""}</span></span>
+                    <span class="ai-example">Сейчас: {row.current || "нет перевода"}</span>
+                  </div>
+                  <input type="text" class="input" bind:value={row.translated} aria-label={`Новое имя ${row.source}`} />
                 </div>
-                <input type="text" class="input" bind:value={row.translated} aria-label={`Новое имя ${row.original}`} />
-              </div>
+              {/each}
             {/each}
             {#if reviewNames.length > 0}
               <button class="btn-apply" onclick={applyNames} disabled={chosenNames.length === 0 || isProcessing}>
@@ -794,6 +818,13 @@
 
   .ai-term {
     color: #f1f5f9;
+  }
+
+  .ai-group {
+    margin-top: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #94a3b8;
   }
 
   .ai-example {

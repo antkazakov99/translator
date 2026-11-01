@@ -1,7 +1,7 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { characterForms, characterTitle, formOwners, formTranslation, hasScriptCode, knownNames, linkOptions, newCharacterAlias, ownerOptions } from '../src/lib/name-forms.ts';
+import { baseNames, canonicalForms, characterForms, characterTitle, defaultCanonicalName, followsCanonical, formNames, formOwners, formTranslation, fullName, hasScriptCode, knownNames, linkOptions, mainTranslation, nameTargetKey, newCharacterAlias, NO_CANONICAL_NAME, ownerOptions } from '../src/lib/name-forms.ts';
 
 const term = (name, linked = []) => ({ kind: 'term', id: name, names: [name], linked });
 const owners = (found) => found.map((owner) => owner.id);
@@ -33,17 +33,17 @@ test('a record is never a form of itself', () => {
 });
 
 test('a form shared by characters is one entry, the most frequent go first', () => {
-  const char = (alias, original_name, forms, card_name = '') => ({ alias, original_name, card_name, forms: forms.map(([source, translated = '']) => ({ source, translated })) });
+  const char = (alias, original_name, forms, last_name = '') => ({ ...NO_CANONICAL_NAME, alias, original_name, last_name, forms: forms.map(([source, translated = '']) => ({ source, translated })) });
   const found = characterForms(
     [
       char('em', 'Emma', [['Karanovic', 'Каранович'], ['Emma Karanovic'], [' ']]),
-      char('ve', 'Vera', [[' karanovic ', 'Каранович'], ['Sister'], ['Boss', 'Шеф']], 'Vera K'),
+      char('ve', 'Vera', [[' karanovic ', 'Каранович'], ['Sister'], ['Boss', 'Шеф']], 'Karanovic'),
       char('k', 'Kate', [['Boss', 'Босс']])
     ],
     new Map([['karanovic', 30], ['sister', 2]])
   );
   assert.deepEqual(found.map((form) => [form.source, form.count]), [['Karanovic', 30], ['Sister', 2], ['Boss', 0], ['Emma Karanovic', 0]]);
-  assert.deepEqual(found[0].owners, [{ alias: 'em', name: 'Emma' }, { alias: 've', name: 'Vera K' }]);
+  assert.deepEqual(found[0].owners, [{ alias: 'em', name: 'Emma' }, { alias: 've', name: 'Karanovic' }]);
   assert.deepEqual(found[0].translations, ['Каранович']);
   assert.deepEqual(found[2].translations, ['Шеф', 'Босс']);
 });
@@ -74,10 +74,94 @@ test('a name shared by records keeps its translation but not a gender, and a dis
   assert.deepEqual(knownNames([name('Smith', 'Лиза', 'female'), name('Smith', 'Боб', 'male')]), []);
 });
 
-test('a card shows its own name, then the name from the game, then the code', () => {
-  assert.equal(characterTitle({ alias: 'lis', original_name: 'Lisa', card_name: ' Lisa Smith ' }), 'Lisa Smith');
-  assert.equal(characterTitle({ alias: 'lis', original_name: 'Lisa', card_name: '  ' }), 'Lisa');
-  assert.equal(characterTitle({ alias: 'lis', original_name: '', card_name: '' }), 'lis');
+test('a card shows the first and last name, then the name from the game, then the code', () => {
+  assert.equal(characterTitle({ alias: 'lis', original_name: 'Liz', first_name: ' Lisa ', last_name: ' Smith ' }), 'Lisa Smith');
+  assert.equal(characterTitle({ alias: 'lis', original_name: 'Liz', first_name: '', last_name: 'Smith' }), 'Smith');
+  assert.equal(characterTitle({ alias: 'lis', original_name: 'Lisa', first_name: '  ', last_name: '' }), 'Lisa');
+  assert.equal(characterTitle({ alias: 'lis', original_name: '', first_name: '', last_name: '' }), 'lis');
+  assert.equal(fullName({ first_name: 'Lisa', last_name: ' ' }), 'Lisa');
+});
+
+const person = (alias, original_name, details = {}) => ({
+  ...NO_CANONICAL_NAME, alias, original_name, translated_name: '', gender: 'female', forms: [], ...details
+});
+
+test('the canonical name becomes forms and leaves out empty parts', () => {
+  assert.deepEqual(canonicalForms(person('l', 'Lisa', { first_name: ' Lisa ', translated_first_name: ' Лиза ' })), [{ source: 'Lisa', translated: 'Лиза' }]);
+  assert.deepEqual(canonicalForms(person('l', 'Lisa')), []);
+});
+
+test('the canonical name shows up among forms unless it is the name from the game', () => {
+  const lisa = person('l', 'Lisa', { first_name: 'Lisa', last_name: 'Smith', translated_last_name: 'Смит', forms: [{ source: 'smith', translated: '' }] });
+  const found = characterForms([lisa], new Map());
+  assert.deepEqual(found.map((form) => [form.source, form.owners.length, form.translations]), [['Smith', 1, ['Смит']]]);
+});
+
+test('the name from the game follows the canonical name it matches', () => {
+  const details = { first_name: 'Lisa', last_name: 'Smith', translated_first_name: ' Лиза ', translated_last_name: 'Смит' };
+  assert.equal(mainTranslation(person('l', 'lisa', details)), 'Лиза');
+  assert.equal(mainTranslation(person('l', 'Smith', details)), 'Смит');
+  assert.equal(mainTranslation(person('l', 'Lisa Smith', details)), 'Лиза Смит');
+  assert.equal(mainTranslation(person('l', 'Lisa Smith', { ...details, translated_last_name: '' })), 'Лиза');
+  assert.equal(followsCanonical(person('l', 'LISA SMITH', details)), true);
+  assert.equal(followsCanonical(person('l', 'Mrs. S', details)), false);
+  assert.equal(followsCanonical(person('l', '')), false);
+  assert.equal(followsCanonical(person('l', '', details)), false);
+});
+
+test('the first name defaults to the name from the game with its translation', () => {
+  assert.deepEqual(defaultCanonicalName(' Lisa ', ' Лиза '), { ...NO_CANONICAL_NAME, first_name: 'Lisa', translated_first_name: 'Лиза' });
+});
+
+test('the first step spells first and last names, and the name from the game only without them', () => {
+  const batch = baseNames([
+    person('a', 'Anna', { first_name: 'Anna', last_name: 'Kowalski', translated_first_name: 'Анна' }),
+    person('p', 'Piotr', { first_name: 'Piotr', last_name: 'Kowalski', gender: 'male' }),
+    person('z', 'Zofia', { last_name: 'kowalski' }),
+    person('a2', 'ANNA', { translated_name: 'Аня' }),
+    person('b', '', {})
+  ]);
+  assert.deepEqual(batch.requests.map(({ name, kind, gender }) => [name, kind, gender]), [
+    ['Anna', 'name', 'female'],
+    ['Kowalski', 'surname', 'female'],
+    ['Piotr', 'name', 'male'],
+    ['Kowalski', 'surname', 'male'],
+    ['b', 'name', 'female']
+  ]);
+  const owners = batch.targets.get(batch.requests[1].id).map((target) => target.alias);
+  assert.deepEqual(owners, ['a', 'z']);
+  assert.deepEqual(batch.targets.get(batch.requests[0].id).map(({ alias, field, current }) => [alias, field, current]), [['a', 'first', 'Анна'], ['a2', 'main', 'Аня']]);
+});
+
+test('the second step builds forms on a filled name, then on the answer of the first step', () => {
+  const anna = person('a', 'Mrs. K', {
+    first_name: 'Anna',
+    last_name: 'Karanovic',
+    translated_first_name: 'Анна',
+    forms: [{ source: 'Annie', translated: 'Анечка' }, { source: 'karanovic', translated: '' }, { source: ' ', translated: '' }, { source: 'annie', translated: '' }]
+  });
+  const kate = person('k', 'Kate', { translated_name: 'Кейт', forms: [{ source: 'Katie', translated: '' }] });
+  const lisa = person('l', 'Lisa', { forms: [{ source: 'Liz', translated: '' }] });
+  const spelled = new Map([
+    [nameTargetKey({ alias: 'a', field: 'first', source: 'Anna' }), 'Анька'],
+    [nameTargetKey({ alias: 'a', field: 'last', source: 'Karanovic' }), 'Каранович'],
+    [nameTargetKey({ alias: 'l', field: 'main', source: 'Lisa' }), 'Лиза']
+  ]);
+
+  const batch = formNames([anna, kate, lisa], spelled);
+  assert.deepEqual(batch.requests.map(({ name, kind, base }) => [name, kind, base]), [
+    ['Mrs. K', 'form', 'Анна Каранович'],
+    ['Annie', 'form', 'Анна Каранович'],
+    ['Katie', 'form', 'Кейт'],
+    ['Liz', 'form', 'Лиза']
+  ]);
+  const fields = [...batch.targets.values()].flat().map(({ field, current }) => [field, current]);
+  assert.deepEqual(fields, [['main', ''], ['form', 'Анечка'], ['form', ''], ['form', '']]);
+});
+
+test('a name from the game equal to the full name is not a form', () => {
+  const lisa = person('l', 'Lisa Smith', { first_name: 'Lisa', last_name: 'Smith' });
+  assert.deepEqual(formNames([lisa], new Map()).requests, []);
 });
 
 test('the owner search keeps groups in order and shows a suggested record once', () => {

@@ -74,10 +74,31 @@ pub struct CharacterResult {
     pub samples: Vec<String>,
 }
 
+/// Что за имя пишет модель. Фамилия по-русски может зависеть от пола, а форма строится от готового написания.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NameKind {
+    Name,
+    Surname,
+    Form,
+}
+
+/// Имя в запросе к модели. Повторы убирает интерфейс: только он знает, чьё это имя.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NameRequest {
+    pub id: String,
+    pub name: String,
+    pub kind: NameKind,
+    #[serde(default)]
+    pub gender: String,
+    #[serde(default)]
+    pub base: String, // Готовое написание, от которого строится форма ("Анна Каранович")
+}
+
 /// Написание имени от модели. В глоссарий попадает после проверки пользователем.
 #[derive(Debug, Clone, Serialize)]
 pub struct NameSuggestion {
-    pub original: String,
+    pub id: String,
     pub translated: String,
     pub origin: String,
 }
@@ -172,7 +193,7 @@ struct CharacterLlmItem {
 
 #[derive(Debug, Deserialize)]
 struct NameLlmItem {
-    name: Option<String>,
+    id: Option<String>,
     origin: Option<String>,
     translated_name: Option<String>,
 }
@@ -1666,11 +1687,31 @@ Spelling by language:
 Roles, descriptions and abbreviations are translated by meaning: "Old Bartender" -> "Старый бармен", "Agent Lisa" -> "Агент Лиза", "MC" -> "Главный герой".
 Text in [square brackets] is an in-game variable: return it unchanged.
 
+A line may say more about the name:
+- "surname of a woman" or "surname of a man": make the Russian surname agree with the gender if its language changes it: "Kowalski" of a woman -> "Ковальская", "Ivanov" of a woman -> "Иванова". Other surnames stay the same: "Karanovic" -> "Каранович".
+- "form of Анна Каранович": another way to call that character. Keep that spelling for the parts they share and translate titles by meaning: "Mrs. Karanovic" -> "Миссис Каранович", "Annie" -> "Энни".
+
 Respond ONLY with a valid JSON array, one object per name to spell, without markdown fences or explanations:
 [
-  {"name": "Anja", "origin": "сербский", "translated_name": "Аня"}
+  {"id": "n0", "origin": "сербский", "translated_name": "Аня"}
 ]
-"name" is the EXACT name as given. "origin" is its language as one Russian word, or "описание" for roles and descriptions."#;
+"id" is the EXACT id as given. "origin" is the language of the name as one Russian word, or "описание" for roles and descriptions."#;
+
+/// Строка запроса: что это за имя и от какого написания оно строится.
+fn name_line(request: &NameRequest) -> String {
+    let person = match request.gender.as_str() {
+        "female" => "a woman",
+        "male" => "a man",
+        _ => "a character",
+    };
+    let detail = match request.kind {
+        NameKind::Name => String::new(),
+        NameKind::Surname => format!(", surname of {person}"),
+        NameKind::Form if request.base.is_empty() => format!(", name of {person}"),
+        NameKind::Form => format!(", name of {person}, form of {}", request.base),
+    };
+    format!("- id: \"{}\", name: \"{}\"{detail}\n", request.id, request.name)
+}
 
 /// Имена без повторов и пустых строк: регистр не считается отличием, порядок сохраняется.
 fn unique_names(names: &[String]) -> Vec<&str> {
@@ -1693,12 +1734,11 @@ fn is_garbled(name: &str) -> bool {
 /// происхождение одного имени часто понятно только по остальным.
 pub async fn translate_names(
     target: &ChatTarget,
-    names: &[String],
+    names: &[NameRequest],
     cast: &[String],
     cancel: &AtomicBool,
     on_batch: impl Fn(BatchProgress<NameSuggestion>) + Send + Sync,
 ) -> Result<AutofillResult<NameSuggestion>, String> {
-    let names = unique_names(names);
     let cast = unique_names(cast).join(", ");
     let total_batches = names.len().div_ceil(MAX_BATCH_NAMES);
     let mut failed_batches = 0;
@@ -1710,7 +1750,7 @@ pub async fn translate_names(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let list: String = chunk.iter().map(|name| format!("- {name}\n")).collect();
+        let list: String = chunk.iter().map(name_line).collect();
         let user_prompt = format!("All names in this game: {cast}\n\nNames to spell:\n{list}\nProvide JSON array now:");
 
         let raw_response = match call_chat_completion(target, NAMES_SYSTEM_PROMPT, &user_prompt, 0.2, NAME_ANSWER_TOKENS).await {
@@ -1734,17 +1774,17 @@ pub async fn translate_names(
 
         let kept_before = items.len();
         for item in answer {
-            let source = item.name.as_deref().unwrap_or_default().trim();
+            let id = item.id.as_deref().unwrap_or_default().trim();
             let translated = item.translated_name.as_deref().unwrap_or_default().trim();
             // Имени, которого не было в списке, модель придумала сама
-            let Some(original) = chunk.iter().find(|name| name.to_lowercase() == source.to_lowercase()) else {
+            let Some(request) = chunk.iter().find(|request| request.id == id) else {
                 continue;
             };
-            if translated.is_empty() || is_garbled(translated) || items.iter().any(|known| known.original == *original) {
+            if translated.is_empty() || is_garbled(translated) || items.iter().any(|known| known.id == id) {
                 continue;
             }
             items.push(NameSuggestion {
-                original: original.to_string(),
+                id: request.id.clone(),
                 translated: translated.to_string(),
                 origin: item.origin.as_deref().unwrap_or_default().trim().to_string(),
             });
@@ -1981,19 +2021,33 @@ mod tests {
         values.iter().map(|value| value.to_string()).collect()
     }
 
+    fn name_requests(names: &[&str]) -> Vec<NameRequest> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| NameRequest {
+                id: format!("n{index}"),
+                name: name.to_string(),
+                kind: NameKind::Name,
+                gender: String::new(),
+                base: String::new(),
+            })
+            .collect()
+    }
+
     #[test]
     fn test_names_are_spelled_against_the_whole_cast() {
         let content = r#"[
-            {"name":"ANJA","origin":"сербский","translated_name":"Аня"},
-            {"name":"Hilde","translated_name":"Хильде"},
-            {"name":"Hilde","translated_name":"Хильда"},
-            {"name":"Выдумка","translated_name":"Выдумка"},
-            {"name":"Dunja","translated_name":" "},
-            {"name":"Sarah","translated_name":"Саarah"}
+            {"id":"n0","origin":"сербский","translated_name":"Аня"},
+            {"id":"n1","translated_name":"Хильде"},
+            {"id":"n1","translated_name":"Хильда"},
+            {"id":"n9","translated_name":"Выдумка"},
+            {"id":"n2","translated_name":" "},
+            {"id":"n3","translated_name":"Саarah"}
         ]"#;
         let (url, requests) = record_requests(vec![chat_answer(content)]);
         let cancel = AtomicBool::new(false);
-        let names = strings(&["Anja", "Hilde", "hilde", "Dunja", "Sarah", " "]);
+        let names = name_requests(&["Anja", "Hilde", "Dunja", "Sarah"]);
         let cast = strings(&["Anja", "Hilde", "Dunja", "Sarah", "Vlado"]);
 
         let result = tauri::async_runtime::block_on(translate_names(&chat(&url), &names, &cast, &cancel, |_| {}))
@@ -2002,30 +2056,55 @@ mod tests {
         let request = requests.recv().unwrap();
         assert!(!request.to_lowercase().contains("authorization:"), "{request}");
         assert!(request.contains("All names in this game: Anja, Hilde, Dunja, Sarah, Vlado"), "{request}");
-        assert_eq!(request.matches("- Hilde").count(), 1, "{request}");
-        assert!(!request.contains("- hilde"), "{request}");
         let found: Vec<_> = result
             .items
             .iter()
-            .map(|item| (item.original.as_str(), item.translated.as_str(), item.origin.as_str()))
+            .map(|item| (item.id.as_str(), item.translated.as_str(), item.origin.as_str()))
             .collect();
-        assert_eq!(found, [("Anja", "Аня", "сербский"), ("Hilde", "Хильде", "")]);
+        assert_eq!(found, [("n0", "Аня", "сербский"), ("n1", "Хильде", "")]);
         assert_eq!(result.failed_batches, 0);
     }
 
     #[test]
+    fn test_name_lines_say_what_the_name_is() {
+        let [mut name, mut surname, mut form]: [NameRequest; 3] = name_requests(&["Anna", "Kowalski", "Mrs. K"]).try_into().unwrap();
+        assert_eq!(name_line(&name), "- id: \"n0\", name: \"Anna\"\n");
+
+        surname.kind = NameKind::Surname;
+        surname.gender = "female".to_string();
+        assert_eq!(name_line(&surname), "- id: \"n1\", name: \"Kowalski\", surname of a woman\n");
+
+        form.kind = NameKind::Form;
+        form.gender = "male".to_string();
+        assert_eq!(name_line(&form), "- id: \"n2\", name: \"Mrs. K\", name of a man\n");
+        form.base = "Анна Ковальская".to_string();
+        assert_eq!(name_line(&form), "- id: \"n2\", name: \"Mrs. K\", name of a man, form of Анна Ковальская\n");
+
+        name.kind = NameKind::Surname;
+        assert_eq!(name_line(&name), "- id: \"n0\", name: \"Anna\", surname of a character\n");
+    }
+
+    #[test]
+    fn test_name_request_kinds_are_read_from_the_interface() {
+        let request: NameRequest = serde_json::from_str(r#"{"id": "n0", "name": "Annie", "kind": "form", "base": "Анна"}"#).unwrap();
+        assert!(matches!(request.kind, NameKind::Form));
+        assert_eq!(request.gender, "");
+    }
+
+    #[test]
     fn test_every_name_batch_sees_the_whole_cast() {
-        let names: Vec<String> = (0..MAX_BATCH_NAMES + 1).map(|i| format!("Name{i}")).collect();
+        let cast: Vec<String> = (0..MAX_BATCH_NAMES + 1).map(|i| format!("Name{i}")).collect();
+        let names = name_requests(&cast.iter().map(String::as_str).collect::<Vec<_>>());
         let (url, requests) = record_requests(vec![chat_answer("[]"), chat_answer("не JSON")]);
         let cancel = AtomicBool::new(false);
 
-        let result = tauri::async_runtime::block_on(translate_names(&chat(&url), &names, &names, &cancel, |_| {}))
+        let result = tauri::async_runtime::block_on(translate_names(&chat(&url), &names, &cast, &cancel, |_| {}))
             .unwrap();
 
         assert_eq!(result.failed_batches, 1);
         for _ in 0..2 {
             let request = requests.recv().unwrap();
-            assert!(request.contains(&names[0]) && request.contains(&names[MAX_BATCH_NAMES]), "{request}");
+            assert!(request.contains(&cast[0]) && request.contains(&cast[MAX_BATCH_NAMES]), "{request}");
         }
     }
 
@@ -2063,9 +2142,9 @@ mod tests {
     #[test]
     fn test_target_needs_a_server_and_a_model() {
         let cancel = AtomicBool::new(false);
-        let names = strings(&["Anja"]);
+        let names = name_requests(&["Anja"]);
         let run = |target: ChatTarget| {
-            tauri::async_runtime::block_on(translate_names(&target, &names, &names, &cancel, |_| {})).unwrap_err()
+            tauri::async_runtime::block_on(translate_names(&target, &names, &[], &cancel, |_| {})).unwrap_err()
         };
         assert!(run(ChatTarget { api_url: " ".to_string(), ..chat("http://127.0.0.1:1") }).contains("Адрес"));
         assert!(run(ChatTarget { model: String::new(), ..chat("http://127.0.0.1:1") }).contains("Модель"));
@@ -2076,15 +2155,15 @@ mod tests {
         let (url, requests) = record_requests(vec![chat_answer("[]")]);
         let cancel = AtomicBool::new(false);
         let target = ChatTarget { api_key: Some("sec\nret".to_string()), ..chat(&url) };
-        let names = strings(&["Anja"]);
+        let names = name_requests(&["Anja"]);
 
         // Такой ключ нельзя записать в заголовок: это ошибка запроса, а не паника
-        let error = tauri::async_runtime::block_on(translate_names(&target, &names, &names, &cancel, |_| {}))
+        let error = tauri::async_runtime::block_on(translate_names(&target, &names, &[], &cancel, |_| {}))
             .unwrap_err();
         assert!(!error.contains("sec"), "{error}");
 
         let target = ChatTarget { api_key: Some("secret".to_string()), ..target };
-        tauri::async_runtime::block_on(translate_names(&target, &names, &names, &cancel, |_| {})).unwrap();
+        tauri::async_runtime::block_on(translate_names(&target, &names, &[], &cancel, |_| {})).unwrap();
         let request = requests.recv().unwrap();
         assert!(request.to_lowercase().contains("authorization: bearer secret"), "{request}");
     }
@@ -2095,9 +2174,9 @@ mod tests {
         let (url, requests) = record_requests(vec![http_response("200 OK", answer)]);
         let cancel = AtomicBool::new(false);
         let target = ChatTarget { api_key: Some("secret".to_string()), provider: Provider::Claude, ..chat(&url) };
-        let names = strings(&["Anja"]);
+        let names = name_requests(&["Anja"]);
 
-        tauri::async_runtime::block_on(translate_names(&target, &names, &names, &cancel, |_| {})).unwrap();
+        tauri::async_runtime::block_on(translate_names(&target, &names, &[], &cancel, |_| {})).unwrap();
         let request = requests.recv().unwrap();
         let lowered = request.to_lowercase();
         assert!(request.starts_with("POST /v1/messages "), "{request}");
