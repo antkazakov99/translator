@@ -20,12 +20,14 @@ pub struct NameForm {
     pub translated: String,
 }
 
+fn joined_name(first: &str, last: &str) -> String {
+    [first.trim(), last.trim()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
 /// Запись персонажа в глоссарии проекта
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CharacterGlossaryEntry {
     pub alias: String,           // Код/алиас в Ren'Py ("lis", "emm", "me"). Персонаж, которого только упоминают, вместо кода получает внутренний номер с "~"
-    pub original_name: String,   // Оригинальное имя в игре ("Lisa", "Emma", "Jack")
-    pub translated_name: String, // Перевод имени на русский ("Лиза", "Эмма", "Джек")
     pub gender: String,          // "male" (М) | "female" (Ж) | "unknown" (—)
     pub notes: String,           // Описание персонажа
     #[serde(default)]
@@ -39,15 +41,19 @@ pub struct CharacterGlossaryEntry {
     #[serde(default)]
     pub forms: Vec<NameForm>, // Другие имена и обращения ("Miss Granger")
     #[serde(default)]
-    pub first_name: String, // Каноничное имя ("Lisa"). Вместе с фамилией это подпись записи, а реплики и запросы к модели идут с `original_name`
+    pub first_name: String, // Имя ("Lisa"). Вместе с фамилией это подпись записи и имя в запросах к модели
     #[serde(default)]
-    pub last_name: String, // Каноничная фамилия ("Smith")
+    pub last_name: String, // Фамилия ("Smith")
     #[serde(default)]
     pub translated_first_name: String,
     #[serde(default)]
     pub translated_last_name: String,
     #[serde(default, skip_serializing)]
     pub card_name: String, // Прежняя подпись записи: читается только для переноса в имя и фамилию
+    #[serde(default, rename = "original_name", skip_serializing)]
+    pub name_from_game: String, // Прежнее имя записи: читается только для переноса в имя, фамилию или форму
+    #[serde(default, rename = "translated_name", skip_serializing)]
+    pub translated_name_from_game: String,
 }
 
 impl CharacterGlossaryEntry {
@@ -58,24 +64,65 @@ impl CharacterGlossaryEntry {
     }
 
     pub fn names(&self) -> Vec<&str> {
-        std::iter::once(self.original_name.as_str())
+        [self.first_name.as_str(), self.last_name.as_str()]
+            .into_iter()
             .chain(self.merged.iter().map(|m| m.original_name.as_str()))
             .chain(self.forms.iter().map(|form| form.source.as_str()))
-            .chain(
-                [self.first_name.trim(), self.last_name.trim()]
-                    .into_iter()
-                    .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case(self.original_name.trim())),
-            )
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
             .collect()
     }
 
-    /// Имя по умолчанию это имя из игры с его переводом. Фамилию вносит пользователь.
-    fn default_first_name(&mut self) {
-        if self.first_name.trim().is_empty() {
-            self.first_name = self.original_name.trim().to_string();
+    /// Имя с фамилией: так персонаж подписан в карточке и в тексте для модели.
+    pub fn full_name(&self) -> String {
+        match joined_name(&self.first_name, &self.last_name) {
+            name if name.is_empty() => self.alias.clone(),
+            name => name,
         }
-        if self.translated_first_name.trim().is_empty() && self.first_name.eq_ignore_ascii_case(self.original_name.trim()) {
-            self.translated_first_name = self.translated_name.trim().to_string();
+    }
+
+    pub fn translated_full_name(&self) -> String {
+        joined_name(&self.translated_first_name, &self.translated_last_name)
+    }
+
+    /// Записывает перевод полного имени от модели. Разделить на имя и фамилию можно только два слова.
+    pub fn take_translation(&mut self, name: &str) {
+        let words: Vec<&str> = name.split_whitespace().collect();
+        if self.last_name.trim().is_empty() {
+            self.translated_first_name = words.join(" ");
+        } else if let [first, last] = words[..] {
+            self.translated_first_name = first.to_string();
+            self.translated_last_name = last.to_string();
+        }
+    }
+
+    /// Переносит прежнее имя из игры. Если оно не совпало с именем и фамилией, оно становится формой.
+    fn adopt_name_from_game(&mut self) {
+        let name = std::mem::take(&mut self.name_from_game);
+        let translated = std::mem::take(&mut self.translated_name_from_game);
+        let (name, translated) = (name.trim(), translated.trim());
+        if name.is_empty() {
+            return;
+        }
+        if self.first_name.trim().is_empty() {
+            self.first_name = name.to_string();
+        }
+        let fill = |own: &mut String, value: &str| {
+            if own.trim().is_empty() {
+                *own = value.to_string();
+            }
+        };
+        if self.first_name.trim().eq_ignore_ascii_case(name) {
+            fill(&mut self.translated_first_name, translated);
+        } else if self.last_name.trim().eq_ignore_ascii_case(name) {
+            fill(&mut self.translated_last_name, translated);
+        } else if joined_name(&self.first_name, &self.last_name).eq_ignore_ascii_case(name) {
+            if let [first, last] = translated.split_whitespace().collect::<Vec<_>>()[..] {
+                fill(&mut self.translated_first_name, first);
+                fill(&mut self.translated_last_name, last);
+            }
+        } else if !self.forms.iter().any(|form| form.source.trim().eq_ignore_ascii_case(name)) {
+            self.forms.push(NameForm { source: name.to_string(), translated: translated.to_string() });
         }
     }
 
@@ -200,7 +247,7 @@ impl ProjectGlossary {
     fn upgraded(mut self) -> Self {
         for character in &mut self.characters {
             character.adopt_card_name();
-            character.default_first_name();
+            character.adopt_name_from_game();
         }
         self
     }
@@ -237,8 +284,8 @@ impl ProjectGlossary {
                 .iter_mut()
                 .find(|own| own.has_alias(&character.alias));
             match own {
-                Some(own) if own.translated_name.trim().is_empty() => {
-                    if !character.translated_name.trim().is_empty() {
+                Some(own) if own.translated_full_name().is_empty() => {
+                    if !character.translated_full_name().is_empty() {
                         let own_merged = std::mem::take(&mut own.merged);
                         *own = character;
                         own.merged.extend(own_merged);
@@ -307,16 +354,13 @@ impl ProjectGlossary {
                 let gender = auto_detect_gender(name);
                 self.characters.push(CharacterGlossaryEntry {
                     alias: alias.clone(),
-                    original_name: name.clone(),
-                    translated_name: String::new(),
                     gender,
                     first_name: name.trim().to_string(),
                     ..Default::default()
                 });
             }
         }
-        self.characters
-            .sort_by(|a, b| a.original_name.cmp(&b.original_name));
+        self.characters.sort_by_cached_key(CharacterGlossaryEntry::full_name);
     }
 }
 
@@ -413,34 +457,72 @@ mod tests {
     }
 
     #[test]
-    fn test_canonical_name_is_optional_and_empty_one_is_not_a_name() {
-        let old: CharacterGlossaryEntry = serde_json::from_str(
-            r#"{"alias": "lis", "original_name": "Lisa", "translated_name": "", "gender": "female", "notes": ""}"#,
-        )
-        .unwrap();
-        assert_eq!(old.names(), ["Lisa"]);
-
-        let named = CharacterGlossaryEntry { first_name: " Lisa ".to_string(), last_name: "Smith".to_string(), ..old };
-        assert_eq!(named.names(), ["Lisa", "Smith"]);
+    fn test_empty_name_parts_are_not_names() {
+        let named = CharacterGlossaryEntry {
+            alias: "lis".to_string(),
+            first_name: " Lisa ".to_string(),
+            forms: vec![NameForm { source: " ".to_string(), translated: String::new() }, NameForm { source: "Liz".to_string(), translated: String::new() }],
+            ..Default::default()
+        };
+        assert_eq!(named.names(), ["Lisa", "Liz"]);
+        assert_eq!(named.full_name(), "Lisa");
+        assert_eq!(CharacterGlossaryEntry { alias: "lis".to_string(), ..Default::default() }.full_name(), "lis");
     }
 
     #[test]
-    fn test_first_name_defaults_to_the_name_from_the_game() {
+    fn test_first_name_comes_from_the_old_name_and_scan() {
         let glossary = with_card_name("", Vec::new());
         let lisa = &glossary.characters[0];
         assert_eq!((lisa.first_name.as_str(), lisa.translated_first_name.as_str()), ("Lisa", "Лиза"));
         assert_eq!(lisa.last_name, "");
+        assert!(lisa.forms.is_empty());
 
         let mut scanned = ProjectGlossary::default();
         scanned.merge_with_scanned_characters(&[("em".to_string(), "Emma".to_string())]);
         assert_eq!(scanned.characters[0].first_name, "Emma");
     }
 
+    fn adopted(json: &str) -> CharacterGlossaryEntry {
+        let character: CharacterGlossaryEntry = serde_json::from_str(json).unwrap();
+        ProjectGlossary { characters: vec![character], ..Default::default() }.upgraded().characters.remove(0)
+    }
+
+    #[test]
+    fn test_old_name_outside_the_first_and_last_name_becomes_a_form() {
+        let kira = adopted(r#"{"alias": "k", "original_name": "Mrs. K", "translated_name": "Миссис К", "gender": "", "notes": "", "first_name": "Kira"}"#);
+        assert_eq!(kira.forms, [NameForm { source: "Mrs. K".to_string(), translated: "Миссис К".to_string() }]);
+        assert_eq!(kira.translated_first_name, "");
+
+        let text = serde_json::to_string(&kira).unwrap();
+        assert!(!text.contains("original_name") && !text.contains("translated_name\":"), "{text}");
+        assert_eq!(adopted(&text), kira);
+    }
+
+    #[test]
+    fn test_old_full_name_splits_its_translation() {
+        let lisa = adopted(r#"{"alias": "l", "original_name": "lisa smith", "translated_name": "Лиза Смит", "gender": "", "notes": "", "first_name": "Lisa", "last_name": "Smith"}"#);
+        assert_eq!((lisa.translated_first_name.as_str(), lisa.translated_last_name.as_str()), ("Лиза", "Смит"));
+        assert!(lisa.forms.is_empty());
+    }
+
+    #[test]
+    fn test_model_translation_splits_only_into_two_words() {
+        let mut lisa = CharacterGlossaryEntry { first_name: "Lisa".to_string(), last_name: "Smith".to_string(), ..Default::default() };
+        lisa.take_translation("Лиза фон Смит");
+        assert_eq!(lisa.translated_full_name(), "");
+        lisa.take_translation(" Лиза  Смит ");
+        assert_eq!(lisa.translated_full_name(), "Лиза Смит");
+
+        let mut role = CharacterGlossaryEntry { first_name: "Old Bartender".to_string(), ..Default::default() };
+        role.take_translation("Старый бармен");
+        assert_eq!(role.translated_first_name, "Старый бармен");
+    }
+
     fn with_card_name(card_name: &str, forms: Vec<NameForm>) -> ProjectGlossary {
         let lisa = CharacterGlossaryEntry {
             alias: "lis".to_string(),
-            original_name: "Lisa".to_string(),
-            translated_name: "Лиза".to_string(),
+            name_from_game: "Lisa".to_string(),
+            translated_name_from_game: "Лиза".to_string(),
             card_name: card_name.to_string(),
             forms,
             ..Default::default()

@@ -729,9 +729,9 @@ fn scene_transcripts(
     scenes: &HashSet<String>,
     tokens: &TokenNotes,
 ) -> HashMap<String, Vec<String>> {
-    let names: HashMap<String, &str> = characters
+    let names: HashMap<String, String> = characters
         .iter()
-        .flat_map(|c| c.aliases().into_iter().map(|alias| (alias.to_lowercase(), c.original_name.as_str())))
+        .flat_map(|c| c.aliases().into_iter().map(|alias| (alias.to_lowercase(), c.full_name())))
         .collect();
     let mut by_scene: HashMap<String, Vec<String>> = HashMap::new();
     for line in &game.lines {
@@ -742,7 +742,7 @@ fn scene_transcripts(
         let alias = line.alias.as_ref().map(|alias| alias.to_lowercase());
         let speaker = alias
             .as_ref()
-            .and_then(|alias| names.get(alias).copied())
+            .and_then(|alias| names.get(alias).map(String::as_str))
             .or(line.speaker.as_deref())
             .or(line.alias.as_deref())
             .unwrap_or("Narrator");
@@ -1184,12 +1184,12 @@ pub async fn summarize_character(
         A line starting with \"Gender:\" tells who is male or female. \
         A line starting with \"Known terms:\" gives established translations: use them. \
         Respond with plain text only.",
-        character.original_name
+        character.full_name()
     );
 
     let mut stored = read_scene_notes(notes_file);
     let total = chunks.len();
-    let own_name = character.original_name.clone();
+    let own_name = character.full_name();
     let hint_for = |text: &str| glossary_hints(&format!("{own_name}\n{text}"), hints);
 
     // Одна новая часть: запрос сразу пишет описание по её тексту, и оно же становится заметкой
@@ -1211,7 +1211,7 @@ pub async fn summarize_character(
 
     let reader = NoteReader {
         owner: &character.alias,
-        name: &character.original_name,
+        name: &own_name,
         excluded: &character.excluded_notes,
         system_prompt: &system_prompt,
     };
@@ -1356,7 +1356,7 @@ pub async fn autofill_characters(
             if !only_empty {
                 true
             } else {
-                c.translated_name.trim().is_empty()
+                c.translated_full_name().is_empty()
                     || c.gender == "unknown"
                     || c.gender.trim().is_empty()
                     || c.notes.trim().is_empty()
@@ -1434,13 +1434,13 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
                 String::new()
             };
 
-            let translated = match c.translated_name.trim() {
+            let translated = match c.translated_full_name().as_str() {
                 "" => String::new(),
                 name => format!(", translated_name: \"{name}\""),
             };
             user_prompt.push_str(&format!(
-                "- alias: \"{}\", original_name: \"{}\"{}{}\n",
-                c.alias, c.original_name, translated, sample_str
+                "- alias: \"{}\", name: \"{}\"{}{}\n",
+                c.alias, c.full_name(), translated, sample_str
             ));
         }
 
@@ -1490,8 +1490,8 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
             if let Some(item) = item_map.get(&answer_key(&c.alias)) {
                 if let Some(name) = &item.translated_name {
                     let trimmed = name.trim();
-                    if !trimmed.is_empty() && (only_empty && c.translated_name.trim().is_empty() || !only_empty) {
-                        c.translated_name = trimmed.to_string();
+                    if !trimmed.is_empty() && (only_empty && c.translated_full_name().is_empty() || !only_empty) {
+                        c.take_translation(trimmed);
                     }
                 }
 
@@ -2109,6 +2109,20 @@ mod tests {
     }
 
     #[test]
+    fn test_speakers_are_signed_with_first_and_last_name() {
+        let (dir, scripts) = script_with("label one:\n    k \"Hello.\"\n    x \"Bye.\"\n");
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), HashMap::new());
+        let kate = CharacterGlossaryEntry { last_name: "Bell".to_string(), ..kate(&[]) };
+        let keys: HashSet<String> = game.lines.iter().map(|line| line.key()).collect();
+
+        let transcripts = scene_transcripts(&game, &[kate], &keys, &TokenNotes::new());
+
+        let lines: Vec<&String> = transcripts.values().flatten().collect();
+        assert_eq!(lines, ["Kate Bell: Hello.", "x: Bye."]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn test_model_never_sees_the_token_name() {
         let script = "label one:\n    k \"Ask [landlady] about [other].\"\n    \"[landlady!c] is home.\"\n";
         let (dir, scripts) = script_with(script);
@@ -2421,7 +2435,7 @@ mod tests {
     fn kate(excluded: &[&str]) -> CharacterGlossaryEntry {
         CharacterGlossaryEntry {
             alias: "k".to_string(),
-            original_name: "Kate".to_string(),
+            first_name: "Kate".to_string(),
             excluded_scenes: excluded.iter().map(|key| key.to_string()).collect(),
             ..Default::default()
         }
@@ -2501,7 +2515,7 @@ mod tests {
         let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), HashMap::new());
         let hilde = CharacterGlossaryEntry {
             alias: "hil".to_string(),
-            original_name: "Hilde".to_string(),
+            first_name: "Hilde".to_string(),
             merged: vec![crate::glossary::MergedCharacter {
                 alias: "hi".to_string(),
                 original_name: "Hilde".to_string(),
@@ -2729,7 +2743,7 @@ mod tests {
             ..Default::default()
         };
         let character = kate(&[]);
-        let parts = character_parts(chunks.iter().map(source).collect(), "model", &character.alias, &character.original_name, &notes_file, &hints);
+        let parts = character_parts(chunks.iter().map(source).collect(), "model", &character.alias, &character.full_name(), &notes_file, &hints);
         assert_eq!(parts[1].scenes[0].scene, "home");
         assert_eq!(parts[1].names[0].translated, "Кейт");
         assert_eq!(parts[1].terms, ["Three = Три"]);
@@ -2937,7 +2951,7 @@ mod tests {
         (0..count)
             .map(|i| CharacterGlossaryEntry {
                 alias: format!("c{i}"),
-                original_name: format!("Name {i}"),
+                first_name: format!("Name {i}"),
                 gender: "unknown".to_string(),
                 ..Default::default()
             })
@@ -2968,10 +2982,10 @@ mod tests {
         let reports = reports.into_inner().unwrap();
         assert_eq!(reports.len(), 2);
         assert_eq!((reports[0].batch, reports[0].total_batches, reports[0].items.len()), (1, 2, 3));
-        assert_eq!(reports[0].items[0].character.translated_name, "Имя 0");
+        assert_eq!(reports[0].items[0].character.translated_first_name, "Имя 0");
         assert!(reports[0].items[0].samples.is_empty());
         assert_eq!(reports[1].items[1].samples, ["Don't go"]);
-        assert_eq!(result.items[4].translated_name, "Имя 4");
+        assert_eq!(result.items[4].translated_first_name, "Имя 4");
     }
 
     #[test]
@@ -2988,8 +3002,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.failed_batches, 0, "остановка это не сбой");
-        assert_eq!(result.items[0].translated_name, "Первый");
-        assert_eq!(result.items[5].translated_name, "");
+        assert_eq!(result.items[0].translated_first_name, "Первый");
+        assert_eq!(result.items[5].translated_first_name, "");
     }
 
     #[test]

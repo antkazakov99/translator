@@ -48,28 +48,18 @@ export function canonicalForms(char: CanonicalName): NameForm[] {
   ].filter((form) => form.source);
 }
 
-/** Подпись карточки персонажа: имя с фамилией, иначе имя из игры. */
-export const characterTitle = (char: { alias: string; original_name: string; first_name: string; last_name: string }) =>
-  fullName(char) || char.original_name.trim() || char.alias;
+/** Подпись карточки персонажа: имя с фамилией, иначе код. */
+export const characterTitle = (char: { alias: string; first_name: string; last_name: string }) => fullName(char) || char.alias;
 
-/** Имя по умолчанию это имя из игры с его переводом. Фамилию вносит пользователь. */
+/** Перевод подписи карточки. */
+export const translatedTitle = (char: CanonicalName) => joinName(char.translated_first_name, char.translated_last_name);
+
+/** Имя нового персонажа. Фамилию вносит пользователь. */
 export const defaultCanonicalName = (name: string, translated: string): CanonicalName => ({
   ...NO_CANONICAL_NAME,
   first_name: name.trim(),
   translated_first_name: translated.trim()
 });
-
-/** Совпадает ли имя из игры с каноничным: тогда отдельного перевода у него нет, он следует за каноничным. */
-export function followsCanonical(char: CanonicalName & { original_name: string }) {
-  return [char.first_name, char.last_name, fullName(char)].some((name) => name.trim() && sameName(name, char.original_name));
-}
-
-/** Перевод имени из игры, которое следует за каноничным. */
-export function mainTranslation(char: CanonicalName & { original_name: string }) {
-  if (sameName(char.original_name, char.first_name)) return char.translated_first_name.trim();
-  if (sameName(char.original_name, char.last_name)) return char.translated_last_name.trim();
-  return joinName(char.translated_first_name, char.translated_last_name);
-}
 
 /** Есть ли у персонажа настоящий код из скриптов. Показывать можно только его. */
 export const hasScriptCode = (alias: string) => !alias.startsWith(NO_CODE);
@@ -150,48 +140,71 @@ export function ownerOptions(query: string, suggested: FormOwner[], characters: 
   ];
 }
 
-/** Пункты выбора нескольких персонажей: связанные всегда сверху, чтобы было видно, с кем связана форма. */
-export function linkOptions(query: string, suggested: FormOwner[], characters: FormOwner[], linked: string[]) {
-  const options = ownerOptions(query, suggested, characters, []);
-  return [
-    ...options.filter((option) => linked.includes(option.id)).map((option) => ({ ...option, group: "Связано" })),
-    ...options.filter((option) => !linked.includes(option.id))
-  ];
-}
-
 interface FormCharacter extends CanonicalName {
   alias: string;
-  original_name: string;
+  merged: { alias: string; original_name: string }[];
   forms: NameForm[];
 }
 
-/**
- * Формы персонажей, по одной на написание: фамилия бывает общей. Отдельно они нигде не хранятся.
- * Каноничные имя и фамилия тоже входят, кроме совпавших с именем из игры: оно не форма.
- * Сначала идут самые частые, а `counts` даёт число строк игры с формой в нижнем регистре.
- */
-export function characterForms(characters: FormCharacter[], counts: Map<string, number>) {
-  const found = new Map<string, { key: string; source: string; count: number; owners: { alias: string; name: string }[]; translations: string[] }>();
-  for (const char of characters) {
-    const canonical = canonicalForms(char).filter((form) => !sameName(form.source, char.original_name));
-    for (const form of [...canonical, ...char.forms]) {
-      const source = form.source.trim();
-      if (!source) continue;
-      const key = source.toLowerCase();
-      const entry = found.get(key) ?? { key, source, count: counts.get(key) ?? 0, owners: [], translations: [] };
-      if (!entry.owners.some((owner) => owner.alias === char.alias)) entry.owners.push({ alias: char.alias, name: characterTitle(char) });
-      if (form.translated.trim() && !entry.translations.includes(form.translated)) entry.translations.push(form.translated);
-      found.set(key, entry);
-    }
-  }
-  return [...found.values()].sort((a, b) => b.count - a.count || a.source.localeCompare(b.source));
-}
+/** Все написания персонажа: по ним он находится в поиске и среди говорящих без кода. */
+export const allNames = (char: FormCharacter) =>
+  [fullName(char), char.first_name, char.last_name, ...char.merged.map((part) => part.original_name), ...char.forms.map((form) => form.source)]
+    .map((name) => name.trim())
+    .filter(Boolean);
 
 /** Форма записи и перевод, который она получит: если своего нет, берётся перевод записи. */
 export const formTranslation = (form: NameForm, main: string) => form.translated.trim() || main.trim();
 
+/**
+ * Формы без пустых строк и повторов: написание сравнивается с именами записи `names` и с более ранними
+ * формами. Перевод лишней формы не теряется, если у оставшейся записи его нет.
+ */
+export function uniqueForms(forms: NameForm[], names: NameForm[]) {
+  const own = names.map((name) => ({ ...name }));
+  const kept: NameForm[] = [];
+  for (const form of forms) {
+    if (!form.source.trim()) continue;
+    const same = [...own, ...kept].filter((name) => sameName(name.source, form.source));
+    if (same.length === 0) kept.push({ ...form });
+    for (const name of same) {
+      if (!name.translated.trim()) name.translated = form.translated;
+    }
+  }
+  return { forms: kept, names: own };
+}
+
+/**
+ * Убирает повторы форм персонажа, иначе одно написание получит два перевода и подсказка модели пропадёт.
+ * Запись без кода в скриптах вошла в персонажа только именем, поэтому она становится формой.
+ */
+export function cleanCharacterForms(char: FormCharacter) {
+  const noCode = char.merged.filter((part) => !hasScriptCode(part.alias));
+  char.merged = char.merged.filter((part) => hasScriptCode(part.alias));
+  const allForms = [...char.forms, ...noCode.map((part) => ({ source: part.original_name, translated: "" }))];
+  const { forms, names } = uniqueForms(allForms, [
+    { source: char.first_name, translated: char.translated_first_name },
+    { source: char.last_name, translated: char.translated_last_name },
+    { source: fullName(char), translated: "" },
+    ...char.merged.map((part) => ({ source: part.original_name, translated: "" }))
+  ]);
+  char.forms = forms;
+  const [first, last, full] = names.map((name) => name.translated);
+  // Перевод полного имени нужен полям, пока те пусты, но разделить можно только два слова
+  const words = wordsOf(full);
+  const split = words.length === 2 && char.first_name.trim() && char.last_name.trim();
+  char.translated_first_name = first.trim() || (split ? words[0] : first);
+  char.translated_last_name = last.trim() || (split ? words[1] : last);
+}
+
+/** Убирает повторы форм термина. */
+export function cleanTermForms(term: { source_term: string; translated_term: string; forms: NameForm[] }) {
+  const { forms, names } = uniqueForms(term.forms, [{ source: term.source_term, translated: term.translated_term }]);
+  term.forms = forms;
+  term.translated_term = names[0].translated;
+}
+
 /** Поле персонажа, в которое попадёт написание от модели. */
-export type NameField = "main" | "first" | "last" | "form";
+export type NameField = "first" | "last" | "form";
 
 /** Имя в запросе к модели. Одинаковые запросы объединены: написание нужно всем их `NameTarget`. */
 export interface NameRequest {
@@ -217,7 +230,6 @@ export interface NameBatch {
 }
 
 interface NamedCharacter extends FormCharacter {
-  translated_name: string;
   gender: string;
 }
 
@@ -247,15 +259,12 @@ function nameBatch(wanted: WantedName[], prefix: string): NameBatch {
   return batch;
 }
 
-/** Первый шаг: имена и фамилии, а у кого их нет, имя из игры. Они станут основой для форм. */
+/** Первый шаг: имена и фамилии. Они станут основой для форм. */
 export function baseNames(characters: NamedCharacter[]) {
   return nameBatch(characters.flatMap((char): WantedName[] => {
     const common = { alias: char.alias, gender: char.gender, base: "" };
     const first = char.first_name.trim();
     const last = char.last_name.trim();
-    if (!first && !last) {
-      return [{ ...common, field: "main", source: char.original_name.trim() || char.alias, current: char.translated_name.trim(), kind: "name" }];
-    }
     return [
       ...(first ? [{ ...common, field: "first", source: first, current: char.translated_first_name.trim(), kind: "name" } as const] : []),
       ...(last ? [{ ...common, field: "last", source: last, current: char.translated_last_name.trim(), kind: "surname" } as const] : [])
@@ -271,17 +280,12 @@ export function formNames(characters: NamedCharacter[], spelled: Map<string, str
   return nameBatch(characters.flatMap((char): WantedName[] => {
     const known = (field: NameField, source: string, current: string) =>
       current.trim() || spelled.get(nameTargetKey({ alias: char.alias, field, source: source.trim() })) || "";
-    const base = joinName(known("first", char.first_name, char.translated_first_name), known("last", char.last_name, char.translated_last_name))
-      || known("main", char.original_name.trim() || char.alias, char.translated_name);
+    const base = joinName(known("first", char.first_name, char.translated_first_name), known("last", char.last_name, char.translated_last_name));
     const common = { alias: char.alias, gender: char.gender, base, kind: "form" as const };
     const taken = canonicalForms(char).map((form) => form.source);
     const isTaken = (source: string) => taken.some((name) => sameName(name, source));
-    const mainIsForm = taken.length > 0 && char.original_name.trim() && !followsCanonical(char);
-    return [
-      ...(mainIsForm ? [{ ...common, field: "main" as const, source: char.original_name.trim(), current: char.translated_name.trim() }] : []),
-      ...char.forms
-        .filter((form) => form.source.trim() && !isTaken(form.source))
-        .map((form) => ({ ...common, field: "form" as const, source: form.source.trim(), current: form.translated.trim() }))
-    ];
+    return char.forms
+      .filter((form) => form.source.trim() && !isTaken(form.source))
+      .map((form) => ({ ...common, field: "form" as const, source: form.source.trim(), current: form.translated.trim() }));
   }), "f");
 }

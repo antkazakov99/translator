@@ -4,14 +4,12 @@
   import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, Sparkles, Square } from "lucide-svelte";
   import EntryPicker from "./EntryPicker.svelte";
   import LlmChoice from "./LlmChoice.svelte";
-  import { baseNames, characterTitle, formNames, nameTargetKey, type CanonicalName, type NameBatch, type NameField, type NameForm, type NameTarget } from "./name-forms";
+  import { baseNames, characterTitle, formNames, nameTargetKey, translatedTitle, type CanonicalName, type NameBatch, type NameField, type NameForm, type NameTarget } from "./name-forms";
   import { beginLlmRun, endLlmRun, llmRun } from "./llm-run.svelte";
   import { LLM_ACTIONS, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "./llm-settings";
 
   interface PanelCharacter extends CanonicalName {
     alias: string;
-    original_name: string;
-    translated_name: string;
     gender: string;
     merged: { alias: string; original_name: string }[];
     forms: NameForm[];
@@ -160,11 +158,10 @@
   }
 
   // Имена
-  const characterName = (c: PanelCharacter) => c.original_name.trim() || c.alias;
   let unselectedAliases = $state<string[]>([]);
   let nameTargets = $derived(characters.filter((c) => !unselectedAliases.includes(c.alias)));
   let reviewNames = $state<(NameTarget & { key: string; translated: string; origin: string; selected: boolean })[]>([]);
-  const FIELD_LABELS: Record<NameField, string> = { main: "Имя из игры", first: "Имя", last: "Фамилия", form: "Другая форма" };
+  const FIELD_LABELS: Record<NameField, string> = { first: "Имя", last: "Фамилия", form: "Другая форма" };
   // Формы показываются рядом со своим именем, в какой бы момент ни пришёл ответ
   let reviewGroups = $derived(characters.flatMap((character) => {
     const rows = reviewNames.filter((row) => row.alias === character.alias);
@@ -202,7 +199,7 @@
       const result = await invoke<AutofillResult<NameSuggestion>>("translate_character_names", {
         target: targetFor(settings, "names"),
         names: requests,
-        cast: characters.flatMap((c) => [characterTitle(c), characterName(c), ...c.merged.map((m) => m.original_name)]),
+        cast: characters.flatMap((c) => [characterTitle(c), ...c.merged.map((m) => m.original_name)]),
         onBatch: batchChannel<NameSuggestion>((items) => {
           for (const item of items) {
             // Модель получает повторы один раз, а написание нужно каждому их владельцу
@@ -421,7 +418,7 @@
           unselected={unselectedAliases}
           disabled={llmRun.active}
           onchange={(next) => unselectedAliases = next}
-          onempty={() => unselectedAliases = characters.filter((c) => c.translated_name.trim()).map((c) => c.alias)}
+          onempty={() => unselectedAliases = characters.filter((c) => translatedTitle(c)).map((c) => c.alias)}
         />
         {@render runButton(`Перевести имена (${nameTargets.length})`, nameTargets.length === 0, startNames)}
 

@@ -1841,7 +1841,7 @@ async fn list_character_parts(
         let base_path = effective_game_directory(Path::new(&game_dir));
         let parts = llm::scene_parts(&game_lines(&base_path), &llm::token_notes(&hints.tokens), &character);
         let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
-        llm::character_parts(parts, &model, &character.alias, &character.original_name, &notes_file, &hints)
+        llm::character_parts(parts, &model, &character.alias, &character.full_name(), &notes_file, &hints)
     })
     .await
     .map_err(|e| format!("Ошибка чтения заметок персонажа: {}", e))
@@ -2367,7 +2367,7 @@ mod tests {
         save_edits(&new_story, &[("Bye", "До встречи")]);
         let character = |translated: &str| glossary::CharacterGlossaryEntry {
             alias: "e".into(),
-            translated_name: translated.into(),
+            translated_first_name: translated.into(),
             ..Default::default()
         };
         glossary::ProjectGlossary {
@@ -2394,7 +2394,7 @@ mod tests {
         assert_eq!(translated_text(&new_story, "Hello").as_deref(), Some("Привет"));
         assert_eq!(translated_text(&new_story, "Bye").as_deref(), Some("До встречи"));
         let merged = glossary::ProjectGlossary::load_for_project(&new_game).unwrap();
-        assert_eq!(merged.characters[0].translated_name, "Эйлин");
+        assert_eq!(merged.characters[0].translated_first_name, "Эйлин");
 
         // Повторный перенос ничего не меняет, а исходные данные остаются
         let message = transfer_project(&source, &new_game).unwrap();
@@ -3422,7 +3422,7 @@ mod tests {
 
             assert_eq!(gl.characters.len(), 2);
             let dh = gl.characters.iter_mut().find(|c| c.alias == "dh").unwrap();
-            dh.translated_name = "Охотник на демонов".to_string();
+            dh.translated_first_name = "Охотник на демонов".to_string();
 
             gl.terms.push(glossary::TermGlossaryEntry {
                 id: "term_1".to_string(),

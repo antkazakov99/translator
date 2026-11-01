@@ -17,7 +17,7 @@
     placeholder: string;
     translatedPlaceholder: string;
     onchange: (forms: NameForm[]) => void;
-    onsplit: (form: NameForm) => void;
+    onsplit?: (form: NameForm) => void;
   } = $props();
 
   function edit(index: number, change: Partial<NameForm>) {
@@ -34,7 +34,7 @@
     </button>
   </div>
   {#each forms as form, index (index)}
-    <div class="forms-row">
+    <div class="forms-row" class:no-split={!onsplit}>
       <input
         type="text"
         class="forms-input"
@@ -51,12 +51,14 @@
         aria-label={`${label}: перевод`}
         oninput={(event) => edit(index, { translated: event.currentTarget.value })}
       />
-      <button
-        class="forms-split"
-        disabled={!form.source.trim()}
-        title="Сделать отдельным термином"
-        onclick={() => onsplit(form)}
-      >В термин</button>
+      {#if onsplit}
+        <button
+          class="forms-split"
+          disabled={!form.source.trim()}
+          title="Сделать отдельным термином"
+          onclick={() => onsplit(form)}
+        >В термин</button>
+      {/if}
       <button
         class="forms-remove"
         title="Удалить форму"
@@ -117,6 +119,10 @@
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto;
     align-items: center;
     gap: 6px;
+  }
+
+  .forms-row.no-split {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
   }
 
   .forms-input {
