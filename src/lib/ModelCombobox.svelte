@@ -10,12 +10,15 @@
     models,
     label,
     placeholder = "",
+    fallback = "",
     disabled = false
   }: {
     value: string;
     models: string[];
     label: string;
     placeholder?: string;
+    /** Модель, которая будет использована при пустом значении. Показывается как обычный текст. */
+    fallback?: string;
     disabled?: boolean;
   } = $props();
 
@@ -28,6 +31,9 @@
   let showAll = $state(false);
   let active = $state(-1);
   let listStyle = $state("");
+  // Пока идёт ввод, поле можно очистить: запасная модель вернётся, когда фокус уйдёт
+  let editing = $state(false);
+  let text = $derived(value || editing ? value : fallback);
 
   // Выбранная модель не сужает список: иначе в нём осталась бы только она
   let shown = $derived.by(() => {
@@ -102,11 +108,18 @@
     spellcheck="false"
     {placeholder}
     {disabled}
-    bind:value
+    value={text}
     onfocus={() => openList(false)}
     onclick={() => { if (!open) openList(false); }}
-    oninput={() => openList(false)}
-    onblur={() => open = false}
+    oninput={(event) => {
+      editing = true;
+      value = event.currentTarget.value;
+      openList(false);
+    }}
+    onblur={() => {
+      editing = false;
+      open = false;
+    }}
     {onkeydown}
   />
   <button
@@ -127,9 +140,9 @@
           type="button"
           class="option"
           class:active={index === active}
-          class:selected={model === value.trim()}
+          class:selected={model === text.trim()}
           role="option"
-          aria-selected={model === value.trim()}
+          aria-selected={model === text.trim()}
           tabindex="-1"
           onmousedown={(event) => event.preventDefault()}
           onclick={() => pick(model)}

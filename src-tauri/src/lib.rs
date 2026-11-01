@@ -1886,11 +1886,10 @@ async fn summarize_glossary_character(
 async fn autofill_glossary_terms(
     target: llm::ChatTarget,
     terms: Vec<glossary::TermGlossaryEntry>,
-    only_empty: bool,
     on_batch: Channel<llm::BatchProgress<glossary::TermGlossaryEntry>>,
 ) -> Result<llm::AutofillResult<glossary::TermGlossaryEntry>, String> {
     let run = LlmRun::begin()?;
-    llm::autofill_terms(&target, terms, only_empty, run.cancel(), |progress| {
+    llm::autofill_terms(&target, terms, run.cancel(), |progress| {
         send_progress(&on_batch, progress)
     })
     .await

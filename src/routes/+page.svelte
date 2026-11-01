@@ -3,14 +3,14 @@
   import SceneGraph from "../lib/SceneGraph.svelte";
   import SceneNodeIcon from "../lib/SceneNodeIcon.svelte";
   import SourceViewerModal from "../lib/SourceViewerModal.svelte";
-  import CharacterPicker from "../lib/CharacterPicker.svelte";
+  import EntryPicker from "../lib/EntryPicker.svelte";
   import GlossaryAiPanel from "../lib/GlossaryAiPanel.svelte";
   import LlmSettingsModal from "../lib/LlmSettingsModal.svelte";
   import RequestSlider from "../lib/RequestSlider.svelte";
   import { partsToRead, type CharacterChunks } from "../lib/character-parts";
   import { beginLlmRun, endLlmRun, llmRun } from "../lib/llm-run.svelte";
   import LlmChoice from "../lib/LlmChoice.svelte";
-  import { saveLlmSettings, loadLlmSettings, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings, type LlmTarget } from "../lib/llm-settings";
+  import { defaultLlmChoices, saveLlmSettings, loadLlmSettings, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings, type LlmTarget } from "../lib/llm-settings";
   import { progressLabel, progressPercent } from "../lib/progress";
   import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -770,17 +770,6 @@
     return sceneAllRead ? "все прочитаны" : `${sceneParts} из ${sceneChunkCount}`;
   });
   let sceneNotesRevision = $state(0);
-  // Шкала делится на части. Если частей слишком много, зазоры съели бы сами сегменты
-  const MAX_SEGMENTS_WITH_GAPS = 80;
-  let sceneTrackStyle = $derived.by(() => {
-    const total = sceneChunkCount || 1;
-    // Центр бегунка ходит между половинами его ширины по краям шкалы
-    const stop = (parts: number) => {
-      if (parts <= 0) return "0px";
-      return parts >= total ? "100%" : `calc(7px + (100% - 14px) * ${parts / total})`;
-    };
-    return `--ready-stop: ${stop(sceneReadyCount)}; --parts-stop: ${stop(sceneChunkCount ? sceneParts : 0)}; --segment: calc((100% + 2px) / ${total})`;
-  });
   let summaryRunning = $state(false);
   const sceneChunkCache = new Map<string, { total: number; ready: number }>();
   // Чтение частей и сборка описания это разные шаги: сборка идёт и после остановки чтения
@@ -1271,7 +1260,6 @@
 
   function selectLlmModel(action: LlmAction, choice: LlmActionSettings) {
     llmSettings.actions[action] = choice;
-    saveLlmSettings($state.snapshot(llmSettings));
   }
 
   function applyPanelNames(rows: { alias: string; translated: string }[]) {
@@ -2097,6 +2085,8 @@
       showToast("Сначала выберите или откройте проект для работы с глоссарием", "warning");
       return;
     }
+    // Идущий запуск остаётся на своей модели, и его выбор виден, пока он не закончится
+    if (!llmRun.active) llmSettings.actions = defaultLlmChoices();
     showGlossaryModal = true;
     // Без загруженного глоссария правки в пустом окне заменили бы данные на диске
     if (!(await loadGlossary())) {
@@ -3732,8 +3722,8 @@
         </div>
 
         {#snippet groupUpdate()}
-          <CharacterPicker
-            characters={glossary.characters.map((c) => ({ alias: c.alias, name: c.original_name || c.alias }))}
+          <EntryPicker
+            items={glossary.characters.map((c) => ({ id: c.alias, name: c.original_name || c.alias }))}
             unselected={groupDeselected}
             disabled={llmRun.active}
             onchange={(next) => groupUnselected = next}
@@ -3743,10 +3733,9 @@
             id="group-parts"
             label="Частей на персонажа"
             status={groupCounting ? "подсчёт..." : groupReadable.length === 0 ? "нет сцен" : `${groupParts} из ${groupMaxParts}`}
-            min={1}
-            max={Math.max(groupMaxParts, 2)}
+            max={groupMaxParts}
             value={groupParts}
-            oninput={(event) => groupPartsWanted = event.currentTarget.valueAsNumber}
+            onchange={(value) => groupPartsWanted = value}
             disabled={llmRun.active || groupCounting || groupMaxParts < 2}
           >
             {#snippet ends()}
@@ -3778,7 +3767,7 @@
               onclick={updateCharacterGroup}
             >
               <Sparkles size={13} />
-              <span>Обновить через ИИ ({groupReadable.length})</span>
+              <span>Обновить описания ({groupReadable.length})</span>
             </button>
           {/if}
           {#if groupResult}
@@ -4168,16 +4157,11 @@
                         id="scene-parts"
                         label="Частей запроса"
                         status={scenePartsStatus}
-                        min={0}
                         max={Math.max(sceneChunkCount ?? 1, 1)}
-                        value={sceneParts}
-                        trackStyle={sceneTrackStyle}
-                        segmented={(sceneChunkCount ?? 0) <= MAX_SEGMENTS_WITH_GAPS}
-                        oninput={(event) => {
-                          const wanted = Math.max(event.currentTarget.valueAsNumber, sceneReadyCount, 1);
-                          if (selectedGlossaryChar) scenePartsByAlias[selectedGlossaryChar.alias] = wanted;
-                          event.currentTarget.value = String(wanted);
-                        }}
+                        value={sceneChunkCount ? sceneParts : 0}
+                        floor={Math.max(sceneReadyCount, 1)}
+                        ready={sceneReadyCount}
+                        onchange={(value) => { if (selectedGlossaryChar) scenePartsByAlias[selectedGlossaryChar.alias] = value; }}
                         disabled={llmRun.active || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
                       >
                         {#snippet ends()}
@@ -4203,7 +4187,7 @@
                         {:else}
                           <Sparkles size={13} />
                         {/if}
-                        <span>{sceneAllRead ? "Восстановить" : "Обновить через ИИ"}</span>
+                        <span>{sceneAllRead ? "Восстановить" : "Обновить описание"}</span>
                       </button>
                     </div>
                   </div>

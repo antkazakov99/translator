@@ -2,11 +2,11 @@
   import { onDestroy, type Snippet } from "svelte";
   import { Channel, invoke } from "@tauri-apps/api/core";
   import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, Sparkles, Square } from "lucide-svelte";
-  import CharacterPicker from "./CharacterPicker.svelte";
+  import EntryPicker from "./EntryPicker.svelte";
   import RequestSlider from "./RequestSlider.svelte";
   import LlmChoice from "./LlmChoice.svelte";
   import { beginLlmRun, endLlmRun, llmRun } from "./llm-run.svelte";
-  import { outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "./llm-settings";
+  import { LLM_ACTIONS, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "./llm-settings";
 
   interface PanelCharacter {
     alias: string;
@@ -100,20 +100,13 @@
     ontokens: (rows: { name: string; value: string; note: string }[]) => void;
   } = $props();
 
-  const SECTIONS: Record<GlossaryTab, { id: LlmAction; label: string }[]> = {
-    characters: [
-      { id: "descriptions", label: "Описания персонажей" },
-      { id: "names", label: "Имена" }
-    ],
-    terms: [
-      { id: "terms", label: "Перевод терминов" },
-      { id: "termSearch", label: "Поиск в тексте игры" }
-    ],
-    tokens: [{ id: "tokens", label: "Пояснения токенов" }]
+  const SECTIONS: Record<GlossaryTab, LlmAction[]> = {
+    characters: ["descriptions", "names"],
+    terms: ["terms", "termSearch"],
+    tokens: ["tokens"]
   };
-  // Размеры пакетов те же, что в llm.rs: так ползунок считает настоящие запросы
+  // Размер пакета тот же, что в llm.rs: так ползунок считает настоящие запросы
   const TERMS_PER_REQUEST = 20;
-  const TOKENS_PER_REQUEST = 10;
   const MAX_TERM_REQUESTS = 10;
 
   let panelOpen = $state(false);
@@ -181,6 +174,7 @@
   // Имена
   const characterName = (c: PanelCharacter) => c.original_name.trim() || c.alias;
   let unselectedAliases = $state<string[]>([]);
+  let nameTargets = $derived(characters.filter((c) => !unselectedAliases.includes(c.alias)));
   let reviewNames = $state<{ alias: string; original: string; current: string; translated: string; origin: string; selected: boolean }[]>([]);
   let unchangedNames = $state(0);
   let namesRequested = $state(0);
@@ -196,11 +190,7 @@
 
   /** Модель пишет имена выбранных персонажей, видя весь состав игры. Заполненные имена тоже участвуют. */
   async function startNames() {
-    const chosen = characters.filter((c) => !unselectedAliases.includes(c.alias));
-    if (chosen.length === 0) {
-      errorMessage = "Нет персонажей для обработки: выберите хотя бы одного.";
-      return;
-    }
+    const chosen = nameTargets;
     if (!beginRun("Модель определяет происхождение имён...")) return;
     reviewNames = [];
     unchangedNames = 0;
@@ -237,7 +227,7 @@
       if (result.failed_batches > 0) errorMessage = failedBatchesMessage(result.failed_batches);
     } catch (e) {
       namesRequested = 0;
-      errorMessage = `Не удалось обновить имена: ${String(e)}`;
+      errorMessage = `Не удалось перевести имена: ${String(e)}`;
     } finally {
       endRun();
     }
@@ -251,7 +241,10 @@
   }
 
   // Перевод терминов
-  let onlyEmptyTerms = $state(true);
+  // Без явного выбора в запуске непереведённые: готовый перевод нельзя заменить случайно
+  let unselectedTerms = $state<string[] | null>(null);
+  let termsDeselected = $derived(unselectedTerms ?? terms.filter((t) => t.translated_term.trim()).map((t) => t.id));
+  let termTargets = $derived(terms.filter((t) => !termsDeselected.includes(t.id)));
   let reviewTranslations = $state<{ id: string; source: string; current: string; translated: string; category: string; notes: string; selected: boolean }[]>([]);
   let translationsRun = $state(false);
   let chosenTranslations = $derived(reviewTranslations.filter((row) => row.selected && row.translated.trim()));
@@ -263,8 +256,7 @@
     try {
       const result = await invoke<AutofillResult<PanelTerm>>("autofill_glossary_terms", {
         target: targetFor(settings, "terms"),
-        terms: $state.snapshot(terms),
-        onlyEmpty: onlyEmptyTerms,
+        terms: $state.snapshot(termTargets),
         onBatch: batchChannel<PanelTerm>((items) => {
           for (const term of items) {
             const known = terms.find((t) => t.id === term.id);
@@ -342,18 +334,17 @@
     foundNote = "";
   }
 
-  // Токены: они идут от самых частых, поэтому меньшее число запросов берёт важные
-  let onlyEmptyTokens = $state(true);
-  let tokenRequests = $state(1);
-  let tokenTargets = $derived(tokens.filter((t) => t.lines > 0 && (!onlyEmptyTokens || (!t.value.trim() && !t.note.trim()))));
-  let maxTokenRequests = $derived(Math.max(Math.ceil(tokenTargets.length / TOKENS_PER_REQUEST), 1));
-  let tokenRequestsShown = $derived(Math.min(tokenRequests, maxTokenRequests));
+  // Токены без реплик модели показать нечего. Без явного выбора в запуске незаполненные, как у терминов
+  let readableTokens = $derived(tokens.filter((t) => t.lines > 0));
+  let unselectedTokens = $state<string[] | null>(null);
+  let tokensDeselected = $derived(unselectedTokens ?? readableTokens.filter((t) => t.value.trim() || t.note.trim()).map((t) => t.name));
+  let tokenTargets = $derived(readableTokens.filter((t) => !tokensDeselected.includes(t.name)));
   let reviewTokens = $state<(TokenSuggestion & { lines: number; selected: boolean })[]>([]);
   let tokensRun = $state(false);
   let chosenTokens = $derived(reviewTokens.filter((t) => t.selected && (t.value.trim() || t.note.trim())));
 
   async function startTokens() {
-    const names = tokenTargets.slice(0, tokenRequestsShown * TOKENS_PER_REQUEST).map((t) => t.name);
+    const names = tokenTargets.map((t) => t.name);
     if (!beginRun("Модель читает реплики с токенами...")) return;
     reviewTokens = [];
     tokensRun = true;
@@ -373,7 +364,7 @@
       });
       if (result.failed_batches > 0) errorMessage = failedBatchesMessage(result.failed_batches);
     } catch (e) {
-      errorMessage = `Не удалось разобрать токены: ${String(e)}`;
+      errorMessage = `Не удалось обновить пояснения: ${String(e)}`;
     } finally {
       endRun();
     }
@@ -434,7 +425,7 @@
 
   {#if panelOpen}
     <div class="ai-tabs">
-      {#each SECTIONS[tab] as section (section.id)}
+      {#each LLM_ACTIONS.filter(({ id }) => SECTIONS[tab].includes(id)) as section (section.id)}
         <button
           class="ai-tab"
           class:active={openSection === section.id}
@@ -463,14 +454,14 @@
         {@render descriptions()}
       {:else if openSection === "names"}
         <p class="ai-note">Модель увидит все имена игры, определит их происхождение и заново напишет имена выбранных персонажей, включая заполненные. Что заменить, выберете вы.</p>
-        <CharacterPicker
-          characters={characters.map((c) => ({ alias: c.alias, name: characterName(c) }))}
+        <EntryPicker
+          items={characters.map((c) => ({ id: c.alias, name: characterName(c) }))}
           unselected={unselectedAliases}
           disabled={llmRun.active}
           onchange={(next) => unselectedAliases = next}
           onempty={() => unselectedAliases = characters.filter((c) => c.translated_name.trim()).map((c) => c.alias)}
         />
-        {@render runButton("Обновить имена всей группой", characters.length === 0, startNames)}
+        {@render runButton(`Перевести имена (${nameTargets.length})`, nameTargets.length === 0, startNames)}
 
         {#if namesRequested > 0}
           <div class="ai-review">
@@ -502,11 +493,14 @@
           </div>
         {/if}
       {:else if openSection === "terms"}
-        <label class="ai-check">
-          <input type="checkbox" bind:checked={onlyEmptyTerms} disabled={llmRun.active} />
-          <span>Только непереведённые термины</span>
-        </label>
-        {@render runButton("Перевести термины", terms.length === 0, startTerms)}
+        <EntryPicker
+          items={terms.map((t) => ({ id: t.id, name: t.source_term }))}
+          unselected={termsDeselected}
+          disabled={llmRun.active}
+          onchange={(next) => unselectedTerms = next}
+          onempty={() => unselectedTerms = null}
+        />
+        {@render runButton(`Перевести термины (${termTargets.length})`, termTargets.length === 0, startTerms)}
 
         {#if translationsRun && !isProcessing && reviewTranslations.length === 0 && !errorMessage}
           <p class="ai-note">Модель не предложила изменений.</p>
@@ -535,18 +529,17 @@
           id="term-requests"
           label="Запросов"
           status={`${termRequests} из ${MAX_TERM_REQUESTS}`}
-          min={1}
           max={MAX_TERM_REQUESTS}
           value={termRequests}
           disabled={llmRun.active}
-          oninput={(event) => termRequests = event.currentTarget.valueAsNumber}
+          onchange={(value) => termRequests = value}
         >
           {#snippet ends()}
             <span>{TERMS_PER_REQUEST} частых названий</span>
             <span>{MAX_TERM_REQUESTS * TERMS_PER_REQUEST} названий, долго</span>
           {/snippet}
         </RequestSlider>
-        {@render runButton("Найти термины в игре", false, startTermSearch)}
+        {@render runButton("Найти термины", false, startTermSearch)}
 
         {#if foundNote || foundTerms.length > 0}
           <div class="ai-review">
@@ -580,26 +573,14 @@
         {/if}
       {:else if openSection === "tokens"}
         <p class="ai-note">Модель читает реплики с токеном, не видя его имени, и предлагает пояснение и значение. Что записать в глоссарий, выберете вы.</p>
-        <label class="ai-check">
-          <input type="checkbox" bind:checked={onlyEmptyTokens} disabled={llmRun.active} />
-          <span>Только незаполненные</span>
-        </label>
-        <RequestSlider
-          id="token-requests"
-          label="Запросов"
-          status={tokenTargets.length === 0 ? "нет токенов" : `${tokenRequestsShown} из ${maxTokenRequests}`}
-          min={1}
-          max={Math.max(maxTokenRequests, 2)}
-          value={tokenRequestsShown}
-          disabled={llmRun.active || maxTokenRequests < 2}
-          oninput={(event) => tokenRequests = event.currentTarget.valueAsNumber}
-        >
-          {#snippet ends()}
-            <span>самые частые</span>
-            <span>токенов: {tokenTargets.length}</span>
-          {/snippet}
-        </RequestSlider>
-        {@render runButton("Разобрать токены", tokenTargets.length === 0, startTokens)}
+        <EntryPicker
+          items={readableTokens.map((t) => ({ id: t.name, name: `[${t.name}]` }))}
+          unselected={tokensDeselected}
+          disabled={llmRun.active}
+          onchange={(next) => unselectedTokens = next}
+          onempty={() => unselectedTokens = null}
+        />
+        {@render runButton(`Обновить пояснения (${tokenTargets.length})`, tokenTargets.length === 0, startTokens)}
 
         {#if tokensRun && !isProcessing && reviewTokens.length === 0 && !errorMessage}
           <p class="ai-note">Модель не смогла ничего предложить.</p>
@@ -786,13 +767,6 @@
     border-radius: 6px;
     background: rgba(244, 63, 94, 0.1);
     color: #fecdd3;
-  }
-
-  .ai-check {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    cursor: pointer;
   }
 
   .ai-toggles {

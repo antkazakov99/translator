@@ -69,7 +69,8 @@
     bind:value={() => choice.model, (model) => onselect(action, { connection: choice.connection, model })}
     models={modelsByConnection[connection.id] ?? []}
     label="Модель"
-    placeholder={connection.model.trim() || "Имя модели"}
+    placeholder="Имя модели"
+    fallback={connection.model.trim()}
     disabled={llmRun.active}
   />
 </div>

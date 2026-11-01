@@ -1,9 +1,10 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { connectionFor, newConnection, outsideNote, parseLlmSettings, readyToCheck, targetFor, textModels, withoutConnection } from '../src/lib/llm-settings.ts';
+import { connectionFor, newConnection, outsideNote, parseLlmSettings, readyToCheck, serializeLlmSettings, targetFor, textModels, withoutConnection } from '../src/lib/llm-settings.ts';
 
 const noLegacy = () => null;
+const noChoice = { connection: '', model: '' };
 
 test('fresh settings point every action at the local server', () => {
   const settings = parseLlmSettings(null, noLegacy);
@@ -26,8 +27,7 @@ test('older connection settings carry over', () => {
   };
   const settings = parseLlmSettings(null, (key) => legacy[key] ?? null);
   assert.equal(settings.connections[0].url, 'http://10.0.0.5:1234/v1');
-  assert.deepEqual(settings.actions.names, { connection: 'external', model: 'big' });
-  assert.deepEqual(settings.actions.tokens, { connection: '', model: '' });
+  assert.deepEqual(settings.actions.names, noChoice);
   assert.equal(settings.connections[0].model, 'qwen');
   assert.equal(settings.connections[1].model, 'big');
   assert.equal(settings.connections[1].key, 'secret');
@@ -45,12 +45,11 @@ test('settings with a local and an external server become two connections', () =
     ['local', 'local', 'http://a/v1', ''],
     ['external', 'compatible', 'https://b/v1', 'secret']
   ]);
-  assert.deepEqual(settings.actions.terms, { connection: 'external', model: 'm' });
-  assert.deepEqual(settings.actions.names, { connection: 'local', model: 'n' });
-  assert.deepEqual(settings.actions.tokens, { connection: '', model: '' });
+  assert.deepEqual(settings.connections.map((c) => c.model), ['n', 'm']);
+  assert.deepEqual(settings.actions.terms, noChoice);
 });
 
-test('models of actions move to their connections and the actions keep working', () => {
+test('models of actions move to their connections and the actions go back to the default', () => {
   const saved = JSON.stringify({
     connections: [
       { id: 'local', provider: 'local', url: 'http://a/v1', key: '' },
@@ -61,21 +60,25 @@ test('models of actions move to their connections and the actions keep working',
   const settings = parseLlmSettings(saved, noLegacy);
   assert.deepEqual(settings.connections.map((c) => c.model), ['mistral', 'flash']);
   assert.equal(settings.defaultConnection, 'local');
-  assert.equal(targetFor(settings, 'names').model, 'flash');
-  assert.equal(targetFor(settings, 'names').provider, 'gemini');
-  assert.equal(targetFor(settings, 'tokens').model, 'mistral');
+  assert.equal(targetFor(settings, 'names').model, 'mistral');
+  assert.equal(targetFor(settings, 'names').provider, 'compatible');
 });
 
 test('saved connections survive a round trip', () => {
   const settings = parseLlmSettings(null, noLegacy);
   settings.connections.push(newConnection('claude', settings.connections));
-  settings.actions.names = { connection: 'claude-1', model: 'claude-sonnet-5-5' };
-  assert.deepEqual(parseLlmSettings(JSON.stringify(settings), noLegacy), settings);
+  settings.defaultConnection = 'claude-1';
+  assert.deepEqual(parseLlmSettings(serializeLlmSettings(settings), noLegacy), settings);
 });
 
-test('an action of an unknown connection falls back to the first one', () => {
-  const saved = JSON.stringify({ connections: [{ id: 'a', provider: 'openai', url: 'u' }], actions: { names: { connection: 'gone', model: 'm' } } });
-  assert.equal(parseLlmSettings(saved, noLegacy).actions.names.connection, 'a');
+test('a choice made for an action is never saved', () => {
+  const settings = parseLlmSettings(null, noLegacy);
+  settings.connections.push(newConnection('claude', settings.connections));
+  settings.actions.names = { connection: 'claude-1', model: 'claude-sonnet-5-5' };
+
+  assert.deepEqual(parseLlmSettings(serializeLlmSettings(settings), noLegacy).actions.names, noChoice);
+  // Выбор, записанный прежней версией, тоже не действует
+  assert.deepEqual(parseLlmSettings(JSON.stringify(settings), noLegacy).actions.names, noChoice);
 });
 
 test('broken settings fall back to defaults', () => {

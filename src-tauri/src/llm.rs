@@ -1406,22 +1406,10 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
 pub async fn autofill_terms(
     target: &ChatTarget,
     mut terms: Vec<TermGlossaryEntry>,
-    only_empty: bool,
     cancel: &AtomicBool,
     on_batch: impl Fn(BatchProgress<TermGlossaryEntry>) + Send + Sync,
 ) -> Result<AutofillResult<TermGlossaryEntry>, String> {
-    let indices_to_process: Vec<usize> = terms
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| {
-            if !only_empty {
-                true
-            } else {
-                t.translated_term.trim().is_empty()
-            }
-        })
-        .map(|(i, _)| i)
-        .collect();
+    let indices_to_process: Vec<usize> = (0..terms.len()).collect();
 
     if indices_to_process.is_empty() {
         return Ok(AutofillResult {
@@ -1970,14 +1958,14 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let url = serve_responses(vec![http_response("200 OK", &body), failure.clone()]);
-        let result = tauri::async_runtime::block_on(autofill_terms(&chat(&url), terms(), false, &cancel, |_| {}))
+        let result = tauri::async_runtime::block_on(autofill_terms(&chat(&url), terms(), &cancel, |_| {}))
             .unwrap();
         assert_eq!(result.failed_batches, 2);
         assert_eq!(result.items[0].translated_term, "Первый");
 
         // Если готового ещё нет, пользователь видит саму ошибку сервера
         let url = serve_responses(vec![failure]);
-        let error = tauri::async_runtime::block_on(autofill_terms(&chat(&url), terms(), false, &cancel, |_| {}))
+        let error = tauri::async_runtime::block_on(autofill_terms(&chat(&url), terms(), &cancel, |_| {}))
             .unwrap_err();
         assert!(error.contains("сбой"), "{error}");
     }

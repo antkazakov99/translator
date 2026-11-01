@@ -12,11 +12,11 @@ export const LLM_PROVIDERS: { id: LlmProvider; label: string; url: string; urlHi
 ];
 
 export const LLM_ACTIONS: { id: LlmAction; label: string; sends: string; gameText: boolean }[] = [
-  { id: "descriptions", label: "Описания персонажей", sends: "сцены с репликами", gameText: true },
-  { id: "names", label: "Имена", sends: "только список имён", gameText: false },
+  { id: "descriptions", label: "Обновление описаний", sends: "сцены с репликами", gameText: true },
+  { id: "names", label: "Перевод имён", sends: "только список имён", gameText: false },
   { id: "terms", label: "Перевод терминов", sends: "только термины", gameText: false },
   { id: "termSearch", label: "Поиск терминов", sends: "названия и примеры реплик", gameText: true },
-  { id: "tokens", label: "Токены", sends: "реплики с токенами", gameText: true }
+  { id: "tokens", label: "Обновление пояснений", sends: "реплики с токенами", gameText: true }
 ];
 
 export interface LlmConnection {
@@ -29,7 +29,10 @@ export interface LlmConnection {
   model: string;
 }
 
-/** Выбор действия. Пустое поле значит значение по умолчанию. */
+/**
+ * Разовый выбор действия. Пустое поле значит значение по умолчанию. Выбор не сохраняется и сбрасывается
+ * при открытии глоссария, чтобы текст игры не ушёл случайно на сервер, выбранный когда-то раньше.
+ */
 export interface LlmActionSettings {
   connection: string;
   model: string;
@@ -64,6 +67,9 @@ const SETTINGS_KEY = "translator.llm_settings";
 const DEFAULT_MODEL = "mistral-small";
 
 const providerOf = (id: LlmProvider) => LLM_PROVIDERS.find((provider) => provider.id === id)!;
+
+export const defaultLlmChoices = () =>
+  Object.fromEntries(LLM_ACTIONS.map(({ id }) => [id, { connection: "", model: "" }])) as Record<LlmAction, LlmActionSettings>;
 
 function storedConnection(connection: Partial<LlmConnection>, index: number): LlmConnection {
   const provider = LLM_PROVIDERS.some(({ id }) => id === connection.provider) ? connection.provider! : "compatible";
@@ -106,10 +112,11 @@ export function parseLlmSettings(saved: string | null, legacy: (key: string) => 
     }
   }
 
+  // Выбор действий прежних версий нужен только для переноса моделей в подключения
   const known = (id: string | undefined) => (connections.some((connection) => connection.id === id) ? id! : connections[0].id);
   const fallback = (id: LlmAction): LlmActionSettings =>
     id === "names" && oldNamesUrl ? { connection: "external", model: oldNamesModel } : { connection: "", model: "" };
-  const actions = Object.fromEntries(
+  const oldActions = Object.fromEntries(
     LLM_ACTIONS.map(({ id }) => {
       const action = stored.actions?.[id];
       if (!action) return [id, fallback(id)];
@@ -121,11 +128,11 @@ export function parseLlmSettings(saved: string | null, legacy: (key: string) => 
   // Прежние настройки хранили модель в действиях: подключение получает первую из них
   connections.forEach((connection, index) => {
     if (stored.connections?.[index]?.model !== undefined) return;
-    const used = Object.values(actions).find((action) => action.connection === connection.id && action.model);
+    const used = Object.values(oldActions).find((action) => action.connection === connection.id && action.model);
     connection.model = used?.model ?? (connection.provider === "local" ? localModel : "");
   });
-  const defaultConnection = known(stored.defaultConnection ?? actions.descriptions.connection);
-  return { connections, defaultConnection, actions };
+  const defaultConnection = known(stored.defaultConnection ?? oldActions.descriptions.connection);
+  return { connections, defaultConnection, actions: defaultLlmChoices() };
 }
 
 export function loadLlmSettings() {
@@ -139,9 +146,14 @@ export function loadLlmSettings() {
   return parseLlmSettings(read(SETTINGS_KEY), read);
 }
 
+/** Настройки для хранилища: подключения и значения по умолчанию, но не разовый выбор действий. */
+export function serializeLlmSettings({ connections, defaultConnection }: LlmSettings) {
+  return JSON.stringify({ connections, defaultConnection });
+}
+
 export function saveLlmSettings(settings: LlmSettings) {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    localStorage.setItem(SETTINGS_KEY, serializeLlmSettings(settings));
   } catch {
     // Без хранилища настройки живут до закрытия приложения
   }

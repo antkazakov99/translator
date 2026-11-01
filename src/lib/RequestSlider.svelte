@@ -5,33 +5,43 @@
     id,
     label,
     status,
-    min,
     max,
     value,
-    trackStyle,
-    segmented = false,
+    floor = 1,
+    ready = 0,
     disabled = false,
-    oninput,
+    onchange,
     ends
   }: {
     id: string;
     label: string;
     status: string;
-    min: number;
+    /** Шкала делится на `max` частей, и значение равно числу закрашенных. */
     max: number;
     value: number;
-    trackStyle?: string;
-    segmented?: boolean;
+    /** Ниже этого значения бегунок не опускается. */
+    floor?: number;
+    /** Части, которые уже готовы: они выделены своим цветом. */
+    ready?: number;
     disabled?: boolean;
-    oninput: (event: Event & { currentTarget: HTMLInputElement }) => void;
+    onchange: (value: number) => void;
     ends: Snippet;
   } = $props();
 
+  // Если частей слишком много, зазоры съели бы сами сегменты
+  const MAX_SEGMENTS_WITH_GAPS = 80;
+
   // Центр бегунка ходит между половинами его ширины по краям шкалы
-  let fillStyle = $derived.by(() => {
-    const share = max > min ? (value - min) / (max - min) : 0;
-    return `--ready-stop: 0px; --parts-stop: ${share >= 1 ? "100%" : `calc(7px + (100% - 14px) * ${share})`}`;
-  });
+  function stop(parts: number) {
+    if (parts <= 0) return "0px";
+    return parts >= max ? "100%" : `calc(7px + (100% - 14px) * ${parts / max})`;
+  }
+
+  function oninput(event: Event & { currentTarget: HTMLInputElement }) {
+    const wanted = Math.max(event.currentTarget.valueAsNumber, floor);
+    event.currentTarget.value = String(wanted);
+    onchange(wanted);
+  }
 </script>
 
 <div class="slider">
@@ -39,7 +49,17 @@
     <label for={id}>{label}</label>
     <span class="slider-status">{status}</span>
   </div>
-  <input {id} type="range" {min} {max} {value} style={trackStyle ?? fillStyle} class:segmented {disabled} {oninput} />
+  <input
+    {id}
+    type="range"
+    min="0"
+    {max}
+    {value}
+    style={`--ready-stop: ${stop(ready)}; --parts-stop: ${stop(value)}; --segment: calc((100% + 2px) / ${max})`}
+    class:segmented={max <= MAX_SEGMENTS_WITH_GAPS}
+    {disabled}
+    {oninput}
+  />
   <div class="slider-ends">{@render ends()}</div>
 </div>
 
