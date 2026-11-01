@@ -48,7 +48,8 @@
     Plus,
     Save,
     BookMarked,
-    ExternalLink
+    ExternalLink,
+    RotateCcw
   } from "lucide-svelte";
 
   // Стейт проекта на Svelte 5 (Runes)
@@ -722,6 +723,8 @@
   let sceneReadyCount = $state(0);
   let sceneParts = $derived(Math.min(Math.max(scenePartsWanted, sceneReadyCount), sceneChunkCount ?? 1));
   let sceneRequests = $derived(sceneParts > 1 || sceneReadyCount > 0 ? sceneParts - sceneReadyCount + 1 : 1);
+  // Всё прочитано: читать нечего, остаётся собрать описание из заметок
+  let sceneAllRead = $derived(characterUpdateMode === "scenes" && !!sceneChunkCount && sceneReadyCount >= sceneChunkCount);
   let sceneNotesRevision = $state(0);
   // Шкала делится на части. Если частей слишком много, зазоры съели бы сами сегменты
   const MAX_SEGMENTS_WITH_GAPS = 80;
@@ -732,7 +735,7 @@
       if (parts <= 0) return "0px";
       return parts >= total ? "100%" : `calc(7px + (100% - 14px) * ${parts / total})`;
     };
-    return `--ready-stop: ${stop(sceneReadyCount)}; --parts-stop: ${stop(sceneChunkCount ? sceneParts : 0)}; --segment: ${100 / total}%`;
+    return `--ready-stop: ${stop(sceneReadyCount)}; --parts-stop: ${stop(sceneChunkCount ? sceneParts : 0)}; --segment: calc((100% + 2px) / ${total})`;
   });
   let summaryRunning = $state(false);
   const sceneChunkCache = new Map<string, { total: number; ready: number }>();
@@ -3639,7 +3642,7 @@
                   <div class="character-update-row">
                     <select bind:value={characterUpdateMode} class="sidebar-select" disabled={updatingCharacter} aria-label="Что передать модели">
                       <option value="lines">По отдельным репликам</option>
-                      <option value="scenes">По сценам целиком</option>
+                      <option value="scenes">По сценам</option>
                     </select>
                     <button
                       class="btn-modal-ai"
@@ -3648,10 +3651,12 @@
                     >
                       {#if updatingCharacter}
                         <Loader2 size={13} class="spin" />
+                      {:else if sceneAllRead}
+                        <RotateCcw size={13} />
                       {:else}
                         <Sparkles size={13} />
                       {/if}
-                      <span>Обновить через ИИ</span>
+                      <span>{sceneAllRead ? "Восстановить" : "Обновить через ИИ"}</span>
                     </button>
                   </div>
                   {#if characterUpdateMode === "scenes" && selectedGlossaryChar}
@@ -3663,6 +3668,8 @@
                             подсчёт...
                           {:else if sceneChunkCount === 0}
                             нет реплик
+                          {:else if sceneAllRead}
+                            все прочитаны
                           {:else}
                             {sceneParts} из {sceneChunkCount} · запросов: {sceneRequests}
                           {/if}
@@ -3680,7 +3687,7 @@
                           scenePartsWanted = Math.max(event.currentTarget.valueAsNumber, sceneReadyCount, 1);
                           event.currentTarget.value = String(scenePartsWanted);
                         }}
-                        disabled={updatingCharacter || !sceneChunkCount || sceneChunkCount < 2 || sceneReadyCount >= sceneChunkCount}
+                        disabled={updatingCharacter || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
                       />
                       <div class="character-depth-ends">
                         {#if sceneReadyCount > 0}
@@ -3688,7 +3695,7 @@
                         {:else}
                           <span>1 часть, 1 запрос</span>
                         {/if}
-                        <span>весь текст, долго</span>
+                        <span>{sceneAllRead ? "соберётся из заметок" : "весь текст, долго"}</span>
                       </div>
                     </div>
                   {/if}
@@ -3945,7 +3952,7 @@
                 </div>
                 <div class="gender-filter-group">
                   <button class="btn-filter-pill" class:active={sceneLineFilter === 'all'} onclick={() => sceneLineFilter = 'all'}>Все</button>
-                  <button class="btn-filter-pill" class:active={sceneLineFilter === 'spoken'} onclick={() => sceneLineFilter = 'spoken'}>Его реплики</button>
+                  <button class="btn-filter-pill" class:active={sceneLineFilter === 'spoken'} onclick={() => sceneLineFilter = 'spoken'}>Реплики</button>
                   <button class="btn-filter-pill" class:active={sceneLineFilter === 'mentioned'} onclick={() => sceneLineFilter = 'mentioned'}>Упоминания</button>
                 </div>
               </div>
@@ -7375,7 +7382,8 @@
     background-image: var(--track);
   }
 
-  /* Зазоры уже шкалы на ширину бегунка: его центр ходит ровно по границам сегментов */
+  /* Зазоры уже шкалы на ширину бегунка: его центр ходит ровно по границам сегментов.
+     Слой короче ещё на зазор, чтобы последний не отрезал от конца шкалы кусочек */
   .character-scene-depth input.segmented::-webkit-slider-runnable-track {
     background-image:
       repeating-linear-gradient(
@@ -7384,9 +7392,9 @@
         #0f172a calc(var(--segment) - 2px) var(--segment)
       ),
       var(--track);
-    background-position: center;
+    background-position: 7px center, 0 0;
     background-repeat: no-repeat;
-    background-size: calc(100% - 14px) 100%, 100% 100%;
+    background-size: calc(100% - 16px) 100%, 100% 100%;
   }
 
   .character-scene-depth input::-webkit-slider-thumb {
