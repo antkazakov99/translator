@@ -13,9 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Сколько реплик персонажа получает модель, если не задано другое.
-pub const DEFAULT_CHARACTER_SAMPLES: usize = 64;
-pub const MAX_CHARACTER_SAMPLES: usize = 256;
+/// Сколько реплик персонажа получает модель при обновлении по отдельным репликам.
+pub const CHARACTER_SAMPLES: usize = 64;
 /// Предел текста реплик на персонажа и на запрос: окно контекста модели не бесконечно.
 const MAX_SAMPLE_TEXT: usize = 12_000;
 /// Подробные описания длинные: больше персонажей в ответе не успевают и не помещаются.
@@ -25,6 +24,12 @@ const CHARACTER_ANSWER_TOKENS: u32 = 3072;
 /// а таймаут запроса пять. Весь состав игры модель видит в каждом пакете.
 const MAX_BATCH_NAMES: usize = 30;
 const NAME_ANSWER_TOKENS: u32 = 3072;
+/// Сколько токенов разбирается за запрос и сколько реплик модель видит на каждый.
+const TOKEN_BATCH: usize = 10;
+const TOKEN_SAMPLES: usize = 8;
+const TOKEN_ANSWER_TOKENS: u32 = 1536;
+/// Что видит модель на месте разбираемого токена.
+const TOKEN_GAP: &str = "[___]";
 /// Локальная модель пишет подробный ответ минутами.
 const REQUEST_TIMEOUT_SECS: u64 = 300;
 const SCENE_NOTE_TOKENS: u32 = 768;
@@ -92,6 +97,14 @@ pub struct NameSuggestion {
     pub origin: String,
 }
 
+/// Предположение модели о токене. В глоссарий попадает после проверки пользователем.
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenSuggestion {
+    pub name: String,
+    pub value: String,
+    pub note: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
@@ -149,6 +162,13 @@ struct NameLlmItem {
 }
 
 #[derive(Debug, Deserialize)]
+struct TokenLlmItem {
+    id: Option<String>,
+    value: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TermLlmItem {
     id: Option<String>,
     source_term: Option<String>,
@@ -161,6 +181,14 @@ struct TermLlmItem {
 fn make_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .no_proxy()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| format!("Не удалось инициализировать HTTP-клиент: {}", e))
+}
+
+/// Клиент для внешнего сервиса: он может быть доступен только через системный прокси.
+fn make_external_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .build()
         .map_err(|e| format!("Не удалось инициализировать HTTP-клиент: {}", e))
@@ -183,9 +211,10 @@ fn normalize_api_url(raw: &str) -> String {
 }
 
 /// Проверяет доступность сервера и возвращает список доступных моделей
-pub async fn check_models(api_url: &str) -> Result<Vec<String>, String> {
+pub async fn check_models(api_url: &str, api_key: Option<&str>) -> Result<Vec<String>, String> {
     let base_url = normalize_api_url(api_url);
-    let client = make_client(6)?;
+    let api_key = api_key.map(str::trim).filter(|key| !key.is_empty());
+    let client = if api_key.is_some() { make_external_client(6)? } else { make_client(6)? };
 
     // Если в URL уже есть /v1, то /models, если нет — пробуем /v1/models
     let models_url = if base_url.ends_with("/v1") {
@@ -194,8 +223,11 @@ pub async fn check_models(api_url: &str) -> Result<Vec<String>, String> {
         format!("{}/v1/models", base_url)
     };
 
-    let resp = client
-        .get(&models_url)
+    let mut request = client.get(&models_url);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let resp = request
         .send()
         .await
         .map_err(|e| format!("Ошибка подключения к {}: {}", models_url, e))?;
@@ -220,14 +252,21 @@ pub async fn check_models(api_url: &str) -> Result<Vec<String>, String> {
 
 /// Выполняет один запрос в OpenAI-совместимый chat completions endpoint
 async fn call_chat_completion(
-    api_url: &str,
-    model: &str,
+    target: &ChatTarget,
     system_prompt: &str,
     user_prompt: &str,
     temperature: f32,
     max_tokens: u32,
 ) -> Result<String, String> {
-    let base_url = normalize_api_url(api_url);
+    if target.api_url.trim().is_empty() {
+        return Err("Адрес сервера не задан в настройках LLM".to_string());
+    }
+    if target.model.trim().is_empty() {
+        return Err("Модель не выбрана в настройках LLM".to_string());
+    }
+    let model = target.model.as_str();
+    let api_key = target.key();
+    let base_url = normalize_api_url(&target.api_url);
     let endpoint = if base_url.ends_with("/chat/completions") {
         base_url.clone()
     } else if base_url.ends_with("/v1") {
@@ -236,7 +275,11 @@ async fn call_chat_completion(
         format!("{}/v1/chat/completions", base_url)
     };
 
-    let client = make_client(REQUEST_TIMEOUT_SECS)?;
+    let client = if api_key.is_some() {
+        make_external_client(REQUEST_TIMEOUT_SECS)?
+    } else {
+        make_client(REQUEST_TIMEOUT_SECS)?
+    };
     let request_body = ChatCompletionRequest {
         model: model.to_string(),
         messages: vec![
@@ -253,9 +296,11 @@ async fn call_chat_completion(
         max_tokens: Some(max_tokens),
     };
 
-    let response = client
-        .post(&endpoint)
-        .json(&request_body)
+    let mut request = client.post(&endpoint).json(&request_body);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| {
@@ -668,52 +713,6 @@ fn scene_transcripts(
     by_scene
 }
 
-/// Собирает сцены персонажа целиком, со всеми участниками: так видно, кто с кем говорит.
-/// Сцены берутся равномерно в пределах объёма.
-pub fn collect_scene_samples(
-    game: &GameLines,
-    tokens: &TokenNotes,
-    characters: &[CharacterGlossaryEntry],
-) -> HashMap<String, Vec<String>> {
-    let character_keys: Vec<Vec<String>> = characters
-        .iter()
-        .map(|character| {
-            scenes::character_scenes(game, &character.aliases(), &character.names())
-                .into_iter()
-                .map(|scene| scene.key)
-                .filter(|key| !character.excluded_scenes.contains(key))
-                .collect()
-        })
-        .collect();
-    let by_scene = scene_transcripts(game, characters, &character_keys.iter().flatten().cloned().collect(), tokens);
-    let mut samples = HashMap::new();
-    for (character, keys) in characters.iter().zip(character_keys) {
-        let text: usize = keys
-            .iter()
-            .flat_map(|key| by_scene.get(key).into_iter().flatten())
-            .map(|line| line.chars().count())
-            .sum();
-        let scene_count = (keys.len() * MAX_SAMPLE_TEXT / text.max(1)).clamp(1, keys.len().max(1));
-
-        let mut picked = Vec::new();
-        let mut size = 0;
-        'scenes: for i in 0..scene_count.min(keys.len()) {
-            let key = &keys[i * keys.len() / scene_count];
-            for line in by_scene.get(key).into_iter().flatten() {
-                size += line.chars().count();
-                if size > MAX_SAMPLE_TEXT {
-                    break 'scenes;
-                }
-                picked.push(line.clone());
-            }
-        }
-        if !picked.is_empty() {
-            samples.insert(character.alias.to_lowercase(), picked);
-        }
-    }
-    samples
-}
-
 /// Строка между сценами внутри части: они могут быть далеко друг от друга в игре.
 const SCENE_BREAK: &str = "---\n";
 
@@ -963,8 +962,7 @@ fn write_scene_notes(path: &Path, notes: &HashMap<String, String>) -> Result<(),
 
 /// Сжимает заметки, пока они не поместятся в итоговый запрос.
 async fn condense_notes(
-    api_url: &str,
-    model: &str,
+    target: &ChatTarget,
     mut notes: Vec<String>,
     on_progress: &(impl Fn(SummaryProgress) + Send + Sync),
 ) -> Result<Vec<String>, String> {
@@ -997,7 +995,7 @@ async fn condense_notes(
         for (done, group) in groups.iter().enumerate() {
             on_progress(SummaryProgress { stage: "condense".to_string(), done, total });
             let prompt = format!("Notes:\n\n{}\n\nMerge them:", group.join("\n\n"));
-            condensed.push(call_chat_completion(api_url, model, system_prompt, &prompt, 0.2, CHARACTER_ANSWER_TOKENS).await?);
+            condensed.push(call_chat_completion(target, system_prompt, &prompt, 0.2, CHARACTER_ANSWER_TOKENS).await?);
         }
         notes = condensed;
     }
@@ -1050,32 +1048,41 @@ fn is_refusal(note: &str) -> bool {
 
 /// Итоговый запрос: сборка идёт и после остановки чтения, поэтому общий флаг её не касается.
 async fn write_description(
-    api_url: &str,
-    model: &str,
+    target: &ChatTarget,
     character: CharacterGlossaryEntry,
     lines: Vec<String>,
 ) -> Result<CharacterGlossaryEntry, String> {
     let samples = HashMap::from([(character.alias.to_lowercase(), lines)]);
     let cancel = AtomicBool::new(false);
-    let result = autofill_characters(api_url, model, vec![character], false, samples, &cancel, |_| {}).await?;
+    let result = autofill_characters(target, vec![character], false, samples, &cancel, |_| {}).await?;
     match result.items.into_iter().next() {
         Some(updated) if result.failed_batches == 0 => Ok(updated),
         _ => Err("Модель не вернула данные о персонаже, попробуйте ещё раз".to_string()),
     }
 }
 
-/// Адрес и модель для запросов.
-#[derive(Debug, Clone, Copy)]
-pub struct ChatTarget<'a> {
-    pub api_url: &'a str,
-    pub model: &'a str,
+/// Куда идёт запрос. У каждого действия своя цель из настроек LLM, а ключ нужен только внешним сервисам.
+/// `Debug` не выводится намеренно: ключ не должен попасть в журнал.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatTarget {
+    pub api_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+impl ChatTarget {
+    fn key(&self) -> Option<&str> {
+        self.api_key.as_deref().map(str::trim).filter(|key| !key.is_empty())
+    }
 }
 
 /// Обновляет персонажа по частям его сцен: собирает заметки, а затем пишет описание по ним. Готовые заметки лежат на диске, поэтому остановленный запуск
 /// продолжается с того же места. После остановки описание собирается из того, что уже прочитано.
 /// Возвращает `None`, если запуск остановлен раньше первой заметки.
 pub async fn summarize_character(
-    target: &ChatTarget<'_>,
+    target: &ChatTarget,
     character: CharacterGlossaryEntry,
     chunks: Vec<String>,
     hints: &ModelHints,
@@ -1083,7 +1090,7 @@ pub async fn summarize_character(
     cancel: &AtomicBool,
     on_progress: impl Fn(SummaryProgress) + Send + Sync,
 ) -> Result<Option<CharacterGlossaryEntry>, String> {
-    let ChatTarget { api_url, model } = *target;
+    let model = target.model.as_str();
     let system_prompt = format!(
         "You read a part of a visual novel script and take notes about the character {}. \
         The text has the form \"Speaker: text\", and \"you\" usually means the protagonist. \
@@ -1118,7 +1125,7 @@ pub async fn summarize_character(
         }
         on_progress(SummaryProgress { stage: "single".to_string(), done: 0, total });
         let lines = hint_for(&chunks[0]).into_iter().chain(chunks[0].lines().map(str::to_string)).collect();
-        let updated = write_description(api_url, model, character, lines).await?;
+        let updated = write_description(target, character, lines).await?;
         stored.insert(key, updated.notes.clone());
         write_scene_notes(notes_file, &stored)?;
         return Ok(Some(updated));
@@ -1136,7 +1143,7 @@ pub async fn summarize_character(
             None => {
                 let hint: String = hint_for(chunk).iter().map(|hint| format!("{hint}\n\n")).collect();
                 let prompt = format!("{hint}Script:\n\n{chunk}\n\nNotes about {}:", character.original_name);
-                let note = call_chat_completion(api_url, model, &system_prompt, &prompt, 0.2, SCENE_NOTE_TOKENS).await?;
+                let note = call_chat_completion(target, &system_prompt, &prompt, 0.2, SCENE_NOTE_TOKENS).await?;
                 stored.insert(key, note.clone());
                 write_scene_notes(notes_file, &stored)?;
                 note
@@ -1156,17 +1163,16 @@ pub async fn summarize_character(
             Err("В выбранных сценах модель не нашла сведений о персонаже".to_string())
         };
     }
-    let mut notes = condense_notes(api_url, model, notes, &on_progress).await?;
+    let mut notes = condense_notes(target, notes, &on_progress).await?;
     // В заметках имена уже по-русски, поэтому упомянутых ищем в самом тексте игры
     notes.splice(0..0, hint_for(&chunks.join("\n")));
     on_progress(SummaryProgress { stage: "final".to_string(), done: total, total });
-    write_description(api_url, model, character, notes).await.map(Some)
+    write_description(target, character, notes).await.map(Some)
 }
 
 /// Автозаполнение персонажей в глоссарии через LLM
 pub async fn autofill_characters(
-    api_url: &str,
-    model: &str,
+    target: &ChatTarget,
     mut characters: Vec<CharacterGlossaryEntry>,
     only_empty: bool,
     samples: HashMap<String, Vec<String>>,
@@ -1201,7 +1207,7 @@ pub async fn autofill_characters(
     info!(
         "Отправка {} персонажей на автозаполнение через LLM ({})",
         indices_to_process.len(),
-        model
+        target.model
     );
 
     let system_prompt = r#"You are an expert game localizer and linguist specializing in translating visual novels and RPGs from English to Russian.
@@ -1272,8 +1278,7 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
         user_prompt.push_str("\nProvide JSON array now:");
 
         let raw_response = match call_chat_completion(
-            api_url,
-            model,
+            target,
             system_prompt,
             &user_prompt,
             0.2, // низкая температура для точности и следования схеме
@@ -1363,8 +1368,7 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
 
 /// Автозаполнение и перевод терминов в глоссарии через LLM
 pub async fn autofill_terms(
-    api_url: &str,
-    model: &str,
+    target: &ChatTarget,
     mut terms: Vec<TermGlossaryEntry>,
     only_empty: bool,
     cancel: &AtomicBool,
@@ -1393,7 +1397,7 @@ pub async fn autofill_terms(
     info!(
         "Отправка {} терминов на автозаполнение через LLM ({})",
         indices_to_process.len(),
-        model
+        target.model
     );
 
     let system_prompt = r#"You are an expert game localization specialist translating English terms to Russian.
@@ -1432,8 +1436,7 @@ Respond ONLY with a valid JSON array of objects:
         user_prompt.push_str("\nProvide JSON array now:");
 
         let raw_response = match call_chat_completion(
-            api_url,
-            model,
+            target,
             system_prompt,
             &user_prompt,
             0.2,
@@ -1509,8 +1512,7 @@ pub fn script_texts(scripts: &[PathBuf]) -> Vec<String> {
 /// Проверяет кандидатов из `terms`: модель отсеивает мусор и переводит остальное.
 /// Окончательно термины выбирает пользователь, поэтому результат не попадает в глоссарий сам.
 pub async fn check_term_candidates(
-    api_url: &str,
-    model: &str,
+    target: &ChatTarget,
     candidates: &[TermCandidate],
     cancel: &AtomicBool,
     on_batch: impl Fn(BatchProgress<ReviewedTerm>) + Send + Sync,
@@ -1554,8 +1556,7 @@ Respond ONLY with a valid JSON array of the kept candidates, or [] if none quali
         user_prompt.push_str("\nProvide JSON array now:");
 
         let raw_response = match call_chat_completion(
-            api_url,
-            model,
+            target,
             system_prompt,
             &user_prompt,
             0.2,
@@ -1665,8 +1666,7 @@ fn is_garbled(name: &str) -> bool {
 /// Предлагает написание имён `names`. Модель видит весь состав игры `cast`, потому что
 /// происхождение одного имени часто понятно только по остальным.
 pub async fn translate_names(
-    api_url: &str,
-    model: &str,
+    target: &ChatTarget,
     names: &[String],
     cast: &[String],
     cancel: &AtomicBool,
@@ -1687,16 +1687,7 @@ pub async fn translate_names(
         let list: String = chunk.iter().map(|name| format!("- {name}\n")).collect();
         let user_prompt = format!("All names in this game: {cast}\n\nNames to spell:\n{list}\nProvide JSON array now:");
 
-        let raw_response = match call_chat_completion(
-            api_url,
-            model,
-            NAMES_SYSTEM_PROMPT,
-            &user_prompt,
-            0.2,
-            NAME_ANSWER_TOKENS,
-        )
-        .await
-        {
+        let raw_response = match call_chat_completion(target, NAMES_SYSTEM_PROMPT, &user_prompt, 0.2, NAME_ANSWER_TOKENS).await {
             Ok(response) => response,
             Err(error) => {
                 failed_batches += remaining_batches(error, batch, total_batches)?;
@@ -1731,6 +1722,141 @@ pub async fn translate_names(
                 translated: translated.to_string(),
                 origin: item.origin.as_deref().unwrap_or_default().trim().to_string(),
             });
+        }
+        report(batch, failed_batches, items[kept_before..].to_vec());
+    }
+
+    Ok(AutofillResult { items, failed_batches })
+}
+
+const TOKENS_SYSTEM_PROMPT: &str = r#"You study text variables of a visual novel that is being translated into Russian.
+The game replaces each variable with a string at run time. In the lines below the variable is shown as [___].
+
+Work out from the lines what each variable stands for. Rely only on the lines and on "Script values", the values the scripts really assign to it. If the lines do not show what it means, leave the field empty instead of guessing.
+
+For each variable output:
+1. "id": EXACT id as given.
+2. "note": One short sentence in Russian for a translator: what the variable stands for and who it refers to.
+3. "value": A Russian word or phrase in the nominative case that reads correctly in place of [___]. Empty string if the player types it in, if it changes during the game, or if the lines do not settle it.
+
+A line starting with "Russian names:" gives the exact spelling of names. A line starting with "Known terms:" gives established translations.
+
+Respond ONLY with a valid JSON array, without markdown fences or explanations:
+[
+  {"id": "t0", "note": "Кем Селия приходится главному герою", "value": "мать"},
+  {"id": "t1", "note": "Имя главного героя, его вводит игрок", "value": ""}
+]"#;
+
+/// Токен с материалом для модели.
+#[derive(Debug)]
+pub struct TokenSample {
+    name: String,
+    values: Vec<String>,
+    lines: Vec<String>,
+}
+
+/// Реплики с токенами `names`, равномерно по игре. Имени разбираемого токена в них нет: модель верит
+/// ему больше, чем репликам. Токены без реплик пропускаются: судить модели не о чем.
+pub fn token_samples(game: &GameLines, tokens: &TokenNotes, names: &[String]) -> Vec<TokenSample> {
+    let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
+    let mut found: HashMap<&str, Vec<&ScriptLine>> = HashMap::new();
+    for line in &game.lines {
+        let used: HashSet<&str> = RE_TEXT_VARIABLE
+            .captures_iter(&line.text)
+            .filter_map(|caps| caps.get(1))
+            .map(|name| name.as_str())
+            .filter(|name| wanted.contains(name))
+            .collect();
+        for name in used {
+            found.entry(name).or_default().push(line);
+        }
+    }
+    names
+        .iter()
+        .filter_map(|name| {
+            let lines = found.get(name.as_str())?;
+            let mut hidden = tokens.clone();
+            hidden.insert(name.clone(), TOKEN_GAP.to_string());
+            let lines = (0..TOKEN_SAMPLES.min(lines.len())).map(|i| {
+                let line = lines[i * lines.len() / TOKEN_SAMPLES.min(lines.len())];
+                let text = sample_text(&line.text, &game.variables, &hidden);
+                match line.speaker.as_deref().or(line.alias.as_deref()) {
+                    Some(speaker) => format!("{speaker}: {text}"),
+                    None => text,
+                }
+            });
+            Some(TokenSample {
+                name: name.clone(),
+                values: game.variables.get(name).cloned().unwrap_or_default(),
+                lines: lines.collect(),
+            })
+        })
+        .collect()
+}
+
+/// Предлагает пояснения и значения токенов. Окончательно их выбирает пользователь.
+pub async fn suggest_tokens(
+    target: &ChatTarget,
+    samples: &[TokenSample],
+    hints: &ModelHints,
+    cancel: &AtomicBool,
+    on_batch: impl Fn(BatchProgress<TokenSuggestion>) + Send + Sync,
+) -> Result<AutofillResult<TokenSuggestion>, String> {
+    let total_batches = samples.len().div_ceil(TOKEN_BATCH);
+    let mut failed_batches = 0;
+    let mut items: Vec<TokenSuggestion> = Vec::new();
+    let report = |batch: usize, failed_batches: usize, items: Vec<TokenSuggestion>| {
+        on_batch(BatchProgress { batch: batch + 1, total_batches, failed_batches, items })
+    };
+    for (batch, chunk) in samples.chunks(TOKEN_BATCH).enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let text: String = chunk.iter().flat_map(|sample| &sample.lines).map(|line| format!("{line}\n")).collect();
+        let mut user_prompt: String = glossary_hints(&text, hints).iter().map(|hint| format!("{hint}\n")).collect();
+        for (index, sample) in chunk.iter().enumerate() {
+            user_prompt.push_str(&format!("\nid: t{index}\n"));
+            if !sample.values.is_empty() {
+                user_prompt.push_str(&format!("Script values: {}\n", sample.values.join(", ")));
+            }
+            user_prompt.push_str("Lines:\n");
+            for line in &sample.lines {
+                user_prompt.push_str(&format!("{line}\n"));
+            }
+        }
+        user_prompt.push_str("\nProvide JSON array now:");
+
+        let raw_response = match call_chat_completion(target, TOKENS_SYSTEM_PROMPT, &user_prompt, 0.2, TOKEN_ANSWER_TOKENS).await {
+            Ok(response) => response,
+            Err(error) => {
+                failed_batches += remaining_batches(error, batch, total_batches)?;
+                report(total_batches - 1, failed_batches, Vec::new());
+                break;
+            }
+        };
+
+        let answer: Vec<TokenLlmItem> = match serde_json::from_str(extract_json_content(&raw_response)) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!("Не удалось распарсить JSON токенов от LLM: {}. Сырой ответ:\n{}", e, raw_response);
+                failed_batches += 1;
+                report(batch, failed_batches, Vec::new());
+                continue;
+            }
+        };
+
+        let kept_before = items.len();
+        for item in answer {
+            let id = item.id.as_deref().unwrap_or_default().trim();
+            let Some(sample) = id.strip_prefix('t').and_then(|index| index.parse::<usize>().ok()).and_then(|index| chunk.get(index)) else {
+                continue;
+            };
+            let value = item.value.as_deref().unwrap_or_default().trim();
+            let note = item.note.as_deref().unwrap_or_default().trim();
+            if (value.is_empty() && note.is_empty()) || items.iter().any(|known| known.name == sample.name) {
+                continue;
+            }
+            items.push(TokenSuggestion { name: sample.name.clone(), value: value.to_string(), note: note.to_string() });
         }
         report(batch, failed_batches, items[kept_before..].to_vec());
     }
@@ -1808,14 +1934,14 @@ mod tests {
 
         let cancel = AtomicBool::new(false);
         let url = serve_responses(vec![http_response("200 OK", &body), failure.clone()]);
-        let result = tauri::async_runtime::block_on(autofill_terms(&url, "model", terms(), false, &cancel, |_| {}))
+        let result = tauri::async_runtime::block_on(autofill_terms(&chat(&url), terms(), false, &cancel, |_| {}))
             .unwrap();
         assert_eq!(result.failed_batches, 2);
         assert_eq!(result.items[0].translated_term, "Первый");
 
         // Если готового ещё нет, пользователь видит саму ошибку сервера
         let url = serve_responses(vec![failure]);
-        let error = tauri::async_runtime::block_on(autofill_terms(&url, "model", terms(), false, &cancel, |_| {}))
+        let error = tauri::async_runtime::block_on(autofill_terms(&chat(&url), terms(), false, &cancel, |_| {}))
             .unwrap_err();
         assert!(error.contains("сбой"), "{error}");
     }
@@ -1844,10 +1970,11 @@ mod tests {
         let names = strings(&["Anja", "Hilde", "hilde", "Dunja", "Sarah", " "]);
         let cast = strings(&["Anja", "Hilde", "Dunja", "Sarah", "Vlado"]);
 
-        let result = tauri::async_runtime::block_on(translate_names(&url, "model", &names, &cast, &cancel, |_| {}))
+        let result = tauri::async_runtime::block_on(translate_names(&chat(&url), &names, &cast, &cancel, |_| {}))
             .unwrap();
 
         let request = requests.recv().unwrap();
+        assert!(!request.to_lowercase().contains("authorization:"), "{request}");
         assert!(request.contains("All names in this game: Anja, Hilde, Dunja, Sarah, Vlado"), "{request}");
         assert_eq!(request.matches("- Hilde").count(), 1, "{request}");
         assert!(!request.contains("- hilde"), "{request}");
@@ -1866,7 +1993,7 @@ mod tests {
         let (url, requests) = record_requests(vec![chat_answer("[]"), chat_answer("не JSON")]);
         let cancel = AtomicBool::new(false);
 
-        let result = tauri::async_runtime::block_on(translate_names(&url, "model", &names, &names, &cancel, |_| {}))
+        let result = tauri::async_runtime::block_on(translate_names(&chat(&url), &names, &names, &cancel, |_| {}))
             .unwrap();
 
         assert_eq!(result.failed_batches, 1);
@@ -1874,6 +2001,66 @@ mod tests {
             let request = requests.recv().unwrap();
             assert!(request.contains(&names[0]) && request.contains(&names[MAX_BATCH_NAMES]), "{request}");
         }
+    }
+
+    #[test]
+    fn test_model_never_sees_the_token_name() {
+        let script = "label one:\n    k \"Ask [landlady] about [other].\"\n    \"[landlady!c] is home.\"\n";
+        let (dir, scripts) = script_with(script);
+        let variables = HashMap::from([("landlady".to_string(), vec!["Mary".to_string()])]);
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), variables);
+
+        let samples = token_samples(&game, &TokenNotes::new(), &strings(&["landlady", "absent"]));
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].lines, ["k: Ask [___] about [other].", "[___] is home."]);
+
+        let content = r#"[
+            {"id":"t0","value":"мать","note":"Кем она приходится герою"},
+            {"id":"t7","value":"выдумка","note":""}
+        ]"#;
+        let (url, requests) = record_requests(vec![chat_answer(content)]);
+        let cancel = AtomicBool::new(false);
+        let result = tauri::async_runtime::block_on(suggest_tokens(
+            &chat(&url), &samples, &ModelHints::default(), &cancel, |_| {},
+        ))
+        .unwrap();
+
+        let request = requests.recv().unwrap();
+        assert!(!request.contains("landlady"), "{request}");
+        assert!(request.contains("Script values: Mary"), "{request}");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].name, "landlady");
+        assert_eq!(result.items[0].value, "мать");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_target_needs_a_server_and_a_model() {
+        let cancel = AtomicBool::new(false);
+        let names = strings(&["Anja"]);
+        let run = |target: ChatTarget| {
+            tauri::async_runtime::block_on(translate_names(&target, &names, &names, &cancel, |_| {})).unwrap_err()
+        };
+        assert!(run(ChatTarget { api_url: " ".to_string(), ..chat("http://127.0.0.1:1") }).contains("Адрес"));
+        assert!(run(ChatTarget { model: String::new(), ..chat("http://127.0.0.1:1") }).contains("Модель"));
+    }
+
+    #[test]
+    fn test_external_server_gets_the_api_key() {
+        let (url, requests) = record_requests(vec![chat_answer("[]")]);
+        let cancel = AtomicBool::new(false);
+        let target = ChatTarget { api_key: Some("sec\nret".to_string()), ..chat(&url) };
+        let names = strings(&["Anja"]);
+
+        // Такой ключ нельзя записать в заголовок: это ошибка запроса, а не паника
+        let error = tauri::async_runtime::block_on(translate_names(&target, &names, &names, &cancel, |_| {}))
+            .unwrap_err();
+        assert!(!error.contains("sec"), "{error}");
+
+        let target = ChatTarget { api_key: Some("secret".to_string()), ..target };
+        tauri::async_runtime::block_on(translate_names(&target, &names, &names, &cancel, |_| {})).unwrap();
+        let request = requests.recv().unwrap();
+        assert!(request.to_lowercase().contains("authorization: bearer secret"), "{request}");
     }
 
     /// Реплики персонажей из скрипта теми же шагами, что и в команде.
@@ -2014,8 +2201,7 @@ mod tests {
 
         let samples = collect_character_dialogue_samples(&game.lines, &game.variables, &notes, &[kate(&[])], 5);
         assert_eq!(samples["k"][0], "Ask мать about the rent.");
-        let scenes = collect_scene_samples(&game, &notes, &[kate(&[])]);
-        assert_eq!(scenes["k"][0], "Kate: Ask мать about the rent.");
+        assert!(scene_chunks(&game, &notes, &kate(&[]))[0].starts_with("Kate: Ask мать about the rent."));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2215,8 +2401,8 @@ mod tests {
         let (dir, scripts) = script_with(TWO_SCENES);
         let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), HashMap::new());
 
-        let all = collect_scene_samples(&game, &TokenNotes::new(), &[kate(&["story.rpy::bar"])]);
-        assert_eq!(all["k"], ["Kate: I am staying home tonight.", "m: Then I will cook, Kate."]);
+        let all = scene_chunks(&game, &TokenNotes::new(), &kate(&["story.rpy::bar"]));
+        assert_eq!(all, ["Kate: I am staying home tonight.\nm: Then I will cook, Kate.\n"]);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2243,8 +2429,8 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    fn chat(url: &str) -> ChatTarget<'_> {
-        ChatTarget { api_url: url, model: "model" }
+    fn chat(url: &str) -> ChatTarget {
+        ChatTarget { api_url: url.to_string(), model: "model".to_string(), api_key: None }
     }
 
     fn completion(content: &str) -> String {
@@ -2495,7 +2681,7 @@ mod tests {
         let long = "заметка ".repeat(1200);
         let url = serve_responses(vec![completion("Сжато 1"), completion("Сжато 2")]);
         let notes = tauri::async_runtime::block_on(condense_notes(
-            &url, "model", vec![long.clone(), long], &|_| {},
+            &chat(&url), vec![long.clone(), long], &|_| {},
         ))
         .unwrap();
         assert_eq!(notes, ["Сжато 1", "Сжато 2"]);
@@ -2508,7 +2694,7 @@ mod tests {
         let url = serve_responses(vec![http_response("200 OK", &body)]);
         let cancel = AtomicBool::new(false);
         let result = tauri::async_runtime::block_on(autofill_characters(
-            &url, "model", characters(1), true, HashMap::new(), &cancel, |_| {},
+            &chat(&url), characters(1), true, HashMap::new(), &cancel, |_| {},
         ))
         .unwrap();
         assert_eq!(result.items[0].notes, "Вежливая");
@@ -2550,7 +2736,7 @@ mod tests {
         let candidates = [candidate("Konoha"), candidate("Oh God"), candidate("Rare Thing")];
 
         let cancel = AtomicBool::new(false);
-        let result = tauri::async_runtime::block_on(check_term_candidates(&url, "model", &candidates, &cancel, |_| {}))
+        let result = tauri::async_runtime::block_on(check_term_candidates(&chat(&url), &candidates, &cancel, |_| {}))
             .unwrap();
 
         assert_eq!(result.failed_batches, 0);
@@ -2573,7 +2759,7 @@ mod tests {
         let url = serve_responses(vec![http_response("200 OK", &body), failure]);
         let cancel = AtomicBool::new(false);
         let reports = std::sync::Mutex::new(Vec::new());
-        let result = tauri::async_runtime::block_on(check_term_candidates(&url, "model", &candidates, &cancel, |p| {
+        let result = tauri::async_runtime::block_on(check_term_candidates(&chat(&url), &candidates, &cancel, |p| {
             reports.lock().unwrap().push((p.batch, p.total_batches, p.failed_batches, p.items.len()));
         }))
         .unwrap();
@@ -2610,7 +2796,7 @@ mod tests {
         let reports = std::sync::Mutex::new(Vec::new());
 
         let result = tauri::async_runtime::block_on(autofill_characters(
-            &url, "model", characters(5), true, samples, &cancel,
+            &chat(&url), characters(5), true, samples, &cancel,
             |progress| reports.lock().unwrap().push(progress),
         ))
         .unwrap();
@@ -2632,7 +2818,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         let result = tauri::async_runtime::block_on(autofill_characters(
-            &url, "model", characters(12), true, HashMap::new(), &cancel,
+            &chat(&url), characters(12), true, HashMap::new(), &cancel,
             |_| cancel.store(true, Ordering::Relaxed),
         ))
         .unwrap();

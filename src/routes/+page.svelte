@@ -3,7 +3,11 @@
   import SceneGraph from "../lib/SceneGraph.svelte";
   import SceneNodeIcon from "../lib/SceneNodeIcon.svelte";
   import SourceViewerModal from "../lib/SourceViewerModal.svelte";
-  import GlossaryAiModal from "../lib/GlossaryAiModal.svelte";
+  import GlossaryAiPanel from "../lib/GlossaryAiPanel.svelte";
+  import LlmSettingsModal from "../lib/LlmSettingsModal.svelte";
+  import RequestSlider from "../lib/RequestSlider.svelte";
+  import { distributeRequests, requestRange, type CharacterChunks } from "../lib/character-requests";
+  import { saveLlmSettings, loadLlmSettings, targetFor, type LlmSettings } from "../lib/llm-settings";
   import { progressLabel, progressPercent } from "../lib/progress";
   import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -16,6 +20,7 @@
     CheckCircle2, 
     AlertCircle, 
     Sparkles, 
+    Settings2,
     Search, 
     Users, 
     Languages, 
@@ -719,7 +724,12 @@
 
   // Состояние глоссария проекта
   let showGlossaryModal = $state(false);
-  let showGlossaryAiModal = $state(false);
+  let showLlmSettings = $state(false);
+  let llmSettings = $state<LlmSettings>(loadLlmSettings());
+  // Заметки по сценам привязаны к модели, поэтому от неё зависит и подсчёт готовых частей
+  let descriptionModel = $derived(llmSettings.actions.descriptions.model.trim());
+  // Остановка общая на все запросы, поэтому запуски идут по одному
+  let aiPanelBusy = $state(false);
   let glossaryTab = $state<'characters' | 'terms' | 'tokens'>('characters');
   // Пустая карточка новой записи на текущей вкладке
   let addingEntry = $state(false);
@@ -753,6 +763,11 @@
   let sceneParts = $derived(Math.min(Math.max(scenePartsWanted, sceneReadyCount), sceneChunkCount ?? 1));
   // Всё прочитано: читать нечего, остаётся собрать описание из заметок
   let sceneAllRead = $derived(characterUpdateMode === "scenes" && !!sceneChunkCount && sceneReadyCount >= sceneChunkCount);
+  let scenePartsStatus = $derived.by(() => {
+    if (sceneChunkCount === null) return "подсчёт...";
+    if (sceneChunkCount === 0) return "нет реплик";
+    return sceneAllRead ? "все прочитаны" : `${sceneParts} из ${sceneChunkCount}`;
+  });
   let sceneNotesRevision = $state(0);
   // Шкала делится на части. Если частей слишком много, зазоры съели бы сами сегменты
   const MAX_SEGMENTS_WITH_GAPS = 80;
@@ -790,6 +805,30 @@
   let otherCharacterUpdating = $derived(updatingAlias !== null && selectedGlossaryChar?.alias !== updatingAlias);
   let updatingCharacterEntry = $derived(glossary.characters.find((char) => char.alias === updatingAlias) ?? null);
   const characterScenesCache = new Map<string, CharacterScene[]>();
+
+  // Обновление группы: персонажи идут по очереди тем же путём, что и отдельный персонаж
+  let descriptionsOpen = $state(false);
+  let groupOnlyEmpty = $state(true);
+  let groupUnselected = $state<string[]>([]);
+  let groupChunks = $state.raw<Record<string, CharacterChunks>>({});
+  let groupCounting = $state(false);
+  let groupRequestsWanted = $state(0);
+  let groupRun = $state<{ index: number; total: number; name: string } | null>(null);
+  let groupStopping = $state(false);
+  let groupResult = $state<{ updated: number; total: number; failed: string[] } | null>(null);
+
+  const needsCharacterWork = (c: CharacterGlossaryEntry) =>
+    !c.translated_name.trim() || c.gender === "unknown" || !c.gender.trim() || !c.notes.trim() || !c.speech.trim();
+
+  let groupTargets = $derived(
+    glossary.characters.filter((c) => !groupUnselected.includes(c.alias) && (!groupOnlyEmpty || needsCharacterWork(c)))
+  );
+  // Персонажи без сцен читать нечего: они не входят в план
+  let groupReadable = $derived(groupTargets.filter((c) => (groupChunks[c.alias]?.total ?? 0) > 0));
+  let groupReadableChunks = $derived(groupReadable.map((c) => groupChunks[c.alias]));
+  let groupRange = $derived(requestRange(groupReadableChunks));
+  let groupRequests = $derived(Math.min(Math.max(groupRequestsWanted, groupRange.min), groupRange.max));
+  let groupWithoutScenes = $derived(groupCounting ? 0 : groupTargets.length - groupReadable.length);
 
   let characterSceneTotals = $derived({
     spoken: (characterScenes ?? []).reduce((sum, scene) => sum + scene.spoken, 0),
@@ -885,7 +924,7 @@
     if (characterUpdateMode !== "scenes" || !char || !scenesTarget || glossaryTab !== "characters") return;
     const delay = sceneChunkTarget === scenesTarget ? 100 : 0;
     sceneChunkTarget = scenesTarget;
-    const model = storedLlmModel();
+    const model = descriptionModel;
     const tokens = $state.snapshot(glossary.tokens);
     const key = JSON.stringify([scenesTarget, char.excluded_scenes, model, sceneNotesRevision, tokens]);
     const show = (chunks: { total: number; ready: number } | null) => {
@@ -907,6 +946,34 @@
         })
         .catch(() => { if (current) show(null); });
     }, delay);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+    };
+  });
+
+  // Ключ не меняется при вводе текста в карточке персонажа, поэтому части не пересчитываются зря
+  let groupCountKey = $derived(JSON.stringify(groupTargets.map((c) => [c.alias, c.excluded_scenes])));
+  $effect(() => {
+    if (!descriptionsOpen || !showGlossaryModal || groupRun) return;
+    void [groupCountKey, sceneNotesRevision];
+    const targets = untrack(() => $state.snapshot(groupTargets));
+    const model = descriptionModel;
+    const tokens = $state.snapshot(glossary.tokens);
+    const dir = gameDir;
+    let current = true;
+    groupCounting = true;
+    const timer = setTimeout(() => {
+      Promise.all(
+        targets.map((character) =>
+          invoke<CharacterChunks>("count_character_chunks", { gameDir: dir, model, character, tokens })
+            .then((chunks) => [character.alias, chunks] as const)
+        )
+      )
+        .then((entries) => { if (current) groupChunks = Object.fromEntries(entries); })
+        .catch(() => { if (current) groupChunks = {}; })
+        .finally(() => { if (current) groupCounting = false; });
+    }, 100);
     return () => {
       current = false;
       clearTimeout(timer);
@@ -941,7 +1008,7 @@
       characterPartsError = null;
       invoke<CharacterPart[]>("list_character_parts", {
         gameDir: dir,
-        model: storedLlmModel(),
+        model: descriptionModel,
         character: untrack(() => $state.snapshot(char)),
         hints
       })
@@ -971,14 +1038,6 @@
       sceneNotesRevision += 1;
     } catch (e) {
       showToast(`Не удалось сбросить заметки: ${e}`, "error");
-    }
-  }
-
-  function storedLlmModel() {
-    try {
-      return (localStorage.getItem("translator.llm_model") || "mistral-small").trim();
-    } catch {
-      return "mistral-small";
     }
   }
 
@@ -1110,66 +1169,68 @@
     char.speech = updated.speech;
     if (!char.translated_name.trim()) char.translated_name = updated.translated_name;
     glossaryDirty = true;
-    showToast(`Персонаж ${char.original_name} обновлён`, "success");
   }
 
-  /** Обновляет одного персонажа через модель. Готовый перевод имени остаётся: его мог задать пользователь. */
-  async function updateCharacterWithLlm(char: CharacterGlossaryEntry) {
-    const stored = (key: string, fallback: string) => {
-      try {
-        return localStorage.getItem(key) || fallback;
-      } catch {
-        return fallback;
-      }
-    };
+  function resetSummaryState() {
+    updatingAlias = null;
+    summaryRunning = false;
+    summaryProgress = null;
+    summaryBuild = null;
+    summaryStopping = false;
+    sceneNotesRevision += 1;
+  }
+
+  /** Читает `parts` частей сцен персонажа и пишет описание. Готовый перевод имени остаётся: его мог задать пользователь. */
+  async function summarizeCharacter(char: CharacterGlossaryEntry, parts: number) {
     updatingAlias = char.alias;
+    summaryRunning = true;
     try {
-      const apiUrl = stored("translator.llm_api_url", "http://127.0.0.1:1234/v1").trim();
-      const model = storedLlmModel();
-      if (characterUpdateMode === "scenes") {
-        summaryRunning = true;
-        const onProgress = new Channel<{ stage: string; done: number; total: number }>();
-        onProgress.onmessage = (progress) => {
-          // Новый шаг значит, что заметка прошлой части уже на диске
-          sceneNotesRevision += 1;
-          if (progress.stage === "scenes") {
-            summaryProgress = progress;
-          } else {
-            if (summaryProgress && !summaryStopping) summaryProgress = { ...summaryProgress, done: summaryProgress.total };
-            summaryBuild = progress;
-          }
-        };
-        const summary = await invoke<CharacterGlossaryEntry | null>("summarize_glossary_character", {
-          gameDir,
-          apiUrl,
-          model,
-          character: $state.snapshot(char),
-          hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
-          parts: sceneParts,
-          onProgress
-        });
-        if (summary) {
-          applyCharacterUpdate(char, summary);
-          if (summaryStopping) showToast("Описание собрано по прочитанным частям, следующий запуск дочитает остальные", "info");
+      const onProgress = new Channel<{ stage: string; done: number; total: number }>();
+      onProgress.onmessage = (progress) => {
+        // Новый шаг значит, что заметка прошлой части уже на диске
+        sceneNotesRevision += 1;
+        if (progress.stage === "scenes") {
+          summaryProgress = progress;
         } else {
+          if (summaryProgress && !summaryStopping) summaryProgress = { ...summaryProgress, done: summaryProgress.total };
+          summaryBuild = progress;
+        }
+      };
+      const summary = await invoke<CharacterGlossaryEntry | null>("summarize_glossary_character", {
+        gameDir,
+        target: targetFor(llmSettings, "descriptions"),
+        character: $state.snapshot(char),
+        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
+        parts,
+        onProgress
+      });
+      if (!summary) return "stopped";
+      applyCharacterUpdate(char, summary);
+      return summaryStopping ? "partial" : "updated";
+    } finally {
+      resetSummaryState();
+    }
+  }
+
+  async function updateCharacterWithLlm(char: CharacterGlossaryEntry) {
+    try {
+      if (characterUpdateMode === "scenes") {
+        const outcome = await summarizeCharacter(char, sceneParts);
+        if (outcome === "stopped") {
           showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
+        } else {
+          showToast(`Персонаж ${char.original_name} обновлён`, "success");
+          if (outcome === "partial") showToast("Описание собрано по прочитанным частям, следующий запуск дочитает остальные", "info");
         }
         return;
       }
 
-      const count = Number(stored("translator.llm_sample_count", "64"));
+      updatingAlias = char.alias;
       const result = await invoke<{ items: CharacterGlossaryEntry[]; failed_batches: number }>("autofill_glossary_characters", {
         gameDir,
-        apiUrl,
-        model,
+        target: targetFor(llmSettings, "descriptions"),
         characters: [$state.snapshot(char)],
-        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
-        options: {
-          onlyEmpty: false,
-          sampleCount: count > 0 ? count : 64,
-          wholeScenes: false
-        },
-        onBatch: new Channel()
+        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) }
       });
       const updated = result.items[0];
       if (result.failed_batches > 0 || !updated) {
@@ -1177,28 +1238,81 @@
         return;
       }
       applyCharacterUpdate(char, updated);
+      showToast(`Персонаж ${char.original_name} обновлён`, "success");
     } catch (e) {
       showToast(`Не удалось обновить персонажа: ${e}`, "error");
     } finally {
-      updatingAlias = null;
-      summaryRunning = false;
-      summaryProgress = null;
-      summaryBuild = null;
-      summaryStopping = false;
-      sceneNotesRevision += 1;
+      resetSummaryState();
     }
   }
 
-  function handleGlossaryAiApply(updatedChars: CharacterGlossaryEntry[], updatedTerms: TermGlossaryEntry[]) {
-    const selectedAlias = selectedGlossaryChar?.alias;
-    const selectedTermId = selectedGlossaryTerm?.id;
-    glossary.characters = updatedChars;
-    glossary.terms = updatedTerms;
-    // Инспектор должен править записи нового списка, а не заменённые
-    selectedGlossaryChar = glossary.characters.find(c => c.alias === selectedAlias) ?? glossary.characters[0] ?? null;
-    selectedGlossaryTerm = glossary.terms.find(t => t.id === selectedTermId) ?? glossary.terms[0] ?? null;
+  /** Обновляет персонажей группы по очереди. Две ошибки подряд значат, что дело не в персонаже, а в сервере. */
+  async function updateCharacterGroup() {
+    const plan = distributeRequests(groupReadableChunks, groupRequests)
+      .map((parts, index) => ({ char: groupReadable[index], parts }));
+    const dir = gameDir;
+    const failed: string[] = [];
+    let updated = 0;
+    let failuresInRow = 0;
+    groupResult = null;
+    groupStopping = false;
+    for (const [index, { char, parts }] of plan.entries()) {
+      if (groupStopping || gameDir !== dir || failuresInRow >= 2) break;
+      groupRun = { index, total: plan.length, name: char.original_name || char.alias };
+      try {
+        if ((await summarizeCharacter(char, parts)) !== "stopped") updated += 1;
+        failuresInRow = 0;
+      } catch (e) {
+        failed.push(`${char.original_name || char.alias}: ${e}`);
+        failuresInRow += 1;
+      }
+    }
+    groupRun = null;
+    groupResult = { updated, total: plan.length, failed };
+  }
+
+  function stopCharacterGroup() {
+    groupStopping = true;
+    summaryStopping = true;
+    invoke("cancel_llm_run");
+  }
+
+  function saveLlmConnections(settings: LlmSettings) {
+    llmSettings = settings;
+    saveLlmSettings(settings);
+  }
+
+  function applyPanelNames(rows: { alias: string; translated: string }[]) {
+    for (const row of rows) {
+      const char = glossary.characters.find((c) => c.alias === row.alias);
+      if (char) char.translated_name = row.translated;
+    }
     glossaryDirty = true;
-    showToast("Глоссарий обновлён через нейросеть!", "info");
+  }
+
+  function applyPanelTerms(rows: { id: string; translated: string; category: string; notes: string }[]) {
+    for (const row of rows) {
+      const term = glossary.terms.find((t) => t.id === row.id);
+      if (!term) continue;
+      term.translated_term = row.translated;
+      term.category = row.category;
+      if (row.notes.trim()) term.notes = row.notes;
+    }
+    glossaryDirty = true;
+  }
+
+  function addPanelTerms(terms: TermGlossaryEntry[]) {
+    glossary.terms = [...glossary.terms, ...terms];
+    selectedGlossaryTerm ??= glossary.terms[0] ?? null;
+    glossaryDirty = true;
+  }
+
+  // Пустое поле в ответе модели значит «не знаю», а не «стереть»
+  function applyPanelTokens(rows: { name: string; value: string; note: string }[]) {
+    for (const { name, value, note } of rows) {
+      if (value) setTokenField(name, "value", value);
+      if (note) setTokenField(name, "note", note);
+    }
   }
 
   // Фильтры глоссария
@@ -1913,6 +2027,14 @@
 
   let selectedTokenName = $state<string | null>(null);
   let selectedToken = $derived(tokenRows.find((token) => token.name === selectedTokenName) ?? tokenRows[0] ?? null);
+
+  let panelTokens = $derived(
+    tokenRows.map(({ name, lines }) => {
+      const own = tokenEntry(name);
+      return { name, lines, value: own?.value ?? "", note: own?.note ?? "" };
+    })
+  );
+  let panelHints = $derived({ tokens: glossary.tokens, names: characterNames, terms: glossary.terms });
 
   function tokenEntry(name: string) {
     return glossary.tokens.find((token) => token.name === name);
@@ -3540,7 +3662,7 @@
     <div 
       class="modal-backdrop" 
       onclick={(e) => { if (e.target === e.currentTarget) void closeGlossary(); }}
-      onkeydown={(e) => { if (e.key === 'Escape' && !showSourceViewer && !showGlossaryAiModal) void closeGlossary(); }}
+      onkeydown={(e) => { if (e.key === 'Escape' && !showSourceViewer && !showLlmSettings) void closeGlossary(); }}
       role="dialog"
       aria-modal="true"
       aria-label="Глоссарий проекта"
@@ -3559,12 +3681,11 @@
           <div class="modal-header-actions">
             <button 
               class="btn-modal-ai"
-              disabled={updatingCharacter}
-              onclick={() => showGlossaryAiModal = true}
-              title="Автозаполнение через нейросеть (LM Studio / Ollama)"
+              onclick={() => showLlmSettings = true}
+              title="Серверы и модели для каждого действия"
             >
-              <Sparkles size={14} class="text-violet-400" />
-              <span>Заполнить через ИИ</span>
+              <Settings2 size={14} class="text-violet-400" />
+              <span>Настройки LLM</span>
             </button>
             <button 
               class="btn-modal-save" 
@@ -3616,6 +3737,104 @@
             <span>Токены ({glossary.tokens.length})</span>
           </button>
         </div>
+
+        {#snippet groupUpdate()}
+          <label class="character-group-check">
+            <input type="checkbox" bind:checked={groupOnlyEmpty} disabled={!!groupRun} />
+            <span>Только незаполненные</span>
+          </label>
+          <details class="character-group-picker">
+            <summary>Выбрано: {glossary.characters.length - groupUnselected.length} из {glossary.characters.length}</summary>
+            <div class="character-group-toggles">
+              <button class="character-scene-link" onclick={() => groupUnselected = []}>Выбрать всех</button>
+              <button class="character-scene-link" onclick={() => groupUnselected = glossary.characters.map((c) => c.alias)}>Снять всех</button>
+            </div>
+            <div class="character-group-grid">
+              {#each glossary.characters as char (char.alias)}
+                <label class="character-group-check">
+                  <input
+                    type="checkbox"
+                    checked={!groupUnselected.includes(char.alias)}
+                    disabled={!!groupRun}
+                    onchange={(e) => {
+                      groupUnselected = e.currentTarget.checked
+                        ? groupUnselected.filter((alias) => alias !== char.alias)
+                        : [...groupUnselected, char.alias];
+                    }}
+                  />
+                  <span>{char.original_name || char.alias}</span>
+                </label>
+              {/each}
+            </div>
+          </details>
+          <RequestSlider
+            id="group-requests"
+            label="Запросов"
+            status={groupCounting ? "подсчёт..." : groupReadable.length === 0 ? "нет сцен" : `${groupRequests} из ${groupRange.max}`}
+            min={groupRange.min}
+            max={Math.max(groupRange.max, groupRange.min + 1)}
+            value={groupRequests}
+            oninput={(event) => groupRequestsWanted = event.currentTarget.valueAsNumber}
+            disabled={!!groupRun || groupCounting || groupRange.max <= groupRange.min}
+          >
+            {#snippet ends()}
+              <span>1 часть на персонажа</span>
+              <span>весь текст, долго</span>
+            {/snippet}
+          </RequestSlider>
+          {#if groupWithoutScenes > 0}
+            <p class="character-group-note">Без сцен, будут пропущены: {groupWithoutScenes}</p>
+          {/if}
+          {#if groupRun}
+            <div class="character-summary-progress">
+              <div class="character-summary-line">
+                <Loader2 size={13} class="spin" />
+                <span class="character-group-name">Персонаж {groupRun.index + 1} из {groupRun.total}: {groupRun.name}</span>
+                {#if !groupStopping}
+                  <button class="character-scene-link" onclick={stopCharacterGroup}>Остановить</button>
+                {/if}
+              </div>
+              <div class="character-summary-track">
+                <div class="character-summary-fill" style={`width: ${(groupRun.index / groupRun.total) * 100}%`}></div>
+              </div>
+              <span class="character-group-note">{groupStopping ? "Останавливаю: заканчиваю текущего персонажа" : summaryBuild ? summaryBuildLabel : summaryLabel}</span>
+            </div>
+          {:else}
+            <button
+              class="btn-modal-ai character-group-run"
+              disabled={updatingCharacter || aiPanelBusy || groupCounting || groupReadable.length === 0}
+              onclick={updateCharacterGroup}
+            >
+              <Sparkles size={13} />
+              <span>Обновить через ИИ ({groupReadable.length})</span>
+            </button>
+          {/if}
+          {#if groupResult}
+            <p class="character-group-note">Обновлено: {groupResult.updated} из {groupResult.total}. Не забудьте сохранить глоссарий.</p>
+            {#each groupResult.failed as failure}
+              <p class="character-group-note character-group-error">{failure}</p>
+            {/each}
+          {/if}
+        {/snippet}
+
+        <GlossaryAiPanel
+          tab={glossaryTab}
+          {gameDir}
+          characters={glossary.characters}
+          terms={glossary.terms}
+          tokens={panelTokens}
+          hints={panelHints}
+          settings={llmSettings}
+          locked={updatingCharacter || !!groupRun}
+          lockedNote={groupRun ? `Персонаж ${groupRun.index + 1} из ${groupRun.total}: ${groupRun.name}` : updatingCharacterEntry ? `Обновляется ${updatingCharacterEntry.original_name}` : ""}
+          bind:busy={aiPanelBusy}
+          bind:descriptionsOpen
+          descriptions={groupUpdate}
+          onnames={applyPanelNames}
+          onterms={applyPanelTerms}
+          onaddterms={addPanelTerms}
+          ontokens={applyPanelTokens}
+        />
 
         <!-- СПИСОК СЛЕВА, ОСНОВНОЕ МЕСТО ОТДАНО ВЫБРАННОЙ ЗАПИСИ -->
         <div class="glossary-split-container">
@@ -3964,7 +4183,7 @@
                     </select>
                     <button
                       class="btn-modal-ai"
-                      disabled={updatingCharacter}
+                      disabled={updatingCharacter || aiPanelBusy}
                       onclick={() => { if (selectedGlossaryChar) updateCharacterWithLlm(selectedGlossaryChar); }}
                     >
                       {#if updatingCharacter}
@@ -3978,45 +4197,31 @@
                     </button>
                   </div>
                   {#if characterUpdateMode === "scenes" && selectedGlossaryChar}
-                    <div class="character-scene-depth">
-                      <div class="character-summary-line">
-                        <label for="scene-parts">Частей запроса</label>
-                        <span class="char-sub-label">
-                          {#if sceneChunkCount === null}
-                            подсчёт...
-                          {:else if sceneChunkCount === 0}
-                            нет реплик
-                          {:else if sceneAllRead}
-                            все прочитаны
-                          {:else}
-                            {sceneParts} из {sceneChunkCount}
-                          {/if}
-                        </span>
-                      </div>
-                      <input
-                        id="scene-parts"
-                        type="range"
-                        min="0"
-                        max={Math.max(sceneChunkCount ?? 1, 1)}
-                        value={sceneParts}
-                        style={sceneTrackStyle}
-                        class:segmented={(sceneChunkCount ?? 0) <= MAX_SEGMENTS_WITH_GAPS}
-                        oninput={(event) => {
-                          const wanted = Math.max(event.currentTarget.valueAsNumber, sceneReadyCount, 1);
-                          if (selectedGlossaryChar) scenePartsByAlias[selectedGlossaryChar.alias] = wanted;
-                          event.currentTarget.value = String(wanted);
-                        }}
-                        disabled={updatingCharacter || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
-                      />
-                      <div class="character-depth-ends">
+                    <RequestSlider
+                      id="scene-parts"
+                      label="Частей запроса"
+                      status={scenePartsStatus}
+                      min={0}
+                      max={Math.max(sceneChunkCount ?? 1, 1)}
+                      value={sceneParts}
+                      trackStyle={sceneTrackStyle}
+                      segmented={(sceneChunkCount ?? 0) <= MAX_SEGMENTS_WITH_GAPS}
+                      oninput={(event) => {
+                        const wanted = Math.max(event.currentTarget.valueAsNumber, sceneReadyCount, 1);
+                        if (selectedGlossaryChar) scenePartsByAlias[selectedGlossaryChar.alias] = wanted;
+                        event.currentTarget.value = String(wanted);
+                      }}
+                      disabled={updatingCharacter || aiPanelBusy || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
+                    >
+                      {#snippet ends()}
                         {#if sceneReadyCount > 0}
                           <span class="character-depth-ready">готово: {sceneReadyCount}</span>
                         {:else}
                           <span>1 часть</span>
                         {/if}
                         <span>{sceneAllRead ? "соберётся из заметок" : "весь текст, долго"}</span>
-                      </div>
-                    </div>
+                      {/snippet}
+                    </RequestSlider>
                   {/if}
                   {#if summaryRunning && !otherCharacterUpdating}
                     <div class="character-summary-progress">
@@ -4664,17 +4869,12 @@
     onclose={() => showSourceViewer = false}
   />
 
-  <!-- МОДАЛЬНОЕ ОКНО ИИ-АВТОЗАПОЛНЕНИЯ ГЛОССАРИЯ -->
-  <GlossaryAiModal
-    show={showGlossaryAiModal}
-    gameDir={gameDir}
-    characters={glossary.characters}
-    terms={glossary.terms}
-    tokens={glossary.tokens}
-    names={characterNames}
-    initialTab={glossaryTab === 'terms' ? 'terms' : 'characters'}
-    onapply={handleGlossaryAiApply}
-    onclose={() => showGlossaryAiModal = false}
+  <!-- НАСТРОЙКИ LLM: СЕРВЕРЫ И МОДЕЛЬ ДЛЯ КАЖДОГО ДЕЙСТВИЯ -->
+  <LlmSettingsModal
+    show={showLlmSettings}
+    settings={llmSettings}
+    onsave={saveLlmConnections}
+    onclose={() => showLlmSettings = false}
   />
 
   <!-- ВСПЛЫВАЮЩИЙ ТОАСТ НАВИГАЦИИ -->
@@ -7915,88 +8115,8 @@
     margin-top: 10px;
   }
 
-  .character-scene-depth {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin-top: 10px;
-    font-size: 12px;
-    color: #cbd5e1;
-  }
-
-  .character-scene-depth input {
-    --track: linear-gradient(
-      to right,
-      #38bdf8 var(--ready-stop),
-      #10b981 var(--ready-stop) var(--parts-stop),
-      #1e293b var(--parts-stop)
-    );
-    appearance: none;
-    width: 100%;
-    height: 16px;
-    margin: 0;
-    background: transparent;
-    cursor: pointer;
-  }
-
-  .character-scene-depth input:disabled {
-    cursor: default;
-  }
-
-  .character-scene-depth input::-webkit-slider-runnable-track {
-    height: 8px;
-    border-radius: 4px;
-    background-image: var(--track);
-  }
-
-  /* Зазоры уже шкалы на ширину бегунка: его центр ходит ровно по границам сегментов.
-     Слой короче ещё на зазор, чтобы последний не отрезал от конца шкалы кусочек */
-  .character-scene-depth input.segmented::-webkit-slider-runnable-track {
-    background-image:
-      repeating-linear-gradient(
-        to right,
-        transparent 0 calc(var(--segment) - 2px),
-        #0f172a calc(var(--segment) - 2px) var(--segment)
-      ),
-      var(--track);
-    background-position: 7px center, 0 0;
-    background-repeat: no-repeat;
-    background-size: calc(100% - 16px) 100%, 100% 100%;
-  }
-
-  .character-scene-depth input::-webkit-slider-thumb {
-    appearance: none;
-    width: 14px;
-    height: 14px;
-    margin-top: -3px;
-    border: 2px solid #0f172a;
-    border-radius: 50%;
-    background: #f8fafc;
-  }
-
-  .character-scene-depth input:disabled::-webkit-slider-thumb {
-    background: #64748b;
-  }
-
-  .character-scene-depth input:focus-visible {
-    outline: 1px solid #10b981;
-    outline-offset: 2px;
-    border-radius: 4px;
-  }
-
   .character-depth-ready {
     color: #38bdf8;
-  }
-
-  .character-scene-depth .char-sub-label {
-    margin-left: auto;
-  }
-
-  .character-depth-ends {
-    display: flex;
-    justify-content: space-between;
-    font-size: 11px;
-    color: #64748b;
   }
 
   .character-summary-progress {
@@ -8052,6 +8172,57 @@
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
     margin-top: 10px;
+  }
+
+  .character-group-picker {
+    margin-top: 6px;
+    color: #94a3b8;
+  }
+
+  .character-group-picker summary {
+    cursor: pointer;
+  }
+
+  .character-group-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+    gap: 0 12px;
+  }
+
+  .character-group-toggles {
+    display: flex;
+    gap: 10px;
+    margin: 4px 0;
+  }
+
+  .character-group-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+    cursor: pointer;
+  }
+
+  .character-group-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .character-group-run {
+    align-self: flex-start;
+    margin-top: 10px;
+  }
+
+  .character-group-note {
+    margin: 6px 0 0;
+    font-size: 11px;
+    color: #94a3b8;
+  }
+
+  .character-group-error {
+    color: #fb7185;
   }
 
   .character-line {
