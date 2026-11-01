@@ -37,7 +37,6 @@
       descriptions: { connection: "", model: "" },
       names: { connection: "", model: "" },
       terms: { connection: "", model: "" },
-      termSearch: { connection: "", model: "" },
       tokens: { connection: "", model: "" }
     }
   });

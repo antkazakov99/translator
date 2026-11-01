@@ -2,7 +2,6 @@
 use crate::glossary::NameForm;
 use crate::glossary::{CharacterGlossaryEntry, TermGlossaryEntry, TokenGlossaryEntry};
 use crate::scenes::{self, GameLines, ScriptLine};
-use crate::terms::TermCandidate;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -73,19 +72,6 @@ pub struct CharacterResult {
     #[serde(flatten)]
     pub character: CharacterGlossaryEntry,
     pub samples: Vec<String>,
-}
-
-/// Термин, который модель оставила в списке кандидатов.
-#[derive(Debug, Clone, Serialize)]
-pub struct ReviewedTerm {
-    #[serde(flatten)]
-    pub term: TermGlossaryEntry,
-    pub count: usize,
-    pub example: String,
-    /// Полное название, если модель считает термин его сокращением или другой формой.
-    pub short_for: String,
-    /// Модель считает кандидата именем человека. Это только значение по умолчанию при отборе.
-    pub person: bool,
 }
 
 /// Написание имени от модели. В глоссарий попадает после проверки пользователем.
@@ -201,12 +187,9 @@ struct TokenLlmItem {
 #[derive(Debug, Deserialize)]
 struct TermLlmItem {
     id: Option<String>,
-    source_term: Option<String>,
     translated_term: Option<String>,
     category: Option<String>,
     notes: Option<String>,
-    short_for: Option<String>,
-    person: Option<bool>,
 }
 
 /// Создаёт HTTP клиент с таймаутом и отключенным прокси для надёжной работы с локальными серверами
@@ -1547,153 +1530,6 @@ pub fn script_texts(game: &GameLines) -> Vec<String> {
     game.lines.iter().map(|line| line.text.clone()).collect()
 }
 
-/// Имена персонажей для запроса: модель узнаёт по ним обращения к уже известным героям.
-fn known_characters_line(characters: &[String]) -> String {
-    let mut size = 0;
-    let names: Vec<&str> = characters
-        .iter()
-        .map(|name| name.trim())
-        .filter(|name| !name.is_empty())
-        .take_while(|name| {
-            size += name.chars().count() + 2;
-            size <= MAX_TERM_HINT_CHARS
-        })
-        .collect();
-    if names.is_empty() {
-        return String::new();
-    }
-    format!("Known characters: {}\n\n", names.join(", "))
-}
-
-/// Проверяет кандидатов из `terms`: модель отсеивает мусор и переводит остальное.
-/// Окончательно термины выбирает пользователь, поэтому результат не попадает в глоссарий сам.
-/// `on_rejected` получает отброшенных кандидатов каждого пакета, на который модель ответила.
-pub async fn check_term_candidates(
-    target: &ChatTarget,
-    candidates: &[TermCandidate],
-    characters: &[String],
-    cancel: &AtomicBool,
-    on_rejected: impl Fn(Vec<String>) + Send + Sync,
-    on_batch: impl Fn(BatchProgress<ReviewedTerm>) + Send + Sync,
-) -> Result<AutofillResult<ReviewedTerm>, String> {
-    let system_prompt = r#"You are an expert game localizer preparing a translation glossary into Russian.
-You receive candidate terms found automatically in a visual novel or RPG, each with a line of game text that shows its use. The game text may be in any language.
-
-Keep only names worth a glossary: places, organizations, factions, unique items, skills, ranks, titles and other world-specific concepts. Abbreviations of such names count. Keep names of people and ways to address them too, and mark them.
-Reject interjections, shouted ordinary words, ordinary words and phrases, interface labels, and fragments of sentences.
-A line starting with "Known characters:" lists people already known: a candidate that is one of them or a way to address them is a person, and "short_for" is that name.
-
-Rules:
-1. "source_term": EXACT candidate text.
-2. "translated_term": Natural, authentic Russian translation.
-3. "category": One of "general", "location", "title", "item".
-4. "notes": Brief context/commentary in Russian, or empty string.
-5. "short_for": If the candidate is an abbreviation, a short form or a way to address someone whose longer name you can tell from the text, that longer name. Otherwise an empty string.
-6. "person": true if the candidate names a person or addresses one, otherwise false.
-
-Respond ONLY with a valid JSON array of the kept candidates, or [] if none qualify:
-[
-  {"source_term": "Demon Hunter Association", "translated_term": "Ассоциация охотников на демонов", "category": "title", "notes": "Организация", "short_for": "", "person": false},
-  {"source_term": "DHA", "translated_term": "АОД", "category": "title", "notes": "Сокращение", "short_for": "Demon Hunter Association", "person": false},
-  {"source_term": "Miss Granger", "translated_term": "Мисс Грейнджер", "category": "general", "notes": "", "short_for": "Hermione Granger", "person": true}
-]"#;
-
-    const BATCH_SIZE: usize = 20;
-    let total_batches = candidates.len().div_ceil(BATCH_SIZE);
-    let timestamp = chrono::Utc::now().timestamp_millis();
-    let mut failed_batches = 0;
-    let mut items: Vec<ReviewedTerm> = Vec::new();
-    let report = |batch: usize, failed_batches: usize, items: Vec<ReviewedTerm>| {
-        on_batch(BatchProgress { batch: batch + 1, total_batches, failed_batches, items })
-    };
-    for (batch, chunk) in candidates.chunks(BATCH_SIZE).enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        let mut user_prompt = format!("{}Candidate terms:\n\n", known_characters_line(characters));
-        for candidate in chunk {
-            user_prompt.push_str(&format!(
-                "- source_term: \"{}\", example: \"{}\"\n",
-                candidate.term, candidate.example
-            ));
-        }
-        user_prompt.push_str("\nProvide JSON array now:");
-
-        let raw_response = match call_chat_completion(
-            target,
-            system_prompt,
-            &user_prompt,
-            0.2,
-            2048,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                failed_batches += remaining_batches(error, batch, total_batches)?;
-                report(total_batches - 1, failed_batches, Vec::new());
-                break;
-            }
-        };
-
-        let json_clean = extract_json_content(&raw_response);
-        let answer: Vec<TermLlmItem> = match serde_json::from_str(json_clean) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                warn!("Не удалось распарсить JSON кандидатов от LLM: {}", e);
-                failed_batches += 1;
-                report(batch, failed_batches, Vec::new());
-                continue;
-            }
-        };
-
-        let kept_before = items.len();
-        for item in answer {
-            let Some(source) = item.source_term.as_deref().map(str::trim) else {
-                continue;
-            };
-            let translated = item.translated_term.as_deref().unwrap_or_default().trim();
-            // Термин, которого не было в списке, модель придумала сама
-            let Some(candidate) = chunk.iter().find(|c| c.term.eq_ignore_ascii_case(source)) else {
-                continue;
-            };
-            if translated.is_empty() || items.iter().any(|known| known.term.source_term == candidate.term) {
-                continue;
-            }
-            let category = item.category.as_deref().map(|c| c.trim().to_lowercase()).unwrap_or_default();
-            items.push(ReviewedTerm {
-                term: TermGlossaryEntry {
-                    id: format!("term_auto_{}_{}", timestamp, items.len()),
-                    source_term: candidate.term.clone(),
-                    translated_term: translated.to_string(),
-                    category: if matches!(category.as_str(), "location" | "title" | "item") {
-                        category
-                    } else {
-                        "general".to_string()
-                    },
-                    notes: item.notes.unwrap_or_default(),
-                    forms: Vec::new(),
-                },
-                count: candidate.count,
-                example: candidate.example.clone(),
-                short_for: item.short_for.unwrap_or_default(),
-                person: item.person.unwrap_or_default(),
-            });
-        }
-        let kept = &items[kept_before..];
-        on_rejected(
-            chunk
-                .iter()
-                .filter(|candidate| !kept.iter().any(|item| item.term.source_term == candidate.term))
-                .map(|candidate| candidate.term.clone())
-                .collect(),
-        );
-        report(batch, failed_batches, kept.to_vec());
-    }
-
-    Ok(AutofillResult { items, failed_batches })
-}
-
 const NAMES_SYSTEM_PROMPT: &str = r#"You are an expert in personal names and their established Russian spellings, preparing a translation glossary for a visual novel or RPG.
 You receive every character name of one game and the names to spell in Russian.
 
@@ -2819,86 +2655,6 @@ mod tests {
             ["Welcome to Jack's Bar, friend.", "The Demon Hunter Association is here."]
         );
         let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn test_known_characters_line_stays_short() {
-        assert_eq!(known_characters_line(&[]), "");
-        assert_eq!(
-            known_characters_line(&["Kate".to_string(), " ".to_string(), "Hilde".to_string()]),
-            "Known characters: Kate, Hilde\n\n"
-        );
-        let many: Vec<String> = (0..2000).map(|i| format!("Name{i}")).collect();
-        assert!(known_characters_line(&many).chars().count() <= MAX_TERM_HINT_CHARS + "Known characters: \n\n".len());
-    }
-
-    fn candidate(term: &str) -> TermCandidate {
-        TermCandidate { term: term.to_string(), count: 7, example: format!("See {term} here") }
-    }
-
-    #[test]
-    fn test_model_keeps_only_listed_candidates() {
-        let content = r#"[
-            {"source_term":"konoha","translated_term":"Коноха","category":"location","notes":"Деревня","person":false},
-            {"source_term":"Invented Place","translated_term":"Выдумка"},
-            {"source_term":"Oh God","translated_term":""},
-            {"source_term":"Rare Thing","translated_term":"Редкость","category":"weapon","person":true}
-        ]"#;
-        let body = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
-        let url = serve_responses(vec![http_response("200 OK", &body)]);
-        let candidates = [candidate("Konoha"), candidate("Oh God"), candidate("Rare Thing")];
-
-        let cancel = AtomicBool::new(false);
-        let rejected = std::sync::Mutex::new(Vec::new());
-        let result = tauri::async_runtime::block_on(check_term_candidates(
-            &chat(&url),
-            &candidates,
-            &[],
-            &cancel,
-            |terms| rejected.lock().unwrap().extend(terms),
-            |_| {},
-        ))
-        .unwrap();
-
-        assert_eq!(result.failed_batches, 0);
-        let kept: Vec<_> = result.items.iter().map(|item| item.term.source_term.as_str()).collect();
-        assert_eq!(kept, ["Konoha", "Rare Thing"]);
-        assert_eq!(rejected.into_inner().unwrap(), ["Oh God"]);
-        assert!(!result.items[0].person);
-        assert!(result.items[1].person);
-        assert_eq!(result.items[0].term.category, "location");
-        assert_eq!(result.items[0].count, 7);
-        assert_eq!(result.items[0].example, "See Konoha here");
-        assert_eq!(result.items[1].term.category, "general");
-        assert_ne!(result.items[0].term.id, result.items[1].term.id);
-    }
-
-    #[test]
-    fn test_failed_check_keeps_finished_batches() {
-        let content = r#"[{"source_term":"Term 0","translated_term":"Термин"}]"#;
-        let body = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
-        let failure = http_response("500 Internal Server Error", "сбой");
-        let candidates: Vec<_> = (0..45).map(|i| candidate(&format!("Term {i}"))).collect();
-
-        let url = serve_responses(vec![http_response("200 OK", &body), failure]);
-        let cancel = AtomicBool::new(false);
-        let reports = std::sync::Mutex::new(Vec::new());
-        let rejected = std::sync::Mutex::new(Vec::new());
-        let result = tauri::async_runtime::block_on(check_term_candidates(
-            &chat(&url),
-            &candidates,
-            &[],
-            &cancel,
-            |terms| rejected.lock().unwrap().extend(terms),
-            |p| reports.lock().unwrap().push((p.batch, p.total_batches, p.failed_batches, p.items.len())),
-        ))
-        .unwrap();
-        assert_eq!(result.failed_batches, 2);
-        assert_eq!(result.items.len(), 1);
-        // Кандидаты пакетов без ответа не считаются проверенными
-        assert_eq!(rejected.into_inner().unwrap().len(), 19);
-        // Сбой не теряет отчёт: интерфейс узнаёт, что обработка дошла до конца
-        assert_eq!(reports.into_inner().unwrap(), [(1, 3, 0, 1), (3, 3, 2, 0)]);
     }
 
     fn characters(count: usize) -> Vec<CharacterGlossaryEntry> {

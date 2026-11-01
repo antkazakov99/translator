@@ -1,5 +1,5 @@
 export type LlmProvider = "local" | "openai" | "claude" | "gemini" | "compatible";
-export type LlmAction = "descriptions" | "names" | "terms" | "termSearch" | "tokens";
+export type LlmAction = "descriptions" | "names" | "terms" | "tokens";
 
 const LOCAL_URL = "http://127.0.0.1:1234/v1";
 
@@ -15,7 +15,6 @@ export const LLM_ACTIONS: { id: LlmAction; label: string; sends: string; gameTex
   { id: "descriptions", label: "Обновление описаний", sends: "сцены с репликами", gameText: true },
   { id: "names", label: "Перевод имён", sends: "только список имён", gameText: false },
   { id: "terms", label: "Перевод терминов", sends: "только термины", gameText: false },
-  { id: "termSearch", label: "Поиск терминов", sends: "названия и примеры реплик", gameText: true },
   { id: "tokens", label: "Обновление пояснений", sends: "реплики с токенами", gameText: true }
 ];
 

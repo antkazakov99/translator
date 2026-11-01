@@ -1,13 +1,10 @@
 <script lang="ts">
-  import { onDestroy, untrack, type Snippet } from "svelte";
+  import { onDestroy, type Snippet } from "svelte";
   import { Channel, invoke } from "@tauri-apps/api/core";
   import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, Sparkles, Square } from "lucide-svelte";
   import EntryPicker from "./EntryPicker.svelte";
-  import RequestSlider from "./RequestSlider.svelte";
   import LlmChoice from "./LlmChoice.svelte";
-  import { partsToRead } from "./character-parts";
-  import OwnerSelect from "./OwnerSelect.svelte";
-  import { NEW_CHARACTER, formOwners as ownersOfForm, type FormOwner, type NameForm } from "./name-forms";
+  import type { NameForm } from "./name-forms";
   import { beginLlmRun, endLlmRun, llmRun } from "./llm-run.svelte";
   import { LLM_ACTIONS, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "./llm-settings";
 
@@ -16,7 +13,6 @@
     original_name: string;
     translated_name: string;
     merged: { alias: string; original_name: string }[];
-    forms: NameForm[];
   }
 
   interface PanelTerm {
@@ -47,20 +43,6 @@
     items: T[];
   }
 
-  interface ReviewedTerm extends PanelTerm {
-    count: number;
-    example: string;
-    short_for: string;
-    person: boolean;
-  }
-
-  interface ExtractedTerms {
-    items: ReviewedTerm[];
-    failed_batches: number;
-    candidates: number;
-    single_words_skipped: boolean;
-  }
-
   interface NameSuggestion {
     original: string;
     translated: string;
@@ -84,15 +66,10 @@
     hints,
     settings,
     descriptionsOpen = $bindable(false),
-    checksRevision = $bindable(0),
     descriptions,
-    formOwners,
     onselect,
     onnames,
     onterms,
-    onaddterms,
-    onaddform,
-    onaddcharacter,
     ontokens
   }: {
     tab: GlossaryTab;
@@ -103,26 +80,18 @@
     hints: object;
     settings: LlmSettings;
     descriptionsOpen?: boolean;
-    /** Растёт, когда меняются отброшенные термины: их показывает и список глоссария. */
-    checksRevision?: number;
     descriptions: Snippet;
-    formOwners: FormOwner[];
     onselect: (action: LlmAction, choice: LlmActionSettings) => void;
     onnames: (rows: { alias: string; translated: string }[]) => void;
     onterms: (rows: { id: string; translated: string; category: string; notes: string }[]) => void;
-    onaddterms: (terms: PanelTerm[]) => void;
-    onaddform: (owner: { kind: "term" | "character"; id: string }, form: NameForm) => void;
-    onaddcharacter: (name: string, translated: string) => void;
     ontokens: (rows: { name: string; value: string; note: string }[]) => void;
   } = $props();
 
   const SECTIONS: Record<GlossaryTab, LlmAction[]> = {
     characters: ["descriptions", "names"],
-    terms: ["terms", "termSearch"],
+    terms: ["terms"],
     tokens: ["tokens"]
   };
-  // Размер пакета тот же, что в llm.rs: часть ползунка равна одному запросу
-  const TERMS_PER_REQUEST = 20;
 
   let panelOpen = $state(false);
   let sectionByTab = $state<Record<GlossaryTab, LlmAction>>({ characters: "descriptions", terms: "terms", tokens: "tokens" });
@@ -302,143 +271,6 @@
     doneMessage = `Обновлено терминов: ${chosenTranslations.length}`;
     reviewTranslations = [];
     translationsRun = false;
-  }
-
-  // Поиск терминов. Кандидаты идут частями от самых частых, а проверенные запоминаются:
-  // следующий запуск продолжает с того же места
-  // `formOf` говорит, чем станет находка: формой записи «kind:id», новым персонажем или, если пусто, термином
-  let foundTerms = $state<(ReviewedTerm & { selected: boolean; formOf: string })[]>([]);
-  let foundNote = $state("");
-  let chosenFound = $derived(foundTerms.filter((t) => t.selected && t.translated_term.trim()));
-  // Сокращение и полное название могут найтись в одном запуске
-  let foundOwners = $derived<FormOwner[]>([
-    ...formOwners,
-    ...foundTerms.map((t) => ({ kind: "found" as const, id: t.id, names: [t.source_term] }))
-  ]);
-  let characterOwners = $derived(formOwners.filter((owner) => owner.kind === "character"));
-
-  /** Имя человека сразу предлагается как новый персонаж, если он не похож на уже известного. */
-  function defaultFormOf(item: ReviewedTerm) {
-    const known = ownersOfForm(item.source_term, characterOwners, item.short_for);
-    return item.person && known.length === 0 ? NEW_CHARACTER : "";
-  }
-
-  let candidateCount = $state<{ total: number; checked: number } | null>(null);
-  let termPartsWanted = $state<number | null>(null);
-  const formNames = (forms: NameForm[]) => forms.map((form) => form.source);
-  const allNames = (c: PanelCharacter) => [c.original_name, ...c.merged.map((m) => m.original_name)];
-  // Термины на проверке у пользователя и записи глоссария модели больше не нужны
-  let knownTerms = $derived([
-    ...[...terms, ...foundTerms].flatMap((t) => [t.source_term, ...formNames(t.forms)]),
-    ...characters.flatMap((c) => [...allNames(c), ...formNames(c.forms)])
-  ]);
-  let knownTermsKey = $derived(JSON.stringify(knownTerms));
-  let uncheckedTerms = $derived(candidateCount ? candidateCount.total - candidateCount.checked : 0);
-  let termPartsTotal = $derived(Math.ceil((candidateCount?.total ?? 0) / TERMS_PER_REQUEST));
-  let termPartsReady = $derived(termPartsTotal - Math.ceil(uncheckedTerms / TERMS_PER_REQUEST));
-  let termParts = $derived(partsToRead({ total: termPartsTotal, ready: termPartsReady }, termPartsWanted ?? termPartsReady + 1));
-  let termsToCheck = $derived(Math.min((termParts - termPartsReady) * TERMS_PER_REQUEST, uncheckedTerms));
-  let termPartsStatus = $derived.by(() => {
-    if (!candidateCount) return "подсчёт...";
-    if (termPartsTotal === 0) return "нет кандидатов";
-    return uncheckedTerms === 0 ? "все проверены" : `${termParts} из ${termPartsTotal}`;
-  });
-
-  $effect(() => {
-    if (!panelOpen || openSection !== "termSearch") return;
-    void [knownTermsKey, checksRevision];
-    const dir = gameDir;
-    const known = untrack(() => $state.snapshot(knownTerms));
-    let current = true;
-    const timer = setTimeout(() => {
-      invoke<{ total: number; checked: number }>("count_term_candidates", { gameDir: dir, knownTerms: known })
-        .then((count) => { if (current) candidateCount = count; })
-        .catch(() => { if (current) candidateCount = { total: 0, checked: 0 }; });
-    }, 100);
-    return () => {
-      current = false;
-      clearTimeout(timer);
-    };
-  });
-
-  async function resetTermChecks() {
-    try {
-      await invoke("reset_term_checks", { gameDir });
-      termPartsWanted = null;
-      checksRevision += 1;
-    } catch (e) {
-      errorMessage = String(e);
-    }
-  }
-
-  async function startTermSearch() {
-    if (!beginRun("Поиск названий по всему тексту игры...")) return;
-    foundNote = "";
-    try {
-      const result = await invoke<ExtractedTerms>("extract_glossary_terms_from_game", {
-        gameDir,
-        target: targetFor(settings, "termSearch"),
-        count: termsToCheck,
-        knownTerms: $state.snapshot(knownTerms),
-        characters: characters.flatMap(allNames),
-        onBatch: batchChannel<ReviewedTerm>((items) => {
-          foundTerms.push(...items.map((item) => ({ ...item, selected: true, formOf: defaultFormOf(item) })));
-          if (!stopRequested) progressStep = "Модель проверяет кандидатов...";
-        })
-      });
-      foundNote = result.candidates === 0
-        ? "В тексте игры не нашлось новых названий."
-        : `Модель оставила ${result.items.length} из ${result.candidates} кандидатов.`;
-      if (stopRequested) foundNote = `Остановлено. Модель оставила ${result.items.length} терминов.`;
-      if (result.single_words_skipped) {
-        foundNote += " В языке игры заглавные пишутся у всех существительных, поэтому искались только фразы из нескольких слов.";
-      }
-      if (result.failed_batches > 0) {
-        errorMessage = `Часть кандидатов модель не обработала (пакетов с ошибкой: ${result.failed_batches}). Запустите поиск ещё раз.`;
-      }
-    } catch (e) {
-      errorMessage = `Не удалось найти термины: ${String(e)}`;
-    } finally {
-      termPartsWanted = null;
-      checksRevision += 1;
-      endRun();
-    }
-  }
-
-  /** Записи без отметки считаются отброшенными и попадают в архив. */
-  async function addFoundTerms() {
-    const skipped = foundTerms.filter((t) => !chosenFound.includes(t)).map((t) => t.source_term);
-    const asTerm = ({ id, source_term, translated_term, category, notes }: PanelTerm): PanelTerm =>
-      ({ id, source_term, translated_term, category, notes, forms: [] });
-    const added = chosenFound.filter((row) => !row.formOf).map(asTerm);
-    for (const row of chosenFound.filter((row) => row.formOf)) {
-      if (row.formOf === NEW_CHARACTER) {
-        onaddcharacter(row.source_term, row.translated_term);
-        continue;
-      }
-      const separator = row.formOf.indexOf(":");
-      const kind = row.formOf.slice(0, separator);
-      const id = row.formOf.slice(separator + 1);
-      const form = { source: row.source_term, translated: row.translated_term.trim() };
-      if (kind === "term" || kind === "character") {
-        onaddform({ kind, id }, form);
-        continue;
-      }
-      // Название, к которому привязали форму, могли не отметить: тогда она остаётся термином
-      const owner = added.find((term) => term.id === id);
-      if (owner) owner.forms.push(form);
-      else added.push(asTerm(row));
-    }
-    onaddterms(added);
-    doneMessage = `Добавлено записей: ${chosenFound.length}`;
-    foundTerms = [];
-    foundNote = "";
-    try {
-      if (skipped.length > 0) await invoke("reject_term_candidates", { gameDir, terms: skipped });
-    } catch (e) {
-      errorMessage = String(e);
-    }
-    checksRevision += 1;
   }
 
   // Токены без реплик модели показать нечего. Без явного выбора в запуске незаполненные, как у терминов
@@ -631,81 +463,6 @@
             </button>
           </div>
         {/if}
-      {:else if openSection === "termSearch"}
-        <RequestSlider
-          id="term-parts"
-          label="Частей"
-          status={termPartsStatus}
-          max={Math.max(termPartsTotal, 1)}
-          value={termParts}
-          floor={Math.max(Math.min(termPartsReady + 1, termPartsTotal), 1)}
-          ready={termPartsReady}
-          disabled={llmRun.active || !candidateCount || termPartsTotal < 2 || uncheckedTerms === 0}
-          onchange={(value) => termPartsWanted = value}
-        >
-          {#snippet ends()}
-            {#if termPartsReady > 0}
-              <span class="ai-ready">готово: {termPartsReady}</span>
-            {:else}
-              <span>{TERMS_PER_REQUEST} самых частых</span>
-            {/if}
-            <span>кандидатов: {candidateCount?.total ?? 0}</span>
-          {/snippet}
-        </RequestSlider>
-        <div class="ai-actions">
-          {@render runButton(`Найти термины (${termsToCheck})`, termsToCheck === 0, startTermSearch)}
-          {#if termPartsReady > 0}
-            <button
-              class="btn-link"
-              disabled={llmRun.active}
-              title="Забыть отброшенные термины и показать кандидатов модели заново"
-              onclick={resetTermChecks}
-            >Проверить заново</button>
-          {/if}
-        </div>
-
-        {#if foundNote || foundTerms.length > 0}
-          <div class="ai-review">
-            <div class="ai-review-head">
-              <span class="ai-note">{foundNote || "Найденные термины появляются здесь по мере проверки."}</span>
-              {#if foundTerms.length > 0}
-                <div class="ai-toggles">
-                  <button class="btn-link" onclick={() => { for (const term of foundTerms) term.selected = true; }}>Выбрать все</button>
-                  <button class="btn-link" onclick={() => { for (const term of foundTerms) term.selected = false; }}>Снять все</button>
-                </div>
-              {/if}
-            </div>
-            {#each foundTerms as term (term.id)}
-              {@const owners = ownersOfForm(term.source_term, foundOwners, term.short_for)}
-              <div class="ai-row ai-row-select" class:off={!term.selected}>
-                <input type="checkbox" bind:checked={term.selected} aria-label={`Добавить термин ${term.source_term}`} />
-                <div class="ai-source">
-                  <span class="ai-term">{term.source_term} <span class="ai-count">× {term.count}</span></span>
-                  <span class="ai-example" title={term.example}>{term.example}</span>
-                </div>
-                <input type="text" class="input" bind:value={term.translated_term} aria-label={`Перевод термина ${term.source_term}`} />
-                {@render categorySelect(term, term.source_term)}
-                <div class="ai-form-of" class:suggested={owners.length > 0}>
-                  <span>{owners.length > 0 ? "Похоже на форму другой записи:" : "Записать как:"}</span>
-                  <OwnerSelect
-                    value={term.formOf}
-                    label={`Куда записать ${term.source_term}`}
-                    blank="Отдельный термин"
-                    suggested={owners}
-                    characters={characterOwners}
-                    onchange={(choice) => term.formOf = choice}
-                  />
-                </div>
-              </div>
-            {/each}
-            {#if foundTerms.length > 0}
-              <button class="btn-apply" onclick={addFoundTerms} disabled={chosenFound.length === 0 || isProcessing}>
-                <Check size={14} />
-                <span>Добавить выбранные ({chosenFound.length})</span>
-              </button>
-            {/if}
-          </div>
-        {/if}
       {:else if openSection === "tokens"}
         <p class="ai-note">Модель читает реплики с токеном, не видя его имени, и предлагает пояснение и значение. Что записать в глоссарий, выберете вы.</p>
         <EntryPicker
@@ -862,11 +619,6 @@
     background: #0b0b1a;
   }
 
-  /* Отступы между строками задаёт панель */
-  .ai-body :global(.slider) {
-    margin-top: 0;
-  }
-
   .ai-choice {
     flex: 0 1 26.5rem;
     min-width: 0;
@@ -927,30 +679,6 @@
   .btn-link:disabled {
     opacity: 0.5;
     cursor: default;
-  }
-
-  .ai-actions {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-
-  .ai-ready {
-    color: #38bdf8;
-  }
-
-  .ai-form-of {
-    display: flex;
-    grid-column: 2 / -1;
-    align-items: center;
-    gap: 8px;
-    font-size: 11px;
-    color: #94a3b8;
-    white-space: nowrap;
-  }
-
-  .ai-form-of.suggested {
-    color: #fbbf24;
   }
 
   .btn-run,

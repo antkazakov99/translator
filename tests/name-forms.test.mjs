@@ -29,12 +29,7 @@ test('a short form finds its full name, but a shared adjective does not', () => 
 
 test('a record is never a form of itself', () => {
   assert.deepEqual(formOwners('Ninja Academy', [term('Ninja Academy')]), []);
-  assert.deepEqual(formOwners('ppf', [term('PPF')], 'PPF'), []);
-});
-
-test('the model can name an owner the letters do not give away', () => {
-  const list = [term('Demon Hunter Association'), term('Black Market')];
-  assert.deepEqual(owners(formOwners('Hunters', list, 'demon hunter association')), ['Demon Hunter Association']);
+  assert.deepEqual(formOwners('ppf', [term('PPF')]), []);
 });
 
 test('a character without a script code gets a free inner id that never looks like a code', () => {

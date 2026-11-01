@@ -6,7 +6,7 @@ export interface NameForm {
 
 /** Запись глоссария, которой может принадлежать форма. */
 export interface FormOwner {
-  kind: "term" | "character" | "found";
+  kind: "term" | "character";
   id: string;
   /** Имена, с которыми сравнивается форма. Первое показывается пользователю. */
   names: string[];
@@ -57,15 +57,14 @@ function matchesName(form: string, name: string) {
 
 /**
  * Записи, формой которых похоже выступает `form`. Это только подсказка: одинаковые буквы и слова
- * ещё не значат одно и то же, поэтому связывает записи пользователь. `shortFor` это мнение модели.
+ * ещё не значат одно и то же, поэтому связывает записи пользователь.
  */
-export function formOwners(form: string, owners: FormOwner[], shortFor = "") {
+export function formOwners(form: string, owners: FormOwner[]) {
   const source = form.trim();
-  const named = shortFor.trim().toLowerCase();
   return owners.filter(({ names }) => {
     const own = names.map((name) => name.trim()).filter(Boolean);
     if (own.some((name) => name.toLowerCase() === source.toLowerCase())) return false;
-    return own.some((name) => name.toLowerCase() === named || matchesName(source, name));
+    return own.some((name) => matchesName(source, name));
   });
 }
 

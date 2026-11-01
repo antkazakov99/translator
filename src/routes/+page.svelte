@@ -460,7 +460,7 @@
     forms: NameForm[];
   }
 
-  interface RejectedTerm {
+  interface TermCandidate {
     term: string;
     count: number;
     example: string;
@@ -753,11 +753,11 @@
   let glossaryProjectPath = $state<string | null>(null);
   let selectedGlossaryChar = $state<CharacterGlossaryEntry | null>(null);
   let selectedGlossaryTerm = $state<TermGlossaryEntry | null>(null);
-  // Архив: кандидаты, которых отбросила модель или пользователь. Их можно посмотреть и всё же взять
+  // Архив: названия из текста игры, которых нет в глоссарии. Что из них взять, решает пользователь
   let termArchiveOpen = $state(false);
-  let rejectedTerms = $state.raw<RejectedTerm[]>([]);
-  let selectedRejected = $state.raw<RejectedTerm | null>(null);
-  let termChecksRevision = $state(0);
+  let termCandidates = $state.raw<TermCandidate[]>([]);
+  let singleWordsSkipped = $state(false);
+  let selectedArchived = $state.raw<TermCandidate | null>(null);
   let characterScenes = $state.raw<CharacterScene[] | null>(null);
   let characterScenesError = $state<string | null>(null);
   let sceneLineFilter = $state<"all" | "spoken" | "mentioned">("all");
@@ -866,7 +866,7 @@
     if (!showGlossaryModal || addingEntry) return null;
     if (glossaryTab === "tokens") return selectedToken ? JSON.stringify([gameDir, "token", selectedToken.name]) : null;
     if (glossaryTab === "terms") {
-      if (termArchiveOpen) return selectedRejected ? JSON.stringify([gameDir, "term", [selectedRejected.term]]) : null;
+      if (termArchiveOpen) return selectedArchived ? JSON.stringify([gameDir, "term", [selectedArchived.term]]) : null;
       const term = selectedGlossaryTerm;
       if (!term?.source_term.trim()) return null;
       return JSON.stringify([gameDir, "term", [term.source_term, ...formSources(term.forms)]]);
@@ -1132,6 +1132,7 @@
     }))
   ]);
   let characterFormOwners = $derived(glossaryFormOwners.filter((owner) => owner.kind === "character"));
+  let termFormOwners = $derived(glossaryFormOwners.filter((owner) => owner.kind === "term"));
   const isSameTerm = (owner: FormOwner, term: TermGlossaryEntry | null) => owner.kind === "term" && owner.id === term?.id;
   let selectedTermOwners = $derived(
     selectedGlossaryTerm
@@ -1221,15 +1222,15 @@
 
   $effect(() => {
     if (!showGlossaryModal || glossaryTab !== "terms") return;
-    void termChecksRevision;
     let current = true;
-    invoke<RejectedTerm[]>("list_rejected_terms", { gameDir })
-      .then((list) => {
+    invoke<{ candidates: TermCandidate[]; single_words_skipped: boolean }>("list_term_candidates", { gameDir })
+      .then((search) => {
         if (!current) return;
-        rejectedTerms = list;
-        selectedRejected = list.find((item) => item.term === selectedRejected?.term) ?? (termArchiveOpen ? list[0] ?? null : null);
+        termCandidates = search.candidates;
+        singleWordsSkipped = search.single_words_skipped;
+        selectedArchived = archivedTerms.find((item) => item.term === selectedArchived?.term) ?? (termArchiveOpen ? archivedTerms[0] ?? null : null);
       })
-      .catch(() => { if (current) rejectedTerms = []; });
+      .catch(() => { if (current) termCandidates = []; });
     return () => { current = false; };
   });
 
@@ -1237,47 +1238,41 @@
     termArchiveOpen = open;
     addingEntry = false;
     glossarySearch = "";
-    selectedRejected = open ? rejectedTerms[0] ?? null : null;
+    selectedArchived = open ? archivedTerms[0] ?? null : null;
   }
 
-  /** Запись из архива уходит в глоссарий, а выбор переходит к следующей. */
-  async function takeRejected(rejected: RejectedTerm) {
-    const position = rejectedTerms.indexOf(rejected);
-    rejectedTerms = rejectedTerms.filter((item) => item !== rejected);
-    selectedRejected = rejectedTerms[position] ?? rejectedTerms.at(-1) ?? null;
-    try {
-      await invoke("restore_term_candidates", { gameDir, terms: [rejected.term] });
-    } catch (e) {
-      showToast(`Запись осталась в архиве: ${e}`, "error");
-    }
-    termChecksRevision += 1;
+  /** Запись, попавшая в глоссарий, сама уходит из архива, а выбор переходит к следующей. */
+  function takeArchived(position: number) {
+    selectedArchived = archivedTerms[position] ?? archivedTerms.at(-1) ?? null;
   }
 
   /** Термин из архива попадает в глоссарий без перевода: его даст «Перевод терминов». */
-  function addRejectedTerm(rejected: RejectedTerm) {
+  function addArchivedTerm(archived: TermCandidate) {
+    const position = archivedTerms.indexOf(archived);
     glossary.terms = [{
       id: `term_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      source_term: rejected.term,
+      source_term: archived.term,
       translated_term: "",
       category: "general",
       notes: "",
       forms: []
     }, ...glossary.terms];
     glossaryDirty = true;
-    showToast(`Термин "${rejected.term}" добавлен в глоссарий`, "success");
-    void takeRejected(rejected);
+    showToast(`Термин "${archived.term}" добавлен в глоссарий`, "success");
+    takeArchived(position);
   }
 
-  function linkRejected(rejected: RejectedTerm, choice: string) {
+  function linkArchived(archived: TermCandidate, choice: string) {
+    const position = archivedTerms.indexOf(archived);
     if (choice === NEW_CHARACTER) {
-      addNamedCharacter(rejected.term, "");
+      addNamedCharacter(archived.term, "");
     } else {
       const owner = glossaryFormOwners.find((own) => ownerKey(own) === choice);
       if (!owner) return;
-      addFormTo(owner, { source: rejected.term, translated: "" });
-      showToast(`«${rejected.term}» теперь форма записи «${owner.names[0]}»`, "success");
+      addFormTo(owner, { source: archived.term, translated: "" });
+      showToast(`«${archived.term}» теперь форма записи «${owner.names[0]}»`, "success");
     }
-    void takeRejected(rejected);
+    takeArchived(position);
   }
 
   const formOwnerName = (owner: FormOwner) => owner.kind === "character" ? `${owner.names[0]} (персонаж)` : owner.names[0];
@@ -1468,12 +1463,6 @@
       term.category = row.category;
       if (row.notes.trim()) term.notes = row.notes;
     }
-    glossaryDirty = true;
-  }
-
-  function addPanelTerms(terms: TermGlossaryEntry[]) {
-    glossary.terms = [...glossary.terms, ...terms];
-    selectedGlossaryTerm ??= glossary.terms[0] ?? null;
     glossaryDirty = true;
   }
 
@@ -2141,9 +2130,19 @@
     });
   });
 
-  let filteredRejectedTerms = $derived.by(() => {
+  let glossaryNames = $derived(new Set([
+    ...glossary.terms.flatMap((term) => [term.source_term, ...term.forms.map((form) => form.source)]),
+    ...glossary.characters.flatMap((char) => [
+      char.original_name,
+      ...char.merged.map((m) => m.original_name),
+      ...char.forms.map((form) => form.source)
+    ])
+  ].map((name) => name.trim().toLowerCase())));
+  let archivedTerms = $derived(termCandidates.filter((item) => !glossaryNames.has(item.term.toLowerCase())));
+
+  let filteredArchivedTerms = $derived.by(() => {
     const q = glossarySearch.trim().toLowerCase();
-    return rejectedTerms.filter((item) => `${item.term} ${item.example}`.toLowerCase().includes(q));
+    return archivedTerms.filter((item) => `${item.term} ${item.example}`.toLowerCase().includes(q));
   });
 
   let filteredGlossaryTerms = $derived.by(() => {
@@ -2354,7 +2353,7 @@
     glossaryTab = tab;
     addingEntry = false;
     termArchiveOpen = false;
-    selectedRejected = null;
+    selectedArchived = null;
   }
 
   function startAddingEntry() {
@@ -3995,15 +3994,10 @@
           hints={panelHints}
           settings={llmSettings}
           bind:descriptionsOpen
-          bind:checksRevision={termChecksRevision}
           descriptions={groupUpdate}
-          formOwners={glossaryFormOwners}
           onselect={selectLlmModel}
           onnames={applyPanelNames}
           onterms={applyPanelTerms}
-          onaddterms={addPanelTerms}
-          onaddform={addFormTo}
-          onaddcharacter={addNamedCharacter}
           ontokens={applyPanelTokens}
         />
 
@@ -4197,17 +4191,17 @@
                   {/each}
                 {/if}
               {:else if termArchiveOpen}
-                {#if filteredRejectedTerms.length === 0}
+                {#if filteredArchivedTerms.length === 0}
                   <div class="glossary-empty-state">
                     <Archive size={32} class="text-slate-600" />
-                    <p>{glossarySearch ? `Ничего не найдено по запросу «${glossarySearch}»` : "Отброшенных терминов пока нет"}</p>
+                    <p>{glossarySearch ? `Ничего не найдено по запросу «${glossarySearch}»` : "В тексте игры нет новых названий"}</p>
                   </div>
                 {:else}
-                  {#each filteredRejectedTerms as item (item.term)}
+                  {#each filteredArchivedTerms as item (item.term)}
                     <button
                       class="glossary-list-item"
-                      class:selected-row={selectedRejected?.term === item.term}
-                      onclick={() => selectedRejected = item}
+                      class:selected-row={selectedArchived?.term === item.term}
+                      onclick={() => selectedArchived = item}
                     >
                       <span class="glossary-item-text">
                         <span class="char-name-en">{item.term}</span>
@@ -4255,7 +4249,7 @@
                   <span>К терминам ({glossary.terms.length})</span>
                 {:else}
                   <Archive size={14} />
-                  <span>Архив ({rejectedTerms.length})</span>
+                  <span>Архив ({archivedTerms.length})</span>
                 {/if}
               </button>
             {/if}
@@ -4630,41 +4624,45 @@
             {:else}
               <!-- Редактирование термина -->
               {#if termArchiveOpen}
-                {#if selectedRejected}
+                {#if selectedArchived}
                   <div class="sidebar-edit-header">
                     <div class="sidebar-char-headings">
-                      <h4>{selectedRejected.term}</h4>
-                      <span class="char-sub-label">Отброшен при поиске терминов · строк в игре: {selectedRejected.count}</span>
+                      <h4>{selectedArchived.term}</h4>
+                      <span class="char-sub-label">Найден в тексте игры · строк: {selectedArchived.count}</span>
                     </div>
                   </div>
 
                   <div class="sidebar-edit-content">
                     <div class="edit-group">
                       <span class="edit-label">Пример из игры:</span>
-                      <p class="archive-example">{selectedRejected.example}</p>
+                      <p class="archive-example">{selectedArchived.example}</p>
                     </div>
                     <div class="edit-group">
-                      <span class="edit-label">Если это имя или обращение:</span>
-                      {#key selectedRejected.term}
+                      <span class="edit-label">Если это имя, обращение или сокращение:</span>
+                      {#key selectedArchived.term}
                         <OwnerSelect
-                          label="Привязать к персонажу"
-                          blank="Привязать к персонажу…"
-                          suggested={formOwners(selectedRejected.term, characterFormOwners)}
+                          label="Привязать к записи"
+                          blank="Привязать к записи…"
+                          suggested={formOwners(selectedArchived.term, glossaryFormOwners)}
                           characters={characterFormOwners}
-                          onchange={(choice) => { if (selectedRejected && choice) linkRejected(selectedRejected, choice); }}
+                          terms={termFormOwners}
+                          onchange={(choice) => { if (selectedArchived && choice) linkArchived(selectedArchived, choice); }}
                         />
                       {/key}
                     </div>
-                    <button class="btn-confirm-add" onclick={() => { if (selectedRejected) addRejectedTerm(selectedRejected); }}>
+                    <button class="btn-confirm-add" onclick={() => { if (selectedArchived) addArchivedTerm(selectedArchived); }}>
                       <Plus size={14} />
                       <span>Добавить как термин</span>
                     </button>
                     <span class="edit-hint">Термин появится без перевода, его даст «Перевод терминов».</span>
+                    {#if singleWordsSkipped}
+                      <span class="edit-hint">В языке игры заглавные пишутся у всех существительных, поэтому искались только фразы из нескольких слов.</span>
+                    {/if}
                   </div>
                 {:else}
                   <div class="sidebar-edit-empty">
                     <Archive size={36} class="text-slate-600" />
-                    <p>Здесь появятся термины, которые отбросила модель или вы при поиске</p>
+                    <p>Здесь появятся названия из текста игры</p>
                   </div>
                 {/if}
               {:else if selectedGlossaryTerm}

@@ -1,12 +1,9 @@
-//! Кандидаты в термины глоссария. Модель принимает лишь малую часть текста игры, поэтому
-//! названия сначала ищутся по всем репликам, а она проверяет и переводит найденное.
+//! Кандидаты в термины глоссария: названия по всем репликам игры. Они лежат в архиве,
+//! а в глоссарий их берёт пользователь, поэтому мусор здесь допустим, а пропуск нет.
 
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::Path;
 use std::sync::LazyLock;
 
 /// С такой доли слов с заглавной в середине предложения заглавная перестаёт выделять
@@ -33,30 +30,12 @@ pub struct TermCandidate {
     pub example: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CandidateSearch {
     /// Все найденные названия, самые важные первыми.
     pub candidates: Vec<TermCandidate>,
     /// Одиночные слова не рассматривались: в языке игры заглавная их не выделяет.
     pub single_words_skipped: bool,
-}
-
-impl CandidateSearch {
-    /// Кандидаты, которых ещё нет в `known`.
-    pub fn unchecked(&self, known: &HashSet<String>) -> Vec<TermCandidate> {
-        self.candidates.iter().filter(|candidate| !known.contains(&candidate.key())).cloned().collect()
-    }
-
-    /// Кандидаты, которые есть в `known`.
-    pub fn listed_in(&self, known: &HashSet<String>) -> Vec<TermCandidate> {
-        self.candidates.iter().filter(|candidate| known.contains(&candidate.key())).cloned().collect()
-    }
-}
-
-impl TermCandidate {
-    fn key(&self) -> String {
-        self.term.to_lowercase()
-    }
 }
 
 /// Что известно о словах игры после первого прохода по строкам.
@@ -191,7 +170,6 @@ fn excerpt(line: &str, position: usize) -> String {
 
 /// Расставляет названия от самых частых. Названия из реплик идут первыми, но каждое третье место
 /// остаётся за отдельными строками: предметы и навыки часто встречаются всего раз, в меню.
-/// Порядок зависит только от текста игры, поэтому части списка не сдвигаются между запусками.
 fn rank(found: HashMap<String, Found>) -> Vec<TermCandidate> {
     let by_count = |a: &Found, b: &Found| b.count.cmp(&a.count).then_with(|| a.term.cmp(&b.term));
     let (mut in_sentences, mut titles): (Vec<Found>, Vec<Found>) =
@@ -215,7 +193,7 @@ fn rank(found: HashMap<String, Found>) -> Vec<TermCandidate> {
 }
 
 /// Похоже ли слово заглавными на сокращение. Такими словами чаще всего кричат, но обычное
-/// слово игра пишет и строчными. Оставшиеся междометия отсеивает модель.
+/// слово игра пишет и строчными.
 fn is_abbreviation(word: &str, vocabulary: &Vocabulary, names: &HashSet<String>) -> bool {
     !vocabulary.is_common(word) && !is_stuttering(word) && !names.contains(&word.to_lowercase())
 }
@@ -269,40 +247,6 @@ pub fn find_candidates(texts: &[String], names: &HashSet<String>) -> CandidateSe
     }
 
     CandidateSearch { candidates: rank(found), single_words_skipped: skip_single_words }
-}
-
-/// Кандидаты, которые больше не нужно показывать модели.
-pub fn read_checked(path: &Path) -> HashSet<String> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default()
-}
-
-pub fn remember_checked(path: &Path, terms: &[String]) -> Result<(), String> {
-    let mut checked = read_checked(path);
-    checked.extend(terms.iter().map(|term| term.trim().to_lowercase()));
-    write_checked(path, checked)
-}
-
-/// Возвращает термины из отброшенных: они снова считаются непроверенными.
-pub fn forget_checked(path: &Path, terms: &[String]) -> Result<(), String> {
-    let mut checked = read_checked(path);
-    for term in terms {
-        checked.remove(&term.trim().to_lowercase());
-    }
-    write_checked(path, checked)
-}
-
-fn write_checked(path: &Path, checked: HashSet<String>) -> Result<(), String> {
-    let mut checked: Vec<String> = checked.into_iter().collect();
-    checked.sort();
-    let json = serde_json::to_string(&checked)
-        .map_err(|e| format!("Не удалось подготовить проверенные термины: {}", e))?;
-    crate::rpa::write_atomic(path, |out: &mut File| {
-        out.write_all(json.as_bytes())
-            .map_err(|e| format!("Не удалось сохранить проверенные термины {:?}: {}", path, e))
-    })
 }
 
 #[cfg(test)]
@@ -396,35 +340,6 @@ mod tests {
             terms(&["I saw Miss Granger today.", "This is Miss Granger's book, and Bernie's Bowling Bar."], &[]),
             ["Miss Granger", "Bernie's Bowling Bar"]
         );
-    }
-
-    #[test]
-    fn known_terms_are_not_offered_again() {
-        let known = ["konoha".to_string()].into_iter().collect();
-        let found = find_candidates(&lines(&["We left Konoha for Suna."]), &HashSet::new());
-        assert_eq!(found.candidates.len(), 2);
-        let left = found.unchecked(&known);
-        assert_eq!(left.len(), 1);
-        assert_eq!(left[0].term, "Suna");
-    }
-
-    #[test]
-    fn checked_terms_do_not_shift_the_rest_and_survive_on_disk() {
-        let texts = lines(&["We saw Alpha Gate, then Beta Gate and Gamma Gate.", "Alpha Gate again, and Beta Gate."]);
-        let path = std::env::temp_dir().join(format!("translator_term_checks_{}.json", uuid::Uuid::new_v4()));
-        let found = find_candidates(&texts, &HashSet::new());
-        let order = |known: &HashSet<String>| -> Vec<String> {
-            found.unchecked(known).into_iter().map(|c| c.term).collect()
-        };
-        assert_eq!(order(&HashSet::new()), ["Alpha Gate", "Beta Gate", "Gamma Gate"]);
-
-        remember_checked(&path, &[" Beta Gate ".to_string()]).unwrap();
-        remember_checked(&path, &["Alpha Gate".to_string()]).unwrap();
-        assert_eq!(order(&read_checked(&path)), ["Gamma Gate"]);
-
-        forget_checked(&path, &["beta gate".to_string()]).unwrap();
-        assert_eq!(order(&read_checked(&path)), ["Beta Gate", "Gamma Gate"]);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]
