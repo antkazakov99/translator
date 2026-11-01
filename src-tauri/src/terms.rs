@@ -4,6 +4,9 @@
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
 use std::sync::LazyLock;
 
 /// С такой доли слов с заглавной в середине предложения заглавная перестаёт выделять
@@ -16,6 +19,7 @@ const EXAMPLE_CONTEXT_CHARS: usize = 40;
 
 static RE_MARKUP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{[^}]*\}|\[[^\]]*\]").unwrap());
 pub(crate) static RE_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\p{L}+(?:['’]\p{L}+)?").unwrap());
+static RE_ABBREVIATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\p{Lu}{2,6}\b").unwrap());
 static RE_PHRASE: LazyLock<Regex> = LazyLock::new(|| {
     let word = r"\p{Lu}\p{Ll}+(?:['’]\p{Ll}+)?(?:-\p{Lu}?\p{Ll}+)?";
     Regex::new(&format!(r"\b{word}(?: (?:(?:of|the|de|la|del|von|der) )*{word})*\b")).unwrap()
@@ -31,9 +35,28 @@ pub struct TermCandidate {
 
 #[derive(Debug, Default)]
 pub struct CandidateSearch {
+    /// Все найденные названия, самые важные первыми.
     pub candidates: Vec<TermCandidate>,
     /// Одиночные слова не рассматривались: в языке игры заглавная их не выделяет.
     pub single_words_skipped: bool,
+}
+
+impl CandidateSearch {
+    /// Кандидаты, которых ещё нет в `known`.
+    pub fn unchecked(&self, known: &HashSet<String>) -> Vec<TermCandidate> {
+        self.candidates.iter().filter(|candidate| !known.contains(&candidate.key())).cloned().collect()
+    }
+
+    /// Кандидаты, которые есть в `known`.
+    pub fn listed_in(&self, known: &HashSet<String>) -> Vec<TermCandidate> {
+        self.candidates.iter().filter(|candidate| known.contains(&candidate.key())).cloned().collect()
+    }
+}
+
+impl TermCandidate {
+    fn key(&self) -> String {
+        self.term.to_lowercase()
+    }
 }
 
 /// Что известно о словах игры после первого прохода по строкам.
@@ -166,35 +189,40 @@ fn excerpt(line: &str, position: usize) -> String {
     line.chars().skip(skip).take(MAX_EXAMPLE_CHARS).collect()
 }
 
-/// Выбирает самые частые названия. Названия из реплик идут первыми, но треть мест остаётся
-/// за отдельными строками: предметы и навыки часто встречаются всего раз, в меню.
-fn select(found: HashMap<String, Found>, limit: usize) -> Vec<TermCandidate> {
+/// Расставляет названия от самых частых. Названия из реплик идут первыми, но каждое третье место
+/// остаётся за отдельными строками: предметы и навыки часто встречаются всего раз, в меню.
+/// Порядок зависит только от текста игры, поэтому части списка не сдвигаются между запусками.
+fn rank(found: HashMap<String, Found>) -> Vec<TermCandidate> {
     let by_count = |a: &Found, b: &Found| b.count.cmp(&a.count).then_with(|| a.term.cmp(&b.term));
     let (mut in_sentences, mut titles): (Vec<Found>, Vec<Found>) =
         found.into_values().partition(|entry| entry.in_sentence);
     in_sentences.sort_by(by_count);
     titles.sort_by(by_count);
 
-    let title_places = (limit / 3).min(titles.len());
-    let sentence_places = (limit - title_places).min(in_sentences.len());
-    let title_places = (limit - sentence_places).min(titles.len());
-    let mut selected: Vec<Found> = in_sentences.into_iter().take(sentence_places).collect();
-    selected.extend(titles.into_iter().take(title_places));
-    selected.sort_by(by_count);
-    selected
-        .into_iter()
-        .map(|entry| TermCandidate { term: entry.term, count: entry.count, example: entry.example })
-        .collect()
+    let mut ranked = Vec::with_capacity(in_sentences.len() + titles.len());
+    let (mut in_sentences, mut titles) = (in_sentences.into_iter(), titles.into_iter());
+    loop {
+        let next = if ranked.len() % 3 == 2 {
+            titles.next().or_else(|| in_sentences.next())
+        } else {
+            in_sentences.next().or_else(|| titles.next())
+        };
+        let Some(entry) = next else {
+            return ranked;
+        };
+        ranked.push(TermCandidate { term: entry.term, count: entry.count, example: entry.example });
+    }
 }
 
-/// Ищет названия: фразы с заглавной в репликах и строки, целиком похожие на название.
-/// `names` содержит слова имён персонажей в нижнем регистре, `known` уже известные термины.
-pub fn find_candidates(
-    texts: &[String],
-    names: &HashSet<String>,
-    known: &HashSet<String>,
-    limit: usize,
-) -> CandidateSearch {
+/// Похоже ли слово заглавными на сокращение. Такими словами чаще всего кричат, но обычное
+/// слово игра пишет и строчными. Оставшиеся междометия отсеивает модель.
+fn is_abbreviation(word: &str, vocabulary: &Vocabulary, names: &HashSet<String>) -> bool {
+    !vocabulary.is_common(word) && !is_stuttering(word) && !names.contains(&word.to_lowercase())
+}
+
+/// Ищет названия: фразы с заглавной в репликах, сокращения и строки, целиком похожие на название.
+/// `names` содержит слова имён персонажей в нижнем регистре.
+pub fn find_candidates(texts: &[String], names: &HashSet<String>) -> CandidateSearch {
     let mut seen = HashSet::new();
     let lines: Vec<String> = texts
         .iter()
@@ -207,17 +235,10 @@ pub fn find_candidates(
     let mut found: HashMap<String, Found> = HashMap::new();
     for line in &lines {
         let mut in_line = HashSet::new();
-        for phrase in RE_PHRASE.find_iter(line) {
-            let whole_line = phrase.as_str() == line;
-            let at_start = starts_sentence(&line[..phrase.start()]);
-            let Some(term) =
-                normalize(phrase.as_str(), whole_line, at_start, skip_single_words, &vocabulary, names)
-            else {
-                continue;
-            };
+        let mut record = |term: String, position: usize, whole_line: bool| {
             let key = term.to_lowercase();
-            if known.contains(&key) || !in_line.insert(key.clone()) {
-                continue;
+            if !in_line.insert(key.clone()) {
+                return;
             }
             let entry = found.entry(key).or_insert_with(|| Found {
                 term,
@@ -228,12 +249,60 @@ pub fn find_candidates(
             entry.count += 1;
             entry.in_sentence |= !whole_line;
             if entry.example.is_empty() || (entry.example == entry.term && !whole_line) {
-                entry.example = excerpt(line, phrase.start());
+                entry.example = excerpt(line, position);
+            }
+        };
+        for phrase in RE_PHRASE.find_iter(line) {
+            let whole_line = phrase.as_str() == line;
+            let at_start = starts_sentence(&line[..phrase.start()]);
+            if let Some(term) =
+                normalize(phrase.as_str(), whole_line, at_start, skip_single_words, &vocabulary, names)
+            {
+                record(term, phrase.start(), whole_line);
+            }
+        }
+        for word in RE_ABBREVIATION.find_iter(line) {
+            if is_abbreviation(word.as_str(), &vocabulary, names) {
+                record(word.as_str().to_string(), word.start(), word.as_str() == line);
             }
         }
     }
 
-    CandidateSearch { candidates: select(found, limit), single_words_skipped: skip_single_words }
+    CandidateSearch { candidates: rank(found), single_words_skipped: skip_single_words }
+}
+
+/// Кандидаты, которые больше не нужно показывать модели.
+pub fn read_checked(path: &Path) -> HashSet<String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
+}
+
+pub fn remember_checked(path: &Path, terms: &[String]) -> Result<(), String> {
+    let mut checked = read_checked(path);
+    checked.extend(terms.iter().map(|term| term.trim().to_lowercase()));
+    write_checked(path, checked)
+}
+
+/// Возвращает термины из отброшенных: они снова считаются непроверенными.
+pub fn forget_checked(path: &Path, terms: &[String]) -> Result<(), String> {
+    let mut checked = read_checked(path);
+    for term in terms {
+        checked.remove(&term.trim().to_lowercase());
+    }
+    write_checked(path, checked)
+}
+
+fn write_checked(path: &Path, checked: HashSet<String>) -> Result<(), String> {
+    let mut checked: Vec<String> = checked.into_iter().collect();
+    checked.sort();
+    let json = serde_json::to_string(&checked)
+        .map_err(|e| format!("Не удалось подготовить проверенные термины: {}", e))?;
+    crate::rpa::write_atomic(path, |out: &mut File| {
+        out.write_all(json.as_bytes())
+            .map_err(|e| format!("Не удалось сохранить проверенные термины {:?}: {}", path, e))
+    })
 }
 
 #[cfg(test)]
@@ -246,7 +315,7 @@ mod tests {
 
     fn terms(texts: &[&str], names: &[&str]) -> Vec<String> {
         let names = names.iter().map(|name| name.to_string()).collect();
-        find_candidates(&lines(texts), &names, &HashSet::new(), 60)
+        find_candidates(&lines(texts), &names)
             .candidates
             .into_iter()
             .map(|candidate| candidate.term)
@@ -263,8 +332,6 @@ mod tests {
                 "The academy is far.",
             ]),
             &HashSet::new(),
-            &HashSet::new(),
-            60,
         );
         let top = &found.candidates[0];
         assert_eq!((top.term.as_str(), top.count), ("Ninja Academy", 3));
@@ -334,14 +401,47 @@ mod tests {
     #[test]
     fn known_terms_are_not_offered_again() {
         let known = ["konoha".to_string()].into_iter().collect();
-        let found = find_candidates(
-            &lines(&["We left Konoha for Suna."]),
-            &HashSet::new(),
-            &known,
-            60,
+        let found = find_candidates(&lines(&["We left Konoha for Suna."]), &HashSet::new());
+        assert_eq!(found.candidates.len(), 2);
+        let left = found.unchecked(&known);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].term, "Suna");
+    }
+
+    #[test]
+    fn checked_terms_do_not_shift_the_rest_and_survive_on_disk() {
+        let texts = lines(&["We saw Alpha Gate, then Beta Gate and Gamma Gate.", "Alpha Gate again, and Beta Gate."]);
+        let path = std::env::temp_dir().join(format!("translator_term_checks_{}.json", uuid::Uuid::new_v4()));
+        let found = find_candidates(&texts, &HashSet::new());
+        let order = |known: &HashSet<String>| -> Vec<String> {
+            found.unchecked(known).into_iter().map(|c| c.term).collect()
+        };
+        assert_eq!(order(&HashSet::new()), ["Alpha Gate", "Beta Gate", "Gamma Gate"]);
+
+        remember_checked(&path, &[" Beta Gate ".to_string()]).unwrap();
+        remember_checked(&path, &["Alpha Gate".to_string()]).unwrap();
+        assert_eq!(order(&read_checked(&path)), ["Gamma Gate"]);
+
+        forget_checked(&path, &["beta gate".to_string()]).unwrap();
+        assert_eq!(order(&read_checked(&path)), ["Beta Gate", "Gamma Gate"]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn abbreviations_are_found_and_shouting_is_not() {
+        assert_eq!(
+            terms(
+                &[
+                    "The PPF sent me, and the PPF knows.",
+                    "I told you to WAIT HERE, you hear me?",
+                    "You should wait here. I will wait.",
+                    "AAAH! Stop it.",
+                    "Call AL now.",
+                ],
+                &["al"],
+            ),
+            ["PPF"]
         );
-        assert_eq!(found.candidates.len(), 1);
-        assert_eq!(found.candidates[0].term, "Suna");
     }
 
     #[test]
@@ -355,7 +455,7 @@ mod tests {
             .map(|i| format!("Ich sehe den Wald und das Dorf {i}."))
             .collect();
         texts.push("Ich sehe den Wald mit Herr Lauert im Haus.".to_string());
-        let found = find_candidates(&texts, &HashSet::new(), &HashSet::new(), 60);
+        let found = find_candidates(&texts, &HashSet::new());
         assert!(found.single_words_skipped);
         let terms: Vec<_> = found.candidates.iter().map(|c| c.term.as_str()).collect();
         assert_eq!(terms, ["Herr Lauert"]);
@@ -367,9 +467,9 @@ mod tests {
             .map(|i| format!("We saw Place{} near it.", char::from(b'a' + i)))
             .collect();
         texts.extend((0..9).map(|i| format!("Item{}", char::from(b'a' + i))));
-        let found = find_candidates(&texts, &HashSet::new(), &HashSet::new(), 9);
-        assert_eq!(found.candidates.len(), 9);
-        let titles = found.candidates.iter().filter(|c| c.term.starts_with("Item")).count();
+        let found = find_candidates(&texts, &HashSet::new());
+        assert_eq!(found.candidates.len(), 18);
+        let titles = found.candidates[..9].iter().filter(|c| c.term.starts_with("Item")).count();
         assert_eq!(titles, 3);
     }
 }

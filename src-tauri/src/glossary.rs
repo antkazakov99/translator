@@ -12,10 +12,18 @@ pub struct MergedCharacter {
     pub original_name: String,
 }
 
+/// Другая форма той же записи со своим переводом: сокращение термина («PPF») или
+/// обращение к персонажу («Miss Granger»). Пустой перевод значит перевод самой записи.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct NameForm {
+    pub source: String,
+    pub translated: String,
+}
+
 /// Запись персонажа в глоссарии проекта
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct CharacterGlossaryEntry {
-    pub alias: String,           // Код/алиас в Ren'Py (например "lis", "emm", "me")
+    pub alias: String,           // Код/алиас в Ren'Py ("lis", "emm", "me"). Персонаж, которого только упоминают, вместо кода получает внутренний номер с "~"
     pub original_name: String,   // Оригинальное имя в игре ("Lisa", "Emma", "Jack")
     pub translated_name: String, // Перевод имени на русский ("Лиза", "Эмма", "Джек")
     pub gender: String,          // "male" (М) | "female" (Ж) | "unknown" (—)
@@ -28,6 +36,8 @@ pub struct CharacterGlossaryEntry {
     pub merged: Vec<MergedCharacter>, // Другие коды этого же персонажа
     #[serde(default)]
     pub excluded_notes: Vec<String>, // Заметки частей, которые не идут в итоговое описание
+    #[serde(default)]
+    pub forms: Vec<NameForm>, // Другие имена и обращения ("Miss Granger")
 }
 
 impl CharacterGlossaryEntry {
@@ -40,6 +50,7 @@ impl CharacterGlossaryEntry {
     pub fn names(&self) -> Vec<&str> {
         std::iter::once(self.original_name.as_str())
             .chain(self.merged.iter().map(|m| m.original_name.as_str()))
+            .chain(self.forms.iter().map(|form| form.source.as_str()))
             .collect()
     }
 
@@ -56,6 +67,8 @@ pub struct TermGlossaryEntry {
     pub translated_term: String, // Перевод ("Охотник на демонов", "Штаб ППФ", "Древняя руна")
     pub category: String,    // "general" | "location" | "title" | "item"
     pub notes: String,       // Контекст / комментарий
+    #[serde(default)]
+    pub forms: Vec<NameForm>, // Сокращения и короткие формы ("PPF", "Academy")
 }
 
 /// Подстановка в репликах вроде `[landlady]`

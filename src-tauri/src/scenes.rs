@@ -143,13 +143,18 @@ pub fn token_scenes(game: &GameLines, name: &str) -> Vec<CharacterScene> {
     matching_scenes(game, &format!(r"\[{}(?:![a-z]+)?\]", regex::escape(name)))
 }
 
-/// Сцены, в репликах которых встречается термин. Регистр не важен, термин ищется целым словом.
-pub fn term_scenes(game: &GameLines, term: &str) -> Vec<CharacterScene> {
-    let term = term.trim();
-    if term.is_empty() {
+/// Сцены, в репликах которых встречается термин в любой из форм. Регистр не важен, форма ищется целым словом.
+pub fn term_scenes(game: &GameLines, forms: &[String]) -> Vec<CharacterScene> {
+    let forms: Vec<String> = forms
+        .iter()
+        .map(|form| form.trim())
+        .filter(|form| !form.is_empty())
+        .map(regex::escape)
+        .collect();
+    if forms.is_empty() {
         return Vec::new();
     }
-    matching_scenes(game, &format!(r"(?i)(?:^|\W){}(?:$|\W)", regex::escape(term)))
+    matching_scenes(game, &format!(r"(?i)(?:^|\W)(?:{})(?:$|\W)", forms.join("|")))
 }
 
 fn matching_scenes(game: &GameLines, pattern: &str) -> Vec<CharacterScene> {
@@ -247,10 +252,10 @@ mod tests {
             "label end:\n",
             "    m \"PPF HQ\"\n",
         ));
-        let found = term_scenes(&game, " PPF HQ ");
+        let found = term_scenes(&game, &[" PPF HQ ".to_string(), " ".to_string()]);
         let names: Vec<&str> = found.iter().map(|scene| scene.scene.as_str()).collect();
         assert_eq!(names, ["home", "end"]);
-        assert!(term_scenes(&game, " ").is_empty());
+        assert!(term_scenes(&game, &[" ".to_string()]).is_empty());
     }
 
     #[test]

@@ -121,6 +121,8 @@ struct ProjectCache {
     speakers: HashMap<PathBuf, SpeakerMap>,
     /// Разобранные реплики открытых проектов: разбор всех скриптов занимает секунды.
     lines: HashMap<PathBuf, Arc<scenes::GameLines>>,
+    /// Кандидаты в термины: зависят только от текста игры, поэтому считаются один раз на скан.
+    term_candidates: HashMap<PathBuf, Arc<terms::CandidateSearch>>,
     /// Корни открытых проектов по их папкам скриптов в кэше.
     project_roots: HashMap<PathBuf, PathBuf>,
 }
@@ -587,7 +589,11 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
             return Err(format!("Папка игры не найдена: {}", game_dir));
         }
         register_project(&base_path);
-        PROJECT_CACHE.lock().lines.remove(&base_path);
+        {
+            let mut cache = PROJECT_CACHE.lock();
+            cache.lines.remove(&base_path);
+            cache.term_candidates.remove(&base_path);
+        }
 
         // 1. Ищем персонажей в оригинальных скриптах игры в параллельных потоках (Rayon)
         let mut script_files = Vec::new();
@@ -1360,6 +1366,7 @@ async fn clear_project_script_cache(game_dir: String) -> Result<(), String> {
             let mut cache = PROJECT_CACHE.lock();
             cache.scripts.remove(&base_path);
             cache.lines.remove(&base_path);
+            cache.term_candidates.remove(&base_path);
             cache.speakers.remove(&base_path);
         }
         SCRIPT_STRUCTURE_CACHE
@@ -1411,6 +1418,16 @@ async fn decompile_rpyc_file(
     .map_err(|e| format!("Ошибка декомпиляции: {}", e))?
 }
 
+/// Персонажи, объявленные строкой: `default cam = "Camila"`, а не `Character`. Движок показывает
+/// значение как имя. Переменная считается персонажем, только если у неё есть реплики.
+fn string_speakers(game: &scenes::GameLines) -> SpeakerMap {
+    game.lines
+        .iter()
+        .filter_map(|line| line.alias.as_deref())
+        .filter_map(|alias| Some((alias.to_string(), game.variables.get(alias)?.first()?.clone())))
+        .collect()
+}
+
 #[tauri::command]
 async fn get_project_glossary(
     game_dir: String,
@@ -1421,6 +1438,13 @@ async fn get_project_glossary(
         let mut gl = glossary::ProjectGlossary::load_for_project(&base_path)?;
         if let Some(ref chars) = scanned_characters {
             gl.merge_with_scanned_characters(chars);
+        }
+        let speakers = string_speakers(&game_lines(&base_path));
+        gl.merge_with_scanned_characters(&speakers.clone().into_iter().collect::<Vec<_>>());
+        if let Some(known) = PROJECT_CACHE.lock().speakers.get_mut(&base_path) {
+            for (alias, name) in speakers {
+                known.entry(alias).or_insert(name);
+            }
         }
         Ok(gl)
     })
@@ -1694,9 +1718,9 @@ async fn get_token_scenes(game_dir: String, name: String) -> Result<Vec<scenes::
 
 /// Сцены, в репликах которых встречается термин.
 #[tauri::command]
-async fn get_term_scenes(game_dir: String, term: String) -> Result<Vec<scenes::CharacterScene>, String> {
+async fn get_term_scenes(game_dir: String, forms: Vec<String>) -> Result<Vec<scenes::CharacterScene>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        scenes::term_scenes(&game_lines(&effective_game_directory(Path::new(&game_dir))), &term)
+        scenes::term_scenes(&game_lines(&effective_game_directory(Path::new(&game_dir))), &forms)
     })
     .await
     .map_err(|e| format!("Ошибка поиска сцен термина: {}", e))
@@ -1895,9 +1919,11 @@ async fn autofill_glossary_terms(
     .await
 }
 
-/// Сколько кандидатов в термины проверяет модель. Каждые 20 это один запрос.
-const DEFAULT_TERM_CANDIDATES: usize = 60;
-const MAX_TERM_CANDIDATES: usize = 200;
+#[derive(Debug, Serialize)]
+struct TermCandidateCount {
+    total: usize,
+    checked: usize,
+}
 
 #[derive(Debug, Serialize)]
 struct ExtractedTerms {
@@ -1920,14 +1946,110 @@ fn character_name_words(game_dir: &Path) -> HashSet<String> {
         .collect()
 }
 
-/// Находит названия по всему тексту игры и отдаёт модели на проверку. В глоссарий
-/// термины попадают только после отбора пользователем.
+fn term_checks_file(base_path: &Path) -> PathBuf {
+    get_project_cache_dir(base_path).join("term_checks.json")
+}
+
+fn remember_term_checks(file: &Path, terms: &[String]) -> Result<(), String> {
+    let file_lock = path_lock(file);
+    let _guard = file_lock.lock();
+    terms::remember_checked(file, terms)
+}
+
+/// Кандидаты в термины. Текст игры разбирается один раз, новый скан начинает заново.
+fn term_candidates(base_path: &Path) -> Arc<terms::CandidateSearch> {
+    if let Some(search) = PROJECT_CACHE.lock().term_candidates.get(base_path) {
+        return search.clone();
+    }
+    let texts = llm::script_texts(&game_lines(base_path));
+    let search = Arc::new(terms::find_candidates(&texts, &character_name_words(base_path)));
+    PROJECT_CACHE.lock().term_candidates.insert(base_path.to_path_buf(), search.clone());
+    search
+}
+
+/// Отброшенные кандидаты вместе с `known_terms`, уже известными в глоссарии.
+fn known_terms_of(base_path: &Path, known_terms: &[String]) -> HashSet<String> {
+    let mut known = terms::read_checked(&term_checks_file(base_path));
+    known.extend(known_terms.iter().map(|term| term.trim().to_lowercase()));
+    known
+}
+
+/// Сколько кандидатов нашлось и сколько из них проверено. Модель здесь не участвует.
+#[tauri::command]
+async fn count_term_candidates(game_dir: String, known_terms: Vec<String>) -> Result<TermCandidateCount, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let search = term_candidates(&base_path);
+        let total = search.candidates.len();
+        let unchecked = search.unchecked(&known_terms_of(&base_path, &known_terms)).len();
+        TermCandidateCount { total, checked: total - unchecked }
+    })
+    .await
+    .map_err(|e| format!("Ошибка подсчёта кандидатов: {}", e))
+}
+
+/// Отброшенные кандидаты в том же порядке, что и весь список.
+#[tauri::command]
+async fn list_rejected_terms(game_dir: String) -> Result<Vec<terms::TermCandidate>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        term_candidates(&base_path).listed_in(&terms::read_checked(&term_checks_file(&base_path)))
+    })
+    .await
+    .map_err(|e| format!("Ошибка чтения отброшенных терминов: {}", e))
+}
+
+/// Убирает термины из отброшенных: их взяли в глоссарий.
+#[tauri::command]
+async fn restore_term_candidates(game_dir: String, terms: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = term_checks_file(&effective_game_directory(Path::new(&game_dir)));
+        let file_lock = path_lock(&file);
+        let _guard = file_lock.lock();
+        terms::forget_checked(&file, &terms)
+    })
+    .await
+    .map_err(|e| format!("Ошибка записи проверенных терминов: {}", e))?
+}
+
+/// Запоминает кандидатов, которых пользователь не взял в глоссарий.
+#[tauri::command]
+async fn reject_term_candidates(game_dir: String, terms: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        remember_term_checks(&term_checks_file(&effective_game_directory(Path::new(&game_dir))), &terms)
+    })
+    .await
+    .map_err(|e| format!("Ошибка записи проверенных терминов: {}", e))?
+}
+
+/// Забывает проверенные термины: следующий запуск пройдёт кандидатов заново.
+#[tauri::command]
+async fn reset_term_checks(game_dir: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let file = term_checks_file(&effective_game_directory(Path::new(&game_dir)));
+        let file_lock = path_lock(&file);
+        let _guard = file_lock.lock();
+        match std::fs::remove_file(&file) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(format!("Не удалось сбросить проверенные термины: {}", error))
+            }
+            _ => Ok(()),
+        }
+    })
+    .await
+    .map_err(|e| format!("Ошибка сброса проверенных терминов: {}", e))?
+}
+
+/// Отдаёт модели на проверку `count` следующих кандидатов. Отброшенные запоминаются сразу,
+/// поэтому новый запуск продолжит с того же места. В глоссарий термины попадают только
+/// после отбора пользователем.
 #[tauri::command]
 async fn extract_glossary_terms_from_game(
     game_dir: String,
     target: llm::ChatTarget,
-    max_candidates: Option<usize>,
+    count: usize,
     known_terms: Vec<String>,
+    characters: Vec<String>,
     on_batch: Channel<llm::BatchProgress<llm::ReviewedTerm>>,
 ) -> Result<ExtractedTerms, String> {
     let run = LlmRun::begin()?;
@@ -1935,24 +2057,29 @@ async fn extract_glossary_terms_from_game(
     if !base_path.exists() {
         return Err(format!("Папка игры не найдена: {:?}", base_path));
     }
-    let limit = max_candidates.unwrap_or(DEFAULT_TERM_CANDIDATES).clamp(1, MAX_TERM_CANDIDATES);
-    let known: HashSet<String> = known_terms.iter().map(|term| term.trim().to_lowercase()).collect();
-    let search = tauri::async_runtime::spawn_blocking(move || {
-        let texts = llm::script_texts(&original_scripts(&base_path));
-        terms::find_candidates(&texts, &character_name_words(&base_path), &known, limit)
+    let checks_file = term_checks_file(&base_path);
+    let (mut candidates, single_words_skipped) = tauri::async_runtime::spawn_blocking(move || {
+        let search = term_candidates(&base_path);
+        (search.unchecked(&known_terms_of(&base_path, &known_terms)), search.single_words_skipped)
     })
     .await
     .map_err(|e| format!("Ошибка поиска терминов: {}", e))?;
+    candidates.truncate(count);
 
-    let checked = llm::check_term_candidates(&target, &search.candidates, run.cancel(), |progress| {
+    let on_rejected = |terms: Vec<String>| {
+        if let Err(error) = remember_term_checks(&checks_file, &terms) {
+            tracing::warn!(%error, "Проверенные термины не сохранены");
+        }
+    };
+    let checked = llm::check_term_candidates(&target, &candidates, &characters, run.cancel(), on_rejected, |progress| {
         send_progress(&on_batch, progress)
     })
     .await?;
     Ok(ExtractedTerms {
         items: checked.items,
         failed_batches: checked.failed_batches,
-        candidates: search.candidates.len(),
-        single_words_skipped: search.single_words_skipped,
+        candidates: candidates.len(),
+        single_words_skipped,
     })
 }
 
@@ -2001,6 +2128,11 @@ pub fn run() {
             translate_character_names,
             suggest_glossary_tokens,
             autofill_glossary_terms,
+            count_term_candidates,
+            list_rejected_terms,
+            reject_term_candidates,
+            restore_term_candidates,
+            reset_term_checks,
             extract_glossary_terms_from_game,
             cancel_llm_run,
             summarize_glossary_character,
@@ -2967,7 +3099,7 @@ mod tests {
 
         let scripts = original_scripts(&game_dir);
         assert_eq!(scripts, [get_project_scripts_cache_dir(&game_dir).join("packed.rpy")]);
-        assert_eq!(llm::script_texts(&scripts), ["Hello there"]);
+        assert_eq!(llm::script_texts(&game_lines(&game_dir)), ["Hello there"]);
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -3329,6 +3461,37 @@ mod tests {
     }
 
     #[test]
+    fn test_characters_declared_as_strings_join_the_glossary() {
+        let game_dir = std::env::temp_dir().join(format!("translator_string_speakers_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&game_dir).unwrap();
+        std::fs::write(
+            game_dir.join("script.rpy"),
+            concat!(
+                "default cam = \"Camila\"\n",
+                "default town = \"Sunnyvale\"\n",
+                "define e = Character(\"Erika\")\n",
+                "label start:\n",
+                "    cam \"Hello there.\"\n",
+                "    e \"Hi.\"\n",
+            ),
+        )
+        .unwrap();
+
+        let glossary = tauri::async_runtime::block_on(get_project_glossary(
+            game_dir.to_string_lossy().into_owned(),
+            Some(vec![("e".to_string(), "Erika".to_string())]),
+        ))
+        .unwrap();
+        let mut names: Vec<_> = glossary.characters.iter().map(|c| (c.alias.as_str(), c.original_name.as_str())).collect();
+        names.sort();
+        // Переменная без реплик персонажем не считается
+        assert_eq!(names, [("cam", "Camila"), ("e", "Erika")]);
+
+        let _ = std::fs::remove_dir_all(&game_dir);
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+    }
+
+    #[test]
     fn test_glossary_commands() {
         tauri::async_runtime::block_on(async {
             let unique_id = std::time::SystemTime::now()
@@ -3359,6 +3522,7 @@ mod tests {
                 translated_term: "Клинок демона".to_string(),
                 category: "item".to_string(),
                 notes: "Реликвия".to_string(),
+                forms: Vec::new(),
             });
 
             let save_msg = save_project_glossary(temp_game_dir.to_string_lossy().to_string(), gl)
