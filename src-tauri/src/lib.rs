@@ -1636,8 +1636,8 @@ async fn reveal_in_system_explorer(file_path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn check_llm_models(api_url: String) -> Result<Vec<String>, String> {
-    llm::check_models(&api_url).await
+async fn check_llm_models(api_url: String, api_key: Option<String>) -> Result<Vec<String>, String> {
+    llm::check_models(&api_url, api_key.as_deref()).await
 }
 
 /// Имя скрипта относительно игры: одинаковое для файла на диске и в кэше.
@@ -1717,65 +1717,70 @@ fn send_progress<T: Serialize + Clone>(channel: &Channel<llm::BatchProgress<T>>,
     }
 }
 
-/// Что и как передать модели при обновлении персонажей.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CharacterRunOptions {
-    only_empty: bool,
-    sample_count: Option<usize>,
-    #[serde(default)]
-    whole_scenes: bool,
-}
-
+/// Обновляет персонажа по отдельным репликам. По сценам работает `summarize_glossary_character`.
 #[tauri::command]
 async fn autofill_glossary_characters(
     game_dir: String,
-    api_url: String,
-    model: String,
+    target: llm::ChatTarget,
     characters: Vec<glossary::CharacterGlossaryEntry>,
     hints: llm::ModelHints,
-    options: CharacterRunOptions,
-    on_batch: Channel<llm::BatchProgress<llm::CharacterResult>>,
 ) -> Result<llm::AutofillResult<glossary::CharacterGlossaryEntry>, String> {
     LLM_CANCEL.store(false, Ordering::Relaxed);
     let base_path = effective_game_directory(Path::new(&game_dir));
-    let only_empty = options.only_empty;
-    let sample_count = options
-        .sample_count
-        .unwrap_or(llm::DEFAULT_CHARACTER_SAMPLES)
-        .clamp(1, llm::MAX_CHARACTER_SAMPLES);
     let selected = characters.clone();
     let samples = tauri::async_runtime::spawn_blocking(move || {
         let game = game_lines(&base_path);
         let notes = llm::token_notes(&hints.tokens);
-        let mut samples = if options.whole_scenes {
-            llm::collect_scene_samples(&game, &notes, &selected)
-        } else {
-            llm::collect_character_dialogue_samples(&game.lines, &game.variables, &notes, &selected, sample_count)
-        };
+        let mut samples = llm::collect_character_dialogue_samples(
+            &game.lines,
+            &game.variables,
+            &notes,
+            &selected,
+            llm::CHARACTER_SAMPLES,
+        );
         llm::add_glossary_hints(&mut samples, &hints);
         samples
     })
     .await
     .map_err(|e| format!("Ошибка сбора контекста персонажей: {}", e))?;
 
-    llm::autofill_characters(&api_url, &model, characters, only_empty, samples, &LLM_CANCEL, |progress| {
-        send_progress(&on_batch, progress)
-    })
-    .await
+    llm::autofill_characters(&target, characters, false, samples, &LLM_CANCEL, |_| {}).await
 }
 
 /// Предлагает написание имён по всему составу игры. Какие из них попадут в глоссарий, решает пользователь.
 #[tauri::command]
 async fn translate_character_names(
-    api_url: String,
-    model: String,
+    target: llm::ChatTarget,
     names: Vec<String>,
     cast: Vec<String>,
     on_batch: Channel<llm::BatchProgress<llm::NameSuggestion>>,
 ) -> Result<llm::AutofillResult<llm::NameSuggestion>, String> {
     LLM_CANCEL.store(false, Ordering::Relaxed);
-    llm::translate_names(&api_url, &model, &names, &cast, &LLM_CANCEL, |progress| {
+    llm::translate_names(&target, &names, &cast, &LLM_CANCEL, |progress| {
+        send_progress(&on_batch, progress)
+    })
+    .await
+}
+
+/// Предлагает пояснения и значения токенов по репликам. В глоссарий их отбирает пользователь.
+#[tauri::command]
+async fn suggest_glossary_tokens(
+    game_dir: String,
+    target: llm::ChatTarget,
+    names: Vec<String>,
+    hints: llm::ModelHints,
+    on_batch: Channel<llm::BatchProgress<llm::TokenSuggestion>>,
+) -> Result<llm::AutofillResult<llm::TokenSuggestion>, String> {
+    LLM_CANCEL.store(false, Ordering::Relaxed);
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let notes = llm::token_notes(&hints.tokens);
+    let samples = tauri::async_runtime::spawn_blocking(move || {
+        llm::token_samples(&game_lines(&base_path), &notes, &names)
+    })
+    .await
+    .map_err(|e| format!("Ошибка сбора реплик токенов: {}", e))?;
+
+    llm::suggest_tokens(&target, &samples, &hints, &LLM_CANCEL, |progress| {
         send_progress(&on_batch, progress)
     })
     .await
@@ -1853,8 +1858,7 @@ async fn reset_character_notes(game_dir: String, keys: Vec<String>) -> Result<()
 #[tauri::command]
 async fn summarize_glossary_character(
     game_dir: String,
-    api_url: String,
-    model: String,
+    target: llm::ChatTarget,
     character: glossary::CharacterGlossaryEntry,
     hints: llm::ModelHints,
     parts: usize,
@@ -1865,7 +1869,7 @@ async fn summarize_glossary_character(
     let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
     let selected = character.clone();
     let notes = notes_file.clone();
-    let chosen_model = model.clone();
+    let chosen_model = target.model.clone();
     let tokens = hints.tokens.clone();
     let chunks = tauri::async_runtime::spawn_blocking(move || {
         let chunks = llm::scene_chunks(&game_lines(&base_path), &llm::token_notes(&tokens), &selected);
@@ -1875,7 +1879,6 @@ async fn summarize_glossary_character(
     .await
     .map_err(|e| format!("Ошибка подготовки сцен персонажа: {}", e))?;
 
-    let target = llm::ChatTarget { api_url: &api_url, model: &model };
     llm::summarize_character(&target, character, chunks, &hints, &notes_file, &LLM_CANCEL, |progress| {
         if let Err(error) = on_progress.send(progress) {
             tracing::warn!(%error, "Ход обработки не передан в интерфейс");
@@ -1886,14 +1889,13 @@ async fn summarize_glossary_character(
 
 #[tauri::command]
 async fn autofill_glossary_terms(
-    api_url: String,
-    model: String,
+    target: llm::ChatTarget,
     terms: Vec<glossary::TermGlossaryEntry>,
     only_empty: bool,
     on_batch: Channel<llm::BatchProgress<glossary::TermGlossaryEntry>>,
 ) -> Result<llm::AutofillResult<glossary::TermGlossaryEntry>, String> {
     LLM_CANCEL.store(false, Ordering::Relaxed);
-    llm::autofill_terms(&api_url, &model, terms, only_empty, &LLM_CANCEL, |progress| {
+    llm::autofill_terms(&target, terms, only_empty, &LLM_CANCEL, |progress| {
         send_progress(&on_batch, progress)
     })
     .await
@@ -1929,8 +1931,7 @@ fn character_name_words(game_dir: &Path) -> HashSet<String> {
 #[tauri::command]
 async fn extract_glossary_terms_from_game(
     game_dir: String,
-    api_url: String,
-    model: String,
+    target: llm::ChatTarget,
     max_candidates: Option<usize>,
     known_terms: Vec<String>,
     on_batch: Channel<llm::BatchProgress<llm::ReviewedTerm>>,
@@ -1949,7 +1950,7 @@ async fn extract_glossary_terms_from_game(
     .await
     .map_err(|e| format!("Ошибка поиска терминов: {}", e))?;
 
-    let checked = llm::check_term_candidates(&api_url, &model, &search.candidates, &LLM_CANCEL, |progress| {
+    let checked = llm::check_term_candidates(&target, &search.candidates, &LLM_CANCEL, |progress| {
         send_progress(&on_batch, progress)
     })
     .await?;
@@ -2005,6 +2006,7 @@ pub fn run() {
             check_llm_models,
             autofill_glossary_characters,
             translate_character_names,
+            suggest_glossary_tokens,
             autofill_glossary_terms,
             extract_glossary_terms_from_game,
             cancel_llm_run,
