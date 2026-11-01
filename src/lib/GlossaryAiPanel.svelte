@@ -329,6 +329,7 @@
   <select class="input" bind:value={row.category} aria-label={`Категория термина ${label}`}>
     <option value="general">Общее</option>
     <option value="location">Локация</option>
+    <option value="organization">Организация</option>
     <option value="title">Титул</option>
     <option value="item">Предмет</option>
   </select>

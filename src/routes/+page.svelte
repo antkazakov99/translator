@@ -458,7 +458,7 @@
     id: string;
     source_term: string;
     translated_term: string;
-    category: string; // "general" | "location" | "title" | "item"
+    category: string; // "general" | "location" | "organization" | "title" | "item"
     notes: string;
     forms: NameForm[];
     excluded_scenes: string[];
@@ -1397,7 +1397,7 @@
   async function showEntry(entry: DescribedEntry) {
     if (isCharacter(entry)) return showCharacter(entry);
     glossarySearch = "";
-    glossaryCategoryFilter = "all";
+    hiddenCategories = [];
     openGlossaryTab("terms");
     selectedGlossaryTerm = entry;
   }
@@ -1582,7 +1582,25 @@
   // Фильтры глоссария
   let glossarySearch = $state("");
   let glossaryGenderFilter = $state<"all" | "male" | "female" | "neuter" | "unknown">("all");
-  let glossaryCategoryFilter = $state<"all" | "general" | "location" | "title" | "item">("all");
+  const TERM_CATEGORIES = [
+    { value: "general", label: "Общий", plural: "Общие" },
+    { value: "location", label: "Локация", plural: "Локации" },
+    { value: "organization", label: "Организация", plural: "Организации" },
+    { value: "title", label: "Титул", plural: "Титулы" },
+    { value: "item", label: "Предмет", plural: "Предметы" }
+  ];
+  // Скрытые, а не выбранные: «всё, кроме общих» это один клик
+  let hiddenCategories = $state<string[]>([]);
+
+  function toggleCategory(category: string) {
+    hiddenCategories = hiddenCategories.includes(category)
+      ? hiddenCategories.filter((hidden) => hidden !== category)
+      : [...hiddenCategories, category];
+  }
+
+  function toggleAllCategories() {
+    hiddenCategories = hiddenCategories.length === 0 ? TERM_CATEGORIES.map((category) => category.value) : [];
+  }
 
   // Добавление термина
   const emptyTerm = (): TermGlossaryEntry => ({ id: "", source_term: "", translated_term: "", category: "general", notes: "", forms: [], excluded_scenes: [], excluded_notes: [] });
@@ -2273,7 +2291,7 @@
   let filteredGlossaryTerms = $derived.by(() => {
     const q = glossarySearch.trim().toLowerCase();
     return glossary.terms.filter(t => {
-      if (glossaryCategoryFilter !== 'all' && t.category !== glossaryCategoryFilter) {
+      if (hiddenCategories.includes(t.category)) {
         return false;
       }
       if (!q) return true;
@@ -2513,7 +2531,7 @@
     glossary.terms = [newEntry, ...glossary.terms];
     selectedGlossaryTerm = glossary.terms[0];
     glossarySearch = "";
-    glossaryCategoryFilter = "all";
+    hiddenCategories = [];
     addingEntry = false;
     glossaryDirty = true;
     showToast(`Термин "${src}" добавлен в глоссарий`, "success");
@@ -2788,6 +2806,7 @@
                     >
                       <option value="general">Общий термин</option>
                       <option value="location">Локация / Место</option>
+                      <option value="organization">Организация / Фракция</option>
                       <option value="title">Титул / Звание</option>
                       <option value="item">Предмет / Артефакт</option>
                     </select>
@@ -4335,41 +4354,24 @@
                 <!-- Фильтр по категории терминов -->
                 <div class="category-filter-group">
                   <span class="filter-label">Категория:</span>
-                  <button 
-                    class="btn-filter-pill" 
-                    class:active={glossaryCategoryFilter === 'all'} 
-                    onclick={() => glossaryCategoryFilter = 'all'}
+                  <button
+                    class="btn-filter-pill"
+                    class:active={hiddenCategories.length === 0}
+                    aria-pressed={hiddenCategories.length === 0}
+                    onclick={toggleAllCategories}
                   >
                     Все
                   </button>
-                  <button 
-                    class="btn-filter-pill" 
-                    class:active={glossaryCategoryFilter === 'general'} 
-                    onclick={() => glossaryCategoryFilter = 'general'}
-                  >
-                    Общие
-                  </button>
-                  <button 
-                    class="btn-filter-pill" 
-                    class:active={glossaryCategoryFilter === 'location'} 
-                    onclick={() => glossaryCategoryFilter = 'location'}
-                  >
-                    Локации
-                  </button>
-                  <button 
-                    class="btn-filter-pill" 
-                    class:active={glossaryCategoryFilter === 'title'} 
-                    onclick={() => glossaryCategoryFilter = 'title'}
-                  >
-                    Титулы
-                  </button>
-                  <button 
-                    class="btn-filter-pill" 
-                    class:active={glossaryCategoryFilter === 'item'} 
-                    onclick={() => glossaryCategoryFilter = 'item'}
-                  >
-                    Предметы
-                  </button>
+                  {#each TERM_CATEGORIES as category (category.value)}
+                    <button
+                      class="btn-filter-pill filter-{category.value}"
+                      class:active={!hiddenCategories.includes(category.value)}
+                      aria-pressed={!hiddenCategories.includes(category.value)}
+                      onclick={() => toggleCategory(category.value)}
+                    >
+                      {category.plural}
+                    </button>
+                  {/each}
                 </div>
               {/if}
 
@@ -4514,7 +4516,7 @@
                 {#if filteredGlossaryTerms.length === 0}
                   <div class="glossary-empty-state">
                     <BookMarked size={32} class="text-slate-600" />
-                    <p>В глоссарии пока нет терминов. Добавьте термин выше!</p>
+                    <p>{glossary.terms.length === 0 ? "В глоссарии пока нет терминов. Добавьте термин выше!" : "Нет терминов в выбранных категориях."}</p>
                   </div>
                 {:else}
                   {#each filteredGlossaryTerms as term (term.id)}
@@ -4532,7 +4534,7 @@
                         {/if}
                       </span>
                       <span class="category-badge category-{term.category}">
-                        {term.category === 'location' ? 'Локация' : term.category === 'title' ? 'Титул' : term.category === 'item' ? 'Предмет' : 'Общий'}
+                        {TERM_CATEGORIES.find((category) => category.value === term.category)?.label ?? 'Общий'}
                       </span>
                     </button>
                   {/each}
@@ -9154,6 +9156,36 @@
     color: #f8fafc;
   }
 
+  .btn-filter-pill.filter-general.active {
+    background: rgba(148, 163, 184, 0.2);
+    border-color: #94a3b8;
+    color: #cbd5e1;
+  }
+
+  .btn-filter-pill.filter-location.active {
+    background: rgba(56, 189, 248, 0.2);
+    border-color: #38bdf8;
+    color: #7dd3fc;
+  }
+
+  .btn-filter-pill.filter-organization.active {
+    background: rgba(52, 211, 153, 0.2);
+    border-color: #34d399;
+    color: #6ee7b7;
+  }
+
+  .btn-filter-pill.filter-title.active {
+    background: rgba(245, 158, 11, 0.2);
+    border-color: #f59e0b;
+    color: #fcd34d;
+  }
+
+  .btn-filter-pill.filter-item.active {
+    background: rgba(168, 85, 247, 0.2);
+    border-color: #a855f7;
+    color: #d8b4fe;
+  }
+
   .btn-filter-pill.filter-male.active {
     background: rgba(56, 189, 248, 0.2);
     border-color: #38bdf8;
@@ -9394,6 +9426,7 @@
 
   .category-general { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
   .category-location { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
+  .category-organization { background: rgba(52, 211, 153, 0.15); color: #34d399; }
   .category-title { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
   .category-item { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
 

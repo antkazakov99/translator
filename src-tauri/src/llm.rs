@@ -1546,7 +1546,7 @@ Rules:
 1. "id": EXACT same id as input.
 2. "translated_term": Accurate, authentic Russian translation.
    Examples: "Demon Hunter" -> "Охотник на демонов", "PPF Headquarters" -> "Штаб ППФ", "Ancient Rune" -> "Древняя руна", "Silver Key" -> "Серебряный ключ".
-3. "category": One of "general", "location", "title", "item".
+3. "category": One of "general", "location", "organization", "title", "item". Use "organization" for companies, factions, agencies, gangs, schools as institutions and other groups of people.
 4. "notes": Brief context/commentary in Russian, or empty string.
 
 Respond ONLY with a valid JSON array of objects:
@@ -1618,7 +1618,7 @@ Respond ONLY with a valid JSON array of objects:
                 }
                 if let Some(cat) = &item.category {
                     let trimmed = cat.trim().to_lowercase();
-                    if matches!(trimmed.as_str(), "general" | "location" | "title" | "item") {
+                    if matches!(trimmed.as_str(), "general" | "location" | "organization" | "title" | "item") {
                         t.category = trimmed;
                     }
                 }

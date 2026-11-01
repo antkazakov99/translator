@@ -68,7 +68,7 @@ pub struct TermGlossaryEntry {
     pub id: String,
     pub source_term: String, // Исходный термин ("Demon Hunter", "PPF HQ", "Ancient Rune")
     pub translated_term: String, // Перевод ("Охотник на демонов", "Штаб ППФ", "Древняя руна")
-    pub category: String,    // "general" | "location" | "title" | "item"
+    pub category: String,    // "general" | "location" | "organization" | "title" | "item"
     pub notes: String,       // Контекст / комментарий
     #[serde(default)]
     pub forms: Vec<NameForm>, // Сокращения и короткие формы ("PPF", "Academy")
