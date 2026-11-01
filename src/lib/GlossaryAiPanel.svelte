@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onDestroy, type Snippet } from "svelte";
   import { Channel, invoke } from "@tauri-apps/api/core";
-  import { AlertCircle, Check, Loader2, Sparkles, Square } from "lucide-svelte";
+  import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, Sparkles, Square } from "lucide-svelte";
+  import CharacterPicker from "./CharacterPicker.svelte";
   import RequestSlider from "./RequestSlider.svelte";
   import { actionLabel, targetFor, type LlmAction, type LlmSettings } from "./llm-settings";
 
@@ -117,8 +118,9 @@
   const TOKENS_PER_REQUEST = 10;
   const MAX_TERM_REQUESTS = 10;
 
-  let openByTab = $state<Record<GlossaryTab, LlmAction | null>>({ characters: null, terms: null, tokens: null });
-  let openSection = $derived(openByTab[tab]);
+  let panelOpen = $state(false);
+  let sectionByTab = $state<Record<GlossaryTab, LlmAction>>({ characters: "descriptions", terms: "terms", tokens: "tokens" });
+  let openSection = $derived(sectionByTab[tab]);
 
   let isProcessing = $state(false);
   let progressStep = $state("");
@@ -128,7 +130,7 @@
   let doneMessage = $state("");
 
   $effect(() => { busy = isProcessing; });
-  $effect(() => { descriptionsOpen = openByTab.characters === "descriptions"; });
+  $effect(() => { descriptionsOpen = panelOpen && sectionByTab.characters === "descriptions"; });
   // Сообщение относится к разделу, в котором появилось
   $effect(() => {
     void openSection;
@@ -397,14 +399,15 @@
 
 <div class="ai-panel">
   <div class="ai-bar">
-    <Sparkles size={14} class="ai-bar-icon" />
-    {#each SECTIONS[tab] as section (section.id)}
-      <button
-        class="ai-pill"
-        class:active={openSection === section.id}
-        onclick={() => { openByTab[tab] = openSection === section.id ? null : section.id; }}
-      >{section.label}</button>
-    {/each}
+    <button class="ai-toggle" aria-expanded={panelOpen} onclick={() => panelOpen = !panelOpen}>
+      {#if panelOpen}
+        <ChevronDown size={15} />
+      {:else}
+        <ChevronRight size={15} />
+      {/if}
+      <Sparkles size={14} class="ai-bar-icon" />
+      <span class="ai-title">Обработка через LLM</span>
+    </button>
     <div class="ai-status">
       {#if isProcessing}
         <Loader2 size={13} class="spin" />
@@ -423,10 +426,18 @@
     </div>
   </div>
 
-  {#if openSection}
+  {#if panelOpen}
+    <div class="ai-tabs">
+      {#each SECTIONS[tab] as section (section.id)}
+        <button
+          class="ai-tab"
+          class:active={openSection === section.id}
+          onclick={() => { sectionByTab[tab] = section.id; }}
+        >{section.label}</button>
+      {/each}
+      <span class="ai-model">Модель: {actionLabel(settings, openSection)}</span>
+    </div>
     <div class="ai-body">
-      <p class="ai-model">Модель: {actionLabel(settings, openSection)}</p>
-
       {#if errorMessage}
         <div class="ai-error">
           <AlertCircle size={14} />
@@ -441,30 +452,13 @@
         {@render descriptions()}
       {:else if openSection === "names"}
         <p class="ai-note">Модель увидит все имена игры, определит их происхождение и заново напишет имена выбранных персонажей, включая заполненные. Что заменить, выберете вы.</p>
-        <details class="ai-picker">
-          <summary>Выбрано: {characters.length - unselectedAliases.length} из {characters.length}</summary>
-          <div class="ai-toggles">
-            <button class="btn-link" onclick={() => unselectedAliases = []}>Выбрать всех</button>
-            <button class="btn-link" onclick={() => unselectedAliases = characters.map((c) => c.alias)}>Снять всех</button>
-          </div>
-          <div class="ai-picker-grid">
-            {#each characters as character (character.alias)}
-              <label class="ai-check">
-                <input
-                  type="checkbox"
-                  checked={!unselectedAliases.includes(character.alias)}
-                  disabled={isProcessing}
-                  onchange={(e) => {
-                    unselectedAliases = e.currentTarget.checked
-                      ? unselectedAliases.filter((alias) => alias !== character.alias)
-                      : [...unselectedAliases, character.alias];
-                  }}
-                />
-                <span>{characterName(character)}</span>
-              </label>
-            {/each}
-          </div>
-        </details>
+        <CharacterPicker
+          characters={characters.map((c) => ({ alias: c.alias, name: characterName(c) }))}
+          unselected={unselectedAliases}
+          disabled={isProcessing}
+          onchange={(next) => unselectedAliases = next}
+          onempty={() => unselectedAliases = characters.filter((c) => c.translated_name.trim()).map((c) => c.alias)}
+        />
         {@render runButton("Обновить имена всей группой", characters.length === 0, startNames)}
 
         {#if namesRequested > 0}
@@ -624,10 +618,16 @@
 </div>
 
 <style>
+  /* Цвет запусков модели, как у кнопки обновления персонажа: панель не должна сливаться с вкладками и списком */
   .ai-panel {
     flex-shrink: 0;
-    border-bottom: 1px solid #1a2232;
-    background: #0d0f16;
+    margin: 10px 16px;
+    overflow: hidden;
+    border: 1px solid rgba(99, 102, 241, 0.4);
+    border-left: 3px solid #6366f1;
+    border-radius: 8px;
+    background: #12122a;
+    box-shadow: 0 8px 20px -12px rgba(0, 0, 0, 0.9);
     font-size: 12px;
     color: #cbd5e1;
   }
@@ -637,34 +637,70 @@
     align-items: center;
     gap: 8px;
     min-height: 40px;
-    padding: 6px 16px;
+    padding-right: 12px;
+    background: #26245c;
   }
 
-  .ai-bar :global(.ai-bar-icon) {
-    flex-shrink: 0;
-    color: #a78bfa;
-  }
-
-  .ai-pill {
-    padding: 4px 12px;
-    border: 1px solid #1e2638;
-    border-radius: 999px;
+  .ai-toggle {
+    display: flex;
+    flex: 1;
+    align-items: center;
+    align-self: stretch;
+    gap: 8px;
+    padding: 6px 12px;
+    border: none;
     background: transparent;
+    color: #a5b4fc;
+    cursor: pointer;
+  }
+
+  .ai-toggle:hover .ai-title {
+    color: #fff;
+  }
+
+  .ai-toggle :global(.ai-bar-icon) {
+    flex-shrink: 0;
+  }
+
+  .ai-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #e0e7ff;
+    white-space: nowrap;
+  }
+
+  /* Выбранная вкладка одного цвета с содержимым и закрывает линию под полосой, как корешок папки */
+  .ai-tabs {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    padding: 8px 12px 0;
+    border-bottom: 1px solid rgba(99, 102, 241, 0.45);
+  }
+
+  .ai-tab {
+    margin-bottom: -1px;
+    padding: 6px 14px;
+    border: 1px solid transparent;
+    border-radius: 6px 6px 0 0;
+    background: rgba(148, 163, 184, 0.08);
     font-size: 12px;
+    font-weight: 500;
     color: #94a3b8;
     white-space: nowrap;
     cursor: pointer;
   }
 
-  .ai-pill:hover {
+  .ai-tab:hover {
     color: #f1f5f9;
-    border-color: #334155;
   }
 
-  .ai-pill.active {
-    color: #34d399;
-    border-color: rgba(16, 185, 129, 0.5);
-    background: rgba(16, 185, 129, 0.08);
+  .ai-tab.active {
+    border-color: rgba(99, 102, 241, 0.45);
+    border-top-color: #818cf8;
+    border-bottom-color: #0b0b1a;
+    background: #0b0b1a;
+    color: #fff;
   }
 
   .ai-status {
@@ -694,14 +730,29 @@
     gap: 10px;
     max-height: 42vh;
     overflow-y: auto;
-    padding: 4px 16px 12px;
+    padding: 10px 12px 12px;
+    background: #0b0b1a;
+  }
+
+  /* Отступы между строками задаёт панель */
+  .ai-body :global(.slider) {
+    margin-top: 0;
   }
 
   .ai-model,
   .ai-note {
     margin: 0;
     font-size: 11px;
-    color: #64748b;
+    color: #818cf8;
+  }
+
+  .ai-model {
+    min-width: 0;
+    margin-left: auto;
+    padding-bottom: 7px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .ai-note {
@@ -734,17 +785,6 @@
     cursor: pointer;
   }
 
-  .ai-picker summary {
-    color: #94a3b8;
-    cursor: pointer;
-  }
-
-  .ai-picker-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 4px 12px;
-  }
-
   .ai-toggles {
     display: flex;
     flex-shrink: 0;
@@ -757,12 +797,12 @@
     border: none;
     background: transparent;
     font-size: 11px;
-    color: #34d399;
+    color: #a5b4fc;
     cursor: pointer;
   }
 
   .btn-link:hover {
-    color: #6ee7b7;
+    color: #e0e7ff;
   }
 
   .btn-run,
@@ -781,7 +821,19 @@
     cursor: pointer;
   }
 
-  .btn-run:hover:not(:disabled),
+  /* Запуск выглядит как обновление групп персонажей, а зелёным остаётся запись в глоссарий */
+  .btn-run {
+    border-color: #4338ca;
+    background: #1e1b4b;
+    color: #c7d2fe;
+  }
+
+  .btn-run:hover:not(:disabled) {
+    border-color: #6366f1;
+    background: #312e81;
+    color: #fff;
+  }
+
   .btn-apply:hover:not(:disabled) {
     background: #047857;
   }

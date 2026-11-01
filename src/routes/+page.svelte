@@ -3,10 +3,11 @@
   import SceneGraph from "../lib/SceneGraph.svelte";
   import SceneNodeIcon from "../lib/SceneNodeIcon.svelte";
   import SourceViewerModal from "../lib/SourceViewerModal.svelte";
+  import CharacterPicker from "../lib/CharacterPicker.svelte";
   import GlossaryAiPanel from "../lib/GlossaryAiPanel.svelte";
   import LlmSettingsModal from "../lib/LlmSettingsModal.svelte";
   import RequestSlider from "../lib/RequestSlider.svelte";
-  import { distributeRequests, requestRange, type CharacterChunks } from "../lib/character-requests";
+  import { partsToRead, type CharacterChunks } from "../lib/character-parts";
   import { saveLlmSettings, loadLlmSettings, targetFor, type LlmSettings } from "../lib/llm-settings";
   import { progressLabel, progressPercent } from "../lib/progress";
   import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
@@ -760,7 +761,7 @@
   let scenePartsWanted = $derived(selectedGlossaryChar ? scenePartsByAlias[selectedGlossaryChar.alias] ?? 1 : 1);
   let sceneChunkCount = $state<number | null>(null);
   let sceneReadyCount = $state(0);
-  let sceneParts = $derived(Math.min(Math.max(scenePartsWanted, sceneReadyCount), sceneChunkCount ?? 1));
+  let sceneParts = $derived(partsToRead({ total: sceneChunkCount ?? 1, ready: sceneReadyCount }, scenePartsWanted));
   // Всё прочитано: читать нечего, остаётся собрать описание из заметок
   let sceneAllRead = $derived(characterUpdateMode === "scenes" && !!sceneChunkCount && sceneReadyCount >= sceneChunkCount);
   let scenePartsStatus = $derived.by(() => {
@@ -808,11 +809,10 @@
 
   // Обновление группы: персонажи идут по очереди тем же путём, что и отдельный персонаж
   let descriptionsOpen = $state(false);
-  let groupOnlyEmpty = $state(true);
-  let groupUnselected = $state<string[]>([]);
+  let groupUnselected = $state<string[] | null>(null);
   let groupChunks = $state.raw<Record<string, CharacterChunks>>({});
   let groupCounting = $state(false);
-  let groupRequestsWanted = $state(0);
+  let groupPartsWanted = $state(1);
   let groupRun = $state<{ index: number; total: number; name: string } | null>(null);
   let groupStopping = $state(false);
   let groupResult = $state<{ updated: number; total: number; failed: string[] } | null>(null);
@@ -820,14 +820,13 @@
   const needsCharacterWork = (c: CharacterGlossaryEntry) =>
     !c.translated_name.trim() || c.gender === "unknown" || !c.gender.trim() || !c.notes.trim() || !c.speech.trim();
 
-  let groupTargets = $derived(
-    glossary.characters.filter((c) => !groupUnselected.includes(c.alias) && (!groupOnlyEmpty || needsCharacterWork(c)))
-  );
+  // Без явного выбора в группе незаполненные: готовые описания нельзя переписать случайно
+  let groupDeselected = $derived(groupUnselected ?? glossary.characters.filter((c) => !needsCharacterWork(c)).map((c) => c.alias));
+  let groupTargets = $derived(glossary.characters.filter((c) => !groupDeselected.includes(c.alias)));
   // Персонажи без сцен читать нечего: они не входят в план
   let groupReadable = $derived(groupTargets.filter((c) => (groupChunks[c.alias]?.total ?? 0) > 0));
-  let groupReadableChunks = $derived(groupReadable.map((c) => groupChunks[c.alias]));
-  let groupRange = $derived(requestRange(groupReadableChunks));
-  let groupRequests = $derived(Math.min(Math.max(groupRequestsWanted, groupRange.min), groupRange.max));
+  let groupMaxParts = $derived(Math.max(...groupReadable.map((c) => groupChunks[c.alias].total), 1));
+  let groupParts = $derived(Math.min(groupPartsWanted, groupMaxParts));
   let groupWithoutScenes = $derived(groupCounting ? 0 : groupTargets.length - groupReadable.length);
 
   let characterSceneTotals = $derived({
@@ -1248,8 +1247,7 @@
 
   /** Обновляет персонажей группы по очереди. Две ошибки подряд значат, что дело не в персонаже, а в сервере. */
   async function updateCharacterGroup() {
-    const plan = distributeRequests(groupReadableChunks, groupRequests)
-      .map((parts, index) => ({ char: groupReadable[index], parts }));
+    const plan = groupReadable.map((char) => ({ char, parts: partsToRead(groupChunks[char.alias], groupParts) }));
     const dir = gameDir;
     const failed: string[] = [];
     let updated = 0;
@@ -2087,6 +2085,7 @@
       if (seq !== glossaryLoadSeq || gameDir.trim() !== path) return true;
       glossary = res;
       glossaryDirty = false;
+      if (glossaryProjectPath !== path) groupUnselected = null;
       glossaryProjectPath = path;
       selectedGlossaryChar = glossary.characters[0] ?? null;
       selectedGlossaryTerm = glossary.terms[0] ?? null;
@@ -3739,46 +3738,25 @@
         </div>
 
         {#snippet groupUpdate()}
-          <label class="character-group-check">
-            <input type="checkbox" bind:checked={groupOnlyEmpty} disabled={!!groupRun} />
-            <span>Только незаполненные</span>
-          </label>
-          <details class="character-group-picker">
-            <summary>Выбрано: {glossary.characters.length - groupUnselected.length} из {glossary.characters.length}</summary>
-            <div class="character-group-toggles">
-              <button class="character-scene-link" onclick={() => groupUnselected = []}>Выбрать всех</button>
-              <button class="character-scene-link" onclick={() => groupUnselected = glossary.characters.map((c) => c.alias)}>Снять всех</button>
-            </div>
-            <div class="character-group-grid">
-              {#each glossary.characters as char (char.alias)}
-                <label class="character-group-check">
-                  <input
-                    type="checkbox"
-                    checked={!groupUnselected.includes(char.alias)}
-                    disabled={!!groupRun}
-                    onchange={(e) => {
-                      groupUnselected = e.currentTarget.checked
-                        ? groupUnselected.filter((alias) => alias !== char.alias)
-                        : [...groupUnselected, char.alias];
-                    }}
-                  />
-                  <span>{char.original_name || char.alias}</span>
-                </label>
-              {/each}
-            </div>
-          </details>
+          <CharacterPicker
+            characters={glossary.characters.map((c) => ({ alias: c.alias, name: c.original_name || c.alias }))}
+            unselected={groupDeselected}
+            disabled={!!groupRun}
+            onchange={(next) => groupUnselected = next}
+            onempty={() => groupUnselected = null}
+          />
           <RequestSlider
-            id="group-requests"
-            label="Запросов"
-            status={groupCounting ? "подсчёт..." : groupReadable.length === 0 ? "нет сцен" : `${groupRequests} из ${groupRange.max}`}
-            min={groupRange.min}
-            max={Math.max(groupRange.max, groupRange.min + 1)}
-            value={groupRequests}
-            oninput={(event) => groupRequestsWanted = event.currentTarget.valueAsNumber}
-            disabled={!!groupRun || groupCounting || groupRange.max <= groupRange.min}
+            id="group-parts"
+            label="Частей на персонажа"
+            status={groupCounting ? "подсчёт..." : groupReadable.length === 0 ? "нет сцен" : `${groupParts} из ${groupMaxParts}`}
+            min={1}
+            max={Math.max(groupMaxParts, 2)}
+            value={groupParts}
+            oninput={(event) => groupPartsWanted = event.currentTarget.valueAsNumber}
+            disabled={!!groupRun || groupCounting || groupMaxParts < 2}
           >
             {#snippet ends()}
-              <span>1 часть на персонажа</span>
+              <span>1 часть</span>
               <span>весь текст, долго</span>
             {/snippet}
           </RequestSlider>
@@ -8174,35 +8152,6 @@
     margin-top: 10px;
   }
 
-  .character-group-picker {
-    margin-top: 6px;
-    color: #94a3b8;
-  }
-
-  .character-group-picker summary {
-    cursor: pointer;
-  }
-
-  .character-group-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 0 12px;
-  }
-
-  .character-group-toggles {
-    display: flex;
-    gap: 10px;
-    margin: 4px 0;
-  }
-
-  .character-group-check {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-top: 6px;
-    cursor: pointer;
-  }
-
   .character-group-name {
     min-width: 0;
     overflow: hidden;
@@ -8212,7 +8161,6 @@
 
   .character-group-run {
     align-self: flex-start;
-    margin-top: 10px;
   }
 
   .character-group-note {
