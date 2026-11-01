@@ -668,10 +668,10 @@ async fn scan_game_project(game_dir: String) -> Result<ProjectSummary, String> {
         let grand_total = files.iter().map(|f| f.total_lines).sum();
         let grand_translated = files.iter().map(|f| f.translated_lines).sum();
 
-        // Сцены персонажей понадобятся при открытии глоссария: их разбор занимает секунды
+        // Сцены персонажей и архив терминов понадобятся при открытии глоссария: их разбор занимает секунды
         let lines_root = base_path.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            game_lines(&lines_root);
+            term_candidates(&lines_root);
         });
 
         Ok(ProjectSummary {
@@ -1655,8 +1655,14 @@ fn script_display_name(path: &Path, game_root: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Реплики игры: разбираются один раз, новый скан начинает заново.
+/// Реплики игры: разбираются один раз, новый скан начинает заново. Глоссарий при открытии
+/// просит их сразу несколькими командами, и они ждут один разбор, а не повторяют его.
 fn game_lines(base_path: &Path) -> Arc<scenes::GameLines> {
+    if let Some(lines) = PROJECT_CACHE.lock().lines.get(base_path) {
+        return lines.clone();
+    }
+    let parse_lock = path_lock(&base_path.join("translator_game_lines"));
+    let _guard = parse_lock.lock();
     if let Some(lines) = PROJECT_CACHE.lock().lines.get(base_path) {
         return lines.clone();
     }
@@ -2948,6 +2954,17 @@ mod tests {
         let scripts = original_scripts(&game_dir);
         assert_eq!(scripts, [get_project_scripts_cache_dir(&game_dir).join("packed.rpy")]);
         assert_eq!(llm::script_texts(&game_lines(&game_dir)), ["Hello there"]);
+
+        // Команды глоссария получают один разбор, сделанный первой из них
+        PROJECT_CACHE.lock().lines.remove(&game_dir);
+        let parallel: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = game_dir.clone();
+                std::thread::spawn(move || game_lines(&dir))
+            })
+            .collect();
+        let parsed: Vec<_> = parallel.into_iter().map(|thread| thread.join().unwrap()).collect();
+        assert!(parsed.iter().all(|lines| Arc::ptr_eq(lines, &parsed[0])));
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
         let _ = std::fs::remove_dir_all(&temp_dir);

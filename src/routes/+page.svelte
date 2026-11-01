@@ -5,8 +5,9 @@
   import SourceViewerModal from "../lib/SourceViewerModal.svelte";
   import EntryPicker from "../lib/EntryPicker.svelte";
   import FormsEditor from "../lib/FormsEditor.svelte";
+  import FormOwnerPicker from "../lib/FormOwnerPicker.svelte";
   import OwnerSelect from "../lib/OwnerSelect.svelte";
-  import { NEW_CHARACTER, formOwners, formTranslation, hasScriptCode, newCharacterAlias, ownerKey, type FormOwner, type NameForm } from "../lib/name-forms";
+  import { characterForms, characterTitle, formOwners, formTranslation, hasScriptCode, knownNames, newCharacterAlias, ownerKey, type FormOwner, type NameForm } from "../lib/name-forms";
   import GlossaryAiPanel from "../lib/GlossaryAiPanel.svelte";
   import LlmSettingsModal from "../lib/LlmSettingsModal.svelte";
   import RequestSlider from "../lib/RequestSlider.svelte";
@@ -28,8 +29,9 @@
     Sparkles, 
     Settings2,
     Search, 
-    Users, 
-    Languages, 
+    Users,
+    UserPlus,
+    Languages,
     Clapperboard,
     GitBranch,
     Split,
@@ -438,6 +440,7 @@
     merged: { alias: string; original_name: string }[];
     excluded_notes: string[];
     forms: NameForm[];
+    card_name: string; // Подпись записи, например полное имя. Реплики и запросы к модели идут с original_name
   }
 
   interface CharacterPart {
@@ -483,6 +486,8 @@
     characters: CharacterGlossaryEntry[];
     terms: TermGlossaryEntry[];
     tokens: TokenGlossaryEntry[];
+    removed_characters: { alias: string; original_name: string }[];
+    discarded_terms: string[];
   }
 
   let project = $state<ProjectSummary | null>(null);
@@ -746,16 +751,19 @@
   let glossaryTab = $state<'characters' | 'terms' | 'tokens'>('characters');
   // Пустая карточка новой записи на текущей вкладке
   let addingEntry = $state(false);
-  let glossary = $state<ProjectGlossary>({ characters: [], terms: [], tokens: [] });
+  let glossary = $state<ProjectGlossary>({ characters: [], terms: [], tokens: [], removed_characters: [], discarded_terms: [] });
   let loadingGlossary = $state(false);
   let savingGlossary = $state(false);
   let glossaryDirty = $state(false);
   let glossaryProjectPath = $state<string | null>(null);
   let selectedGlossaryChar = $state<CharacterGlossaryEntry | null>(null);
   let selectedGlossaryTerm = $state<TermGlossaryEntry | null>(null);
-  // Архив: названия из текста игры, которых нет в глоссарии. Что из них взять, решает пользователь
-  let termArchiveOpen = $state(false);
+  // Архив: названия из текста игры, которых нет в глоссарии. Что из них взять, решает пользователь.
+  // Раздел «Персонажи»: другие имена персонажей, там одно название связывается с несколькими
+  let termView = $state<"terms" | "archive" | "characters" | "trash">("terms");
+  let selectedFormKey = $state("");
   let termCandidates = $state.raw<TermCandidate[]>([]);
+  let termCandidatesLoading = $state(false);
   let singleWordsSkipped = $state(false);
   let selectedArchived = $state.raw<TermCandidate | null>(null);
   let characterScenes = $state.raw<CharacterScene[] | null>(null);
@@ -866,7 +874,8 @@
     if (!showGlossaryModal || addingEntry) return null;
     if (glossaryTab === "tokens") return selectedToken ? JSON.stringify([gameDir, "token", selectedToken.name]) : null;
     if (glossaryTab === "terms") {
-      if (termArchiveOpen) return selectedArchived ? JSON.stringify([gameDir, "term", [selectedArchived.term]]) : null;
+      if (candidatesOpen) return selectedArchived ? JSON.stringify([gameDir, "term", [selectedArchived.term]]) : null;
+      if (termView === "characters") return selectedForm ? JSON.stringify([gameDir, "term", [selectedForm.source]]) : null;
       const term = selectedGlossaryTerm;
       if (!term?.source_term.trim()) return null;
       return JSON.stringify([gameDir, "term", [term.source_term, ...formSources(term.forms)]]);
@@ -878,7 +887,8 @@
       [
         selectedGlossaryChar.original_name,
         ...selectedGlossaryChar.merged.map((m) => m.original_name),
-        ...formSources(selectedGlossaryChar.forms)
+        ...formSources(selectedGlossaryChar.forms),
+        ...(selectedGlossaryChar.card_name.trim() ? [selectedGlossaryChar.card_name.trim()] : [])
       ]
     ]);
   });
@@ -1092,6 +1102,7 @@
     target.excluded_scenes = [...new Set([...target.excluded_scenes, ...other.excluded_scenes])];
     target.forms = [...target.forms, ...other.forms];
     if (!target.translated_name.trim()) target.translated_name = other.translated_name;
+    if (!target.card_name.trim()) target.card_name = other.card_name;
     if (!target.notes.trim()) target.notes = other.notes;
     if (!target.speech.trim()) target.speech = other.speech;
     if (target.gender === "unknown" || !target.gender) target.gender = other.gender;
@@ -1115,7 +1126,8 @@
       excluded_scenes: [],
       merged: [],
       excluded_notes: [],
-      forms: []
+      forms: [],
+      card_name: ""
     });
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
     selectedGlossaryChar = glossary.characters.find((c) => c.alias === target.alias) ?? null;
@@ -1123,12 +1135,19 @@
   }
 
   // Формы записей: сокращения терминов и обращения к персонажам. Связывает их только пользователь
+  const formTexts = (forms: NameForm[]) => forms.flatMap((form) => [form.source, form.translated]);
   let glossaryFormOwners = $derived<FormOwner[]>([
-    ...glossary.terms.map((term) => ({ kind: "term" as const, id: term.id, names: [term.source_term] })),
+    ...glossary.terms.map((term) => ({
+      kind: "term" as const,
+      id: term.id,
+      names: [term.source_term],
+      linked: [term.translated_term, ...formTexts(term.forms)]
+    })),
     ...glossary.characters.map((char) => ({
       kind: "character" as const,
       id: char.alias,
-      names: [char.original_name, ...char.merged.map((m) => m.original_name)]
+      names: [characterTitle(char), char.original_name, ...char.merged.map((m) => m.original_name)],
+      linked: [char.translated_name, ...formTexts(char.forms)]
     }))
   ]);
   let characterFormOwners = $derived(glossaryFormOwners.filter((owner) => owner.kind === "character"));
@@ -1139,6 +1158,7 @@
       ? formOwners(selectedGlossaryTerm.source_term, glossaryFormOwners.filter((owner) => !isSameTerm(owner, selectedGlossaryTerm)))
       : []
   );
+  let selectedArchivedOwners = $derived(selectedArchived ? formOwners(selectedArchived.term, glossaryFormOwners) : []);
   // Термины, которые на самом деле могут быть обращением к выбранному персонажу
   let selectedCharacterTerms = $derived.by(() => {
     const char = selectedGlossaryChar;
@@ -1160,24 +1180,30 @@
     glossaryDirty = true;
   }
 
-  /** Термин становится формой другой записи. Заметки сохраняет только термин: у персонажа они свои. */
-  function termBecomesForm(term: TermGlossaryEntry, owner: Pick<FormOwner, "kind" | "id">) {
-    const record = formOwnerRecord(owner);
-    if (!record) return;
-    record.forms = [...record.forms, { source: term.source_term, translated: term.translated_term }, ...term.forms];
-    if ("source_term" in record && !record.notes.trim()) record.notes = term.notes;
+  /**
+   * Термин становится формой других записей. Их может быть несколько: одна фамилия у разных персонажей.
+   * Заметки сохраняет только термин: у персонажа они свои.
+   */
+  function termBecomesForm(term: TermGlossaryEntry, owners: Pick<FormOwner, "kind" | "id">[]) {
+    const records = owners.flatMap((owner) => formOwnerRecord(owner) ?? []);
+    if (records.length === 0) return;
+    for (const record of records) {
+      record.forms = [...record.forms, { source: term.source_term, translated: term.translated_term }, ...term.forms];
+      if ("source_term" in record && !record.notes.trim()) record.notes = term.notes;
+    }
     glossary.terms = glossary.terms.filter((own) => own.id !== term.id);
     if (selectedGlossaryTerm?.id === term.id) selectedGlossaryTerm = glossary.terms[0] ?? null;
     glossaryDirty = true;
-    const name = "source_term" in record ? record.source_term : record.original_name;
-    showToast(`«${term.source_term}» теперь форма записи «${name}»`, "success");
+    const names = records.map((record) => `«${"source_term" in record ? record.source_term : characterTitle(record)}»`);
+    showToast(`«${term.source_term}» теперь форма: ${names.join(", ")}`, "success");
   }
 
   /** Персонаж, которого нет в скриптах как говорящего: его только упоминают. */
   function addNamedCharacter(name: string, translated: string, details: Partial<CharacterGlossaryEntry> = {}) {
     const taken = glossary.characters.flatMap((char) => [char.alias, ...char.merged.map((m) => m.alias)]);
+    const alias = newCharacterAlias(name, taken);
     glossary.characters.push({
-      alias: newCharacterAlias(name, taken),
+      alias,
       original_name: name.trim(),
       translated_name: translated.trim(),
       gender: "unknown",
@@ -1187,22 +1213,27 @@
       merged: [],
       excluded_notes: [],
       forms: [],
+      card_name: "",
       ...details
     });
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
     glossaryDirty = true;
     showToast(`Персонаж «${name.trim()}» добавлен в глоссарий`, "success");
+    return glossary.characters.find((char) => char.alias === alias)!;
   }
 
-  function linkTerm(term: TermGlossaryEntry, choice: string) {
-    if (choice === NEW_CHARACTER) {
-      addNamedCharacter(term.source_term, term.translated_term, { notes: term.notes, forms: term.forms });
-      glossary.terms = glossary.terms.filter((own) => own.id !== term.id);
-      if (selectedGlossaryTerm?.id === term.id) selectedGlossaryTerm = glossary.terms[0] ?? null;
-      return;
-    }
-    const owner = glossaryFormOwners.find((own) => ownerKey(own) === choice);
-    if (owner) termBecomesForm(term, owner);
+  function termBecomesCharacter(term: TermGlossaryEntry) {
+    const char = addNamedCharacter(term.source_term, term.translated_term, { notes: term.notes, forms: term.forms });
+    glossary.terms = glossary.terms.filter((own) => own.id !== term.id);
+    if (selectedGlossaryTerm?.id === term.id) selectedGlossaryTerm = glossary.terms[0] ?? null;
+    void showCharacter(char);
+  }
+
+  const ownersByKey = (choices: string[]) =>
+    choices.flatMap((choice) => glossaryFormOwners.find((own) => ownerKey(own) === choice) ?? []);
+
+  function linkTerm(term: TermGlossaryEntry, choices: string[]) {
+    termBecomesForm(term, ownersByKey(choices));
   }
 
   function formBecomesTerm(record: TermGlossaryEntry | CharacterGlossaryEntry, form: NameForm) {
@@ -1223,32 +1254,47 @@
   $effect(() => {
     if (!showGlossaryModal || glossaryTab !== "terms") return;
     let current = true;
+    termCandidatesLoading = true;
     invoke<{ candidates: TermCandidate[]; single_words_skipped: boolean }>("list_term_candidates", { gameDir })
       .then((search) => {
         if (!current) return;
         termCandidates = search.candidates;
         singleWordsSkipped = search.single_words_skipped;
-        selectedArchived = archivedTerms.find((item) => item.term === selectedArchived?.term) ?? (termArchiveOpen ? archivedTerms[0] ?? null : null);
+        selectedArchived = visibleCandidates.find((item) => item.term === selectedArchived?.term) ?? (candidatesOpen ? visibleCandidates[0] ?? null : null);
       })
-      .catch(() => { if (current) termCandidates = []; });
+      .catch(() => { if (current) termCandidates = []; })
+      .finally(() => { if (current) termCandidatesLoading = false; });
     return () => { current = false; };
   });
 
-  function showTermArchive(open: boolean) {
-    termArchiveOpen = open;
+  function showTermView(view: typeof termView) {
+    termView = view;
     addingEntry = false;
     glossarySearch = "";
-    selectedArchived = open ? archivedTerms[0] ?? null : null;
+    selectedArchived = candidatesOpen ? visibleCandidates[0] ?? null : null;
+    selectedFormKey = view === "characters" ? linkedForms[0]?.key ?? "" : "";
   }
 
   /** Запись, попавшая в глоссарий, сама уходит из архива, а выбор переходит к следующей. */
-  function takeArchived(position: number) {
-    selectedArchived = archivedTerms[position] ?? archivedTerms.at(-1) ?? null;
+  function takeArchived(archived: TermCandidate) {
+    const next = termCandidates.slice(termCandidates.indexOf(archived) + 1).find((item) => visibleCandidates.includes(item));
+    selectedArchived = next ?? visibleCandidates.at(-1) ?? null;
+  }
+
+  function discardTerm(archived: TermCandidate) {
+    glossary.discarded_terms = [...glossary.discarded_terms, archived.term];
+    glossaryDirty = true;
+    takeArchived(archived);
+  }
+
+  function restoreDiscarded(discarded: TermCandidate) {
+    glossary.discarded_terms = glossary.discarded_terms.filter((term) => term.toLowerCase() !== discarded.term.toLowerCase());
+    glossaryDirty = true;
+    takeArchived(discarded);
   }
 
   /** Термин из архива попадает в глоссарий без перевода: его даст «Перевод терминов». */
   function addArchivedTerm(archived: TermCandidate) {
-    const position = archivedTerms.indexOf(archived);
     glossary.terms = [{
       id: `term_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       source_term: archived.term,
@@ -1259,20 +1305,43 @@
     }, ...glossary.terms];
     glossaryDirty = true;
     showToast(`Термин "${archived.term}" добавлен в глоссарий`, "success");
-    takeArchived(position);
+    takeArchived(archived);
   }
 
-  function linkArchived(archived: TermCandidate, choice: string) {
-    const position = archivedTerms.indexOf(archived);
-    if (choice === NEW_CHARACTER) {
-      addNamedCharacter(archived.term, "");
-    } else {
-      const owner = glossaryFormOwners.find((own) => ownerKey(own) === choice);
-      if (!owner) return;
-      addFormTo(owner, { source: archived.term, translated: "" });
-      showToast(`«${archived.term}» теперь форма записи «${owner.names[0]}»`, "success");
+  /** Название, связанное с персонажем, переходит в раздел «Персонажи»: там его можно связать и с другими. */
+  function linkArchived(archived: TermCandidate, choices: string[]) {
+    const owners = ownersByKey(choices);
+    if (owners.length === 0) return;
+    for (const owner of owners) addFormTo(owner, { source: archived.term, translated: "" });
+    showToast(`«${archived.term}» теперь форма: ${owners.map((owner) => `«${owner.names[0]}»`).join(", ")}`, "success");
+    takeArchived(archived);
+  }
+
+  /** Форма без персонажей уходит из раздела, поэтому выбор переходит к следующей. */
+  function toggleFormOwner(form: LinkedForm, id: string, linked: boolean) {
+    const char = glossary.characters.find((own) => ownerKey({ kind: "character", id: own.alias }) === id);
+    if (!char) return;
+    const position = linkedForms.findIndex((own) => own.key === form.key);
+    char.forms = linked
+      ? [...char.forms, { source: form.source, translated: form.translations.length === 1 ? form.translations[0] : "" }]
+      : char.forms.filter((own) => own.source.trim().toLowerCase() !== form.key);
+    glossaryDirty = true;
+    if (linkedForms.some((own) => own.key === form.key)) return;
+    selectedFormKey = (linkedForms[position] ?? linkedForms.at(-1))?.key ?? "";
+  }
+
+  /** Перевод общий: для подсказки модели он должен совпадать у всех, кто связан с формой. */
+  function setFormTranslation(form: LinkedForm, translated: string) {
+    for (const char of glossary.characters) {
+      for (const own of char.forms) {
+        if (own.source.trim().toLowerCase() === form.key) own.translated = translated;
+      }
     }
-    takeArchived(position);
+    glossaryDirty = true;
+  }
+
+  function addArchivedCharacter(archived: TermCandidate) {
+    void showCharacter(addNamedCharacter(archived.term, ""));
   }
 
   const formOwnerName = (owner: FormOwner) => owner.kind === "character" ? `${owner.names[0]} (персонаж)` : owner.names[0];
@@ -1295,17 +1364,22 @@
     return selectFile(file);
   }
 
+  /** Открывает запись персонажа на его вкладке и прокручивает к ней список. */
+  async function showCharacter(char: CharacterGlossaryEntry) {
+    glossarySearch = "";
+    glossaryGenderFilter = "all";
+    openGlossaryTab("characters");
+    selectedGlossaryChar = char;
+    await tick();
+    document.querySelector(".glossary-list-item.selected-row")?.scrollIntoView({ block: "nearest" });
+  }
+
   /** Закрывает глоссарий и показывает сцену в таблице реплик. */
   async function openPartCharacter(original: string) {
     const char = glossary.characters.find((c) =>
       c.original_name === original || c.merged.some((part) => part.original_name === original)
     );
-    if (!char) return;
-    glossarySearch = "";
-    glossaryGenderFilter = "all";
-    selectedGlossaryChar = char;
-    await tick();
-    document.querySelector(".glossary-list-item.selected-row")?.scrollIntoView({ block: "nearest" });
+    if (char) await showCharacter(char);
   }
 
   function openPartToken(name: string) {
@@ -1387,13 +1461,13 @@
   }
 
   async function updateCharacterWithLlm(char: CharacterGlossaryEntry) {
-    if (!beginLlmRun(`Обновляется ${char.original_name || char.alias}`)) return;
+    if (!beginLlmRun(`Обновляется ${characterTitle(char)}`)) return;
     try {
       const outcome = await summarizeCharacter(char, sceneParts, targetFor(llmSettings, "descriptions"));
       if (outcome === "stopped") {
         showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
       } else {
-        showToast(`Персонаж ${char.original_name} обновлён`, "success");
+        showToast(`Персонаж ${characterTitle(char)} обновлён`, "success");
         if (outcome === "partial") showToast("Описание собрано по прочитанным частям, следующий запуск дочитает остальные", "info");
       }
     } catch (e) {
@@ -1417,13 +1491,13 @@
     groupStopping = false;
     for (const [index, { char, parts }] of plan.entries()) {
       if (groupStopping || gameDir !== dir || failuresInRow >= 2) break;
-      groupRun = { index, total: plan.length, name: char.original_name || char.alias };
+      groupRun = { index, total: plan.length, name: characterTitle(char) };
       llmRun.note = `Персонаж ${index + 1} из ${plan.length}: ${groupRun.name}`;
       try {
         if ((await summarizeCharacter(char, parts, target)) !== "stopped") updated += 1;
         failuresInRow = 0;
       } catch (e) {
-        failed.push(`${char.original_name || char.alias}: ${e}`);
+        failed.push(`${characterTitle(char)}: ${e}`);
         failuresInRow += 1;
       }
     }
@@ -1867,7 +1941,7 @@
     translationEdits = {};
     selectedEntry = null;
     selectedSceneId = "all";
-    glossary = { characters: [], terms: [], tokens: [] };
+    glossary = { characters: [], terms: [], tokens: [], removed_characters: [], discarded_terms: [] };
     textTokens = null;
     scenePartsByAlias = {};
     paneSearch = "";
@@ -2121,28 +2195,48 @@
       if (!q) return true;
       return (
         c.alias.toLowerCase().includes(q) ||
-        c.merged.some((m) => m.alias.toLowerCase().includes(q)) ||
+        c.merged.some((m) => `${m.alias} ${m.original_name}`.toLowerCase().includes(q)) ||
         c.original_name.toLowerCase().includes(q) ||
+        c.card_name.toLowerCase().includes(q) ||
         c.translated_name.toLowerCase().includes(q) ||
         c.forms.some((form) => `${form.source} ${form.translated}`.toLowerCase().includes(q)) ||
         c.notes.toLowerCase().includes(q)
       );
-    });
+    }).sort((a, b) => characterTitle(a).localeCompare(characterTitle(b)));
   });
 
   let glossaryNames = $derived(new Set([
     ...glossary.terms.flatMap((term) => [term.source_term, ...term.forms.map((form) => form.source)]),
     ...glossary.characters.flatMap((char) => [
       char.original_name,
+      char.card_name,
       ...char.merged.map((m) => m.original_name),
       ...char.forms.map((form) => form.source)
     ])
   ].map((name) => name.trim().toLowerCase())));
-  let archivedTerms = $derived(termCandidates.filter((item) => !glossaryNames.has(item.term.toLowerCase())));
+  const inGlossary = (item: TermCandidate) => glossaryNames.has(item.term.toLowerCase());
+  let discardedNames = $derived(new Set(glossary.discarded_terms.map((term) => term.toLowerCase())));
+  const isDiscarded = (item: TermCandidate) => discardedNames.has(item.term.toLowerCase());
+  let archivedTerms = $derived(termCandidates.filter((item) => !inGlossary(item) && !isDiscarded(item)));
+  let trashedTerms = $derived(termCandidates.filter((item) => !inGlossary(item) && isDiscarded(item)));
+  // Архив и корзина показывают найденные названия одинаково, различается только отбор
+  let candidatesOpen = $derived(termView === "archive" || termView === "trash");
+  let visibleCandidates = $derived(termView === "trash" ? trashedTerms : archivedTerms);
+
+  type LinkedForm = ReturnType<typeof characterForms>[number];
+  let termCounts = $derived(new Map(termCandidates.map((item) => [item.term.toLowerCase(), item.count])));
+  let linkedForms = $derived(characterForms(glossary.characters, termCounts));
+  let selectedForm = $derived(linkedForms.find((form) => form.key === selectedFormKey) ?? null);
+  let filteredLinkedForms = $derived.by(() => {
+    const q = glossarySearch.trim().toLowerCase();
+    return linkedForms.filter((form) =>
+      [form.source, ...form.translations, ...form.owners.map((owner) => owner.name)].join(" ").toLowerCase().includes(q)
+    );
+  });
 
   let filteredArchivedTerms = $derived.by(() => {
     const q = glossarySearch.trim().toLowerCase();
-    return archivedTerms.filter((item) => `${item.term} ${item.example}`.toLowerCase().includes(q));
+    return visibleCandidates.filter((item) => `${item.term} ${item.example}`.toLowerCase().includes(q));
   });
 
   let filteredGlossaryTerms = $derived.by(() => {
@@ -2162,7 +2256,7 @@
   });
 
   // Модель пишет имена так же, как они записаны в глоссарии
-  let characterNames = $derived(
+  let characterNames = $derived(knownNames(
     glossary.characters
       .filter((char) => char.translated_name.trim())
       .flatMap((char) => [
@@ -2177,7 +2271,7 @@
           gender: char.gender
         }))
       ])
-  );
+  ));
 
   // Токены ищутся в репликах, а в глоссарии лежат только пояснения. Пояснение остаётся,
   // даже если токен пропал из игры: он мог исчезнуть только в этой версии
@@ -2352,8 +2446,9 @@
   function openGlossaryTab(tab: typeof glossaryTab) {
     glossaryTab = tab;
     addingEntry = false;
-    termArchiveOpen = false;
+    termView = "terms";
     selectedArchived = null;
+    selectedFormKey = "";
   }
 
   function startAddingEntry() {
@@ -2416,6 +2511,44 @@
     showToast(`Токен [${name}] добавлен в глоссарий`, "success");
   }
 
+  /** Персонажа со своим кодом вернул бы следующий скан, поэтому его код запоминается. */
+  function removeCharacter(char: CharacterGlossaryEntry) {
+    const position = filteredGlossaryCharacters.findIndex((own) => own.alias === char.alias);
+    const coded = [char, ...char.merged].filter((part) => hasScriptCode(part.alias));
+    glossary.removed_characters = [
+      ...glossary.removed_characters,
+      ...coded.map(({ alias, original_name }) => ({ alias, original_name }))
+    ];
+    glossary.characters = glossary.characters.filter((own) => own.alias !== char.alias);
+    selectedGlossaryChar = filteredGlossaryCharacters[position] ?? filteredGlossaryCharacters.at(-1) ?? null;
+    glossaryDirty = true;
+    showToast(`Персонаж «${characterTitle(char)}» удалён из глоссария`, "info");
+  }
+
+  /** Возвращает удалённых персонажей пустыми записями, как их нашёл бы скан. */
+  function restoreCharacters() {
+    const taken = glossary.characters.flatMap((char) => [char.alias, ...char.merged.map((m) => m.alias)]);
+    for (const { alias, original_name } of glossary.removed_characters.filter(({ alias }) => !taken.includes(alias))) {
+      glossary.characters.push({
+        alias,
+        original_name,
+        translated_name: "",
+        gender: "unknown",
+        notes: "",
+        speech: "",
+        excluded_scenes: [],
+        merged: [],
+        excluded_notes: [],
+        forms: [],
+        card_name: ""
+      });
+    }
+    glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
+    glossary.removed_characters = [];
+    glossaryDirty = true;
+    showToast("Удалённые персонажи возвращены", "success");
+  }
+
   function removeGlossaryTerm(id: string) {
     glossary.terms = glossary.terms.filter(t => t.id !== id);
     if (selectedGlossaryTerm?.id === id) {
@@ -2446,7 +2579,8 @@
       excluded_scenes: [],
       merged: [],
       excluded_notes: [],
-      forms: []
+      forms: [],
+      card_name: ""
     };
     glossary.characters.push(newChar);
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
@@ -2475,6 +2609,22 @@
         <span class="gender-example">{option.example}</span>
       </button>
     {/each}
+  </div>
+{/snippet}
+
+{#snippet ownerLink(title: string, suggested: FormOwner[], terms: FormOwner[], link: (choices: string[]) => void)}
+  <div class="edit-group">
+    <span class="edit-label">{title}</span>
+    {#each suggested as owner (ownerKey(owner))}
+      <div class="character-twin-row">
+        <span>Похоже на форму записи «{formOwnerName(owner)}».</span>
+        <button class="character-scene-run" onclick={() => link([ownerKey(owner)])}>Связать</button>
+      </div>
+    {/each}
+    {#if suggested.length > 1}
+      <button class="character-scene-run entry-link-all" onclick={() => link(suggested.map(ownerKey))}>Связать со всеми ({suggested.length})</button>
+    {/if}
+    <OwnerSelect label={title} {suggested} characters={characterFormOwners} {terms} onchange={(choice) => link([choice])} />
   </div>
 {/snippet}
 
@@ -3930,7 +4080,7 @@
 
         {#snippet groupUpdate()}
           <EntryPicker
-            items={glossary.characters.map((c) => ({ id: c.alias, name: c.original_name || c.alias }))}
+            items={glossary.characters.map((c) => ({ id: c.alias, name: characterTitle(c) }))}
             unselected={groupDeselected}
             disabled={llmRun.active}
             onchange={(next) => groupUnselected = next}
@@ -4010,7 +4160,7 @@
                 <input 
                   type="text" 
                   bind:value={glossarySearch} 
-                  placeholder={glossaryTab === 'characters' ? "Поиск по коду, имени, переводу..." : termArchiveOpen ? "Поиск по термину, реплике..." : glossaryTab === 'terms' ? "Поиск по термину, переводу..." : "Поиск по токену, реплике, значению..."}
+                  placeholder={glossaryTab === 'characters' ? "Поиск по коду, имени, переводу..." : candidatesOpen ? "Поиск по термину, реплике..." : termView === "characters" ? "Поиск по названию, персонажу..." : glossaryTab === 'terms' ? "Поиск по термину, переводу..." : "Поиск по токену, реплике, значению..."}
                   class="glossary-search-input"
                 />
                 {#if glossarySearch}
@@ -4061,7 +4211,7 @@
                   </button>
                 </div>
 
-              {:else if glossaryTab === 'terms' && !termArchiveOpen}
+              {:else if glossaryTab === 'terms' && termView === 'terms'}
                 <!-- Фильтр по категории терминов -->
                 <div class="category-filter-group">
                   <span class="filter-label">Категория:</span>
@@ -4103,7 +4253,7 @@
                 </div>
               {/if}
 
-              {#if !termArchiveOpen}
+              {#if termView === 'terms'}
                 <button class="btn-toggle-add-char" class:active={addingEntry} onclick={() => addingEntry ? addingEntry = false : startAddingEntry()}>
                   <Plus size={14} />
                   <span>{addingEntry ? 'Отмена' : glossaryTab === 'characters' ? 'Персонаж' : glossaryTab === 'terms' ? 'Термин' : 'Токен'}</span>
@@ -4136,7 +4286,7 @@
                       onclick={() => { selectedGlossaryChar = char; addingEntry = false; }}
                     >
                       <span class="glossary-item-text">
-                        <span class="char-name-en">{char.original_name}</span>
+                        <span class="char-name-en">{characterTitle(char)}</span>
                         {#if char.translated_name}
                           <span class="char-name-ru">{char.translated_name}</span>
                         {:else}
@@ -4190,11 +4340,16 @@
                     </button>
                   {/each}
                 {/if}
-              {:else if termArchiveOpen}
-                {#if filteredArchivedTerms.length === 0}
+              {:else if candidatesOpen}
+                {#if termCandidatesLoading && visibleCandidates.length === 0}
+                  <div class="glossary-empty-state">
+                    <Loader2 size={24} class="spin" />
+                    <p>Ищем названия в тексте игры…</p>
+                  </div>
+                {:else if filteredArchivedTerms.length === 0}
                   <div class="glossary-empty-state">
                     <Archive size={32} class="text-slate-600" />
-                    <p>{glossarySearch ? `Ничего не найдено по запросу «${glossarySearch}»` : "В тексте игры нет новых названий"}</p>
+                    <p>{glossarySearch ? `Ничего не найдено по запросу «${glossarySearch}»` : termView === 'trash' ? "Корзина пуста" : "В тексте игры нет новых названий"}</p>
                   </div>
                 {:else}
                   {#each filteredArchivedTerms as item (item.term)}
@@ -4208,6 +4363,29 @@
                         <span class="char-name-empty">{item.example}</span>
                       </span>
                       <span class="category-badge category-general" title="Строк с термином">{item.count}</span>
+                    </button>
+                  {/each}
+                {/if}
+              {:else if termView === 'characters'}
+                {#if filteredLinkedForms.length === 0}
+                  <div class="glossary-empty-state">
+                    <Users size={32} class="text-slate-600" />
+                    <p>{glossarySearch ? `Ничего не найдено по запросу «${glossarySearch}»` : "Названий, связанных с персонажами, пока нет"}</p>
+                  </div>
+                {:else}
+                  {#each filteredLinkedForms as form (form.key)}
+                    <button
+                      class="glossary-list-item"
+                      class:selected-row={selectedFormKey === form.key}
+                      onclick={() => selectedFormKey = form.key}
+                    >
+                      <span class="glossary-item-text">
+                        <span class="char-name-en">{form.source}</span>
+                        <span class="char-name-ru">{form.owners.map((owner) => owner.name).join(", ")}</span>
+                      </span>
+                      {#if form.count > 0}
+                        <span class="category-badge category-general" title="Строк с названием">{form.count}</span>
+                      {/if}
                     </button>
                   {/each}
                 {/if}
@@ -4242,16 +4420,27 @@
               {/if}
             </div>
 
-            {#if glossaryTab === 'terms'}
-              <button class="glossary-archive-toggle" onclick={() => showTermArchive(!termArchiveOpen)}>
-                {#if termArchiveOpen}
-                  <BookMarked size={14} />
-                  <span>К терминам ({glossary.terms.length})</span>
-                {:else}
-                  <Archive size={14} />
-                  <span>Архив ({archivedTerms.length})</span>
-                {/if}
+            {#if glossaryTab === 'characters' && glossary.removed_characters.length > 0}
+              <button class="glossary-archive-toggle" onclick={restoreCharacters}>
+                <Users size={14} />
+                <span>Вернуть удалённых ({glossary.removed_characters.length})</span>
               </button>
+            {/if}
+            {#if glossaryTab === 'terms'}
+              <div class="glossary-term-views">
+                <button class="glossary-archive-toggle" class:active={termView === 'terms'} onclick={() => showTermView('terms')}>
+                  Термины ({glossary.terms.length})
+                </button>
+                <button class="glossary-archive-toggle" class:active={termView === 'archive'} onclick={() => showTermView('archive')}>
+                  Архив ({termCandidatesLoading && archivedTerms.length === 0 ? "…" : archivedTerms.length})
+                </button>
+                <button class="glossary-archive-toggle" class:active={termView === 'characters'} onclick={() => showTermView('characters')}>
+                  Персонажи ({linkedForms.length})
+                </button>
+                <button class="glossary-archive-toggle" class:active={termView === 'trash'} onclick={() => showTermView('trash')}>
+                  Корзина ({trashedTerms.length})
+                </button>
+              </div>
             {/if}
           </div>
 
@@ -4266,6 +4455,16 @@
               </div>
 
               <div class="sidebar-edit-content">
+                <div class="entry-toolbar">
+                  <div class="entry-actions">
+                    <button class="btn-confirm-add" onclick={() => glossaryTab === 'characters' ? addCustomCharacter() : glossaryTab === 'terms' ? addGlossaryTerm() : addToken()}>
+                      <Plus size={14} />
+                      <span>Добавить</span>
+                    </button>
+                    <button class="btn-secondary" onclick={() => addingEntry = false}>Отмена</button>
+                  </div>
+                </div>
+
                 {#if glossaryTab === 'characters'}
                   <div class="edit-group">
                     <label class="edit-label" for="new-character-alias">
@@ -4315,20 +4514,13 @@
                   </div>
                 {/if}
 
-                <div class="edit-sidebar-footer-actions">
-                  <button class="btn-confirm-add" onclick={() => glossaryTab === 'characters' ? addCustomCharacter() : glossaryTab === 'terms' ? addGlossaryTerm() : addToken()}>
-                    <Plus size={14} />
-                    <span>Добавить</span>
-                  </button>
-                  <button class="btn-secondary" onclick={() => addingEntry = false}>Отмена</button>
-                </div>
               </div>
             {:else if glossaryTab === 'characters'}
               {#if selectedGlossaryChar}
                 {#if otherCharacterUpdating}
                   <div class="character-locked-banner">
                     <Loader2 size={14} class="spin" />
-                    <span>Сейчас обновляется {updatingCharacterEntry?.original_name}. Остальные персонажи недоступны до конца обновления.</span>
+                    <span>Сейчас обновляется {updatingCharacterEntry ? characterTitle(updatingCharacterEntry) : ""}. Остальные персонажи недоступны до конца обновления.</span>
                     <button class="character-scene-link" onclick={() => { if (updatingCharacterEntry) selectedGlossaryChar = updatingCharacterEntry; }}>Перейти</button>
                   </div>
                 {/if}
@@ -4338,7 +4530,10 @@
                       <span class="char-alias-badge-lg">[{selectedGlossaryChar.alias}]</span>
                     {/if}
                     <div class="sidebar-char-headings">
-                      <h4>{selectedGlossaryChar.original_name}</h4>
+                      <h4>{characterTitle(selectedGlossaryChar)}</h4>
+                      {#if selectedGlossaryChar.card_name.trim()}
+                        <span class="char-sub-label">В игре: {selectedGlossaryChar.original_name}</span>
+                      {/if}
                     </div>
                     <details
                       class="character-menu"
@@ -4361,9 +4556,20 @@
                         >
                           <option value="">Выберите персонажа…</option>
                           {#each glossary.characters.filter((c) => c.alias !== selectedGlossaryChar?.alias) as other (other.alias)}
-                            <option value={other.alias}>{other.original_name}{hasScriptCode(other.alias) ? ` [${other.alias}]` : ""}</option>
+                            <option value={other.alias}>{characterTitle(other)}{hasScriptCode(other.alias) ? ` [${other.alias}]` : ""}</option>
                           {/each}
                         </select>
+                        <button
+                          class="btn-delete-term"
+                          disabled={updatingCharacter}
+                          onclick={() => {
+                            characterMenuOpen = false;
+                            if (selectedGlossaryChar) removeCharacter(selectedGlossaryChar);
+                          }}
+                        >
+                          <Trash2 size={14} />
+                          <span>Удалить персонажа</span>
+                        </button>
                       </div>
                     </details>
                   </div>
@@ -4468,6 +4674,21 @@
 
                 <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
                   <div class="edit-group">
+                    <label class="edit-label" for="character-card-name">
+                      <span>Имя карточки:</span>
+                    </label>
+                    <input
+                      id="character-card-name"
+                      type="text"
+                      bind:value={selectedGlossaryChar.card_name}
+                      oninput={() => glossaryDirty = true}
+                      placeholder={selectedGlossaryChar.original_name}
+                      class="sidebar-input"
+                    />
+                    <span class="edit-hint">Например, полное имя с фамилией. Видно в глоссарии и учитывается при поиске упоминаний. Имя из игры в репликах и запросах к модели не меняется.</span>
+                  </div>
+
+                  <div class="edit-group">
                     <label class="edit-label" for="character-translation">
                       <span>Русский перевод имени:</span>
                     </label>
@@ -4494,8 +4715,12 @@
                   {#each selectedCharacterTerms as term (term.id)}
                     <div class="character-twin-row">
                       <span>Термин «{term.source_term}» похож на обращение к этому персонажу.</span>
-                      <button class="character-scene-run" onclick={() => { if (selectedGlossaryChar) termBecomesForm(term, { kind: "character", id: selectedGlossaryChar.alias }); }}>Связать</button>
+                      <button class="character-scene-run" onclick={() => { if (selectedGlossaryChar) termBecomesForm(term, [{ kind: "character", id: selectedGlossaryChar.alias }]); }}>Связать</button>
                     </div>
+                    {#if formOwners(term.source_term, glossaryFormOwners).length > 1}
+                      {@const owners = formOwners(term.source_term, glossaryFormOwners)}
+                      <button class="character-scene-run entry-link-all" onclick={() => termBecomesForm(term, owners)}>Связать со всеми ({owners.length}): {owners.map((owner) => owner.names[0]).join(", ")}</button>
+                    {/if}
                   {/each}
 
                   <div class="edit-group">
@@ -4558,6 +4783,16 @@
                 </div>
 
                 <div class="sidebar-edit-content">
+                  {#if token}
+                    <div class="entry-toolbar">
+                      <div class="entry-actions">
+                        <button class="btn-delete-term" onclick={() => { if (selectedToken) removeToken(selectedToken.name); }}>
+                          <Trash2 size={14} />
+                          <span>Очистить токен</span>
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
                   {#if selectedToken.values.length > 0}
                     <div class="edit-group">
                       <div class="edit-label">
@@ -4605,15 +4840,6 @@
                     ></textarea>
                     <span class="edit-hint">Что стоит за токеном. Пока значения нет, модель видит описание. Части с токеном прочитаются заново.</span>
                   </div>
-
-                  {#if token}
-                    <div class="edit-sidebar-footer-actions">
-                      <button class="btn-delete-term" onclick={() => { if (selectedToken) removeToken(selectedToken.name); }}>
-                        <Trash2 size={13} />
-                        <span>Очистить токен</span>
-                      </button>
-                    </div>
-                  {/if}
                 </div>
               {:else}
                 <div class="sidebar-edit-empty">
@@ -4623,38 +4849,47 @@
               {/if}
             {:else}
               <!-- Редактирование термина -->
-              {#if termArchiveOpen}
+              {#if candidatesOpen}
                 {#if selectedArchived}
                   <div class="sidebar-edit-header">
                     <div class="sidebar-char-headings">
                       <h4>{selectedArchived.term}</h4>
-                      <span class="char-sub-label">Найден в тексте игры · строк: {selectedArchived.count}</span>
+                      <span class="char-sub-label">{termView === 'trash' ? "В корзине" : "Найден в тексте игры"} · строк: {selectedArchived.count}</span>
                     </div>
                   </div>
 
                   <div class="sidebar-edit-content">
+                    <div class="entry-toolbar">
+                      {#if termView === 'trash'}
+                        <div class="entry-actions">
+                          <button class="btn-confirm-add" onclick={() => { if (selectedArchived) restoreDiscarded(selectedArchived); }}>
+                            <Archive size={14} />
+                            <span>Вернуть в архив</span>
+                          </button>
+                        </div>
+                      {:else}
+                        <div class="entry-actions">
+                          <button class="btn-confirm-add" onclick={() => { if (selectedArchived) addArchivedTerm(selectedArchived); }}>
+                            <Plus size={14} />
+                            <span>Добавить как термин</span>
+                          </button>
+                          <button class="btn-confirm-add" onclick={() => { if (selectedArchived) addArchivedCharacter(selectedArchived); }}>
+                            <UserPlus size={14} />
+                            <span>Добавить как персонажа</span>
+                          </button>
+                          <button class="btn-delete-term" onclick={() => { if (selectedArchived) discardTerm(selectedArchived); }}>
+                            <Trash2 size={14} />
+                            <span>В корзину</span>
+                          </button>
+                        </div>
+                        <span class="edit-hint">Термин появится без перевода, его даст «Перевод терминов».</span>
+                        {@render ownerLink("Связать с записью:", selectedArchivedOwners, termFormOwners, (choice) => { if (selectedArchived) linkArchived(selectedArchived, choice); })}
+                      {/if}
+                    </div>
                     <div class="edit-group">
                       <span class="edit-label">Пример из игры:</span>
                       <p class="archive-example">{selectedArchived.example}</p>
                     </div>
-                    <div class="edit-group">
-                      <span class="edit-label">Если это имя, обращение или сокращение:</span>
-                      {#key selectedArchived.term}
-                        <OwnerSelect
-                          label="Привязать к записи"
-                          blank="Привязать к записи…"
-                          suggested={formOwners(selectedArchived.term, glossaryFormOwners)}
-                          characters={characterFormOwners}
-                          terms={termFormOwners}
-                          onchange={(choice) => { if (selectedArchived && choice) linkArchived(selectedArchived, choice); }}
-                        />
-                      {/key}
-                    </div>
-                    <button class="btn-confirm-add" onclick={() => { if (selectedArchived) addArchivedTerm(selectedArchived); }}>
-                      <Plus size={14} />
-                      <span>Добавить как термин</span>
-                    </button>
-                    <span class="edit-hint">Термин появится без перевода, его даст «Перевод терминов».</span>
                     {#if singleWordsSkipped}
                       <span class="edit-hint">В языке игры заглавные пишутся у всех существительных, поэтому искались только фразы из нескольких слов.</span>
                     {/if}
@@ -4662,7 +4897,57 @@
                 {:else}
                   <div class="sidebar-edit-empty">
                     <Archive size={36} class="text-slate-600" />
-                    <p>Здесь появятся названия из текста игры</p>
+                    <p>{termView === 'trash' ? "Сюда попадают мусорные названия из архива" : "Здесь появятся названия из текста игры"}</p>
+                  </div>
+                {/if}
+              {:else if termView === 'characters'}
+                {#if selectedForm}
+                  <div class="sidebar-edit-header">
+                    <div class="sidebar-char-headings">
+                      <h4>{selectedForm.source}</h4>
+                      <span class="char-sub-label">Другое имя персонажей{selectedForm.count > 0 ? ` · строк: ${selectedForm.count}` : ""}</span>
+                    </div>
+                  </div>
+
+                  <div class="sidebar-edit-content">
+                    <div class="edit-group">
+                      <span class="edit-label">Связать с персонажами:</span>
+                      {#key selectedForm.key}
+                        <FormOwnerPicker
+                          label="Связать с персонажами"
+                          suggested={formOwners(selectedForm.source, characterFormOwners)}
+                          characters={characterFormOwners}
+                          linked={selectedForm.owners.map((owner) => ownerKey({ kind: "character", id: owner.alias }))}
+                          onchange={(id, linked) => { if (selectedForm) toggleFormOwner(selectedForm, id, linked); }}
+                        />
+                      {/key}
+                      <span class="edit-hint">Если снять всех, название вернётся в архив.</span>
+                    </div>
+                    <div class="edit-group">
+                      <label class="edit-label" for="linked-form-translation">
+                        <span>Перевод:</span>
+                      </label>
+                      <input
+                        id="linked-form-translation"
+                        type="text"
+                        class="sidebar-input"
+                        value={selectedForm.translations.length === 1 ? selectedForm.translations[0] : ""}
+                        placeholder={selectedForm.translations.length > 1 ? `Разные: ${selectedForm.translations.join(", ")}` : "Перевод, иначе имя персонажа"}
+                        oninput={(event) => { if (selectedForm) setFormTranslation(selectedForm, event.currentTarget.value); }}
+                      />
+                      <span class="edit-hint">Один на всех связанных персонажей. Без него модель не получит подсказку для общей фамилии.</span>
+                    </div>
+                    {#if termCandidates.find((item) => item.term.toLowerCase() === selectedForm?.key)?.example}
+                      <div class="edit-group">
+                        <span class="edit-label">Пример из игры:</span>
+                        <p class="archive-example">{termCandidates.find((item) => item.term.toLowerCase() === selectedForm?.key)?.example}</p>
+                      </div>
+                    {/if}
+                  </div>
+                {:else}
+                  <div class="sidebar-edit-empty">
+                    <Users size={36} class="text-slate-600" />
+                    <p>Здесь появятся названия, связанные с персонажами</p>
                   </div>
                 {/if}
               {:else if selectedGlossaryTerm}
@@ -4674,12 +4959,27 @@
                 </div>
 
                 <div class="sidebar-edit-content">
-                  {#each selectedTermOwners as owner (`${owner.kind}:${owner.id}`)}
-                    <div class="character-twin-row">
-                      <span>Похоже на форму записи «{formOwnerName(owner)}».</span>
-                      <button class="character-scene-run" onclick={() => { if (selectedGlossaryTerm) termBecomesForm(selectedGlossaryTerm, owner); }}>Связать</button>
+                  <div class="entry-toolbar">
+                    <div class="entry-actions">
+                      <button class="btn-confirm-add" onclick={() => { if (selectedGlossaryTerm) termBecomesCharacter(selectedGlossaryTerm); }}>
+                        <UserPlus size={14} />
+                        <span>Сделать персонажем</span>
+                      </button>
+                      <button
+                        class="btn-delete-term"
+                        onclick={() => { if (selectedGlossaryTerm) removeGlossaryTerm(selectedGlossaryTerm.id); }}
+                      >
+                        <Trash2 size={14} />
+                        <span>Удалить термин</span>
+                      </button>
                     </div>
-                  {/each}
+                    {@render ownerLink(
+                      "Связать с записью:",
+                      selectedTermOwners,
+                      termFormOwners.filter((owner) => !isSameTerm(owner, selectedGlossaryTerm)),
+                      (choice) => { if (selectedGlossaryTerm) linkTerm(selectedGlossaryTerm, choice); }
+                    )}
+                  </div>
                   {@render termFields(selectedGlossaryTerm)}
                   <FormsEditor
                     forms={selectedGlossaryTerm.forms}
@@ -4690,28 +4990,6 @@
                     onchange={(forms) => { if (selectedGlossaryTerm) { selectedGlossaryTerm.forms = forms; glossaryDirty = true; } }}
                     onsplit={(form) => { if (selectedGlossaryTerm) formBecomesTerm(selectedGlossaryTerm, form); }}
                   />
-                  <div class="edit-group">
-                    <span class="edit-label">Связать с другой записью:</span>
-                    {#key selectedGlossaryTerm.id}
-                      <OwnerSelect
-                        label="Связать с другой записью"
-                        blank="Выберите персонажа или термин…"
-                        suggested={selectedTermOwners}
-                        characters={characterFormOwners}
-                        terms={glossaryFormOwners.filter((owner) => owner.kind === "term" && !isSameTerm(owner, selectedGlossaryTerm))}
-                        onchange={(choice) => { if (selectedGlossaryTerm && choice) linkTerm(selectedGlossaryTerm, choice); }}
-                      />
-                    {/key}
-                  </div>
-                  <div class="edit-sidebar-footer-actions">
-                    <button
-                      class="btn-delete-term"
-                      onclick={() => { if (selectedGlossaryTerm) removeGlossaryTerm(selectedGlossaryTerm.id); }}
-                    >
-                      <Trash2 size={13} />
-                      <span>Удалить термин</span>
-                    </button>
-                  </div>
                 </div>
               {:else}
                 <div class="sidebar-edit-empty">
@@ -8895,6 +9173,36 @@
     color: #ffffff;
   }
 
+  /* Кнопки делят строку поровну, а в узком окне встают друг под другом */
+  .entry-actions {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 8px;
+  }
+
+  .entry-actions > button {
+    justify-content: center;
+    box-sizing: border-box;
+    height: 31px;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .btn-delete-term:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .entry-toolbar .character-twin-row {
+    margin-top: 0;
+  }
+
+  .entry-link-all {
+    align-self: flex-start;
+  }
+
   /* СПИСОК СЛЕВА, ОСНОВНОЕ МЕСТО ОТДАНО ВЫБРАННОЙ ЗАПИСИ */
   .glossary-split-container {
     flex: 1;
@@ -8937,6 +9245,27 @@
   .glossary-archive-toggle:hover {
     background: #121622;
     color: #f1f5f9;
+  }
+
+  .glossary-term-views {
+    display: grid;
+    flex-shrink: 0;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border-top: 1px solid #1a2232;
+    background: #0f131d;
+  }
+
+  .glossary-term-views .glossary-archive-toggle {
+    justify-content: center;
+    padding: 9px 6px;
+    border-top: none;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .glossary-term-views .glossary-archive-toggle.active {
+    background: #161c28;
+    color: #38bdf8;
   }
 
   .archive-example {
@@ -9288,10 +9617,13 @@
     color: #f1f5f9;
   }
 
-  .edit-sidebar-footer-actions {
-    margin-top: auto;
-    padding-top: 12px;
-    border-top: 1px solid #1a2232;
+  /* Действия записи стоят первыми: длинная карточка не уводит их из виду */
+  .entry-toolbar {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid #1a2232;
   }
 
   .btn-delete-term {

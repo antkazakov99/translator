@@ -100,8 +100,6 @@ struct Found {
     term: String,
     count: usize,
     example: String,
-    /// Встречается не только отдельной строкой, а внутри реплик.
-    in_sentence: bool,
 }
 
 /// Начинается ли предложение после этого текста. Заглавная там ничего не значит.
@@ -168,28 +166,14 @@ fn excerpt(line: &str, position: usize) -> String {
     line.chars().skip(skip).take(MAX_EXAMPLE_CHARS).collect()
 }
 
-/// Расставляет названия от самых частых. Названия из реплик идут первыми, но каждое третье место
-/// остаётся за отдельными строками: предметы и навыки часто встречаются всего раз, в меню.
+/// Расставляет названия от самых частых, а равные по числу упоминаний по алфавиту.
 fn rank(found: HashMap<String, Found>) -> Vec<TermCandidate> {
-    let by_count = |a: &Found, b: &Found| b.count.cmp(&a.count).then_with(|| a.term.cmp(&b.term));
-    let (mut in_sentences, mut titles): (Vec<Found>, Vec<Found>) =
-        found.into_values().partition(|entry| entry.in_sentence);
-    in_sentences.sort_by(by_count);
-    titles.sort_by(by_count);
-
-    let mut ranked = Vec::with_capacity(in_sentences.len() + titles.len());
-    let (mut in_sentences, mut titles) = (in_sentences.into_iter(), titles.into_iter());
-    loop {
-        let next = if ranked.len() % 3 == 2 {
-            titles.next().or_else(|| in_sentences.next())
-        } else {
-            in_sentences.next().or_else(|| titles.next())
-        };
-        let Some(entry) = next else {
-            return ranked;
-        };
-        ranked.push(TermCandidate { term: entry.term, count: entry.count, example: entry.example });
-    }
+    let mut ranked: Vec<TermCandidate> = found
+        .into_values()
+        .map(|entry| TermCandidate { term: entry.term, count: entry.count, example: entry.example })
+        .collect();
+    ranked.sort_by_cached_key(|candidate| (std::cmp::Reverse(candidate.count), candidate.term.to_lowercase()));
+    ranked
 }
 
 /// Похоже ли слово заглавными на сокращение. Такими словами чаще всего кричат, но обычное
@@ -222,10 +206,8 @@ pub fn find_candidates(texts: &[String], names: &HashSet<String>) -> CandidateSe
                 term,
                 count: 0,
                 example: String::new(),
-                in_sentence: false,
             });
             entry.count += 1;
-            entry.in_sentence |= !whole_line;
             if entry.example.is_empty() || (entry.example == entry.term && !whole_line) {
                 entry.example = excerpt(line, position);
             }
@@ -377,14 +359,12 @@ mod tests {
     }
 
     #[test]
-    fn menu_lines_keep_a_third_of_places() {
-        let mut texts: Vec<String> = (0..9)
-            .map(|i| format!("We saw Place{} near it.", char::from(b'a' + i)))
-            .collect();
-        texts.extend((0..9).map(|i| format!("Item{}", char::from(b'a' + i))));
-        let found = find_candidates(&texts, &HashSet::new());
-        assert_eq!(found.candidates.len(), 18);
-        let titles = found.candidates[..9].iter().filter(|c| c.term.starts_with("Item")).count();
-        assert_eq!(titles, 3);
+    fn candidates_go_by_count_then_by_name() {
+        let found = find_candidates(
+            &lines(&["Zeta Gate", "BETA", "Beta Mine", "we saw Alpha Gate.", "they left Alpha Gate.", "and past Alpha Gate."]),
+            &HashSet::new(),
+        );
+        let order: Vec<_> = found.candidates.iter().map(|c| (c.term.as_str(), c.count)).collect();
+        assert_eq!(order, [("Alpha Gate", 3), ("BETA", 1), ("Beta Mine", 1), ("Zeta Gate", 1)]);
     }
 }

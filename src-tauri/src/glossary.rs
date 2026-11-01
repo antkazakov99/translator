@@ -38,6 +38,8 @@ pub struct CharacterGlossaryEntry {
     pub excluded_notes: Vec<String>, // Заметки частей, которые не идут в итоговое описание
     #[serde(default)]
     pub forms: Vec<NameForm>, // Другие имена и обращения ("Miss Granger")
+    #[serde(default)]
+    pub card_name: String, // Подпись записи, например полное имя ("Lisa Smith"). Реплики и запросы к модели идут с `original_name`
 }
 
 impl CharacterGlossaryEntry {
@@ -51,6 +53,7 @@ impl CharacterGlossaryEntry {
         std::iter::once(self.original_name.as_str())
             .chain(self.merged.iter().map(|m| m.original_name.as_str()))
             .chain(self.forms.iter().map(|form| form.source.as_str()))
+            .chain(Some(self.card_name.trim()).filter(|name| !name.is_empty()))
             .collect()
     }
 
@@ -87,6 +90,10 @@ pub struct ProjectGlossary {
     pub terms: Vec<TermGlossaryEntry>,
     #[serde(default)]
     pub tokens: Vec<TokenGlossaryEntry>,
+    #[serde(default)]
+    pub removed_characters: Vec<MergedCharacter>, // Персонажи из скриптов, которых удалил пользователь: скан не возвращает их
+    #[serde(default)]
+    pub discarded_terms: Vec<String>, // Названия из архива, которые пользователь счёл мусором ("Oh God")
 }
 
 impl ProjectGlossary {
@@ -188,16 +195,32 @@ impl ProjectGlossary {
                 merged += 1;
             }
         }
+        for removed in other.removed_characters {
+            let known = self.is_removed(&removed.alias) || self.characters.iter().any(|own| own.has_alias(&removed.alias));
+            if !known {
+                self.removed_characters.push(removed);
+            }
+        }
+        for term in other.discarded_terms {
+            if !self.discarded_terms.iter().any(|own| own.eq_ignore_ascii_case(&term)) {
+                self.discarded_terms.push(term);
+            }
+        }
         merged
+    }
+
+    fn is_removed(&self, alias: &str) -> bool {
+        self.removed_characters.iter().any(|removed| removed.alias.eq_ignore_ascii_case(alias))
     }
 
     /// Объединяет сохраненный глоссарий с новыми персонажами, найденными при сканировании
     pub fn merge_with_scanned_characters(&mut self, scanned: &[(String, String)]) {
         for (alias, name) in scanned {
-            if !self
-                .characters
-                .iter()
-                .any(|c| c.has_alias(alias))
+            if !self.is_removed(alias)
+                && !self
+                    .characters
+                    .iter()
+                    .any(|c| c.has_alias(alias))
             {
                 let gender = auto_detect_gender(name);
                 self.characters.push(CharacterGlossaryEntry {
@@ -265,6 +288,57 @@ mod tests {
         ProjectGlossary::default().save_for_project(&game_dir).unwrap();
         assert!(ProjectGlossary::load_for_project(&game_dir).is_ok());
         let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn test_discarded_terms_are_optional_and_survive_a_transfer() {
+        let old: ProjectGlossary = serde_json::from_str(r#"{"characters": [], "terms": []}"#).unwrap();
+        assert!(old.discarded_terms.is_empty());
+
+        let mut own = ProjectGlossary { discarded_terms: vec!["Oh God".to_string()], ..Default::default() };
+        let other = ProjectGlossary { discarded_terms: vec!["oh god".to_string(), "Yes Master".to_string()], ..Default::default() };
+        own.merge_from(other);
+        assert_eq!(own.discarded_terms, ["Oh God", "Yes Master"]);
+    }
+
+    #[test]
+    fn test_removed_character_does_not_come_back_with_a_scan() {
+        let old: ProjectGlossary = serde_json::from_str(r#"{"characters": [], "terms": []}"#).unwrap();
+        assert!(old.removed_characters.is_empty());
+
+        let removed = MergedCharacter { alias: "var".to_string(), original_name: "Var".to_string() };
+        let mut glossary = ProjectGlossary { removed_characters: vec![removed.clone()], ..Default::default() };
+        glossary.merge_with_scanned_characters(&[
+            ("VAR".to_string(), "Var".to_string()),
+            ("lis".to_string(), "Lisa".to_string()),
+        ]);
+        let aliases: Vec<_> = glossary.characters.iter().map(|c| c.alias.as_str()).collect();
+        assert_eq!(aliases, ["lis"]);
+
+        // Удалённый в другой копии персонаж остаётся удалённым, а тот, что здесь есть, никуда не девается
+        let other = ProjectGlossary {
+            removed_characters: vec![
+                MergedCharacter { alias: "lis".to_string(), original_name: "Lisa".to_string() },
+                MergedCharacter { alias: "old".to_string(), original_name: "Old".to_string() },
+                removed,
+            ],
+            ..Default::default()
+        };
+        glossary.merge_from(other);
+        let removed: Vec<_> = glossary.removed_characters.iter().map(|r| r.alias.as_str()).collect();
+        assert_eq!(removed, ["var", "old"]);
+    }
+
+    #[test]
+    fn test_card_name_is_optional_and_empty_one_is_not_a_name() {
+        let old: CharacterGlossaryEntry = serde_json::from_str(
+            r#"{"alias": "lis", "original_name": "Lisa", "translated_name": "", "gender": "female", "notes": ""}"#,
+        )
+        .unwrap();
+        assert_eq!(old.names(), ["Lisa"]);
+
+        let named = CharacterGlossaryEntry { card_name: " Lisa Smith ".to_string(), ..old };
+        assert_eq!(named.names(), ["Lisa", "Lisa Smith"]);
     }
 
     #[test]

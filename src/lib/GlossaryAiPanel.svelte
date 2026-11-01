@@ -4,7 +4,7 @@
   import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, Sparkles, Square } from "lucide-svelte";
   import EntryPicker from "./EntryPicker.svelte";
   import LlmChoice from "./LlmChoice.svelte";
-  import type { NameForm } from "./name-forms";
+  import { characterTitle, type NameForm } from "./name-forms";
   import { beginLlmRun, endLlmRun, llmRun } from "./llm-run.svelte";
   import { LLM_ACTIONS, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "./llm-settings";
 
@@ -13,6 +13,7 @@
     original_name: string;
     translated_name: string;
     merged: { alias: string; original_name: string }[];
+    card_name: string;
   }
 
   interface PanelTerm {
@@ -394,7 +395,7 @@
       {:else if openSection === "names"}
         <p class="ai-note">Модель увидит все имена игры, определит их происхождение и заново напишет имена выбранных персонажей, включая заполненные. Что заменить, выберете вы.</p>
         <EntryPicker
-          items={characters.map((c) => ({ id: c.alias, name: characterName(c) }))}
+          items={characters.map((c) => ({ id: c.alias, name: characterTitle(c) }))}
           unselected={unselectedAliases}
           disabled={llmRun.active}
           onchange={(next) => unselectedAliases = next}

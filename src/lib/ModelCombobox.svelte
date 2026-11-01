@@ -1,9 +1,5 @@
-<script lang="ts" module>
-  let nextListId = 0;
-</script>
-
 <script lang="ts">
-  import { ChevronDown } from "lucide-svelte";
+  import Combobox from "./Combobox.svelte";
 
   let {
     value = $bindable(""),
@@ -22,233 +18,32 @@
     disabled?: boolean;
   } = $props();
 
-  const LIST_HEIGHT = 240;
-  const listId = `model-list-${nextListId++}`;
-
-  let root = $state<HTMLDivElement>();
-  let list = $state<HTMLDivElement>();
-  let open = $state(false);
-  let showAll = $state(false);
-  let active = $state(-1);
-  let listStyle = $state("");
   // Пока идёт ввод, поле можно очистить: запасная модель вернётся, когда фокус уйдёт
   let editing = $state(false);
   let text = $derived(value || editing ? value : fallback);
 
   // Выбранная модель не сужает список: иначе в нём осталась бы только она
-  let shown = $derived.by(() => {
+  function options(all: boolean) {
     const query = value.trim().toLowerCase();
-    if (showAll || models.includes(value.trim())) return models;
-    return models.filter((model) => model.toLowerCase().includes(query));
-  });
-
-  $effect(() => {
-    if (active >= 0) list?.children[active]?.scrollIntoView({ block: "nearest" });
-  });
-
-  /** Список закреплён на экране: прокручиваемое окно настроек обрезало бы его. */
-  function openList(all: boolean) {
-    if (!root) return;
-    const box = root.getBoundingClientRect();
-    const below = window.innerHeight - box.bottom;
-    const edge = below < LIST_HEIGHT && box.top > below
-      ? `bottom: ${window.innerHeight - box.top + 4}px`
-      : `top: ${box.bottom + 4}px`;
-    listStyle = `left: ${box.left}px; width: ${box.width}px; ${edge}`;
-    showAll = all;
-    active = -1;
-    open = true;
-  }
-
-  function pick(model: string) {
-    value = model;
-    open = false;
-  }
-
-  function onkeydown(event: KeyboardEvent) {
-    if (!open) {
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        openList(true);
-      }
-      return;
-    }
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      if (shown.length > 0) active = (active + 1) % shown.length;
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      if (shown.length > 0) active = (active <= 0 ? shown.length : active) - 1;
-    } else if (event.key === "Enter" && active >= 0) {
-      event.preventDefault();
-      pick(shown[active]);
-    } else if (event.key === "Escape") {
-      // Закрывается только список, а не всё окно настроек
-      event.stopPropagation();
-      open = false;
-    }
+    const shown = all || models.includes(value.trim())
+      ? models
+      : models.filter((model) => model.toLowerCase().includes(query));
+    return shown.map((model) => ({ id: model, label: model }));
   }
 </script>
 
-<svelte:window
-  onresize={() => open = false}
-  onscrollcapture={(event) => { if (event.target !== list) open = false; }}
+<Combobox
+  {text}
+  {options}
+  {label}
+  {placeholder}
+  {disabled}
+  selected={text.trim()}
+  empty={models.length > 0 ? "Таких моделей в списке нет" : "Список появится, когда подключение ответит. Проверьте адрес и ключ"}
+  oninput={(next) => {
+    editing = true;
+    value = next;
+  }}
+  onpick={(model) => value = model}
+  onblur={() => editing = false}
 />
-
-<div class="combobox" bind:this={root}>
-  <input
-    type="text"
-    class="input"
-    role="combobox"
-    aria-expanded={open}
-    aria-controls={listId}
-    aria-autocomplete="list"
-    aria-label={label}
-    autocomplete="off"
-    spellcheck="false"
-    {placeholder}
-    {disabled}
-    value={text}
-    onfocus={() => openList(false)}
-    onclick={() => { if (!open) openList(false); }}
-    oninput={(event) => {
-      editing = true;
-      value = event.currentTarget.value;
-      openList(false);
-    }}
-    onblur={() => {
-      editing = false;
-      open = false;
-    }}
-    {onkeydown}
-  />
-  <button
-    type="button"
-    class="toggle"
-    class:flipped={open}
-    tabindex="-1"
-    {disabled}
-    aria-label={`Показать список: ${label}`}
-    onmousedown={(event) => event.preventDefault()}
-    onclick={() => { if (open) open = false; else openList(true); }}
-  ><ChevronDown size={14} /></button>
-
-  {#if open}
-    <div id={listId} class="list" role="listbox" aria-label={label} style={listStyle} bind:this={list}>
-      {#each shown as model, index (model)}
-        <button
-          type="button"
-          class="option"
-          class:active={index === active}
-          class:selected={model === text.trim()}
-          role="option"
-          aria-selected={model === text.trim()}
-          tabindex="-1"
-          onmousedown={(event) => event.preventDefault()}
-          onclick={() => pick(model)}
-          onmousemove={() => active = index}
-        >{model}</button>
-      {:else}
-        <p class="empty">{models.length > 0 ? "Таких моделей в списке нет" : "Список появится, когда подключение ответит. Проверьте адрес и ключ"}</p>
-      {/each}
-    </div>
-  {/if}
-</div>
-
-<style>
-  .combobox {
-    position: relative;
-    min-width: 0;
-  }
-
-  .input {
-    box-sizing: border-box;
-    width: 100%;
-    min-width: 0;
-    padding: 6px 28px 6px 10px;
-    border: 1px solid rgba(51, 65, 85, 0.8);
-    border-radius: 6px;
-    outline: none;
-    background: #090d16;
-    font-size: 12px;
-    color: #f1f5f9;
-  }
-
-  .input:focus {
-    border-color: #10b981;
-  }
-
-  .toggle {
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    display: flex;
-    align-items: center;
-    padding: 0 7px;
-    border: none;
-    background: transparent;
-    color: #64748b;
-    cursor: pointer;
-  }
-
-  .toggle:hover:not(:disabled) {
-    color: #f1f5f9;
-  }
-
-  .input:disabled,
-  .toggle:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .toggle.flipped :global(svg) {
-    transform: rotate(180deg);
-  }
-
-  .list {
-    position: fixed;
-    z-index: 10;
-    box-sizing: border-box;
-    display: flex;
-    flex-direction: column;
-    max-height: 240px;
-    overflow-y: auto;
-    padding: 4px;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    background: #141824;
-    box-shadow: 0 12px 28px -8px rgba(0, 0, 0, 0.8);
-  }
-
-  .option {
-    flex-shrink: 0;
-    padding: 5px 8px;
-    border: none;
-    border-radius: 5px;
-    background: transparent;
-    overflow: hidden;
-    font-size: 12px;
-    color: #cbd5e1;
-    text-align: left;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    cursor: pointer;
-  }
-
-  .option.active {
-    color: #f8fafc;
-    background: rgba(99, 102, 241, 0.25);
-  }
-
-  .option.selected {
-    color: #34d399;
-  }
-
-  .empty {
-    margin: 0;
-    padding: 6px 8px;
-    font-size: 11px;
-    color: #94a3b8;
-  }
-</style>
