@@ -21,6 +21,10 @@ const MAX_SAMPLE_TEXT: usize = 12_000;
 /// Подробные описания длинные: больше персонажей в ответе не успевают и не помещаются.
 const MAX_BATCH_CHARACTERS: usize = 3;
 const CHARACTER_ANSWER_TOKENS: u32 = 3072;
+/// Сколько имён переводится за запрос: локальная модель пишет 40 имён около трёх минут,
+/// а таймаут запроса пять. Весь состав игры модель видит в каждом пакете.
+const MAX_BATCH_NAMES: usize = 30;
+const NAME_ANSWER_TOKENS: u32 = 3072;
 /// Локальная модель пишет подробный ответ минутами.
 const REQUEST_TIMEOUT_SECS: u64 = 300;
 const SCENE_NOTE_TOKENS: u32 = 768;
@@ -80,6 +84,14 @@ pub struct ReviewedTerm {
     pub example: String,
 }
 
+/// Написание имени от модели. В глоссарий попадает после проверки пользователем.
+#[derive(Debug, Clone, Serialize)]
+pub struct NameSuggestion {
+    pub original: String,
+    pub translated: String,
+    pub origin: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ChatMessage {
     role: String,
@@ -127,6 +139,13 @@ struct CharacterLlmItem {
     gender: Option<String>,
     notes: Option<String>,
     speech: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NameLlmItem {
+    name: Option<String>,
+    origin: Option<String>,
+    translated_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1192,6 +1211,7 @@ For each character provided, you must output:
 1. "alias": EXACT same alias code as provided in input.
 2. "translated_name": Natural, authentic Russian transliteration or translation of the character's name.
    - Standard names are transliterated: "Emma" -> "Эмма", "Lisa" -> "Лиза", "Jack" -> "Джек", "Chloe" -> "Хлоя".
+   - Read a name by the rules of its own language, not English: "Anja" -> "Аня", "Dunja" -> "Дуня", "Giovanni" -> "Джованни".
    - Descriptive names are translated: "The warrior girl" -> "Девушка-воин", "Old Bartender" -> "Старый бармен", "Demon Beast" -> "Демонический зверь".
    - If the input already gives translated_name, return it unchanged and spell the name that way everywhere.
 3. "gender": Grammatical gender in Russian:
@@ -1598,6 +1618,126 @@ Respond ONLY with a valid JSON array of the kept candidates, or [] if none quali
     Ok(AutofillResult { items, failed_batches })
 }
 
+const NAMES_SYSTEM_PROMPT: &str = r#"You are an expert in personal names and their established Russian spellings, preparing a translation glossary for a visual novel or RPG.
+You receive every character name of one game and the names to spell in Russian.
+
+Work in this order:
+1. Read the whole list and work out which languages and countries the names come from. Names of one game usually share a setting, so use the others to settle a name that could belong to several languages.
+2. Decide the language of each name on its own: a game can mix several. A name may lack diacritics: "Dzenana" is "Dženana".
+3. Spell the name the way speakers of that language say it, using the established Russian form if there is one. Never read a name by English rules unless it is English. Final "-ia" becomes "-ия": "Maria" -> "Мария". Answer in Cyrillic letters only.
+
+Spelling by language:
+- Serbian, Croatian, Bosnian: "lj" and "nj" are one soft sound, "j" is "й", "dž" and "đ" are "дж", "c" is "ц": "Anja" -> "Аня", "Dunja" -> "Дуня", "Ljubica" -> "Любица", "Ljiljana" -> "Лиляна", "Mirjana" -> "Мирьяна", "Jovan" -> "Йован", "Dženana" -> "Дженана".
+- German: "ei" is "ай", "eu" is "ой", "j" is "й": "Heike" -> "Хайке", "Jürgen" -> "Юрген", "Hilde" -> "Хильде", "Marlene" -> "Марлен".
+- Italian: "Giovanni" -> "Джованни", "Chiara" -> "Кьяра".
+- French: final consonants are silent: "Claire" -> "Клер", "Jacques" -> "Жак".
+- Spanish: "j" is "х": "Jorge" -> "Хорхе", "Juana" -> "Хуана".
+- Polish, Czech, Hungarian: "Wojciech" -> "Войцех", "Jiří" -> "Иржи", "Erzsébet" -> "Эржебет".
+- Japanese: "Yuki" -> "Юки", "Shoji" -> "Сёдзи".
+- English: "Chloe" -> "Хлоя", "Jack" -> "Джек", "Katy" -> "Кэти".
+
+Roles, descriptions and abbreviations are translated by meaning: "Old Bartender" -> "Старый бармен", "Agent Lisa" -> "Агент Лиза", "MC" -> "Главный герой".
+Text in [square brackets] is an in-game variable: return it unchanged.
+
+Respond ONLY with a valid JSON array, one object per name to spell, without markdown fences or explanations:
+[
+  {"name": "Anja", "origin": "сербский", "translated_name": "Аня"}
+]
+"name" is the EXACT name as given. "origin" is its language as one Russian word, or "описание" for roles and descriptions."#;
+
+/// Имена без повторов и пустых строк: регистр не считается отличием, порядок сохраняется.
+fn unique_names(names: &[String]) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    names
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty() && seen.insert(name.to_lowercase()))
+        .collect()
+}
+
+/// Слово из смеси кириллицы и латиницы: модель сбилась посреди имени.
+fn is_garbled(name: &str) -> bool {
+    name.split_whitespace().any(|word| {
+        word.chars().any(|c| c.is_ascii_alphabetic()) && word.chars().any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'))
+    })
+}
+
+/// Предлагает написание имён `names`. Модель видит весь состав игры `cast`, потому что
+/// происхождение одного имени часто понятно только по остальным.
+pub async fn translate_names(
+    api_url: &str,
+    model: &str,
+    names: &[String],
+    cast: &[String],
+    cancel: &AtomicBool,
+    on_batch: impl Fn(BatchProgress<NameSuggestion>) + Send + Sync,
+) -> Result<AutofillResult<NameSuggestion>, String> {
+    let names = unique_names(names);
+    let cast = unique_names(cast).join(", ");
+    let total_batches = names.len().div_ceil(MAX_BATCH_NAMES);
+    let mut failed_batches = 0;
+    let mut items: Vec<NameSuggestion> = Vec::new();
+    let report = |batch: usize, failed_batches: usize, items: Vec<NameSuggestion>| {
+        on_batch(BatchProgress { batch: batch + 1, total_batches, failed_batches, items })
+    };
+    for (batch, chunk) in names.chunks(MAX_BATCH_NAMES).enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let list: String = chunk.iter().map(|name| format!("- {name}\n")).collect();
+        let user_prompt = format!("All names in this game: {cast}\n\nNames to spell:\n{list}\nProvide JSON array now:");
+
+        let raw_response = match call_chat_completion(
+            api_url,
+            model,
+            NAMES_SYSTEM_PROMPT,
+            &user_prompt,
+            0.2,
+            NAME_ANSWER_TOKENS,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                failed_batches += remaining_batches(error, batch, total_batches)?;
+                report(total_batches - 1, failed_batches, Vec::new());
+                break;
+            }
+        };
+
+        let answer: Vec<NameLlmItem> = match serde_json::from_str(extract_json_content(&raw_response)) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!("Не удалось распарсить JSON имён от LLM: {}. Сырой ответ:\n{}", e, raw_response);
+                failed_batches += 1;
+                report(batch, failed_batches, Vec::new());
+                continue;
+            }
+        };
+
+        let kept_before = items.len();
+        for item in answer {
+            let source = item.name.as_deref().unwrap_or_default().trim();
+            let translated = item.translated_name.as_deref().unwrap_or_default().trim();
+            // Имени, которого не было в списке, модель придумала сама
+            let Some(original) = chunk.iter().find(|name| name.to_lowercase() == source.to_lowercase()) else {
+                continue;
+            };
+            if translated.is_empty() || is_garbled(translated) || items.iter().any(|known| known.original == *original) {
+                continue;
+            }
+            items.push(NameSuggestion {
+                original: original.to_string(),
+                translated: translated.to_string(),
+                origin: item.origin.as_deref().unwrap_or_default().trim().to_string(),
+            });
+        }
+        report(batch, failed_batches, items[kept_before..].to_vec());
+    }
+
+    Ok(AutofillResult { items, failed_batches })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1678,6 +1818,62 @@ mod tests {
         let error = tauri::async_runtime::block_on(autofill_terms(&url, "model", terms(), false, &cancel, |_| {}))
             .unwrap_err();
         assert!(error.contains("сбой"), "{error}");
+    }
+
+    fn chat_answer(content: &str) -> String {
+        let body = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
+        http_response("200 OK", &body)
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn test_names_are_spelled_against_the_whole_cast() {
+        let content = r#"[
+            {"name":"ANJA","origin":"сербский","translated_name":"Аня"},
+            {"name":"Hilde","translated_name":"Хильде"},
+            {"name":"Hilde","translated_name":"Хильда"},
+            {"name":"Выдумка","translated_name":"Выдумка"},
+            {"name":"Dunja","translated_name":" "},
+            {"name":"Sarah","translated_name":"Саarah"}
+        ]"#;
+        let (url, requests) = record_requests(vec![chat_answer(content)]);
+        let cancel = AtomicBool::new(false);
+        let names = strings(&["Anja", "Hilde", "hilde", "Dunja", "Sarah", " "]);
+        let cast = strings(&["Anja", "Hilde", "Dunja", "Sarah", "Vlado"]);
+
+        let result = tauri::async_runtime::block_on(translate_names(&url, "model", &names, &cast, &cancel, |_| {}))
+            .unwrap();
+
+        let request = requests.recv().unwrap();
+        assert!(request.contains("All names in this game: Anja, Hilde, Dunja, Sarah, Vlado"), "{request}");
+        assert_eq!(request.matches("- Hilde").count(), 1, "{request}");
+        assert!(!request.contains("- hilde"), "{request}");
+        let found: Vec<_> = result
+            .items
+            .iter()
+            .map(|item| (item.original.as_str(), item.translated.as_str(), item.origin.as_str()))
+            .collect();
+        assert_eq!(found, [("Anja", "Аня", "сербский"), ("Hilde", "Хильде", "")]);
+        assert_eq!(result.failed_batches, 0);
+    }
+
+    #[test]
+    fn test_every_name_batch_sees_the_whole_cast() {
+        let names: Vec<String> = (0..MAX_BATCH_NAMES + 1).map(|i| format!("Name{i}")).collect();
+        let (url, requests) = record_requests(vec![chat_answer("[]"), chat_answer("не JSON")]);
+        let cancel = AtomicBool::new(false);
+
+        let result = tauri::async_runtime::block_on(translate_names(&url, "model", &names, &names, &cancel, |_| {}))
+            .unwrap();
+
+        assert_eq!(result.failed_batches, 1);
+        for _ in 0..2 {
+            let request = requests.recv().unwrap();
+            assert!(request.contains(&names[0]) && request.contains(&names[MAX_BATCH_NAMES]), "{request}");
+        }
     }
 
     /// Реплики персонажей из скрипта теми же шагами, что и в команде.

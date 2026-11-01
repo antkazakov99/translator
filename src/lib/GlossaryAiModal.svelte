@@ -73,6 +73,19 @@
     single_words_skipped: boolean;
   }
 
+  interface NameSuggestion {
+    original: string;
+    translated: string;
+    origin: string;
+  }
+
+  interface NameReview {
+    index: number;
+    translated: string;
+    origin: string;
+    selected: boolean;
+  }
+
   let {
     show = false,
     gameDir = "",
@@ -146,6 +159,20 @@
   let reviewNote = $state("");
   let selectedReviewCount = $derived(reviewTerms.filter((t) => t.selected).length);
 
+  // Имена, которые модель написала не так, как в глоссарии. Они ждут отбора: часть могла быть исправлена вручную
+  let reviewNames = $state<NameReview[]>([]);
+  let unchangedNames = $state(0);
+  let namesRequested = $state(0);
+  let namesFinished = $state(false);
+  let chosenNames = $derived(reviewNames.filter((row) => row.selected && row.translated.trim()));
+  // Итог команды может опередить последний пакет из канала, поэтому подпись считается по строкам
+  let namesNote = $derived.by(() => {
+    if (!namesFinished) return "Новые написания появляются здесь по мере ответа модели.";
+    const missing = namesRequested - reviewNames.length - unchangedNames;
+    const note = `Другое написание: ${reviewNames.length}, без изменений: ${unchangedNames}`;
+    return missing > 0 ? `${note}, не получено ответов: ${missing}.` : `${note}.`;
+  });
+
   onMount(() => {
     try {
       const savedApi = localStorage.getItem(LLM_API_KEY);
@@ -168,6 +195,8 @@
       hasResults = false;
       reviewTerms = [];
       reviewNote = "";
+      reviewNames = [];
+      namesRequested = 0;
       characterRows = [];
       termRows = [];
       unselectedAliases = [];
@@ -303,6 +332,65 @@
     } finally {
       isProcessing = false;
     }
+  }
+
+  const characterName = (c: CharacterGlossaryEntry) => c.original_name.trim() || c.alias;
+
+  /** Модель пишет имена выбранных персонажей, видя весь состав игры. Заполненные имена тоже участвуют. */
+  async function startNamesUpdate() {
+    beginRun("Модель определяет происхождение имён...");
+    const chosen = previewChars.flatMap((c, index) => (unselectedAliases.includes(c.alias) ? [] : [{ index, name: characterName(c) }]));
+    reviewNames = [];
+    unchangedNames = 0;
+    namesRequested = chosen.length;
+    namesFinished = false;
+    if (chosen.length === 0) {
+      isProcessing = false;
+      errorMessage = "Нет персонажей для обработки: выберите хотя бы одного.";
+      return;
+    }
+
+    try {
+      const result = await invoke<AutofillResult<NameSuggestion>>("translate_character_names", {
+        apiUrl: apiUrl.trim(),
+        model: selectedModel.trim(),
+        names: chosen.map((c) => c.name),
+        cast: previewChars.flatMap((c) => [characterName(c), ...c.merged.map((m) => m.original_name)]),
+        onBatch: batchChannel<NameSuggestion>((items) => {
+          for (const item of items) {
+            // Модель получает повторы один раз, а написание нужно каждому коду с этим именем
+            for (const { index } of chosen.filter((c) => c.name.toLowerCase() === item.original.toLowerCase())) {
+              if (previewChars[index].translated_name.trim() === item.translated) {
+                unchangedNames += 1;
+              } else {
+                reviewNames.push({ index, translated: item.translated, origin: item.origin, selected: true });
+              }
+            }
+          }
+        })
+      });
+      namesFinished = true;
+      if (result.failed_batches > 0) errorMessage = failedBatchesMessage(result.failed_batches);
+    } catch (e) {
+      namesRequested = 0;
+      errorMessage = `Не удалось обновить имена: ${String(e)}`;
+    } finally {
+      isProcessing = false;
+    }
+  }
+
+  function setAllNames(selected: boolean) {
+    for (const row of reviewNames) row.selected = selected;
+  }
+
+  function applyReviewedNames() {
+    const chosen = chosenNames;
+    for (const row of chosen) previewChars[row.index].translated_name = row.translated.trim();
+    reviewNames = [];
+    namesRequested = 0;
+    hasResults = true;
+    finishedRun = null;
+    progressStep = `Готово! Обновлено имён: ${chosen.length}`;
   }
 
   async function startTermsExtraction() {
@@ -652,6 +740,59 @@
               {/if}
             </button>
 
+            <button
+              class="btn-run-generation btn-run-alt"
+              onclick={startNamesUpdate}
+              disabled={isProcessing || characters.length === 0}
+            >
+              <Wand2 size={16} />
+              <span>Обновить имена всей группой</span>
+            </button>
+            <p class="review-note">Модель увидит все имена игры, определит их происхождение и заново напишет имена выбранных персонажей, включая заполненные. Что заменить, выберете вы. Описания сохранят старое написание.</p>
+
+            {#if namesRequested > 0}
+              <div class="review-panel">
+                <div class="review-header">
+                  <span class="review-note">{namesNote}</span>
+                  {#if reviewNames.length > 0}
+                    <div class="review-toggles">
+                      <button class="btn-link" onclick={() => setAllNames(true)}>Выбрать все</button>
+                      <button class="btn-link" onclick={() => setAllNames(false)}>Снять все</button>
+                    </div>
+                  {/if}
+                </div>
+
+                {#each reviewNames as row (row.index)}
+                  {@const character = previewChars[row.index]}
+                  <div class="review-row name-row" class:review-row-off={!row.selected}>
+                    <input
+                      type="checkbox"
+                      class="review-check"
+                      bind:checked={row.selected}
+                      aria-label={`Заменить имя ${characterName(character)}`}
+                    />
+                    <div class="review-source">
+                      <span class="review-term">{characterName(character)} <span class="review-count">{row.origin}</span></span>
+                      <span class="review-example">Сейчас: {character.translated_name || "нет перевода"}</span>
+                    </div>
+                    <input
+                      type="text"
+                      class="input-compact text-xs"
+                      bind:value={row.translated}
+                      aria-label={`Новое имя ${characterName(character)}`}
+                    />
+                  </div>
+                {/each}
+
+                {#if reviewNames.length > 0}
+                  <button class="btn-apply-results review-add" onclick={applyReviewedNames} disabled={chosenNames.length === 0 || isProcessing}>
+                    <Check size={14} />
+                    <span>Заменить выбранные ({chosenNames.length})</span>
+                  </button>
+                {/if}
+              </div>
+            {/if}
+
             {#if characterRows.length > 0}
               <div class="review-panel">
                 {#each characterRows as row (row.index)}
@@ -758,7 +899,7 @@
 
             <!-- Кнопка запуска терминов -->
             <button
-              class="btn-run-generation btn-run-terms"
+              class="btn-run-generation btn-run-alt"
               onclick={extractTermsFromGame ? startTermsExtraction : startTermsAutofill}
               disabled={isProcessing}
             >
@@ -1213,13 +1354,13 @@
     transform: translateY(-1px);
   }
 
-  .btn-run-terms {
+  .btn-run-alt {
     background: linear-gradient(135deg, #059669, #0d9488);
     border-color: rgba(52, 211, 153, 0.4);
     box-shadow: 0 4px 14px rgba(5, 150, 105, 0.35);
   }
 
-  .btn-run-terms:hover:not(:disabled) {
+  .btn-run-alt:hover:not(:disabled) {
     background: linear-gradient(135deg, #047857, #0f766e);
     box-shadow: 0 6px 18px rgba(5, 150, 105, 0.5);
   }
@@ -1392,6 +1533,10 @@
     grid-template-columns: auto minmax(0, 1.2fr) minmax(0, 1fr) 6.2rem;
     align-items: center;
     gap: 0.5rem;
+  }
+
+  .name-row {
+    grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr);
   }
 
   .review-row-off {

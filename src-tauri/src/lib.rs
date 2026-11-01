@@ -1765,6 +1765,22 @@ async fn autofill_glossary_characters(
     .await
 }
 
+/// Предлагает написание имён по всему составу игры. Какие из них попадут в глоссарий, решает пользователь.
+#[tauri::command]
+async fn translate_character_names(
+    api_url: String,
+    model: String,
+    names: Vec<String>,
+    cast: Vec<String>,
+    on_batch: Channel<llm::BatchProgress<llm::NameSuggestion>>,
+) -> Result<llm::AutofillResult<llm::NameSuggestion>, String> {
+    LLM_CANCEL.store(false, Ordering::Relaxed);
+    llm::translate_names(&api_url, &model, &names, &cast, &LLM_CANCEL, |progress| {
+        send_progress(&on_batch, progress)
+    })
+    .await
+}
+
 /// Токены из реплик игры для вкладки глоссария.
 #[tauri::command]
 async fn list_text_tokens(game_dir: String) -> Result<Vec<llm::TextToken>, String> {
@@ -1988,6 +2004,7 @@ pub fn run() {
             reveal_in_system_explorer,
             check_llm_models,
             autofill_glossary_characters,
+            translate_character_names,
             autofill_glossary_terms,
             extract_glossary_terms_from_game,
             cancel_llm_run,
