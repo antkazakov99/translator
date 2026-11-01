@@ -1,4 +1,4 @@
-use crate::glossary::{CharacterGlossaryEntry, TermGlossaryEntry};
+use crate::glossary::{CharacterGlossaryEntry, TermGlossaryEntry, TokenGlossaryEntry};
 use crate::scenes::{self, GameLines, ScriptLine};
 use crate::terms::{TermCandidate, is_stuttering};
 use regex::Regex;
@@ -343,15 +343,81 @@ pub fn string_variables(scripts: &[PathBuf]) -> HashMap<String, Vec<String>> {
     variables
 }
 
+/// Пояснения пользователя к токенам по именам.
+pub type TokenNotes = HashMap<String, String>;
+
+pub fn token_notes(tokens: &[TokenGlossaryEntry]) -> TokenNotes {
+    tokens
+        .iter()
+        .filter(|token| !token.note.trim().is_empty())
+        .map(|token| (token.name.clone(), token.note.trim().to_string()))
+        .collect()
+}
+
+/// Токен из реплик игры.
+#[derive(Debug, Clone, Serialize)]
+pub struct TextToken {
+    pub name: String,
+    /// Сколько реплик его содержит.
+    pub lines: usize,
+    /// Значения из скриптов.
+    pub values: Vec<String>,
+    pub example: String,
+}
+
+/// Все токены из реплик, начиная с самых частых.
+pub fn text_tokens(game: &GameLines) -> Vec<TextToken> {
+    let mut found: HashMap<String, TextToken> = HashMap::new();
+    for line in &game.lines {
+        let text = RE_TEXT_TAG.replace_all(&line.text, "").replace('\n', " ");
+        let names: HashSet<&str> = RE_TEXT_VARIABLE
+            .captures_iter(&text)
+            .filter_map(|caps| caps.get(1))
+            .map(|name| name.as_str())
+            .collect();
+        for name in names {
+            let token = found.entry(name.to_string()).or_insert_with(|| TextToken {
+                name: name.to_string(),
+                lines: 0,
+                values: game.variables.get(name).cloned().unwrap_or_default(),
+                example: text.trim().to_string(),
+            });
+            token.lines += 1;
+        }
+    }
+    let mut tokens: Vec<TextToken> = found.into_values().collect();
+    tokens.sort_by(|a, b| b.lines.cmp(&a.lines).then_with(|| a.name.cmp(&b.name)));
+    tokens
+}
+
 /// Подставляет значения переменных. Переменная с неясным значением остаётся как есть:
-/// модели сказано не делать выводов из её имени.
-fn resolve_variables(text: &str, variables: &HashMap<String, Vec<String>>) -> String {
+/// модели сказано не делать выводов из её имени. Токен с пояснением тоже остаётся, чтобы
+/// модель видела, к чему оно относится.
+fn resolve_variables(text: &str, variables: &HashMap<String, Vec<String>>, tokens: &TokenNotes) -> String {
     RE_TEXT_VARIABLE
         .replace_all(text, |caps: &regex::Captures| match variables.get(&caps[1]) {
-            Some(values) if values.len() <= MAX_VARIABLE_VALUES => values.join("/"),
+            Some(values) if values.len() <= MAX_VARIABLE_VALUES && !tokens.contains_key(&caps[1]) => values.join("/"),
             _ => caps[0].to_string(),
         })
         .into_owned()
+}
+
+/// Пояснения к токенам, которые есть в тексте.
+fn token_hints(text: &str, tokens: &TokenNotes) -> Vec<String> {
+    let mut seen = HashSet::new();
+    RE_TEXT_VARIABLE
+        .captures_iter(text)
+        .filter_map(|caps| caps.get(1))
+        .map(|name| name.as_str())
+        .filter(|name| seen.insert(*name))
+        .filter_map(|name| tokens.get(name).map(|note| format!("[{name}] means: {note}")))
+        .collect()
+}
+
+fn with_token_hints(lines: Vec<String>, tokens: &TokenNotes) -> Vec<String> {
+    let mut hinted = token_hints(&lines.join("\n"), tokens);
+    hinted.extend(lines);
+    hinted
 }
 
 /// Выбирает реплики персонажа: сначала полезные и обычные, затем остальные.
@@ -405,15 +471,16 @@ fn character_batches(
 }
 
 /// Текст реплики в том виде, в каком его видит модель.
-fn sample_text(text: &str, variables: &HashMap<String, Vec<String>>) -> String {
+fn sample_text(text: &str, variables: &HashMap<String, Vec<String>>, tokens: &TokenNotes) -> String {
     let text = RE_TEXT_TAG.replace_all(text, "").replace('\n', " ");
-    resolve_variables(text.trim(), variables)
+    resolve_variables(text.trim(), variables, tokens)
 }
 
 /// Собирает реплики каждого персонажа из разных частей игры, кроме исключённых сцен
 pub fn collect_character_dialogue_samples(
     script_lines: &[ScriptLine],
     variables: &HashMap<String, Vec<String>>,
+    tokens: &TokenNotes,
     characters: &[CharacterGlossaryEntry],
     count: usize,
 ) -> HashMap<String, Vec<String>> {
@@ -434,7 +501,7 @@ pub fn collect_character_dialogue_samples(
         if skipped.contains(line.key().as_str()) {
             continue;
         }
-        let text = sample_text(&line.text, variables);
+        let text = sample_text(&line.text, variables, tokens);
         if (3..=MAX_SAMPLE_CHARS).contains(&text.chars().count()) {
             let list = lines.entry(owner.clone()).or_default();
             if !list.contains(&text) {
@@ -445,7 +512,7 @@ pub fn collect_character_dialogue_samples(
 
     lines
         .into_iter()
-        .map(|(speaker, list)| (speaker, pick_samples(&list, count)))
+        .map(|(speaker, list)| (speaker, with_token_hints(pick_samples(&list, count), tokens)))
         .collect()
 }
 
@@ -454,6 +521,7 @@ fn scene_transcripts(
     game: &GameLines,
     characters: &[CharacterGlossaryEntry],
     scenes: &HashSet<String>,
+    tokens: &TokenNotes,
 ) -> HashMap<String, Vec<String>> {
     let names: HashMap<String, &str> = characters
         .iter()
@@ -475,7 +543,7 @@ fn scene_transcripts(
         by_scene
             .entry(key)
             .or_default()
-            .push(format!("{}: {}", speaker, sample_text(&line.text, &game.variables)));
+            .push(format!("{}: {}", speaker, sample_text(&line.text, &game.variables, tokens)));
     }
     by_scene
 }
@@ -484,6 +552,7 @@ fn scene_transcripts(
 /// Сцены берутся равномерно в пределах объёма.
 pub fn collect_scene_samples(
     game: &GameLines,
+    tokens: &TokenNotes,
     characters: &[CharacterGlossaryEntry],
 ) -> HashMap<String, Vec<String>> {
     let character_keys: Vec<Vec<String>> = characters
@@ -496,7 +565,7 @@ pub fn collect_scene_samples(
                 .collect()
         })
         .collect();
-    let by_scene = scene_transcripts(game, characters, &character_keys.iter().flatten().cloned().collect());
+    let by_scene = scene_transcripts(game, characters, &character_keys.iter().flatten().cloned().collect(), tokens);
     let mut samples = HashMap::new();
     for (character, keys) in characters.iter().zip(character_keys) {
         let text: usize = keys
@@ -519,20 +588,21 @@ pub fn collect_scene_samples(
             }
         }
         if !picked.is_empty() {
-            samples.insert(character.alias.to_lowercase(), picked);
+            samples.insert(character.alias.to_lowercase(), with_token_hints(picked, tokens));
         }
     }
     samples
 }
 
 /// Делит все включённые сцены персонажа на части, каждая из которых помещается в запрос.
-pub fn scene_chunks(game: &GameLines, character: &CharacterGlossaryEntry) -> Vec<String> {
+/// Пояснения к токенам лежат в самой части: с новым пояснением её заметка считается устаревшей.
+pub fn scene_chunks(game: &GameLines, tokens: &TokenNotes, character: &CharacterGlossaryEntry) -> Vec<String> {
     let keys: Vec<String> = scenes::character_scenes(game, &character.aliases(), &character.names())
         .into_iter()
         .map(|scene| scene.key)
         .filter(|key| !character.excluded_scenes.contains(key))
         .collect();
-    let transcripts = scene_transcripts(game, std::slice::from_ref(character), &keys.iter().cloned().collect());
+    let transcripts = scene_transcripts(game, std::slice::from_ref(character), &keys.iter().cloned().collect(), tokens);
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut size = 0;
@@ -552,6 +622,12 @@ pub fn scene_chunks(game: &GameLines, character: &CharacterGlossaryEntry) -> Vec
         chunks.push(current);
     }
     chunks
+        .into_iter()
+        .map(|chunk| match token_hints(&chunk, tokens).join("\n") {
+            hints if hints.is_empty() => chunk,
+            hints => format!("{hints}\n\n{chunk}"),
+        })
+        .collect()
 }
 
 /// Оставляет `count` частей, равномерно по игре, но не меньше готовых: прочитанное не пропадает.
@@ -726,6 +802,7 @@ pub async fn summarize_character(
         occupation, relations with others, and how they speak (tone, slang, \"ты\" or \"вы\"). \
         If the text says nothing about the character, answer only with: {NO_NOTE} \
         Text in [square brackets] is an in-game variable: never infer anything from its name. \
+        If a line says what a variable means, rely on that line. \
         Respond with plain text only.",
         character.original_name
     );
@@ -846,7 +923,7 @@ For each character provided, you must output:
 4. "notes": Detailed description in Russian, 3 to 6 sentences, based only on the provided lines: occupation and place in the story, who they are to the protagonist (lines addressed to "you" are usually addressed to the protagonist), character and motives, how they speak, how they treat others, and what happens to them in the story. A translator will rely on it to keep the voice consistent. Do not invent facts. If there are few lines, write less.
 5. "speech": Required separate field, 1 to 2 sentences in Russian on the manner of speech: tone, vocabulary or slang, and whether they use "ты" or "вы" with others. Fill it for every character, even with few lines. It may repeat what "notes" says: do not shorten "notes" because of it.
 
-Text in [square brackets] is an in-game variable whose value is unknown. Never infer an occupation, kinship or name from the variable's own name.
+Text in [square brackets] is an in-game variable whose value is unknown. Never infer an occupation, kinship or name from the variable's own name. If a line says what a variable means, rely on that line.
 Lines may come as a scene transcript in the form "Speaker: text". Only lines of that speaker show their own manner; lines of others show how they see the character.
 Lines may also be notes collected from every scene of the game: treat them as reliable and use all of them.
 
@@ -1317,7 +1394,7 @@ mod tests {
             .iter()
             .map(|alias| CharacterGlossaryEntry { alias: alias.to_string(), ..Default::default() })
             .collect();
-        collect_character_dialogue_samples(&lines, &string_variables(scripts), &characters, count)
+        collect_character_dialogue_samples(&lines, &string_variables(scripts), &TokenNotes::new(), &characters, count)
     }
 
     fn script_with(content: &str) -> (PathBuf, Vec<PathBuf>) {
@@ -1413,6 +1490,53 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn test_token_note_goes_with_the_text_that_uses_it() {
+        let (dir, scripts) = script_with(concat!(
+            "default landlady = \"landlady\"\n",
+            "label home:\n",
+            "    k \"Ask [landlady!c] about the rent.\"\n",
+            "    k \"Ask [landlady] again, and [nick] too.\"\n",
+        ));
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), string_variables(&scripts));
+        assert_eq!(scene_chunks(&game, &TokenNotes::new(), &kate(&[])), [
+            "Kate: Ask landlady about the rent.\nKate: Ask landlady again, and [nick] too.\n"
+        ]);
+
+        let notes = token_notes(&[
+            TokenGlossaryEntry { name: "landlady".to_string(), note: " мать героя ".to_string() },
+            TokenGlossaryEntry { name: "nick".to_string(), note: " ".to_string() },
+            TokenGlossaryEntry { name: "absent".to_string(), note: "нет в тексте".to_string() },
+        ]);
+        let chunks = scene_chunks(&game, &notes, &kate(&[]));
+        assert_eq!(chunks, [concat!(
+            "[landlady] means: мать героя\n\n",
+            "Kate: Ask [landlady!c] about the rent.\nKate: Ask [landlady] again, and [nick] too.\n"
+        )]);
+
+        let samples = collect_character_dialogue_samples(&game.lines, &game.variables, &notes, &[kate(&[])], 5);
+        assert_eq!(samples["k"][0], "[landlady] means: мать героя");
+        assert_eq!(collect_scene_samples(&game, &notes, &[kate(&[])])["k"][0], "[landlady] means: мать героя");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_text_tokens_list_lines_values_and_example() {
+        let (dir, scripts) = script_with(concat!(
+            "default landlady = \"mom\"\n",
+            "label home:\n",
+            "    k \"{i}Hi{/i} [nick], [nick]!\"\n",
+            "    k \"Ask [landlady!c] and [nick].\"\n",
+        ));
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), string_variables(&scripts));
+        let tokens = text_tokens(&game);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!((tokens[0].name.as_str(), tokens[0].lines, tokens[0].example.as_str()), ("nick", 2, "Hi [nick], [nick]!"));
+        assert_eq!((tokens[1].name.as_str(), tokens[1].lines), ("landlady", 1));
+        assert_eq!(tokens[1].values, ["mom"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     const TWO_SCENES: &str = concat!(
         "label home:\n",
         "    k \"I am staying home tonight.\"\n",
@@ -1436,7 +1560,7 @@ mod tests {
         let (dir, scripts) = script_with(TWO_SCENES);
         let lines = scenes::load_lines(&scripts, |_| "story.rpy".to_string());
         let samples =
-            collect_character_dialogue_samples(&lines, &HashMap::new(), &[kate(&["story.rpy::bar"])], 5);
+            collect_character_dialogue_samples(&lines, &HashMap::new(), &TokenNotes::new(), &[kate(&["story.rpy::bar"])], 5);
         assert_eq!(samples["k"], ["I am staying home tonight."]);
         let _ = fs::remove_dir_all(dir);
     }
@@ -1454,7 +1578,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let samples = collect_character_dialogue_samples(&lines, &HashMap::new(), &[hilde], 5);
+        let samples = collect_character_dialogue_samples(&lines, &HashMap::new(), &TokenNotes::new(), &[hilde], 5);
         assert_eq!(samples["hil"], ["First line of her.", "Second line of her."]);
         assert!(!samples.contains_key("hi"));
         let _ = fs::remove_dir_all(dir);
@@ -1465,7 +1589,7 @@ mod tests {
         let (dir, scripts) = script_with(TWO_SCENES);
         let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), HashMap::new());
 
-        let all = collect_scene_samples(&game, &[kate(&["story.rpy::bar"])]);
+        let all = collect_scene_samples(&game, &TokenNotes::new(), &[kate(&["story.rpy::bar"])]);
         assert_eq!(all["k"], ["Kate: I am staying home tonight.", "m: Then I will cook, Kate."]);
         let _ = fs::remove_dir_all(dir);
     }
@@ -1482,13 +1606,13 @@ mod tests {
         let (dir, scripts) = script_with(&script);
         let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), HashMap::new());
 
-        let chunks = scene_chunks(&game, &kate(&[]));
+        let chunks = scene_chunks(&game, &TokenNotes::new(), &kate(&[]));
         assert!(chunks.len() > 2);
         assert!(chunks.iter().all(|chunk| chunk.chars().count() <= MAX_SAMPLE_TEXT));
         let text = chunks.concat();
         assert!(text.contains("Scene 0 line 0 ") && text.contains("Scene 2 line 119 "));
 
-        let without = scene_chunks(&game, &kate(&["story.rpy::scene_2"]));
+        let without = scene_chunks(&game, &TokenNotes::new(), &kate(&["story.rpy::scene_2"]));
         assert!(!without.concat().contains("Scene 2 line"));
         let _ = fs::remove_dir_all(dir);
     }

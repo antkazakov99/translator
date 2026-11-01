@@ -56,11 +56,20 @@ pub struct TermGlossaryEntry {
     pub notes: String,       // Контекст / комментарий
 }
 
+/// Пояснение к подстановке в репликах вроде `[landlady]`
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TokenGlossaryEntry {
+    pub name: String, // Имя переменной без скобок и флагов ("landlady", "friend.name")
+    pub note: String, // Что она значит
+}
+
 /// Единый глоссарий проекта
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectGlossary {
     pub characters: Vec<CharacterGlossaryEntry>,
     pub terms: Vec<TermGlossaryEntry>,
+    #[serde(default)]
+    pub tokens: Vec<TokenGlossaryEntry>,
 }
 
 impl ProjectGlossary {
@@ -156,6 +165,12 @@ impl ProjectGlossary {
                 }
             }
         }
+        for token in other.tokens {
+            if !self.tokens.iter().any(|own| own.name == token.name) {
+                self.tokens.push(token);
+                merged += 1;
+            }
+        }
         merged
     }
 
@@ -233,6 +248,18 @@ mod tests {
         ProjectGlossary::default().save_for_project(&game_dir).unwrap();
         assert!(ProjectGlossary::load_for_project(&game_dir).is_ok());
         let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn test_tokens_are_optional_and_own_note_wins() {
+        let old: ProjectGlossary = serde_json::from_str(r#"{"characters": [], "terms": []}"#).unwrap();
+        assert!(old.tokens.is_empty());
+
+        let token = |name: &str, note: &str| TokenGlossaryEntry { name: name.to_string(), note: note.to_string() };
+        let mut own = ProjectGlossary { tokens: vec![token("landlady", "своё")], ..Default::default() };
+        let other = ProjectGlossary { tokens: vec![token("landlady", "чужое"), token("nick", "прозвище")], ..Default::default() };
+        assert_eq!(own.merge_from(other), 1);
+        assert_eq!(own.tokens, [token("landlady", "своё"), token("nick", "прозвище")]);
     }
 
     #[test]

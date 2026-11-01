@@ -77,6 +77,7 @@
     gameDir = "",
     characters = [],
     terms = [],
+    tokens = [],
     initialTab = "characters",
     onapply = () => {},
     onclose = () => {}
@@ -85,6 +86,7 @@
     gameDir: string;
     characters: CharacterGlossaryEntry[];
     terms: TermGlossaryEntry[];
+    tokens: { name: string; note: string }[];
     initialTab?: "characters" | "terms";
     onapply: (updatedChars: CharacterGlossaryEntry[], updatedTerms: TermGlossaryEntry[]) => void;
     onclose: () => void;
@@ -277,6 +279,7 @@
         apiUrl: apiUrl.trim(),
         model: selectedModel.trim(),
         characters: rows.map((row) => previewChars[row.index]),
+        tokens: $state.snapshot(tokens),
         options: { onlyEmpty, sampleCount, wholeScenes },
         onBatch: batchChannel<CharacterResult>((items) => {
           for (const { samples, ...character } of items) {
