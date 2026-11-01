@@ -631,6 +631,29 @@ async fn condense_notes(
     Ok(notes)
 }
 
+/// Ответ модели, когда в части нет сведений о персонаже.
+const NO_NOTE: &str = "NONE";
+/// Ответы, которые ничего не сообщают: модель иногда пишет их вместо `NO_NOTE`,
+/// а в сохранённых заметках они остались от прежнего запроса.
+const EMPTY_NOTES: [&str; 3] = ["none", "empty string", "пустая строка"];
+const NOTE_REFUSALS: [&str; 5] = [
+    "нет информации",
+    "нет сведений",
+    "не содержит информации",
+    "ничего не сказано",
+    "не упоминается",
+];
+/// Длинный текст с такими словами уже содержит факты о персонаже.
+const MAX_REFUSAL_LENGTH: usize = 120;
+
+fn is_empty_note(note: &str) -> bool {
+    let text = note.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+    text.is_empty()
+        || EMPTY_NOTES.contains(&text.as_str())
+        || (text.chars().count() <= MAX_REFUSAL_LENGTH
+            && NOTE_REFUSALS.iter().any(|refusal| text.contains(refusal)))
+}
+
 /// Обновляет персонажа по частям его сцен: собирает заметки, а затем пишет описание по ним. Готовые заметки лежат на диске, поэтому остановленный запуск
 /// продолжается с того же места. Возвращает `None`, если запуск остановлен.
 pub async fn summarize_character(
@@ -647,7 +670,7 @@ pub async fn summarize_character(
         The text has the form \"Speaker: text\", and \"you\" usually means the protagonist. \
         Write in Russian, 2 to 5 short sentences, only what this text shows: what the character does, \
         occupation, relations with others, and how they speak (tone, slang, \"ты\" or \"вы\"). \
-        If the text says nothing about the character, answer with an empty string. \
+        If the text says nothing about the character, answer with exactly {NO_NOTE}. \
         Text in [square brackets] is an in-game variable: never infer anything from its name. \
         Respond with plain text only.",
         character.original_name
@@ -675,12 +698,18 @@ pub async fn summarize_character(
                 note
             }
         };
-        if !note.trim().is_empty() {
+        if !is_empty_note(&note) {
             on_progress(SummaryProgress { stage: "note".to_string(), done, total, note: Some(note.clone()) });
             notes.push(note);
         }
     }
 
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    if notes.is_empty() {
+        return Err("В выбранных сценах модель не нашла сведений о персонаже".to_string());
+    }
     let notes = condense_notes(api_url, model, notes, &on_progress).await?;
     if cancel.load(Ordering::Relaxed) {
         return Ok(None);
@@ -1445,6 +1474,52 @@ mod tests {
         assert_eq!(pick_chunks(chunks.clone(), 1), ["0"]);
         assert_eq!(pick_chunks(chunks.clone(), 3), ["0", "3", "6"]);
         assert_eq!(pick_chunks(chunks.clone(), 50), chunks);
+    }
+
+    #[test]
+    fn test_refusals_are_not_notes() {
+        for note in ["", "  ", "NONE", "none.", "\"\"", "''", "Пустая строка", "Пока что в тексте нет информации об Алёнке."] {
+            assert!(is_empty_note(note), "{note:?}");
+        }
+        let long = format!("{} О её прошлом нет информации.", "Работает медсестрой в городской больнице. ".repeat(3));
+        for note in ["Лиза командует отрядом.", long.as_str()] {
+            assert!(!is_empty_note(note), "{note:?}");
+        }
+    }
+
+    #[test]
+    fn test_refusals_stay_out_of_description() {
+        let dir = std::env::temp_dir().join(format!("translator_notes_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let notes_file = dir.join("scene_notes.json");
+        let chunks = vec!["Kate: one".to_string(), "Kate: two".to_string(), "Kate: three".to_string()];
+        let answer = r#"[{"alias":"k","notes":"Итог","speech":"На 'ты'"}]"#;
+        let cancel = AtomicBool::new(false);
+        let shown = std::sync::Mutex::new(Vec::new());
+
+        let url = serve_responses(vec![
+            completion("Пустая строка"),
+            completion("Заметка"),
+            completion("Пока что в тексте нет информации о Кейт."),
+            completion(answer),
+        ]);
+        let updated = tauri::async_runtime::block_on(summarize_character(
+            &url, "model", kate(&[]), chunks, &notes_file, &cancel,
+            |p| shown.lock().unwrap().extend(p.note),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.notes, "Итог");
+        assert_eq!(shown.into_inner().unwrap(), ["Заметка"]);
+
+        // Заметок нет: описание нечему обновлять, модель не должна придумывать его по имени
+        let url = serve_responses(vec![completion("NONE")]);
+        let result = tauri::async_runtime::block_on(summarize_character(
+            &url, "model", kate(&[]), vec!["Kate: four".to_string()], &notes_file, &cancel,
+            |_| {},
+        ));
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
