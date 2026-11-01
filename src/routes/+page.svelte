@@ -49,7 +49,8 @@
     Save,
     BookMarked,
     ExternalLink,
-    RotateCcw
+    RotateCcw,
+    Braces
   } from "lucide-svelte";
 
   // Стейт проекта на Svelte 5 (Runes)
@@ -433,9 +434,22 @@
     notes: string;
   }
 
+  interface TokenGlossaryEntry {
+    name: string;
+    note: string;
+  }
+
+  interface TextToken {
+    name: string;
+    lines: number;
+    values: string[];
+    example: string;
+  }
+
   interface ProjectGlossary {
     characters: CharacterGlossaryEntry[];
     terms: TermGlossaryEntry[];
+    tokens: TokenGlossaryEntry[];
   }
 
   let project = $state<ProjectSummary | null>(null);
@@ -693,8 +707,8 @@
   // Состояние глоссария проекта
   let showGlossaryModal = $state(false);
   let showGlossaryAiModal = $state(false);
-  let glossaryTab = $state<'characters' | 'terms'>('characters');
-  let glossary = $state<ProjectGlossary>({ characters: [], terms: [] });
+  let glossaryTab = $state<'characters' | 'terms' | 'tokens'>('characters');
+  let glossary = $state<ProjectGlossary>({ characters: [], terms: [], tokens: [] });
   let loadingGlossary = $state(false);
   let savingGlossary = $state(false);
   let glossaryDirty = $state(false);
@@ -833,11 +847,12 @@
   let sceneChunkTarget: string | null = null;
   $effect(() => {
     const char = selectedGlossaryChar;
-    if (characterUpdateMode !== "scenes" || !char || !scenesTarget) return;
+    if (characterUpdateMode !== "scenes" || !char || !scenesTarget || glossaryTab === "tokens") return;
     const delay = sceneChunkTarget === scenesTarget ? 100 : 0;
     sceneChunkTarget = scenesTarget;
     const model = storedLlmModel();
-    const key = JSON.stringify([scenesTarget, char.excluded_scenes, model, sceneNotesRevision]);
+    const tokens = $state.snapshot(glossary.tokens);
+    const key = JSON.stringify([scenesTarget, char.excluded_scenes, model, sceneNotesRevision, tokens]);
     const show = (chunks: { total: number; ready: number } | null) => {
       sceneChunkCount = chunks?.total ?? null;
       sceneReadyCount = chunks?.ready ?? 0;
@@ -850,7 +865,7 @@
     let current = true;
     const dir = gameDir;
     const timer = setTimeout(() => {
-      invoke<{ total: number; ready: number }>("count_character_chunks", { gameDir: dir, model, character: untrack(() => $state.snapshot(char)) })
+      invoke<{ total: number; ready: number }>("count_character_chunks", { gameDir: dir, model, character: untrack(() => $state.snapshot(char)), tokens })
         .then((chunks) => {
           sceneChunkCache.set(key, chunks);
           if (current) show(chunks);
@@ -1023,6 +1038,7 @@
             apiUrl,
             model,
             character: $state.snapshot(char),
+            tokens: $state.snapshot(glossary.tokens),
             parts: sceneParts,
             onProgress
           });
@@ -1046,6 +1062,7 @@
         apiUrl,
         model,
         characters: [$state.snapshot(char)],
+        tokens: $state.snapshot(glossary.tokens),
         options: {
           onlyEmpty: false,
           sampleCount: count > 0 ? count : 64,
@@ -1470,7 +1487,8 @@
     translationEdits = {};
     selectedEntry = null;
     selectedSceneId = "all";
-    glossary = { characters: [], terms: [] };
+    glossary = { characters: [], terms: [], tokens: [] };
+    textTokens = null;
     glossaryProjectPath = null;
     glossaryDirty = false;
     selectedGlossaryChar = null;
@@ -1743,6 +1761,47 @@
       );
     });
   });
+
+  // Токены ищутся в репликах, а в глоссарии лежат только пояснения. Пояснение остаётся,
+  // даже если токен пропал из игры: он мог исчезнуть только в этой версии
+  let textTokens = $state<{ dir: string; tokens: TextToken[] } | null>(null);
+  let tokenRows = $derived.by(() => {
+    const found = textTokens?.tokens ?? [];
+    const names = new Set(found.map((token) => token.name));
+    const missing = glossary.tokens
+      .filter((token) => !names.has(token.name))
+      .map((token) => ({ name: token.name, lines: 0, values: [], example: "" }));
+    return [...found, ...missing];
+  });
+  let filteredTokenRows = $derived.by(() => {
+    const q = glossarySearch.trim().toLowerCase();
+    if (!q) return tokenRows;
+    return tokenRows.filter((token) =>
+      token.name.toLowerCase().includes(q) ||
+      token.example.toLowerCase().includes(q) ||
+      tokenNote(token.name).toLowerCase().includes(q)
+    );
+  });
+
+  $effect(() => {
+    if (glossaryTab !== "tokens" || !gameDir || textTokens?.dir === gameDir) return;
+    const dir = gameDir;
+    invoke<TextToken[]>("list_text_tokens", { gameDir: dir })
+      .then((tokens) => { textTokens = { dir, tokens }; })
+      .catch((e) => showToast(`Не удалось найти токены: ${e}`, "error"));
+  });
+
+  function tokenNote(name: string) {
+    return glossary.tokens.find((token) => token.name === name)?.note ?? "";
+  }
+
+  function setTokenNote(name: string, note: string) {
+    const own = glossary.tokens.find((token) => token.name === name);
+    if (!note) glossary.tokens = glossary.tokens.filter((token) => token.name !== name);
+    else if (own) own.note = note;
+    else glossary.tokens.push({ name, note });
+    glossaryDirty = true;
+  }
 
   let glossaryStats = $derived.by(() => {
     const totalChars = glossary.characters.length;
@@ -3294,6 +3353,14 @@
             <BookMarked size={15} />
             <span>Термины и локации ({glossaryStats.totalTerms})</span>
           </button>
+          <button
+            class="tools-tab"
+            class:tab-active={glossaryTab === 'tokens'}
+            onclick={() => glossaryTab = 'tokens'}
+          >
+            <Braces size={15} />
+            <span>Токены ({glossary.tokens.length})</span>
+          </button>
         </div>
 
         <!-- Тулбар фильтрации и поиска внутри глоссария -->
@@ -3400,6 +3467,63 @@
           </div>
         {/if}
 
+        {#if glossaryTab === 'tokens'}
+          <div class="token-pane">
+            <div class="glossary-toolbar">
+              <div class="glossary-search-box">
+                <Search size={14} class="search-box-icon text-slate-400" />
+                <input
+                  type="text"
+                  bind:value={glossarySearch}
+                  placeholder="Поиск по токену, реплике, пояснению..."
+                  class="glossary-search-input"
+                />
+                {#if glossarySearch}
+                  <button class="btn-clear-search" onclick={() => glossarySearch = ""}>
+                    <X size={12} />
+                  </button>
+                {/if}
+              </div>
+              <span class="char-sub-label">Пояснение модель получает вместе с текстом, где встречается токен. Части с этим токеном прочитаются заново.</span>
+            </div>
+            <div class="token-list">
+              {#if textTokens?.dir !== gameDir}
+                <div class="glossary-empty-state">
+                  <Loader2 size={24} class="spin" />
+                </div>
+              {:else if filteredTokenRows.length === 0}
+                <div class="glossary-empty-state">
+                  <Braces size={32} class="text-slate-600" />
+                  <p>{glossarySearch ? `Токены не найдены по запросу «${glossarySearch}»` : "В репликах игры нет токенов"}</p>
+                </div>
+              {:else}
+                {#each filteredTokenRows as token (token.name)}
+                  <div class="token-row">
+                    <div class="token-info">
+                      <div class="token-head">
+                        <code class="char-alias-badge-lg">[{token.name}]</code>
+                        <span class="char-sub-label">{token.lines > 0 ? `реплик: ${token.lines}` : "нет в репликах"}</span>
+                        {#if token.values.length > 0}
+                          <span class="char-sub-label">в скриптах: {token.values.slice(0, 4).join(" / ")}{token.values.length > 4 ? " ..." : ""}</span>
+                        {/if}
+                      </div>
+                      {#if token.example}
+                        <p class="token-example" title={token.example}>{token.example}</p>
+                      {/if}
+                    </div>
+                    <input
+                      class="token-note"
+                      value={tokenNote(token.name)}
+                      placeholder="Что это значит, например: мать героя"
+                      aria-label={`Пояснение к токену ${token.name}`}
+                      oninput={(event) => setTokenNote(token.name, event.currentTarget.value)}
+                    />
+                  </div>
+                {/each}
+              {/if}
+            </div>
+          </div>
+        {:else}
         <!-- СПИСОК СЛЕВА, ОСНОВНОЕ МЕСТО ОТДАНО ВЫБРАННОЙ ЗАПИСИ -->
         <div class="glossary-split-container">
           <div class="glossary-list-pane">
@@ -4032,6 +4156,7 @@
             </section>
           {/if}
         </div>
+        {/if}
 
         <!-- Подвал модального окна глоссария -->
         <div class="glossary-modal-footer">
@@ -4222,7 +4347,8 @@
     gameDir={gameDir}
     characters={glossary.characters}
     terms={glossary.terms}
-    initialTab={glossaryTab}
+    tokens={glossary.tokens}
+    initialTab={glossaryTab === 'terms' ? 'terms' : 'characters'}
     onapply={handleGlossaryAiApply}
     onclose={() => showGlossaryAiModal = false}
   />
@@ -8274,6 +8400,65 @@
     border-color: #a855f7;
     color: #d8b4fe;
     box-shadow: 0 0 8px rgba(168, 85, 247, 0.35);
+  }
+
+  .token-pane {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: #0a0d14;
+  }
+
+  .token-list {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+  }
+
+  .token-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: center;
+    gap: 14px;
+    padding: 10px 18px;
+    border-bottom: 1px solid #1a2232;
+  }
+
+  .token-info {
+    min-width: 0;
+  }
+
+  .token-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 10px;
+  }
+
+  .token-example {
+    margin: 6px 0 0;
+    overflow: hidden;
+    font-size: 12px;
+    color: #94a3b8;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .token-note {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    border: 1px solid #1e293b;
+    border-radius: 6px;
+    background: #0f172a;
+    color: #e2e8f0;
+    font-size: 13px;
+  }
+
+  .token-note:focus {
+    outline: none;
+    border-color: #10b981;
   }
 
   .glossary-empty-state {

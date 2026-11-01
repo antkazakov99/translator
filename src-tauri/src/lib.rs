@@ -1713,6 +1713,7 @@ async fn autofill_glossary_characters(
     api_url: String,
     model: String,
     characters: Vec<glossary::CharacterGlossaryEntry>,
+    tokens: Vec<glossary::TokenGlossaryEntry>,
     options: CharacterRunOptions,
     on_batch: Channel<llm::BatchProgress<llm::CharacterResult>>,
 ) -> Result<llm::AutofillResult<glossary::CharacterGlossaryEntry>, String> {
@@ -1726,10 +1727,11 @@ async fn autofill_glossary_characters(
     let selected = characters.clone();
     let samples = tauri::async_runtime::spawn_blocking(move || {
         let game = game_lines(&base_path);
+        let notes = llm::token_notes(&tokens);
         if options.whole_scenes {
-            llm::collect_scene_samples(&game, &selected)
+            llm::collect_scene_samples(&game, &notes, &selected)
         } else {
-            llm::collect_character_dialogue_samples(&game.lines, &game.variables, &selected, sample_count)
+            llm::collect_character_dialogue_samples(&game.lines, &game.variables, &notes, &selected, sample_count)
         }
     })
     .await
@@ -1739,6 +1741,16 @@ async fn autofill_glossary_characters(
         send_progress(&on_batch, progress)
     })
     .await
+}
+
+/// Токены из реплик игры для вкладки глоссария.
+#[tauri::command]
+async fn list_text_tokens(game_dir: String) -> Result<Vec<llm::TextToken>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        llm::text_tokens(&game_lines(&effective_game_directory(Path::new(&game_dir))))
+    })
+    .await
+    .map_err(|e| format!("Ошибка поиска токенов: {}", e))
 }
 
 #[derive(Debug, Serialize)]
@@ -1753,10 +1765,11 @@ async fn count_character_chunks(
     game_dir: String,
     model: String,
     character: glossary::CharacterGlossaryEntry,
+    tokens: Vec<glossary::TokenGlossaryEntry>,
 ) -> Result<CharacterChunks, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
-        let chunks = llm::scene_chunks(&game_lines(&base_path), &character);
+        let chunks = llm::scene_chunks(&game_lines(&base_path), &llm::token_notes(&tokens), &character);
         let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
         let ready = llm::ready_chunks(&chunks, &model, &character.alias, &notes_file);
         CharacterChunks { total: chunks.len(), ready: ready.iter().filter(|ready| **ready).count() }
@@ -1773,6 +1786,7 @@ async fn summarize_glossary_character(
     api_url: String,
     model: String,
     character: glossary::CharacterGlossaryEntry,
+    tokens: Vec<glossary::TokenGlossaryEntry>,
     parts: usize,
     on_progress: Channel<llm::SummaryProgress>,
 ) -> Result<Option<glossary::CharacterGlossaryEntry>, String> {
@@ -1783,7 +1797,7 @@ async fn summarize_glossary_character(
     let notes = notes_file.clone();
     let chosen_model = model.clone();
     let chunks = tauri::async_runtime::spawn_blocking(move || {
-        let chunks = llm::scene_chunks(&game_lines(&base_path), &selected);
+        let chunks = llm::scene_chunks(&game_lines(&base_path), &llm::token_notes(&tokens), &selected);
         let ready = llm::ready_chunks(&chunks, &chosen_model, &selected.alias, &notes);
         llm::pick_chunks(chunks, parts, &ready)
     })
@@ -1923,6 +1937,7 @@ pub fn run() {
             cancel_llm_run,
             summarize_glossary_character,
             count_character_chunks,
+            list_text_tokens,
             get_character_scenes
         ])
         .run(tauri::generate_context!())
@@ -2212,13 +2227,13 @@ mod tests {
         };
         glossary::ProjectGlossary {
             characters: vec![character("Эйлин")],
-            terms: Vec::new(),
+            ..Default::default()
         }
         .save_for_project(&old_game)
         .unwrap();
         glossary::ProjectGlossary {
             characters: vec![character("")],
-            terms: Vec::new(),
+            ..Default::default()
         }
         .save_for_project(&new_game)
         .unwrap();
