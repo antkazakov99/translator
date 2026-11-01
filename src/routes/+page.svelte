@@ -424,6 +424,14 @@
     speech: string;
     excluded_scenes: string[];
     merged: { alias: string; original_name: string }[];
+    excluded_notes: string[];
+  }
+
+  interface CharacterPart {
+    key: string;
+    start: string;
+    note: string | null;
+    empty: boolean;
   }
 
   interface TermGlossaryEntry {
@@ -878,6 +886,59 @@
     };
   });
 
+  // Режим панели: вместо сцен показывает, что модель записала по каждой части
+  let characterPaneMode = $state<"scenes" | "notes">("scenes");
+  let characterParts = $state.raw<{ target: string; parts: CharacterPart[] } | null>(null);
+  let characterPartsError = $state<string | null>(null);
+  let showUnreadParts = $state(false);
+  let currentParts = $derived(characterParts?.target === scenesTarget ? characterParts?.parts ?? null : null);
+  let visibleParts = $derived(
+    (currentParts ?? [])
+      .map((part, index) => ({ ...part, index }))
+      .filter((part) => showUnreadParts || part.note !== null)
+  );
+  let readParts = $derived((currentParts ?? []).filter((part) => part.note !== null));
+  let emptyParts = $derived(readParts.filter((part) => part.empty));
+
+  $effect(() => {
+    const char = selectedGlossaryChar;
+    const target = scenesTarget;
+    if (characterPaneMode !== "notes" || !char || !target) return;
+    void [char.excluded_scenes.length, sceneNotesRevision];
+    const tokens = $state.snapshot(glossary.tokens);
+    let current = true;
+    characterPartsError = null;
+    invoke<CharacterPart[]>("list_character_parts", {
+      gameDir,
+      model: storedLlmModel(),
+      character: untrack(() => $state.snapshot(char)),
+      tokens
+    })
+      .then((parts) => { if (current) characterParts = { target, parts }; })
+      .catch((e) => { if (current) characterPartsError = String(e); });
+    return () => { current = false; };
+  });
+
+  function toggleNoteForDescription(char: CharacterGlossaryEntry, key: string, included: boolean) {
+    char.excluded_notes = included
+      ? char.excluded_notes.filter((own) => own !== key)
+      : [...char.excluded_notes, key];
+    glossaryDirty = true;
+  }
+
+  async function resetNotes(char: CharacterGlossaryEntry, keys: string[]) {
+    try {
+      await invoke("reset_character_notes", { gameDir, keys });
+      if (char.excluded_notes.some((key) => keys.includes(key))) {
+        char.excluded_notes = char.excluded_notes.filter((key) => !keys.includes(key));
+        glossaryDirty = true;
+      }
+      sceneNotesRevision += 1;
+    } catch (e) {
+      showToast(`Не удалось сбросить заметки: ${e}`, "error");
+    }
+  }
+
   function storedLlmModel() {
     try {
       return (localStorage.getItem("translator.llm_model") || "mistral-small").trim();
@@ -939,7 +1000,8 @@
       notes: "",
       speech: "",
       excluded_scenes: [],
-      merged: []
+      merged: [],
+      excluded_notes: []
     });
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
     selectedGlossaryChar = glossary.characters.find((c) => c.alias === target.alias) ?? null;
@@ -1038,7 +1100,7 @@
             apiUrl,
             model,
             character: $state.snapshot(char),
-            tokens: $state.snapshot(glossary.tokens),
+            hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames },
             parts: sceneParts,
             onProgress
           });
@@ -1062,7 +1124,7 @@
         apiUrl,
         model,
         characters: [$state.snapshot(char)],
-        tokens: $state.snapshot(glossary.tokens),
+        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames },
         options: {
           onlyEmpty: false,
           sampleCount: count > 0 ? count : 64,
@@ -1762,6 +1824,13 @@
     });
   });
 
+  // Модель пишет имена так же, как они записаны в глоссарии
+  let characterNames = $derived(
+    glossary.characters
+      .filter((char) => char.translated_name.trim())
+      .flatMap((char) => [char, ...char.merged].map((part): [string, string] => [part.original_name, char.translated_name.trim()]))
+  );
+
   // Токены ищутся в репликах, а в глоссарии лежат только пояснения. Пояснение остаётся,
   // даже если токен пропал из игры: он мог исчезнуть только в этой версии
   let textTokens = $state<{ dir: string; tokens: TextToken[] } | null>(null);
@@ -1958,7 +2027,8 @@
       notes: "",
       speech: "",
       excluded_scenes: [],
-      merged: []
+      merged: [],
+      excluded_notes: []
     };
     glossary.characters.push(newChar);
     glossary.characters.sort((a, b) => a.original_name.localeCompare(b.original_name));
@@ -4060,6 +4130,32 @@
           {#if glossaryTab === 'characters'}
             <section class="character-scenes">
               <div class="character-scenes-header">
+                <div class="gender-filter-group">
+                  <button class="btn-filter-pill" class:active={characterPaneMode === 'scenes'} onclick={() => characterPaneMode = 'scenes'}>Сцены</button>
+                  <button class="btn-filter-pill" class:active={characterPaneMode === 'notes'} onclick={() => characterPaneMode = 'notes'}>Заметки</button>
+                </div>
+                {#if characterPaneMode === 'notes'}
+                <div class="character-scenes-title">
+                  <h4>Заметки модели</h4>
+                  {#if currentParts}
+                    <span class="char-sub-label">
+                      прочитано {readParts.length} из {currentParts.length} · пустых {emptyParts.length}
+                    </span>
+                  {/if}
+                </div>
+                <div class="character-scenes-tools">
+                  <button
+                    class="character-scene-link"
+                    title="Сбросить заметки, в которых модель не нашла сведений. Эти части прочитаются заново"
+                    disabled={updatingCharacter || emptyParts.length === 0}
+                    onclick={() => { if (selectedGlossaryChar) resetNotes(selectedGlossaryChar, emptyParts.map((part) => part.key)); }}
+                  >Сбросить пустые</button>
+                </div>
+                <div class="gender-filter-group">
+                  <button class="btn-filter-pill" class:active={!showUnreadParts} onclick={() => showUnreadParts = false}>Прочитанные</button>
+                  <button class="btn-filter-pill" class:active={showUnreadParts} onclick={() => showUnreadParts = true}>Все части</button>
+                </div>
+                {:else}
                 <div class="character-scenes-title">
                   <h4>Сцены и реплики</h4>
                   {#if characterScenes}
@@ -4079,12 +4175,58 @@
                   <button class="btn-filter-pill" class:active={sceneLineFilter === 'spoken'} onclick={() => sceneLineFilter = 'spoken'}>Реплики</button>
                   <button class="btn-filter-pill" class:active={sceneLineFilter === 'mentioned'} onclick={() => sceneLineFilter = 'mentioned'}>Упоминания</button>
                 </div>
+                {/if}
               </div>
 
               <div class="character-scenes-list">
                 {#if !selectedGlossaryChar}
                   {#if !loadingGlossary}
                     <p class="character-scenes-note">Выберите персонажа, чтобы увидеть его сцены.</p>
+                  {/if}
+                {:else if characterPaneMode === 'notes'}
+                  {#if characterPartsError}
+                    <p class="character-scenes-note">{characterPartsError}</p>
+                  {:else if !currentParts}
+                    <p class="character-scenes-note">Загрузка заметок...</p>
+                  {:else if visibleParts.length === 0}
+                    <p class="character-scenes-note">{currentParts.length === 0 ? "У персонажа нет реплик в выбранных сценах." : "Прочитанных частей пока нет. Запустите обновление или откройте все части."}</p>
+                  {:else}
+                    {#each visibleParts as part (part.key)}
+                      {@const included = !selectedGlossaryChar.excluded_notes.includes(part.key)}
+                      <article class="character-part" class:character-part-off={part.note === null || part.empty || !included}>
+                        <header class="character-part-head">
+                          <input
+                            type="checkbox"
+                            class="character-scene-check"
+                            checked={included && !part.empty && part.note !== null}
+                            disabled={part.note === null || part.empty}
+                            title="Учитывать заметку в итоговом описании"
+                            aria-label={`Учитывать заметку части ${part.index + 1} в итоговом описании`}
+                            onchange={(e) => { if (selectedGlossaryChar) toggleNoteForDescription(selectedGlossaryChar, part.key, e.currentTarget.checked); }}
+                          />
+                          <strong>Часть {part.index + 1}</strong>
+                          {#if part.note === null}
+                            <span class="char-sub-label">не прочитана</span>
+                          {:else if part.empty}
+                            <span class="char-sub-label">нет сведений</span>
+                          {:else if !included}
+                            <span class="char-sub-label">не учитывается</span>
+                          {/if}
+                          {#if part.note !== null}
+                            <button
+                              class="character-scene-link"
+                              title="Забыть заметку. Часть прочитается заново при следующем запуске"
+                              disabled={updatingCharacter}
+                              onclick={() => { if (selectedGlossaryChar) resetNotes(selectedGlossaryChar, [part.key]); }}
+                            >Сбросить</button>
+                          {/if}
+                        </header>
+                        {#if part.note !== null && !part.empty}
+                          <p class="character-part-note">{part.note}</p>
+                        {/if}
+                        <p class="character-part-start">{part.start}</p>
+                      </article>
+                    {/each}
                   {/if}
                 {:else if characterScenesError}
                   <p class="character-scenes-note">{characterScenesError}</p>
@@ -4348,6 +4490,7 @@
     characters={glossary.characters}
     terms={glossary.terms}
     tokens={glossary.tokens}
+    names={characterNames}
     initialTab={glossaryTab === 'terms' ? 'terms' : 'characters'}
     onapply={handleGlossaryAiApply}
     onclose={() => showGlossaryAiModal = false}
@@ -7262,7 +7405,8 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 12px;
+    flex-wrap: wrap;
+    gap: 8px 12px;
     padding: 16px 18px 12px;
     border-bottom: 1px solid #1a2232;
     background: #111624;
@@ -7280,6 +7424,44 @@
     min-height: 0;
     overflow-y: auto;
     padding: 0 18px 18px;
+  }
+
+  .character-part {
+    padding: 12px 0;
+    border-bottom: 1px solid #1a2232;
+  }
+
+  .character-part-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+    color: #e2e8f0;
+  }
+
+  .character-part-head .character-scene-link {
+    margin-left: auto;
+  }
+
+  .character-part-note {
+    margin: 8px 0 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #cbd5e1;
+    white-space: pre-wrap;
+  }
+
+  .character-part-start {
+    margin: 6px 0 0;
+    overflow: hidden;
+    font-size: 11px;
+    color: #64748b;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .character-part-off .character-part-note {
+    opacity: 0.45;
   }
 
   .character-scenes-note {

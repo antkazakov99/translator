@@ -43,6 +43,7 @@ static RE_STRING_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
 });
 const MAX_VARIABLE_VALUES: usize = 3;
 const MAX_VARIABLE_CHARS: usize = 40;
+const MAX_PART_START: usize = 140;
 
 /// Результат пакетного автозаполнения. Сбой отдельного пакета не отменяет
 /// уже полученные переводы, поэтому число сбоев передаётся интерфейсу.
@@ -346,6 +347,14 @@ pub fn string_variables(scripts: &[PathBuf]) -> HashMap<String, Vec<String>> {
 /// Пояснения пользователя к токенам по именам.
 pub type TokenNotes = HashMap<String, String>;
 
+/// Что модель получает сверх текста игры.
+#[derive(Debug, Default, Deserialize)]
+pub struct ModelHints {
+    pub tokens: Vec<TokenGlossaryEntry>,
+    /// Пары из оригинала имени и его перевода.
+    pub names: Vec<(String, String)>,
+}
+
 pub fn token_notes(tokens: &[TokenGlossaryEntry]) -> TokenNotes {
     tokens
         .iter()
@@ -414,10 +423,10 @@ fn token_hints(text: &str, tokens: &TokenNotes) -> Vec<String> {
         .collect()
 }
 
-fn with_token_hints(lines: Vec<String>, tokens: &TokenNotes) -> Vec<String> {
-    let mut hinted = token_hints(&lines.join("\n"), tokens);
-    hinted.extend(lines);
-    hinted
+/// Пояснения идут после текста: прочитав их перед ним, модель приписывала героям чужое родство.
+fn with_token_hints(mut lines: Vec<String>, tokens: &TokenNotes) -> Vec<String> {
+    lines.extend(token_hints(&lines.join("\n"), tokens));
+    lines
 }
 
 /// Выбирает реплики персонажа: сначала полезные и обычные, затем остальные.
@@ -468,6 +477,37 @@ fn character_batches(
         }
     }
     batches
+}
+
+/// Упомянуто ли имя отдельным словом: Ana не должна находиться в Banana.
+fn mentions(text: &str, name: &str) -> bool {
+    !name.is_empty()
+        && text.match_indices(name).any(|(start, _)| {
+            let before = text[..start].chars().next_back();
+            let after = text[start + name.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+}
+
+/// Переводы имён из глоссария для тех, кто упомянут в тексте. Строка не входит в части сцен:
+/// с уточнённым переводом имени готовые заметки остаются действительными.
+fn name_hint(text: &str, names: &[(String, String)]) -> Option<String> {
+    let mut seen = HashSet::new();
+    let pairs: Vec<String> = names
+        .iter()
+        .filter(|(original, _)| seen.insert(original.as_str()) && mentions(text, original))
+        .map(|(original, translated)| format!("{original} = {translated}"))
+        .collect();
+    (!pairs.is_empty()).then(|| format!("Russian names: {}", pairs.join(", ")))
+}
+
+/// Добавляет к материалам каждого персонажа переводы имён из них.
+pub fn add_name_hints(samples: &mut HashMap<String, Vec<String>>, names: &[(String, String)]) {
+    for lines in samples.values_mut() {
+        if let Some(hint) = name_hint(&lines.join("\n"), names) {
+            lines.insert(0, hint);
+        }
+    }
 }
 
 /// Текст реплики в том виде, в каком его видит модель.
@@ -594,7 +634,41 @@ pub fn collect_scene_samples(
     samples
 }
 
+/// Строка между сценами внутри части: они могут быть далеко друг от друга в игре.
+const SCENE_BREAK: &str = "---\n";
+
+/// Сколько следующих сцен просматривается, чтобы заполнить часть до конца.
+const SCENE_WINDOW: usize = 8;
+
+/// Раскладывает сцены по частям и возвращает их номера. Часть дополняется подходящими сценами
+/// из ближайших: так частей меньше, а порядок сюжета нарушается только в пределах окна.
+pub fn pack_scenes(sizes: &[usize], window: usize) -> Vec<Vec<usize>> {
+    let mut pending: Vec<usize> = (0..sizes.len()).collect();
+    let mut parts = Vec::new();
+    while !pending.is_empty() {
+        let first = pending.remove(0);
+        let mut part = vec![first];
+        let mut size = sizes[first];
+        let mut position = 0;
+        for _ in 0..window {
+            let Some(&scene) = pending.get(position) else {
+                break;
+            };
+            if size + SCENE_BREAK.len() + sizes[scene] <= MAX_SAMPLE_TEXT {
+                size += SCENE_BREAK.len() + sizes[scene];
+                part.push(pending.remove(position));
+            } else {
+                position += 1;
+            }
+        }
+        part.sort_unstable();
+        parts.push(part);
+    }
+    parts
+}
+
 /// Делит все включённые сцены персонажа на части, каждая из которых помещается в запрос.
+/// Части состоят из целых сцен. По репликам режется только сцена, которая сама не помещается.
 /// Пояснения к токенам лежат в самой части: с новым пояснением её заметка считается устаревшей.
 pub fn scene_chunks(game: &GameLines, tokens: &TokenNotes, character: &CharacterGlossaryEntry) -> Vec<String> {
     let keys: Vec<String> = scenes::character_scenes(game, &character.aliases(), &character.names())
@@ -603,29 +677,32 @@ pub fn scene_chunks(game: &GameLines, tokens: &TokenNotes, character: &Character
         .filter(|key| !character.excluded_scenes.contains(key))
         .collect();
     let transcripts = scene_transcripts(game, std::slice::from_ref(character), &keys.iter().cloned().collect(), tokens);
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut size = 0;
-    for key in &keys {
-        for line in transcripts.get(key).into_iter().flatten() {
+    let mut pieces: Vec<String> = Vec::new();
+    for lines in keys.iter().filter_map(|key| transcripts.get(key)) {
+        let mut current = String::new();
+        let mut size = 0;
+        for line in lines {
             let length = line.chars().count() + 1;
             if size > 0 && size + length > MAX_SAMPLE_TEXT {
-                chunks.push(std::mem::take(&mut current));
+                pieces.push(std::mem::take(&mut current));
                 size = 0;
             }
             current.push_str(line);
             current.push('\n');
             size += length;
         }
+        if size > 0 {
+            pieces.push(current);
+        }
     }
-    if size > 0 {
-        chunks.push(current);
-    }
-    chunks
+    let sizes: Vec<usize> = pieces.iter().map(|piece| piece.chars().count()).collect();
+    let chunks = pack_scenes(&sizes, SCENE_WINDOW)
         .into_iter()
+        .map(|part| part.iter().map(|&index| pieces[index].as_str()).collect::<Vec<_>>().join(SCENE_BREAK));
+    chunks
         .map(|chunk| match token_hints(&chunk, tokens).join("\n") {
             hints if hints.is_empty() => chunk,
-            hints => format!("{hints}\n\n{chunk}"),
+            hints => format!("{chunk}\n{hints}"),
         })
         .collect()
 }
@@ -656,6 +733,41 @@ pub struct SummaryProgress {
 
 fn note_key(model: &str, alias: &str, chunk: &str) -> String {
     format!("{:016x}", crate::stable_hash_str(&format!("{model}\n{alias}\n{chunk}")))
+}
+
+/// Часть сцен персонажа с заметкой модели.
+#[derive(Debug, Clone, Serialize)]
+pub struct CharacterPart {
+    pub key: String,
+    /// Начало текста части, чтобы её можно было узнать.
+    pub start: String,
+    pub note: Option<String>,
+    /// Модель не нашла в части сведений, в итог такая заметка не попадает.
+    pub empty: bool,
+}
+
+/// Части персонажа с их заметками от этой модели.
+pub fn character_parts(chunks: &[String], model: &str, alias: &str, notes_file: &Path) -> Vec<CharacterPart> {
+    let stored = read_scene_notes(notes_file);
+    chunks
+        .iter()
+        .map(|chunk| {
+            let key = note_key(model, alias, chunk);
+            let note = stored.get(&key).map(|note| strip_old_marker(note).to_string());
+            let empty = note.as_deref().is_some_and(|note| is_blank_note(note) || is_refusal(note));
+            let start = chunk.lines().next().unwrap_or_default().chars().take(MAX_PART_START).collect();
+            CharacterPart { key, start, note, empty }
+        })
+        .collect()
+}
+
+/// Забывает заметки: следующий запуск прочитает эти части заново.
+pub fn forget_notes(notes_file: &Path, keys: &[String]) -> Result<(), String> {
+    let mut stored = read_scene_notes(notes_file);
+    keys.iter().for_each(|key| {
+        stored.remove(key);
+    });
+    write_scene_notes(notes_file, &stored)
 }
 
 /// Какие части уже прочитаны этой моделью.
@@ -783,32 +895,46 @@ async fn write_description(
     }
 }
 
+/// Адрес и модель для запросов.
+#[derive(Debug, Clone, Copy)]
+pub struct ChatTarget<'a> {
+    pub api_url: &'a str,
+    pub model: &'a str,
+}
+
 /// Обновляет персонажа по частям его сцен: собирает заметки, а затем пишет описание по ним. Готовые заметки лежат на диске, поэтому остановленный запуск
 /// продолжается с того же места. После остановки описание собирается из того, что уже прочитано.
 /// Возвращает `None`, если запуск остановлен раньше первой заметки.
 pub async fn summarize_character(
-    api_url: &str,
-    model: &str,
+    target: &ChatTarget<'_>,
     character: CharacterGlossaryEntry,
     chunks: Vec<String>,
+    names: &[(String, String)],
     notes_file: &Path,
     cancel: &AtomicBool,
     on_progress: impl Fn(SummaryProgress) + Send + Sync,
 ) -> Result<Option<CharacterGlossaryEntry>, String> {
+    let ChatTarget { api_url, model } = *target;
     let system_prompt = format!(
         "You read a part of a visual novel script and take notes about the character {}. \
         The text has the form \"Speaker: text\", and \"you\" usually means the protagonist. \
+        A line \"---\" separates scenes that may be far apart in the story. \
         Write in Russian, 2 to 5 short sentences, only what this text shows: what the character does, \
         occupation, relations with others, and how they speak (tone, slang, \"ты\" or \"вы\"). \
-        If the text says nothing about the character, answer only with: {NO_NOTE} \
+        If the character is neither named nor speaks anywhere in the text, answer only with: {NO_NOTE} \
+        Otherwise always write notes, even if the character appears only briefly. \
         Text in [square brackets] is an in-game variable: never infer anything from its name. \
         If a line says what a variable means, rely on that line. \
+        A line starting with \"Russian names:\" gives the exact spelling of names: always use it, \
+        declining the name as Russian grammar requires. \
         Respond with plain text only.",
         character.original_name
     );
 
     let mut stored = read_scene_notes(notes_file);
     let total = chunks.len();
+    let own_name = character.original_name.clone();
+    let hint_for = |text: &str| name_hint(&format!("{own_name}\n{text}"), names);
 
     // Одна новая часть: запрос сразу пишет описание по её тексту, и оно же становится заметкой
     let new_single_part = match chunks.as_slice() {
@@ -820,7 +946,7 @@ pub async fn summarize_character(
             return Ok(None);
         }
         on_progress(SummaryProgress { stage: "single".to_string(), done: 0, total, note: None });
-        let lines = chunks[0].lines().map(str::to_string).collect();
+        let lines = hint_for(&chunks[0]).into_iter().chain(chunks[0].lines().map(str::to_string)).collect();
         let updated = write_description(api_url, model, character, lines).await?;
         stored.insert(key, updated.notes.clone());
         write_scene_notes(notes_file, &stored)?;
@@ -837,7 +963,8 @@ pub async fn summarize_character(
         let note = match stored.get(&key) {
             Some(note) => note.clone(),
             None => {
-                let prompt = format!("Script:\n\n{chunk}\n\nNotes about {}:", character.original_name);
+                let hint = hint_for(chunk).map(|hint| format!("{hint}\n\n")).unwrap_or_default();
+                let prompt = format!("{hint}Script:\n\n{chunk}\n\nNotes about {}:", character.original_name);
                 let note = call_chat_completion(api_url, model, &system_prompt, &prompt, 0.2, SCENE_NOTE_TOKENS).await?;
                 stored.insert(key, note.clone());
                 write_scene_notes(notes_file, &stored)?;
@@ -845,7 +972,7 @@ pub async fn summarize_character(
             }
         };
         let note = strip_old_marker(&note);
-        if is_blank_note(note) {
+        if is_blank_note(note) || character.excluded_notes.contains(&note_key(model, &character.alias, chunk)) {
             continue;
         }
         on_progress(SummaryProgress { stage: "note".to_string(), done, total, note: Some(note.to_string()) });
@@ -861,7 +988,11 @@ pub async fn summarize_character(
             Err("В выбранных сценах модель не нашла сведений о персонаже".to_string())
         };
     }
-    let notes = condense_notes(api_url, model, notes, &on_progress).await?;
+    let mut notes = condense_notes(api_url, model, notes, &on_progress).await?;
+    // В заметках имена уже по-русски, поэтому упомянутых ищем в самом тексте игры
+    if let Some(hint) = hint_for(&chunks.join("\n")) {
+        notes.insert(0, hint);
+    }
     on_progress(SummaryProgress { stage: "final".to_string(), done: total, total, note: None });
     write_description(api_url, model, character, notes).await.map(Some)
 }
@@ -915,6 +1046,7 @@ For each character provided, you must output:
 2. "translated_name": Natural, authentic Russian transliteration or translation of the character's name.
    - Standard names are transliterated: "Emma" -> "Эмма", "Lisa" -> "Лиза", "Jack" -> "Джек", "Chloe" -> "Хлоя".
    - Descriptive names are translated: "The warrior girl" -> "Девушка-воин", "Old Bartender" -> "Старый бармен", "Demon Beast" -> "Демонический зверь".
+   - If the input already gives translated_name, return it unchanged and spell the name that way everywhere.
 3. "gender": Grammatical gender in Russian:
    - "female": women, girls, female creatures (согласование: сказала, пришла).
    - "male": men, boys, male creatures (согласование: сказал, пришёл).
@@ -924,6 +1056,7 @@ For each character provided, you must output:
 5. "speech": Required separate field, 1 to 2 sentences in Russian on the manner of speech: tone, vocabulary or slang, and whether they use "ты" or "вы" with others. Fill it for every character, even with few lines. It may repeat what "notes" says: do not shorten "notes" because of it.
 
 Text in [square brackets] is an in-game variable whose value is unknown. Never infer an occupation, kinship or name from the variable's own name. If a line says what a variable means, rely on that line.
+A line starting with "Russian names:" gives the exact spelling of names: always use it in "notes" and "speech", declining the name as Russian grammar requires, even if other lines spell it differently.
 Lines may come as a scene transcript in the form "Speaker: text". Only lines of that speaker show their own manner; lines of others show how they see the character.
 Lines may also be notes collected from every scene of the game: treat them as reliable and use all of them.
 
@@ -957,9 +1090,13 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
                 String::new()
             };
 
+            let translated = match c.translated_name.trim() {
+                "" => String::new(),
+                name => format!(", translated_name: \"{name}\""),
+            };
             user_prompt.push_str(&format!(
-                "- alias: \"{}\", original_name: \"{}\"{}\n",
-                c.alias, c.original_name, sample_str
+                "- alias: \"{}\", original_name: \"{}\"{}{}\n",
+                c.alias, c.original_name, translated, sample_str
             ));
         }
 
@@ -1510,14 +1647,37 @@ mod tests {
         ]);
         let chunks = scene_chunks(&game, &notes, &kate(&[]));
         assert_eq!(chunks, [concat!(
-            "[landlady] means: мать героя\n\n",
-            "Kate: Ask [landlady!c] about the rent.\nKate: Ask [landlady] again, and [nick] too.\n"
+            "Kate: Ask [landlady!c] about the rent.\nKate: Ask [landlady] again, and [nick] too.\n",
+            "\n[landlady] means: мать героя"
         )]);
 
         let samples = collect_character_dialogue_samples(&game.lines, &game.variables, &notes, &[kate(&[])], 5);
-        assert_eq!(samples["k"][0], "[landlady] means: мать героя");
-        assert_eq!(collect_scene_samples(&game, &notes, &[kate(&[])])["k"][0], "[landlady] means: мать героя");
+        assert_eq!(samples["k"].last().unwrap(), "[landlady] means: мать героя");
+        assert_eq!(collect_scene_samples(&game, &notes, &[kate(&[])])["k"].last().unwrap(), "[landlady] means: мать героя");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_name_hint_covers_only_names_in_the_text() {
+        let names = [
+            ("Celia".to_string(), "Селия".to_string()),
+            ("Ana".to_string(), "Ана".to_string()),
+            ("Celia".to_string(), "Селия".to_string()),
+            ("Vera".to_string(), "Вера".to_string()),
+        ];
+        assert_eq!(
+            name_hint("Celia: Ask Ana, not the banana.\nCelia: Bye.", &names).as_deref(),
+            Some("Russian names: Celia = Селия, Ana = Ана")
+        );
+        assert_eq!(name_hint("Banana and Celiac.", &names), None);
+
+        let mut samples = HashMap::from([
+            ("ce".to_string(), vec!["Vera is here".to_string()]),
+            ("x".to_string(), vec!["Nobody".to_string()]),
+        ]);
+        add_name_hints(&mut samples, &names);
+        assert_eq!(samples["ce"], ["Russian names: Vera = Вера", "Vera is here"]);
+        assert_eq!(samples["x"], ["Nobody"]);
     }
 
     #[test]
@@ -1553,6 +1713,38 @@ mod tests {
             excluded_scenes: excluded.iter().map(|key| key.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_nearby_scenes_fill_a_part() {
+        assert_eq!(pack_scenes(&[7000, 6000, 5500, 4900], 8), [vec![0, 3], vec![1, 2]]);
+        // Подходящая сцена за пределами окна не трогается
+        assert_eq!(pack_scenes(&[7000, 6000, 5500, 4900], 1), [vec![0], vec![1, 2], vec![3]]);
+    }
+
+    #[test]
+    fn test_parts_keep_scenes_whole() {
+        let scene = |name: &str, lines: usize| {
+            let mut text = format!("label {name}:\n");
+            for line in 0..lines {
+                text.push_str(&format!("    k \"{name} line {line} {}\"\n", "word ".repeat(30)));
+            }
+            text
+        };
+        // Вторая сцена не помещается в запрос, а её остаток может идти с соседними
+        let script = [scene("first", 40), scene("second", 100), scene("third", 5)].concat();
+        let (dir, scripts) = script_with(&script);
+        let game = GameLines::new(scenes::load_lines(&scripts, |_| "story.rpy".to_string()), HashMap::new());
+
+        let chunks = scene_chunks(&game, &TokenNotes::new(), &kate(&[]));
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= MAX_SAMPLE_TEXT));
+        let whole = |name: &str, last: usize| {
+            chunks.iter().any(|chunk| chunk.contains(&format!("{name} line 0 ")) && chunk.contains(&format!("{name} line {last} ")))
+        };
+        assert!(whole("first", 39) && whole("third", 4));
+        assert!(!whole("second", 99));
+        assert!(chunks.iter().any(|chunk| chunk.contains("---\nKate: ")));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1617,6 +1809,10 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn chat(url: &str) -> ChatTarget<'_> {
+        ChatTarget { api_url: url, model: "model" }
+    }
+
     fn completion(content: &str) -> String {
         let body = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
         http_response("200 OK", &body)
@@ -1635,7 +1831,7 @@ mod tests {
         // Первая часть готова, на второй запуск остановлен: описание собирается из неё
         let url = serve_responses(vec![completion("Заметка 1"), completion(answer)]);
         let stopped = tauri::async_runtime::block_on(summarize_character(
-            &url, "model", kate(&[]), chunks.clone(), &notes_file, &cancel,
+            &chat(&url), kate(&[]), chunks.clone(), &[], &notes_file, &cancel,
             |p| {
                 if p.done == 1 {
                     cancel.store(true, Ordering::Relaxed);
@@ -1649,7 +1845,7 @@ mod tests {
         cancel.store(false, Ordering::Relaxed);
         let url = serve_responses(vec![completion("Заметка 2"), completion(answer)]);
         let updated = tauri::async_runtime::block_on(summarize_character(
-            &url, "model", kate(&[]), chunks.clone(), &notes_file, &cancel,
+            &chat(&url), kate(&[]), chunks.clone(), &[], &notes_file, &cancel,
             |p| stages.lock().unwrap().push(p.stage),
         ))
         .unwrap()
@@ -1690,6 +1886,58 @@ mod tests {
     }
 
     #[test]
+    fn test_parts_show_notes_and_can_be_forgotten() {
+        let dir = std::env::temp_dir().join(format!("translator_parts_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let notes_file = dir.join("scene_notes.json");
+        let chunks = ["Kate: one\nKate: two\n", "Kate: three\n", "Kate: four\n"].map(str::to_string);
+        let stored = HashMap::from([
+            (note_key("model", "k", &chunks[0]), "Кейт смеётся.".to_string()),
+            (note_key("model", "k", &chunks[1]), NO_NOTE.to_string()),
+        ]);
+        write_scene_notes(&notes_file, &stored).unwrap();
+
+        let parts = character_parts(&chunks, "model", "k", &notes_file);
+        assert_eq!(parts[0].start, "Kate: one");
+        assert_eq!((parts[0].note.as_deref(), parts[0].empty), (Some("Кейт смеётся."), false));
+        assert_eq!((parts[1].note.as_deref(), parts[1].empty), (Some(NO_NOTE), true));
+        assert_eq!((parts[2].note.as_deref(), parts[2].empty), (None, false));
+
+        forget_notes(&notes_file, std::slice::from_ref(&parts[1].key)).unwrap();
+        assert_eq!(ready_chunks(&chunks, "model", "k", &notes_file), [true, false, false]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_excluded_note_stays_out_of_the_description() {
+        let dir = std::env::temp_dir().join(format!("translator_excluded_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let notes_file = dir.join("scene_notes.json");
+        let chunks = vec!["Kate: one\n".to_string(), "Kate: two\n".to_string()];
+        let keys: Vec<String> = chunks.iter().map(|chunk| note_key("model", "k", chunk)).collect();
+        let stored = HashMap::from([
+            (keys[0].clone(), "Первая.".to_string()),
+            (keys[1].clone(), "Вторая.".to_string()),
+        ]);
+        write_scene_notes(&notes_file, &stored).unwrap();
+
+        let content = r#"[{"alias":"k","translated_name":"Кейт","gender":"female","notes":"Итог","speech":"На 'ты'"}]"#;
+        let url = serve_responses(vec![completion(content)]);
+        let character = CharacterGlossaryEntry { excluded_notes: vec![keys[0].clone()], ..kate(&[]) };
+        let cancel = AtomicBool::new(false);
+        let shown = std::sync::Mutex::new(Vec::new());
+        let updated = tauri::async_runtime::block_on(summarize_character(
+            &chat(&url), character, chunks, &[], &notes_file, &cancel,
+            |p| shown.lock().unwrap().extend(p.note),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.notes, "Итог");
+        assert_eq!(shown.into_inner().unwrap(), ["Вторая."]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn test_refusals_are_not_notes() {
         for note in ["", "  ", "none.", "\"\"", "''", "Пустая строка"] {
             assert!(is_blank_note(note), "{note:?}");
@@ -1715,7 +1963,7 @@ mod tests {
         let run = |response: &str, stages: &std::sync::Mutex<Vec<String>>| {
             let url = serve_responses(vec![completion(response)]);
             tauri::async_runtime::block_on(summarize_character(
-                &url, "model", kate(&[]), chunks.clone(), &notes_file, &cancel,
+                &chat(&url), kate(&[]), chunks.clone(), &[], &notes_file, &cancel,
                 |p| stages.lock().unwrap().push(p.stage),
             ))
         };
@@ -1761,7 +2009,7 @@ mod tests {
             completion(answer),
         ]);
         let updated = tauri::async_runtime::block_on(summarize_character(
-            &url, "model", kate(&[]), chunks, &notes_file, &cancel,
+            &chat(&url), kate(&[]), chunks, &[], &notes_file, &cancel,
             |p| shown.lock().unwrap().extend(p.note),
         ))
         .unwrap()
@@ -1772,7 +2020,7 @@ mod tests {
         // Заметок нет: описание нечему обновлять, модель не должна придумывать его по имени
         let url = serve_responses(vec![completion("NONE"), completion(NO_NOTE)]);
         let result = tauri::async_runtime::block_on(summarize_character(
-            &url, "model", kate(&[]), vec!["Kate: four".to_string(), "Kate: six".to_string()], &notes_file, &cancel,
+            &chat(&url), kate(&[]), vec!["Kate: four".to_string(), "Kate: six".to_string()], &[], &notes_file, &cancel,
             |_| {},
         ));
         assert!(result.is_err());
@@ -1780,7 +2028,7 @@ mod tests {
         // Остановка до первой заметки: собирать нечего, и это не ошибка
         cancel.store(true, Ordering::Relaxed);
         let stopped = tauri::async_runtime::block_on(summarize_character(
-            "http://127.0.0.1:1", "model", kate(&[]), vec!["Kate: five".to_string()], &notes_file, &cancel,
+            &chat("http://127.0.0.1:1"), kate(&[]), vec!["Kate: five".to_string()], &[], &notes_file, &cancel,
             |_| {},
         ));
         assert_eq!(stopped, Ok(None));

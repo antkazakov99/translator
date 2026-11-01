@@ -26,6 +26,8 @@ pub struct CharacterGlossaryEntry {
     pub excluded_scenes: Vec<String>, // Сцены, которые не передаются модели
     #[serde(default)]
     pub merged: Vec<MergedCharacter>, // Другие коды этого же персонажа
+    #[serde(default)]
+    pub excluded_notes: Vec<String>, // Заметки частей, которые не идут в итоговое описание
 }
 
 impl CharacterGlossaryEntry {
