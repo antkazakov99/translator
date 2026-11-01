@@ -1,7 +1,7 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { connectionFor, newConnection, parseLlmSettings, readyToCheck, targetFor, textModels, withoutConnection } from '../src/lib/llm-settings.ts';
+import { connectionFor, newConnection, outsideNote, parseLlmSettings, readyToCheck, targetFor, textModels, withoutConnection } from '../src/lib/llm-settings.ts';
 
 const noLegacy = () => null;
 
@@ -134,6 +134,17 @@ test('the target carries the key and the kind of service', () => {
 
   assert.deepEqual(targetFor(settings, 'names'), { apiUrl: 'https://example.test', model: 'big', apiKey: 'secret', provider: 'claude' });
   assert.deepEqual(targetFor(settings, 'tokens'), { apiUrl: 'http://127.0.0.1:1234/v1', model: 'mistral-small', apiKey: null, provider: 'compatible' });
+});
+
+test('only game text sent to another server gets a warning', () => {
+  const settings = parseLlmSettings(null, noLegacy);
+  settings.connections.push(newConnection('claude', settings.connections));
+  assert.equal(outsideNote(settings, 'descriptions'), '');
+
+  settings.actions.descriptions = { connection: 'claude-1', model: '' };
+  settings.actions.names = { connection: 'claude-1', model: '' };
+  assert.equal(outsideNote(settings, 'descriptions'), 'Наружу, в Claude, уйдут: сцены с репликами');
+  assert.equal(outsideNote(settings, 'names'), '');
 });
 
 test('an action takes the default until it picks its own', () => {

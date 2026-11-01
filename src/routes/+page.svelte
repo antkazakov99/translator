@@ -8,7 +8,9 @@
   import LlmSettingsModal from "../lib/LlmSettingsModal.svelte";
   import RequestSlider from "../lib/RequestSlider.svelte";
   import { partsToRead, type CharacterChunks } from "../lib/character-parts";
-  import { saveLlmSettings, loadLlmSettings, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "../lib/llm-settings";
+  import { beginLlmRun, endLlmRun, llmRun } from "../lib/llm-run.svelte";
+  import LlmChoice from "../lib/LlmChoice.svelte";
+  import { saveLlmSettings, loadLlmSettings, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings, type LlmTarget } from "../lib/llm-settings";
   import { progressLabel, progressPercent } from "../lib/progress";
   import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
   import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -730,8 +732,6 @@
   let llmSettings = $state<LlmSettings>(loadLlmSettings());
   // Заметки по сценам привязаны к модели, поэтому от неё зависит и подсчёт готовых частей
   let descriptionModel = $derived(targetFor(llmSettings, "descriptions").model);
-  // Остановка общая на все запросы, поэтому запуски идут по одному
-  let aiPanelBusy = $state(false);
   let glossaryTab = $state<'characters' | 'terms' | 'tokens'>('characters');
   // Пустая карточка новой записи на текущей вкладке
   let addingEntry = $state(false);
@@ -1181,7 +1181,7 @@
   }
 
   /** Читает `parts` частей сцен персонажа и пишет описание. Готовый перевод имени остаётся: его мог задать пользователь. */
-  async function summarizeCharacter(char: CharacterGlossaryEntry, parts: number) {
+  async function summarizeCharacter(char: CharacterGlossaryEntry, parts: number, target: LlmTarget) {
     updatingAlias = char.alias;
     summaryRunning = true;
     try {
@@ -1198,7 +1198,7 @@
       };
       const summary = await invoke<CharacterGlossaryEntry | null>("summarize_glossary_character", {
         gameDir,
-        target: targetFor(llmSettings, "descriptions"),
+        target,
         character: $state.snapshot(char),
         hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
         parts,
@@ -1213,8 +1213,9 @@
   }
 
   async function updateCharacterWithLlm(char: CharacterGlossaryEntry) {
+    if (!beginLlmRun(`Обновляется ${char.original_name || char.alias}`)) return;
     try {
-      const outcome = await summarizeCharacter(char, sceneParts);
+      const outcome = await summarizeCharacter(char, sceneParts, targetFor(llmSettings, "descriptions"));
       if (outcome === "stopped") {
         showToast("Остановлено. Готовые части сохранены, следующий запуск продолжит с этого места", "info");
       } else {
@@ -1223,12 +1224,17 @@
       }
     } catch (e) {
       showToast(`Не удалось обновить персонажа: ${e}`, "error");
+    } finally {
+      endLlmRun();
     }
   }
 
   /** Обновляет персонажей группы по очереди. Две ошибки подряд значат, что дело не в персонаже, а в сервере. */
   async function updateCharacterGroup() {
+    if (!beginLlmRun("Обновляется группа персонажей")) return;
     const plan = groupReadable.map((char) => ({ char, parts: partsToRead(groupChunks[char.alias], groupParts) }));
+    // Настройки LLM открываются и во время запуска, а вся группа идёт на одной модели
+    const target = targetFor(llmSettings, "descriptions");
     const dir = gameDir;
     const failed: string[] = [];
     let updated = 0;
@@ -1238,8 +1244,9 @@
     for (const [index, { char, parts }] of plan.entries()) {
       if (groupStopping || gameDir !== dir || failuresInRow >= 2) break;
       groupRun = { index, total: plan.length, name: char.original_name || char.alias };
+      llmRun.note = `Персонаж ${index + 1} из ${plan.length}: ${groupRun.name}`;
       try {
-        if ((await summarizeCharacter(char, parts)) !== "stopped") updated += 1;
+        if ((await summarizeCharacter(char, parts, target)) !== "stopped") updated += 1;
         failuresInRow = 0;
       } catch (e) {
         failed.push(`${char.original_name || char.alias}: ${e}`);
@@ -1247,6 +1254,7 @@
       }
     }
     groupRun = null;
+    endLlmRun();
     groupResult = { updated, total: plan.length, failed };
   }
 
@@ -3727,7 +3735,7 @@
           <CharacterPicker
             characters={glossary.characters.map((c) => ({ alias: c.alias, name: c.original_name || c.alias }))}
             unselected={groupDeselected}
-            disabled={!!groupRun}
+            disabled={llmRun.active}
             onchange={(next) => groupUnselected = next}
             onempty={() => groupUnselected = null}
           />
@@ -3739,7 +3747,7 @@
             max={Math.max(groupMaxParts, 2)}
             value={groupParts}
             oninput={(event) => groupPartsWanted = event.currentTarget.valueAsNumber}
-            disabled={!!groupRun || groupCounting || groupMaxParts < 2}
+            disabled={llmRun.active || groupCounting || groupMaxParts < 2}
           >
             {#snippet ends()}
               <span>1 часть</span>
@@ -3766,7 +3774,7 @@
           {:else}
             <button
               class="btn-modal-ai character-group-run"
-              disabled={updatingCharacter || aiPanelBusy || groupCounting || groupReadable.length === 0}
+              disabled={llmRun.active || groupCounting || groupReadable.length === 0}
               onclick={updateCharacterGroup}
             >
               <Sparkles size={13} />
@@ -3789,9 +3797,6 @@
           tokens={panelTokens}
           hints={panelHints}
           settings={llmSettings}
-          locked={updatingCharacter || !!groupRun}
-          lockedNote={groupRun ? `Персонаж ${groupRun.index + 1} из ${groupRun.total}: ${groupRun.name}` : updatingCharacterEntry ? `Обновляется ${updatingCharacterEntry.original_name}` : ""}
-          bind:busy={aiPanelBusy}
           bind:descriptionsOpen
           descriptions={groupUpdate}
           onselect={selectLlmModel}
@@ -4152,6 +4157,12 @@
                     </div>
                   {/each}
                   <div class="character-update-box">
+                    <div class="character-model-choice">
+                      <LlmChoice action="descriptions" settings={llmSettings} onselect={selectLlmModel} />
+                      {#if outsideNote(llmSettings, "descriptions")}
+                        <p class="character-outside-note">{outsideNote(llmSettings, "descriptions")}</p>
+                      {/if}
+                    </div>
                     {#if selectedGlossaryChar}
                       <RequestSlider
                         id="scene-parts"
@@ -4167,7 +4178,7 @@
                           if (selectedGlossaryChar) scenePartsByAlias[selectedGlossaryChar.alias] = wanted;
                           event.currentTarget.value = String(wanted);
                         }}
-                        disabled={updatingCharacter || aiPanelBusy || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
+                        disabled={llmRun.active || !sceneChunkCount || sceneChunkCount < 2 || sceneAllRead}
                       >
                         {#snippet ends()}
                           {#if sceneReadyCount > 0}
@@ -4182,7 +4193,7 @@
                     <div class="character-update-row">
                       <button
                         class="btn-modal-ai"
-                        disabled={updatingCharacter || aiPanelBusy}
+                        disabled={llmRun.active}
                         onclick={() => { if (selectedGlossaryChar) updateCharacterWithLlm(selectedGlossaryChar); }}
                       >
                         {#if updatingCharacter}
@@ -8188,6 +8199,16 @@
 
   .character-update-box :global(.slider) {
     margin-top: 0;
+  }
+
+  .character-model-choice {
+    margin-bottom: 10px;
+  }
+
+  .character-outside-note {
+    margin: 6px 0 0;
+    font-size: 11px;
+    color: #fbbf24;
   }
 
   .character-update-row {

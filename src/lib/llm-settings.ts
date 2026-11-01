@@ -29,7 +29,7 @@ export interface LlmConnection {
   model: string;
 }
 
-/** Выбор в разделе панели. Пустое поле значит значение по умолчанию. */
+/** Выбор действия. Пустое поле значит значение по умолчанию. */
 export interface LlmActionSettings {
   connection: string;
   model: string;
@@ -193,6 +193,14 @@ export function defaultConnectionOf(settings: LlmSettings) {
 /** Подключение действия: его собственный выбор или подключение по умолчанию. */
 export function connectionFor(settings: LlmSettings, action: LlmAction) {
   return settings.connections.find((connection) => connection.id === settings.actions[action].connection) ?? defaultConnectionOf(settings);
+}
+
+/** Предупреждение о тексте игры, который уйдёт на чужой сервер. Пустая строка значит, что он никуда не уходит. */
+export function outsideNote(settings: LlmSettings, action: LlmAction) {
+  const connection = connectionFor(settings, action);
+  const info = LLM_ACTIONS.find(({ id }) => id === action);
+  if (connection.provider === "local" || !info?.gameText) return "";
+  return `Наружу, в ${connection.name}, уйдут: ${info.sends}`;
 }
 
 /** Куда отправить запрос действия. */

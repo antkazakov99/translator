@@ -1702,8 +1702,33 @@ async fn get_term_scenes(game_dir: String, term: String) -> Result<Vec<scenes::C
     .map_err(|e| format!("Ошибка поиска сцен термина: {}", e))
 }
 
-/// Просьба остановить пакетную обработку. Запуски в окне идут по одному.
+/// Просьба остановить пакетную обработку.
 static LLM_CANCEL: AtomicBool = AtomicBool::new(false);
+static LLM_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Запуск модели. Просьба остановиться общая на все запросы, поэтому запуски идут по одному:
+/// её флаг выдаётся только запуску, а второй запуск получает ошибку.
+struct LlmRun(());
+
+impl LlmRun {
+    fn begin() -> Result<Self, String> {
+        if LLM_RUNNING.swap(true, Ordering::AcqRel) {
+            return Err("Модель занята другим запуском. Дождитесь его окончания или остановите его.".to_string());
+        }
+        LLM_CANCEL.store(false, Ordering::Relaxed);
+        Ok(Self(()))
+    }
+
+    fn cancel(&self) -> &'static AtomicBool {
+        &LLM_CANCEL
+    }
+}
+
+impl Drop for LlmRun {
+    fn drop(&mut self) {
+        LLM_RUNNING.store(false, Ordering::Release);
+    }
+}
 
 /// Запрос, уже отправленный модели, дожидается ответа: готовые пакеты сохраняются.
 #[tauri::command]
@@ -1725,8 +1750,8 @@ async fn translate_character_names(
     cast: Vec<String>,
     on_batch: Channel<llm::BatchProgress<llm::NameSuggestion>>,
 ) -> Result<llm::AutofillResult<llm::NameSuggestion>, String> {
-    LLM_CANCEL.store(false, Ordering::Relaxed);
-    llm::translate_names(&target, &names, &cast, &LLM_CANCEL, |progress| {
+    let run = LlmRun::begin()?;
+    llm::translate_names(&target, &names, &cast, run.cancel(), |progress| {
         send_progress(&on_batch, progress)
     })
     .await
@@ -1741,7 +1766,7 @@ async fn suggest_glossary_tokens(
     hints: llm::ModelHints,
     on_batch: Channel<llm::BatchProgress<llm::TokenSuggestion>>,
 ) -> Result<llm::AutofillResult<llm::TokenSuggestion>, String> {
-    LLM_CANCEL.store(false, Ordering::Relaxed);
+    let run = LlmRun::begin()?;
     let base_path = effective_game_directory(Path::new(&game_dir));
     let notes = llm::token_notes(&hints.tokens);
     let samples = tauri::async_runtime::spawn_blocking(move || {
@@ -1750,7 +1775,7 @@ async fn suggest_glossary_tokens(
     .await
     .map_err(|e| format!("Ошибка сбора реплик токенов: {}", e))?;
 
-    llm::suggest_tokens(&target, &samples, &hints, &LLM_CANCEL, |progress| {
+    llm::suggest_tokens(&target, &samples, &hints, run.cancel(), |progress| {
         send_progress(&on_batch, progress)
     })
     .await
@@ -1834,7 +1859,7 @@ async fn summarize_glossary_character(
     parts: usize,
     on_progress: Channel<llm::SummaryProgress>,
 ) -> Result<Option<glossary::CharacterGlossaryEntry>, String> {
-    LLM_CANCEL.store(false, Ordering::Relaxed);
+    let run = LlmRun::begin()?;
     let base_path = effective_game_directory(Path::new(&game_dir));
     let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
     let selected = character.clone();
@@ -1849,7 +1874,7 @@ async fn summarize_glossary_character(
     .await
     .map_err(|e| format!("Ошибка подготовки сцен персонажа: {}", e))?;
 
-    llm::summarize_character(&target, character, chunks, &hints, &notes_file, &LLM_CANCEL, |progress| {
+    llm::summarize_character(&target, character, chunks, &hints, &notes_file, run.cancel(), |progress| {
         if let Err(error) = on_progress.send(progress) {
             tracing::warn!(%error, "Ход обработки не передан в интерфейс");
         }
@@ -1864,8 +1889,8 @@ async fn autofill_glossary_terms(
     only_empty: bool,
     on_batch: Channel<llm::BatchProgress<glossary::TermGlossaryEntry>>,
 ) -> Result<llm::AutofillResult<glossary::TermGlossaryEntry>, String> {
-    LLM_CANCEL.store(false, Ordering::Relaxed);
-    llm::autofill_terms(&target, terms, only_empty, &LLM_CANCEL, |progress| {
+    let run = LlmRun::begin()?;
+    llm::autofill_terms(&target, terms, only_empty, run.cancel(), |progress| {
         send_progress(&on_batch, progress)
     })
     .await
@@ -1906,7 +1931,7 @@ async fn extract_glossary_terms_from_game(
     known_terms: Vec<String>,
     on_batch: Channel<llm::BatchProgress<llm::ReviewedTerm>>,
 ) -> Result<ExtractedTerms, String> {
-    LLM_CANCEL.store(false, Ordering::Relaxed);
+    let run = LlmRun::begin()?;
     let base_path = effective_game_directory(Path::new(&game_dir));
     if !base_path.exists() {
         return Err(format!("Папка игры не найдена: {:?}", base_path));
@@ -1920,7 +1945,7 @@ async fn extract_glossary_terms_from_game(
     .await
     .map_err(|e| format!("Ошибка поиска терминов: {}", e))?;
 
-    let checked = llm::check_term_candidates(&target, &search.candidates, &LLM_CANCEL, |progress| {
+    let checked = llm::check_term_candidates(&target, &search.candidates, run.cancel(), |progress| {
         send_progress(&on_batch, progress)
     })
     .await?;
@@ -2026,6 +2051,19 @@ pub(crate) fn local_test_game(env_var: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_llm_runs_go_one_at_a_time() {
+        let run = LlmRun::begin().unwrap();
+        cancel_llm_run();
+        // Отказанный запуск не отменяет просьбу остановить тот, что идёт
+        assert!(LlmRun::begin().is_err());
+        assert!(run.cancel().load(Ordering::Relaxed));
+
+        drop(run);
+        let next = LlmRun::begin().unwrap();
+        assert!(!next.cancel().load(Ordering::Relaxed));
+    }
 
     #[test]
     fn test_game_root_of_translation_files() {

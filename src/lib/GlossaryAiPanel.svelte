@@ -4,20 +4,9 @@
   import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, Sparkles, Square } from "lucide-svelte";
   import CharacterPicker from "./CharacterPicker.svelte";
   import RequestSlider from "./RequestSlider.svelte";
-  import ModelCombobox from "./ModelCombobox.svelte";
-  import {
-    LLM_ACTIONS,
-    apiProvider,
-    connectionFor,
-    defaultConnectionOf,
-    readyToCheck,
-    targetFor,
-    textModels,
-    type LlmAction,
-    type LlmActionSettings,
-    type LlmConnection,
-    type LlmSettings
-  } from "./llm-settings";
+  import LlmChoice from "./LlmChoice.svelte";
+  import { beginLlmRun, endLlmRun, llmRun } from "./llm-run.svelte";
+  import { outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "./llm-settings";
 
   interface PanelCharacter {
     alias: string;
@@ -87,9 +76,6 @@
     tokens,
     hints,
     settings,
-    locked = false,
-    lockedNote = "",
-    busy = $bindable(false),
     descriptionsOpen = $bindable(false),
     descriptions,
     onselect,
@@ -105,9 +91,6 @@
     tokens: PanelToken[];
     hints: object;
     settings: LlmSettings;
-    locked?: boolean;
-    lockedNote?: string;
-    busy?: boolean;
     descriptionsOpen?: boolean;
     descriptions: Snippet;
     onselect: (action: LlmAction, choice: LlmActionSettings) => void;
@@ -136,37 +119,9 @@
   let panelOpen = $state(false);
   let sectionByTab = $state<Record<GlossaryTab, LlmAction>>({ characters: "descriptions", terms: "terms", tokens: "tokens" });
   let openSection = $derived(sectionByTab[tab]);
+  let openOutsideNote = $derived(outsideNote(settings, openSection));
 
-  // Выбор подключения и модели для раздела. Список моделей подключения запрашивается один раз
-  let activeChoice = $derived(settings.actions[openSection]);
-  let activeConnection = $derived(connectionFor(settings, openSection));
-  let activeAction = $derived(LLM_ACTIONS.find((action) => action.id === openSection));
-  let sendsOutside = $derived(activeConnection.provider !== "local" && !!activeAction?.gameText);
-  let modelsByConnection = $state<Record<string, string[]>>({});
-  const requestedModels = new Set<string>();
-
-  async function loadModels(connection: LlmConnection) {
-    const key = JSON.stringify([connection.provider, connection.url, connection.key]);
-    if (requestedModels.has(key) || !readyToCheck(connection)) return;
-    requestedModels.add(key);
-    try {
-      const models = await invoke<string[]>("check_llm_models", {
-        apiUrl: connection.url.trim(),
-        apiKey: connection.key.trim() || null,
-        provider: apiProvider(connection.provider)
-      });
-      modelsByConnection[connection.id] = textModels(models);
-    } catch {
-      // Модель можно вписать вручную, а следующий выбор подключения спросит список заново
-      requestedModels.delete(key);
-      modelsByConnection[connection.id] = [];
-    }
-  }
-
-  $effect(() => {
-    if (panelOpen) void loadModels(activeConnection);
-  });
-
+  // Запуск этой панели. Настройки и кнопки отключает любой запуск (`llmRun.active`)
   let isProcessing = $state(false);
   let progressStep = $state("");
   let progress = $state<{ batch: number; total: number } | null>(null);
@@ -174,7 +129,6 @@
   let errorMessage = $state<string | null>(null);
   let doneMessage = $state("");
 
-  $effect(() => { busy = isProcessing; });
   $effect(() => { descriptionsOpen = panelOpen && sectionByTab.characters === "descriptions"; });
   // Сообщение относится к разделу, в котором появилось
   $effect(() => {
@@ -189,12 +143,19 @@
   });
 
   function beginRun(step: string) {
+    if (!beginLlmRun(step)) return false;
     isProcessing = true;
     errorMessage = null;
     doneMessage = "";
     progress = null;
     stopRequested = false;
     progressStep = step;
+    return true;
+  }
+
+  function endRun() {
+    isProcessing = false;
+    endLlmRun();
   }
 
   /** Канал итогов пакетов: записи появляются в панели сразу, как только их вернула модель. */
@@ -240,7 +201,7 @@
       errorMessage = "Нет персонажей для обработки: выберите хотя бы одного.";
       return;
     }
-    beginRun("Модель определяет происхождение имён...");
+    if (!beginRun("Модель определяет происхождение имён...")) return;
     reviewNames = [];
     unchangedNames = 0;
     namesRequested = chosen.length;
@@ -278,7 +239,7 @@
       namesRequested = 0;
       errorMessage = `Не удалось обновить имена: ${String(e)}`;
     } finally {
-      isProcessing = false;
+      endRun();
     }
   }
 
@@ -296,7 +257,7 @@
   let chosenTranslations = $derived(reviewTranslations.filter((row) => row.selected && row.translated.trim()));
 
   async function startTerms() {
-    beginRun("Модель переводит термины...");
+    if (!beginRun("Модель переводит термины...")) return;
     reviewTranslations = [];
     translationsRun = true;
     try {
@@ -325,7 +286,7 @@
     } catch (e) {
       errorMessage = `Не удалось обработать термины: ${String(e)}`;
     } finally {
-      isProcessing = false;
+      endRun();
     }
   }
 
@@ -343,7 +304,7 @@
   let chosenFound = $derived(foundTerms.filter((t) => t.selected && t.translated_term.trim()));
 
   async function startTermSearch() {
-    beginRun("Поиск названий по всему тексту игры...");
+    if (!beginRun("Поиск названий по всему тексту игры...")) return;
     foundTerms = [];
     foundNote = "";
     try {
@@ -370,7 +331,7 @@
     } catch (e) {
       errorMessage = `Не удалось найти термины: ${String(e)}`;
     } finally {
-      isProcessing = false;
+      endRun();
     }
   }
 
@@ -393,7 +354,7 @@
 
   async function startTokens() {
     const names = tokenTargets.slice(0, tokenRequestsShown * TOKENS_PER_REQUEST).map((t) => t.name);
-    beginRun("Модель читает реплики с токенами...");
+    if (!beginRun("Модель читает реплики с токенами...")) return;
     reviewTokens = [];
     tokensRun = true;
     try {
@@ -414,7 +375,7 @@
     } catch (e) {
       errorMessage = `Не удалось разобрать токены: ${String(e)}`;
     } finally {
-      isProcessing = false;
+      endRun();
     }
   }
 
@@ -427,7 +388,7 @@
 </script>
 
 {#snippet runButton(label: string, disabled: boolean, onclick: () => void)}
-  <button class="btn-run" {onclick} disabled={disabled || isProcessing || locked}>
+  <button class="btn-run" {onclick} disabled={disabled || llmRun.active}>
     <Sparkles size={13} />
     <span>{label}</span>
   </button>
@@ -464,9 +425,9 @@
           <Square size={11} />
           <span>Остановить</span>
         </button>
-      {:else if lockedNote}
+      {:else if llmRun.active}
         <Loader2 size={13} class="spin" />
-        <span class="ai-status-text">{lockedNote}</span>
+        <span class="ai-status-text">{llmRun.note}</span>
       {/if}
     </div>
   </div>
@@ -481,30 +442,12 @@
         >{section.label}</button>
       {/each}
       <div class="ai-choice">
-        <select
-          class="input ai-connection"
-          value={activeChoice.connection}
-          disabled={isProcessing || locked}
-          aria-label="Подключение"
-          onchange={(event) => onselect(openSection, { connection: event.currentTarget.value, model: "" })}
-        >
-          <option value="">По умолчанию: {defaultConnectionOf(settings).name}</option>
-          {#each settings.connections as connection (connection.id)}
-            <option value={connection.id}>{connection.name}</option>
-          {/each}
-        </select>
-        <ModelCombobox
-          bind:value={() => activeChoice.model, (model) => onselect(openSection, { connection: activeChoice.connection, model })}
-          models={modelsByConnection[activeConnection.id] ?? []}
-          label="Модель"
-          placeholder={activeConnection.model.trim() || "Имя модели"}
-          disabled={isProcessing || locked}
-        />
+        <LlmChoice action={openSection} {settings} {onselect} />
       </div>
     </div>
     <div class="ai-body">
-      {#if sendsOutside}
-        <p class="ai-outside">Наружу, в {activeConnection.name}, уйдут: {activeAction?.sends}</p>
+      {#if openOutsideNote}
+        <p class="ai-outside">{openOutsideNote}</p>
       {/if}
       {#if errorMessage}
         <div class="ai-error">
@@ -523,7 +466,7 @@
         <CharacterPicker
           characters={characters.map((c) => ({ alias: c.alias, name: characterName(c) }))}
           unselected={unselectedAliases}
-          disabled={isProcessing}
+          disabled={llmRun.active}
           onchange={(next) => unselectedAliases = next}
           onempty={() => unselectedAliases = characters.filter((c) => c.translated_name.trim()).map((c) => c.alias)}
         />
@@ -560,7 +503,7 @@
         {/if}
       {:else if openSection === "terms"}
         <label class="ai-check">
-          <input type="checkbox" bind:checked={onlyEmptyTerms} disabled={isProcessing} />
+          <input type="checkbox" bind:checked={onlyEmptyTerms} disabled={llmRun.active} />
           <span>Только непереведённые термины</span>
         </label>
         {@render runButton("Перевести термины", terms.length === 0, startTerms)}
@@ -595,7 +538,7 @@
           min={1}
           max={MAX_TERM_REQUESTS}
           value={termRequests}
-          disabled={isProcessing}
+          disabled={llmRun.active}
           oninput={(event) => termRequests = event.currentTarget.valueAsNumber}
         >
           {#snippet ends()}
@@ -638,7 +581,7 @@
       {:else if openSection === "tokens"}
         <p class="ai-note">Модель читает реплики с токеном, не видя его имени, и предлагает пояснение и значение. Что записать в глоссарий, выберете вы.</p>
         <label class="ai-check">
-          <input type="checkbox" bind:checked={onlyEmptyTokens} disabled={isProcessing} />
+          <input type="checkbox" bind:checked={onlyEmptyTokens} disabled={llmRun.active} />
           <span>Только незаполненные</span>
         </label>
         <RequestSlider
@@ -648,7 +591,7 @@
           min={1}
           max={Math.max(maxTokenRequests, 2)}
           value={tokenRequestsShown}
-          disabled={isProcessing || maxTokenRequests < 2}
+          disabled={llmRun.active || maxTokenRequests < 2}
           oninput={(event) => tokenRequests = event.currentTarget.valueAsNumber}
         >
           {#snippet ends()}
@@ -809,19 +752,10 @@
   }
 
   .ai-choice {
-    display: grid;
-    flex: 1;
-    grid-template-columns: minmax(0, 11rem) minmax(0, 15rem);
-    justify-content: end;
-    gap: 6px;
+    flex: 0 1 26.5rem;
     min-width: 0;
-    margin-left: 12px;
-    padding-bottom: 5px;
-  }
-
-  .ai-connection:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+    margin-left: auto;
+    padding: 0 0 5px 12px;
   }
 
   .ai-note,
