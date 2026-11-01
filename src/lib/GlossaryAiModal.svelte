@@ -89,7 +89,7 @@
     characters: CharacterGlossaryEntry[];
     terms: TermGlossaryEntry[];
     tokens: { name: string; note: string }[];
-    names: [string, string][];
+    names: { original: string; translated: string; gender: string }[];
     initialTab?: "characters" | "terms";
     onapply: (updatedChars: CharacterGlossaryEntry[], updatedTerms: TermGlossaryEntry[]) => void;
     onclose: () => void;
@@ -282,7 +282,7 @@
         apiUrl: apiUrl.trim(),
         model: selectedModel.trim(),
         characters: rows.map((row) => previewChars[row.index]),
-        hints: { tokens: $state.snapshot(tokens), names },
+        hints: { tokens: $state.snapshot(tokens), names, terms: $state.snapshot(terms) },
         options: { onlyEmpty, sampleCount, wholeScenes },
         onBatch: batchChannel<CharacterResult>((items) => {
           for (const { samples, ...character } of items) {

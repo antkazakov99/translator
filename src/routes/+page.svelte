@@ -432,6 +432,9 @@
     start: string;
     note: string | null;
     empty: boolean;
+    scenes: { scene: string; file: string; path: string }[];
+    names: { original: string; translated: string }[];
+    terms: string[];
   }
 
   interface TermGlossaryEntry {
@@ -738,13 +741,11 @@
     return () => clearTimeout(timer);
   });
   let characterUpdateMode = $state<"lines" | "scenes">("scenes");
-  // Ползунок: одна новая часть это один запрос, иначе заметки по частям и итоговый запрос.
-  // Готовые части входят в запуск всегда, поэтому ниже их числа он не опускается
+  // Ползунок: готовые части входят в запуск всегда, поэтому ниже их числа он не опускается
   let scenePartsWanted = $state(1);
   let sceneChunkCount = $state<number | null>(null);
   let sceneReadyCount = $state(0);
   let sceneParts = $derived(Math.min(Math.max(scenePartsWanted, sceneReadyCount), sceneChunkCount ?? 1));
-  let sceneRequests = $derived(sceneParts > 1 || sceneReadyCount > 0 ? sceneParts - sceneReadyCount + 1 : 1);
   // Всё прочитано: читать нечего, остаётся собрать описание из заметок
   let sceneAllRead = $derived(characterUpdateMode === "scenes" && !!sceneChunkCount && sceneReadyCount >= sceneChunkCount);
   let sceneNotesRevision = $state(0);
@@ -890,7 +891,7 @@
   let characterPaneMode = $state<"scenes" | "notes">("scenes");
   let characterParts = $state.raw<{ target: string; parts: CharacterPart[] } | null>(null);
   let characterPartsError = $state<string | null>(null);
-  let showUnreadParts = $state(false);
+  let showUnreadParts = $state(true);
   let currentParts = $derived(characterParts?.target === scenesTarget ? characterParts?.parts ?? null : null);
   let visibleParts = $derived(
     (currentParts ?? [])
@@ -905,18 +906,24 @@
     const target = scenesTarget;
     if (characterPaneMode !== "notes" || !char || !target) return;
     void [char.excluded_scenes.length, sceneNotesRevision];
-    const tokens = $state.snapshot(glossary.tokens);
+    const hints = { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) };
     let current = true;
-    characterPartsError = null;
-    invoke<CharacterPart[]>("list_character_parts", {
-      gameDir,
-      model: storedLlmModel(),
-      character: untrack(() => $state.snapshot(char)),
-      tokens
-    })
-      .then((parts) => { if (current) characterParts = { target, parts }; })
-      .catch((e) => { if (current) characterPartsError = String(e); });
-    return () => { current = false; };
+    const dir = gameDir;
+    const timer = setTimeout(() => {
+      characterPartsError = null;
+      invoke<CharacterPart[]>("list_character_parts", {
+        gameDir: dir,
+        model: storedLlmModel(),
+        character: untrack(() => $state.snapshot(char)),
+        hints
+      })
+        .then((parts) => { if (current) characterParts = { target, parts }; })
+        .catch((e) => { if (current) characterPartsError = String(e); });
+    }, 100);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+    };
   });
 
   function toggleNoteForDescription(char: CharacterGlossaryEntry, key: string, included: boolean) {
@@ -1027,7 +1034,19 @@
   }
 
   /** Закрывает глоссарий и показывает сцену в таблице реплик. */
-  async function openCharacterScene(scene: CharacterScene) {
+  async function openPartCharacter(original: string) {
+    const char = glossary.characters.find((c) =>
+      c.original_name === original || c.merged.some((part) => part.original_name === original)
+    );
+    if (!char) return;
+    glossarySearch = "";
+    glossaryGenderFilter = "all";
+    selectedGlossaryChar = char;
+    await tick();
+    document.querySelector(".glossary-list-item.selected-row")?.scrollIntoView({ block: "nearest" });
+  }
+
+  async function openCharacterScene(scene: Pick<CharacterScene, "scene" | "file" | "path">) {
     await closeGlossary();
     if (showGlossaryModal) return;
     if (scene.scene && scene.scene !== "Общие диалоги") {
@@ -1100,7 +1119,7 @@
             apiUrl,
             model,
             character: $state.snapshot(char),
-            hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames },
+            hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
             parts: sceneParts,
             onProgress
           });
@@ -1124,7 +1143,7 @@
         apiUrl,
         model,
         characters: [$state.snapshot(char)],
-        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames },
+        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
         options: {
           onlyEmpty: false,
           sampleCount: count > 0 ? count : 64,
@@ -1828,7 +1847,11 @@
   let characterNames = $derived(
     glossary.characters
       .filter((char) => char.translated_name.trim())
-      .flatMap((char) => [char, ...char.merged].map((part): [string, string] => [part.original_name, char.translated_name.trim()]))
+      .flatMap((char) => [char, ...char.merged].map((part) => ({
+        original: part.original_name,
+        translated: char.translated_name.trim(),
+        gender: char.gender
+      })))
   );
 
   // Токены ищутся в репликах, а в глоссарии лежат только пояснения. Пояснение остаётся,
@@ -3865,7 +3888,7 @@
                           {:else if sceneAllRead}
                             все прочитаны
                           {:else}
-                            {sceneParts} из {sceneChunkCount} · запросов: {sceneRequests}
+                            {sceneParts} из {sceneChunkCount}
                           {/if}
                         </span>
                       </div>
@@ -3887,7 +3910,7 @@
                         {#if sceneReadyCount > 0}
                           <span class="character-depth-ready">готово: {sceneReadyCount}</span>
                         {:else}
-                          <span>1 часть, 1 запрос</span>
+                          <span>1 часть</span>
                         {/if}
                         <span>{sceneAllRead ? "соберётся из заметок" : "весь текст, долго"}</span>
                       </div>
@@ -4152,8 +4175,8 @@
                   >Сбросить пустые</button>
                 </div>
                 <div class="gender-filter-group">
-                  <button class="btn-filter-pill" class:active={!showUnreadParts} onclick={() => showUnreadParts = false}>Прочитанные</button>
                   <button class="btn-filter-pill" class:active={showUnreadParts} onclick={() => showUnreadParts = true}>Все части</button>
+                  <button class="btn-filter-pill" class:active={!showUnreadParts} onclick={() => showUnreadParts = false}>Прочитанные</button>
                 </div>
                 {:else}
                 <div class="character-scenes-title">
@@ -4189,7 +4212,7 @@
                   {:else if !currentParts}
                     <p class="character-scenes-note">Загрузка заметок...</p>
                   {:else if visibleParts.length === 0}
-                    <p class="character-scenes-note">{currentParts.length === 0 ? "У персонажа нет реплик в выбранных сценах." : "Прочитанных частей пока нет. Запустите обновление или откройте все части."}</p>
+                    <p class="character-scenes-note">{currentParts.length === 0 ? "У персонажа нет реплик в выбранных сценах." : "Прочитанных частей пока нет."}</p>
                   {:else}
                     {#each visibleParts as part (part.key)}
                       {@const included = !selectedGlossaryChar.excluded_notes.includes(part.key)}
@@ -4224,6 +4247,30 @@
                         {#if part.note !== null && !part.empty}
                           <p class="character-part-note">{part.note}</p>
                         {/if}
+                        <dl class="character-part-info">
+                          <dt>Сцены</dt>
+                          <dd class="character-part-links">
+                            {#each part.scenes as scene (`${scene.path}::${scene.scene}`)}
+                              <button class="character-part-link" title={`Открыть сцену в редакторе (${scene.file})`} onclick={() => openCharacterScene(scene)}>
+                                {scene.scene || "Вне сцен"}
+                              </button>
+                            {/each}
+                          </dd>
+                          {#if part.names.length > 0}
+                            <dt>Персонажи</dt>
+                            <dd class="character-part-links">
+                              {#each part.names as name (name.original)}
+                                <button class="character-part-link" title={`Открыть персонажа ${name.original}`} onclick={() => openPartCharacter(name.original)}>
+                                  {name.translated}
+                                </button>
+                              {/each}
+                            </dd>
+                          {/if}
+                          {#if part.terms.length > 0}
+                            <dt>Термины</dt>
+                            <dd>{part.terms.join(", ")}</dd>
+                          {/if}
+                        </dl>
                         <p class="character-part-start">{part.start}</p>
                       </article>
                     {/each}
@@ -7449,6 +7496,45 @@
     line-height: 1.5;
     color: #cbd5e1;
     white-space: pre-wrap;
+  }
+
+  .character-part-info {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 2px 10px;
+    margin: 8px 0 0;
+    font-size: 12px;
+  }
+
+  .character-part-info dt {
+    color: #64748b;
+  }
+
+  .character-part-info dd {
+    margin: 0;
+    color: #94a3b8;
+    overflow-wrap: anywhere;
+  }
+
+  .character-part-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 10px;
+  }
+
+  .character-part-link {
+    padding: 0;
+    border: none;
+    background: none;
+    color: #7dd3fc;
+    font: inherit;
+    text-align: left;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+  }
+
+  .character-part-link:hover {
+    text-decoration: underline;
   }
 
   .character-part-start {

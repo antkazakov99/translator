@@ -1733,7 +1733,7 @@ async fn autofill_glossary_characters(
         } else {
             llm::collect_character_dialogue_samples(&game.lines, &game.variables, &notes, &selected, sample_count)
         };
-        llm::add_name_hints(&mut samples, &hints.names);
+        llm::add_glossary_hints(&mut samples, &hints);
         samples
     })
     .await
@@ -1786,13 +1786,13 @@ async fn list_character_parts(
     game_dir: String,
     model: String,
     character: glossary::CharacterGlossaryEntry,
-    tokens: Vec<glossary::TokenGlossaryEntry>,
+    hints: llm::ModelHints,
 ) -> Result<Vec<llm::CharacterPart>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base_path = effective_game_directory(Path::new(&game_dir));
-        let chunks = llm::scene_chunks(&game_lines(&base_path), &llm::token_notes(&tokens), &character);
+        let parts = llm::scene_parts(&game_lines(&base_path), &llm::token_notes(&hints.tokens), &character);
         let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
-        llm::character_parts(&chunks, &model, &character.alias, &notes_file)
+        llm::character_parts(parts, &model, &character, &notes_file, &hints)
     })
     .await
     .map_err(|e| format!("Ошибка чтения заметок персонажа: {}", e))
@@ -1830,7 +1830,7 @@ async fn summarize_glossary_character(
     let selected = character.clone();
     let notes = notes_file.clone();
     let chosen_model = model.clone();
-    let tokens = hints.tokens;
+    let tokens = hints.tokens.clone();
     let chunks = tauri::async_runtime::spawn_blocking(move || {
         let chunks = llm::scene_chunks(&game_lines(&base_path), &llm::token_notes(&tokens), &selected);
         let ready = llm::ready_chunks(&chunks, &chosen_model, &selected.alias, &notes);
@@ -1840,7 +1840,7 @@ async fn summarize_glossary_character(
     .map_err(|e| format!("Ошибка подготовки сцен персонажа: {}", e))?;
 
     let target = llm::ChatTarget { api_url: &api_url, model: &model };
-    llm::summarize_character(&target, character, chunks, &hints.names, &notes_file, &LLM_CANCEL, |progress| {
+    llm::summarize_character(&target, character, chunks, &hints, &notes_file, &LLM_CANCEL, |progress| {
         if let Err(error) = on_progress.send(progress) {
             tracing::warn!(%error, "Ход обработки не передан в интерфейс");
         }
