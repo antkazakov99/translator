@@ -1302,7 +1302,7 @@ pub async fn summarize_term(
     let name = term.source_term.trim();
     let system_prompt = format!(
         "You read a part of a visual novel script and take notes about the term {name}. \
-        It may be a place, an organization, an item, a skill, a title or another concept of the game. \
+        It may be a place, an organization, an item, a skill, a title, an event or another concept of the game. \
         The text has the form \"Speaker: text\", and \"you\" usually means the protagonist. \
         A line \"---\" separates scenes that may be far apart in the story. \
         Write in Russian, 1 to 3 short sentences, only what this text shows: what it is, \
@@ -1561,13 +1561,13 @@ pub async fn autofill_terms(
     );
 
     let system_prompt = r#"You are an expert game localization specialist translating English terms to Russian.
-Translate in-game terms, locations, factions, artifacts, ranks and items into authentic Russian.
+Translate in-game terms, locations, factions, artifacts, ranks, items and events into authentic Russian.
 
 Rules:
 1. "id": EXACT same id as input.
 2. "translated_term": Accurate, authentic Russian translation.
    Examples: "Demon Hunter" -> "Охотник на демонов", "PPF Headquarters" -> "Штаб ППФ", "Ancient Rune" -> "Древняя руна", "Silver Key" -> "Серебряный ключ".
-3. "category": One of "general", "location", "organization", "title", "item". Use "organization" for companies, factions, agencies, gangs, schools as institutions and other groups of people.
+3. "category": One of "general", "location", "organization", "title", "item", "event". Use "organization" for companies, factions, agencies, gangs, schools as institutions and other groups of people.
 4. "notes": Brief context/commentary in Russian, or empty string.
 
 Respond ONLY with a valid JSON array of objects:
@@ -1639,7 +1639,7 @@ Respond ONLY with a valid JSON array of objects:
                 }
                 if let Some(cat) = &item.category {
                     let trimmed = cat.trim().to_lowercase();
-                    if matches!(trimmed.as_str(), "general" | "location" | "organization" | "title" | "item") {
+                    if matches!(trimmed.as_str(), "general" | "location" | "organization" | "title" | "item" | "event") {
                         t.category = trimmed;
                     }
                 }

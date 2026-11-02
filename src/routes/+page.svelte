@@ -454,7 +454,7 @@
     id: string;
     source_term: string;
     translated_term: string;
-    category: string; // "general" | "location" | "organization" | "title" | "item"
+    category: string; // "general" | "location" | "organization" | "title" | "item" | "event"
     notes: string;
     forms: NameForm[];
     excluded_scenes: string[];
@@ -1589,7 +1589,8 @@
     { value: "location", label: "Локация", plural: "Локации" },
     { value: "organization", label: "Организация", plural: "Организации" },
     { value: "title", label: "Титул", plural: "Титулы" },
-    { value: "item", label: "Предмет", plural: "Предметы" }
+    { value: "item", label: "Предмет", plural: "Предметы" },
+    { value: "event", label: "Событие", plural: "События" }
   ];
   // Скрытые, а не выбранные: «всё, кроме общих» это один клик
   let hiddenCategories = $state<string[]>([]);
@@ -2780,6 +2781,7 @@
                       <option value="organization">Организация / Фракция</option>
                       <option value="title">Титул / Звание</option>
                       <option value="item">Предмет / Артефакт</option>
+                      <option value="event">Событие</option>
                     </select>
                   </div>
 
@@ -9129,6 +9131,12 @@
     color: #d8b4fe;
   }
 
+  .btn-filter-pill.filter-event.active {
+    background: rgba(251, 113, 133, 0.2);
+    border-color: #fb7185;
+    color: #fda4af;
+  }
+
   .btn-filter-pill.filter-male.active {
     background: rgba(56, 189, 248, 0.2);
     border-color: #38bdf8;
@@ -9378,6 +9386,7 @@
   .category-organization { background: rgba(52, 211, 153, 0.15); color: #34d399; }
   .category-title { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
   .category-item { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
+  .category-event { background: rgba(251, 113, 133, 0.15); color: #fb7185; }
 
   /* ПРОФИЛЬ ПЕРСОНАЖА ИЛИ ФОРМА ТЕРМИНА */
   .glossary-edit-sidebar {

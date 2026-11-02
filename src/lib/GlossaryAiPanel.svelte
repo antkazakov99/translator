@@ -350,6 +350,7 @@
     <option value="organization">Организация</option>
     <option value="title">Титул</option>
     <option value="item">Предмет</option>
+    <option value="event">Событие</option>
   </select>
 {/snippet}
 
