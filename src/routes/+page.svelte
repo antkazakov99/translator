@@ -787,7 +787,10 @@
   });
   // Ползунок: готовые части входят в запуск всегда, поэтому ниже их числа он не опускается
   let scenePartsByAlias = $state<Record<string, number>>({});
-  let scenePartsWanted = $derived(describedEntry ? scenePartsByAlias[entryId(describedEntry)] ?? 1 : 1);
+  // План запуска группы не меняется: готовые записи выпадают из списка, и шкала по нему поползла бы
+  let groupPlan = $state.raw<{ tab: string; parts: number; maxParts: number; byEntry: Record<string, number> } | null>(null);
+  // Пока идёт обновление группы, её план важнее выбора пользователя: шкала показывает, что читается
+  let scenePartsWanted = $derived(describedEntry ? groupPlan?.byEntry[entryId(describedEntry)] ?? scenePartsByAlias[entryId(describedEntry)] ?? 1 : 1);
   let sceneChunkCount = $state<number | null>(null);
   let sceneReadyCount = $state(0);
   let sceneParts = $derived(partsToRead({ total: sceneChunkCount ?? 1, ready: sceneReadyCount }, scenePartsWanted));
@@ -823,6 +826,7 @@
   let updatingAlias = $state<string | null>(null);
   let updatingCharacter = $derived(updatingAlias !== null);
   let otherCharacterUpdating = $derived(updatingAlias !== null && (describedEntry ? entryId(describedEntry) : null) !== updatingAlias);
+  let thisCharacterUpdating = $derived(updatingCharacter && !otherCharacterUpdating);
   let updatingCharacterEntry = $derived([...glossary.characters, ...glossary.terms].find((entry) => entryId(entry) === updatingAlias) ?? null);
   const characterScenesCache = new Map<string, CharacterScene[]>();
 
@@ -835,8 +839,9 @@
   let groupCounting = $state(false);
   let groupPartsWanted = $state(1);
   let groupRun = $state<{ index: number; total: number; name: string } | null>(null);
+  let groupPlanHere = $derived(groupPlan?.tab === glossaryTab ? groupPlan : null);
   let groupStopping = $state(false);
-  let groupResult = $state<{ updated: number; total: number; failed: string[] } | null>(null);
+  let groupResult = $state<{ tab: string; updated: number; total: number; failed: string[] } | null>(null);
 
   const needsWork = (c: DescribedEntry) =>
     !c.notes.trim() || (isCharacter(c) && (!translatedTitle(c) || c.gender === "unknown" || !c.gender.trim() || !c.speech.trim()));
@@ -984,7 +989,7 @@
   // Ключ не меняется при вводе текста в карточке персонажа, поэтому части не пересчитываются зря
   let groupCountKey = $derived(JSON.stringify(groupTargets.map((c) => [entryId(c), c.excluded_scenes, isCharacter(c) ? [] : formSources(c.forms)])));
   $effect(() => {
-    if (!descriptionsOpen || !showGlossaryModal || groupRun) return;
+    if (!descriptionsOpen || !showGlossaryModal || groupPlanHere) return;
     void [groupCountKey, sceneNotesRevision];
     const targets = untrack(() => $state.snapshot(groupTargets)) as DescribedEntry[];
     const model = descriptionModel;
@@ -1381,6 +1386,8 @@
     hiddenCategories = [];
     openGlossaryTab("terms");
     selectedGlossaryTerm = entry;
+    await tick();
+    document.querySelector(".glossary-list-item.selected-row")?.scrollIntoView({ block: "nearest" });
   }
 
   /** Закрывает глоссарий и показывает сцену в таблице реплик. */
@@ -1492,6 +1499,13 @@
   async function updateCharacterGroup() {
     if (!beginLlmRun("Обновляется группа записей")) return;
     const plan = groupReadable.map((entry) => ({ entry, parts: partsToRead(groupChunks[entryId(entry)], groupParts) }));
+    const tab = glossaryTab;
+    groupPlan = {
+      tab,
+      parts: groupParts,
+      maxParts: groupMaxParts,
+      byEntry: Object.fromEntries(plan.map(({ entry, parts }) => [entryId(entry), parts]))
+    };
     // Настройки LLM открываются и во время запуска, а вся группа идёт на одной модели
     const target = targetFor(llmSettings, "descriptions");
     const dir = gameDir;
@@ -1513,8 +1527,9 @@
       }
     }
     groupRun = null;
+    groupPlan = null;
     endLlmRun();
-    groupResult = { updated, total: plan.length, failed };
+    groupResult = { tab, updated, total: plan.length, failed };
   }
 
   function stopCharacterGroup() {
@@ -2629,16 +2644,6 @@
   </div>
 {/snippet}
 
-{#snippet descriptionLock()}
-  {#if otherCharacterUpdating}
-    <div class="character-locked-banner">
-      <Loader2 size={14} class="spin" />
-      <span>Сейчас обновляется {updatingCharacterEntry ? entryTitle(updatingCharacterEntry) : ""}. Остальные записи недоступны до конца обновления.</span>
-      <button class="character-scene-link" onclick={() => { if (updatingCharacterEntry) void showEntry(updatingCharacterEntry); }}>Перейти</button>
-    </div>
-  {/if}
-{/snippet}
-
 {#snippet descriptionBox(entry: DescribedEntry)}
   <div class="character-update-box">
     <div class="character-model-choice">
@@ -2673,18 +2678,18 @@
         disabled={llmRun.active}
         onclick={() => updateEntryWithLlm(entry)}
       >
-        {#if updatingCharacter}
+        {#if thisCharacterUpdating}
           <Loader2 size={13} class="spin" />
         {:else if sceneAllRead}
           <RotateCcw size={13} />
         {:else}
           <Sparkles size={13} />
         {/if}
-        <span>{updatingCharacter ? "Обновляется…" : sceneAllRead ? "Восстановить" : "Обновить описание"}</span>
+        <span>{thisCharacterUpdating ? "Обновляется…" : sceneAllRead ? "Восстановить" : "Обновить описание"}</span>
       </button>
     </div>
   </div>
-  {#if summaryRunning && !otherCharacterUpdating}
+  {#if summaryRunning && thisCharacterUpdating}
     <div class="character-summary-progress">
       {#if summaryBuild?.stage !== "single"}
         <div class="character-summary-line">
@@ -4152,6 +4157,14 @@
           </div>
         </div>
 
+        {#if updatingCharacter}
+          <div class="character-locked-banner">
+            <Loader2 size={14} class="spin" />
+            <span>Сейчас обновляется {updatingCharacterEntry ? entryTitle(updatingCharacterEntry) : ""}. Остальные записи недоступны до конца обновления.</span>
+            <button onclick={() => { if (updatingCharacterEntry) void showEntry(updatingCharacterEntry); }}>Перейти к записи</button>
+          </div>
+        {/if}
+
         <!-- Переключатель вкладок: Персонажи / Термины -->
         <div class="tools-tab-bar">
           <button 
@@ -4194,9 +4207,9 @@
           <RequestSlider
             id="group-parts"
             label={glossaryTab === "terms" ? "Частей на термин" : "Частей на персонажа"}
-            status={groupCounting ? "подсчёт..." : groupReadable.length === 0 ? "нет сцен" : `${groupParts} из ${groupMaxParts}`}
-            max={groupMaxParts}
-            value={groupParts}
+            status={groupPlanHere ? `${groupPlanHere.parts} из ${groupPlanHere.maxParts}` : groupCounting ? "подсчёт..." : groupReadable.length === 0 ? "нет сцен" : `${groupParts} из ${groupMaxParts}`}
+            max={groupPlanHere?.maxParts ?? groupMaxParts}
+            value={groupPlanHere?.parts ?? groupParts}
             onchange={(value) => groupPartsWanted = value}
             disabled={llmRun.active || groupCounting || groupMaxParts < 2}
           >
@@ -4208,7 +4221,7 @@
           {#if groupWithoutScenes > 0}
             <p class="character-group-note">Без сцен, будут пропущены: {groupWithoutScenes}</p>
           {/if}
-          {#if groupRun}
+          {#if groupRun && groupPlanHere}
             <div class="character-summary-progress">
               <div class="character-summary-line">
                 <Loader2 size={13} class="spin" />
@@ -4232,7 +4245,7 @@
               <span>Обновить описания ({groupReadable.length})</span>
             </button>
           {/if}
-          {#if groupResult}
+          {#if groupResult?.tab === glossaryTab}
             <p class="character-group-note">Обновлено: {groupResult.updated} из {groupResult.total}. Не забудьте сохранить глоссарий.</p>
             {#each groupResult.failed as failure}
               <p class="character-group-note character-group-error">{failure}</p>
@@ -4579,7 +4592,6 @@
               </div>
             {:else if glossaryTab === 'characters'}
               {#if selectedGlossaryChar}
-                {@render descriptionLock()}
                 <div class="sidebar-edit-header" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
                   <div class="sidebar-char-badge-row">
                     {#if hasScriptCode(selectedGlossaryChar.alias)}
@@ -4651,7 +4663,7 @@
                   {@render descriptionBox(selectedGlossaryChar)}
                 </div>
 
-                <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} class:character-card-busy={updatingCharacter && !otherCharacterUpdating} inert={updatingCharacter}>
+                <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} class:character-card-busy={thisCharacterUpdating} inert={updatingCharacter}>
                   <div class="edit-group">
                     <div class="edit-label">
                       <span>Имя и фамилия:</span>
@@ -4903,7 +4915,6 @@
                   </div>
                 {/if}
               {:else if selectedGlossaryTerm}
-                {@render descriptionLock()}
                 <div class="sidebar-edit-header" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
                   <div class="sidebar-char-headings">
                     <h4>Редактирование термина</h4>
@@ -4912,7 +4923,7 @@
                   {@render descriptionBox(selectedGlossaryTerm)}
                 </div>
 
-                <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} class:character-card-busy={updatingCharacter && !otherCharacterUpdating} inert={updatingCharacter}>
+                <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} class:character-card-busy={thisCharacterUpdating} inert={updatingCharacter}>
                   <div class="entry-toolbar">
                     <div class="entry-actions">
                       <button class="btn-confirm-add" disabled={updatingCharacter} onclick={() => { if (selectedGlossaryTerm) termBecomesCharacter(selectedGlossaryTerm); }}>
@@ -8613,6 +8624,7 @@
 
   .character-locked-banner {
     display: flex;
+    flex-shrink: 0;
     align-items: center;
     gap: 8px;
     padding: 10px 18px;
@@ -8625,6 +8637,21 @@
   .character-locked-banner button {
     flex-shrink: 0;
     margin-left: auto;
+    padding: 4px 10px;
+    border: 1px solid #4338ca;
+    border-radius: 6px;
+    background: #312e81;
+    color: #e0e7ff;
+    font: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .character-locked-banner button:hover {
+    background: #4338ca;
+    border-color: #6366f1;
+    color: #ffffff;
   }
 
   /* Запись во время обновления видна, но её поля перепишет итог модели */
@@ -8916,11 +8943,16 @@
     transition: all 0.15s ease;
   }
 
-  .btn-modal-ai:hover {
+  .btn-modal-ai:hover:not(:disabled) {
     background: #312e81;
     border-color: #6366f1;
     color: #ffffff;
     box-shadow: 0 0 12px rgba(99, 102, 241, 0.35);
+  }
+
+  .btn-modal-ai:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   .btn-modal-save {
@@ -9472,8 +9504,10 @@
     border-color: #10b981;
   }
 
+  /* Поле растёт с текстом: во время обновления карточка inert, и прокрутить его нельзя */
   .sidebar-textarea {
     width: 100%;
+    min-height: calc(3lh + 18px);
     background: #090c12;
     border: 1px solid #222c3f;
     border-radius: 6px;
@@ -9483,7 +9517,8 @@
     line-height: 1.5;
     outline: none;
     box-sizing: border-box;
-    resize: vertical;
+    field-sizing: content;
+    resize: none;
     font-family: inherit;
     transition: all 0.15s;
   }
