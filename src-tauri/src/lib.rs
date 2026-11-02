@@ -1770,6 +1770,18 @@ async fn translate_character_names(
     .await
 }
 
+/// Запрос на написание имён для ручной вставки в чат-бот, в обход API.
+#[tauri::command]
+fn names_chat_request(names: Vec<llm::NameRequest>, cast: Vec<String>) -> Result<String, String> {
+    llm::names_chat_request(&names, &cast)
+}
+
+/// Написания из ответа чат-бота. Какие из них попадут в глоссарий, решает пользователь.
+#[tauri::command]
+fn read_names_chat_answer(names: Vec<llm::NameRequest>, answer: String) -> Result<Vec<llm::NameSuggestion>, String> {
+    llm::read_names_answer(&names, &answer)
+}
+
 /// Предлагает пояснения и значения токенов по репликам. В глоссарий их отбирает пользователь.
 #[tauri::command]
 async fn suggest_glossary_tokens(
@@ -1979,6 +1991,21 @@ async fn autofill_glossary_terms(
     .await
 }
 
+/// Запрос на перевод терминов для ручной вставки в чат-бот, в обход API.
+#[tauri::command]
+fn terms_chat_request(terms: Vec<glossary::TermGlossaryEntry>) -> Result<String, String> {
+    llm::terms_chat_request(&terms)
+}
+
+/// Термины из ответа чат-бота. Какие из них попадут в глоссарий, решает пользователь.
+#[tauri::command]
+fn read_terms_chat_answer(
+    terms: Vec<glossary::TermGlossaryEntry>,
+    answer: String,
+) -> Result<Vec<glossary::TermGlossaryEntry>, String> {
+    llm::read_terms_answer(terms, &answer)
+}
+
 /// Слова имён персонажей проекта в нижнем регистре.
 fn character_name_words(game_dir: &Path) -> HashSet<String> {
     PROJECT_CACHE
@@ -2058,6 +2085,10 @@ pub fn run() {
             translate_character_names,
             suggest_glossary_tokens,
             autofill_glossary_terms,
+            names_chat_request,
+            read_names_chat_answer,
+            terms_chat_request,
+            read_terms_chat_answer,
             list_term_candidates,
             count_term_chunks,
             list_term_parts,

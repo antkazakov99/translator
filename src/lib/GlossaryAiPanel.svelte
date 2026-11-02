@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onDestroy, type Snippet } from "svelte";
   import { Channel, invoke } from "@tauri-apps/api/core";
-  import { AlertCircle, Check, ChevronDown, ChevronRight, Loader2, Sparkles, Square } from "lucide-svelte";
+  import { AlertCircle, Check, ChevronDown, ChevronRight, ClipboardCopy, ClipboardPaste, Loader2, Sparkles, Square } from "lucide-svelte";
   import EntryPicker from "./EntryPicker.svelte";
   import LlmChoice from "./LlmChoice.svelte";
-  import { baseNames, characterTitle, formNames, nameTargetKey, translatedTitle, type CanonicalName, type NameBatch, type NameField, type NameForm, type NameTarget } from "./name-forms";
+  import { baseNames, characterTitle, chatNames, formNames, nameTargetKey, translatedTitle, type CanonicalName, type NameBatch, type NameField, type NameForm, type NameTarget } from "./name-forms";
   import { beginLlmRun, endLlmRun, llmRun } from "./llm-run.svelte";
   import { LLM_ACTIONS, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "./llm-settings";
 
@@ -157,6 +157,33 @@
     return `Часть данных модель не обработала (пакетов с ошибкой: ${count}). Эти записи остались без изменений, запустите обработку ещё раз.`;
   }
 
+  // Обмен с чат-ботом вручную, без API. Состояние живёт здесь: разделы меняются, пока пользователь в чате
+  type ChatSection = "names" | "terms";
+  let chatRequests = $state<Record<ChatSection, string>>({ names: "", terms: "" });
+  let chatAnswers = $state<Record<ChatSection, string>>({ names: "", terms: "" });
+
+  /** Кладёт запрос в буфер обмена. Поле ответа появляется, только когда запрос удалось скопировать. */
+  async function copyChatRequest(section: ChatSection, request: Promise<string>) {
+    errorMessage = null;
+    doneMessage = "";
+    try {
+      const text = await request;
+      await navigator.clipboard.writeText(text);
+      // Повторное копирование того же запроса не стирает вставленный ответ
+      if (text !== chatRequests[section]) chatAnswers[section] = "";
+      chatRequests[section] = text;
+      return true;
+    } catch (e) {
+      errorMessage = `Не удалось скопировать запрос: ${String(e)}`;
+      return false;
+    }
+  }
+
+  function clearChat(section: ChatSection) {
+    chatRequests[section] = "";
+    chatAnswers[section] = "";
+  }
+
   // Имена
   let unselectedAliases = $state<string[]>([]);
   let nameTargets = $derived(characters.filter((c) => !unselectedAliases.includes(c.alias)));
@@ -179,6 +206,21 @@
     return missing > 0 ? `${note}, не получено ответов: ${missing}.` : `${note}.`;
   });
 
+  const gameCast = () => characters.flatMap((c) => [characterTitle(c), ...c.merged.map((m) => m.original_name)]);
+
+  /** Кладёт написания в отбор. Модель получает повторы один раз, а написание нужно каждому их владельцу. */
+  function addNames(items: NameSuggestion[], targets: NameBatch["targets"]) {
+    for (const item of items) {
+      for (const target of targets.get(item.id) ?? []) {
+        if (item.translated === (target.current || target.base)) {
+          unchangedNames += 1;
+        } else {
+          reviewNames.push({ ...target, key: nameTargetKey(target), translated: item.translated, origin: item.origin, selected: !target.current });
+        }
+      }
+    }
+  }
+
   /**
    * Модель пишет имена выбранных персонажей, видя весь состав игры, а затем от них их формы.
    * Заполненные тоже участвуют, но заменятся, только если их отметить.
@@ -199,19 +241,8 @@
       const result = await invoke<AutofillResult<NameSuggestion>>("translate_character_names", {
         target: targetFor(settings, "names"),
         names: requests,
-        cast: characters.flatMap((c) => [characterTitle(c), ...c.merged.map((m) => m.original_name)]),
-        onBatch: batchChannel<NameSuggestion>((items) => {
-          for (const item of items) {
-            // Модель получает повторы один раз, а написание нужно каждому их владельцу
-            for (const target of targets.get(item.id) ?? []) {
-              if (item.translated === (target.current || target.base)) {
-                unchangedNames += 1;
-              } else {
-                reviewNames.push({ ...target, key: nameTargetKey(target), translated: item.translated, origin: item.origin, selected: !target.current });
-              }
-            }
-          }
-        })
+        cast: gameCast(),
+        onBatch: batchChannel<NameSuggestion>((items) => addNames(items, targets))
       });
       failedBatches += result.failed_batches;
       // Итог команды полный, а сообщения канала могут отстать от него
@@ -236,11 +267,43 @@
     }
   }
 
+  // Ответ чат-бота приходит не сразу, а связан с тем запросом, который ушёл в чат
+  let chatNameBatch: NameBatch | null = null;
+
+  async function requestNamesByChat() {
+    const batch = chatNames($state.snapshot(nameTargets));
+    if (batch.requests.length === 0) {
+      errorMessage = "У выбранных персонажей нет имён для перевода.";
+      return;
+    }
+    if (await copyChatRequest("names", invoke<string>("names_chat_request", { names: batch.requests, cast: gameCast() }))) {
+      chatNameBatch = batch;
+    }
+  }
+
+  async function readNamesAnswer() {
+    if (!chatNameBatch) return;
+    const { requests, targets } = chatNameBatch;
+    errorMessage = null;
+    doneMessage = "";
+    try {
+      const items = await invoke<NameSuggestion[]>("read_names_chat_answer", { names: requests, answer: chatAnswers.names });
+      reviewNames = [];
+      unchangedNames = 0;
+      namesRequested = [...targets.values()].flat().length;
+      namesFinished = true;
+      addNames(items, targets);
+    } catch (e) {
+      errorMessage = `Не удалось разобрать ответ: ${String(e)}`;
+    }
+  }
+
   function applyNames() {
     onnames(chosenNames.map(({ alias, field, source, translated }) => ({ alias, field, source, translated: translated.trim() })));
     doneMessage = `Обновлено имён: ${chosenNames.length}. Описания сохранят старое написание, пока их не обновить.`;
     reviewNames = [];
     namesRequested = 0;
+    clearChat("names");
   }
 
   // Перевод терминов
@@ -252,6 +315,23 @@
   let translationsRun = $state(false);
   let chosenTranslations = $derived(reviewTranslations.filter((row) => row.selected && row.translated.trim()));
 
+  function addTerms(items: PanelTerm[]) {
+    for (const term of items) {
+      const known = terms.find((t) => t.id === term.id);
+      if (!known || reviewTranslations.some((row) => row.id === term.id)) continue;
+      if (known.translated_term === term.translated_term && known.category === term.category) continue;
+      reviewTranslations.push({
+        id: term.id,
+        source: term.source_term,
+        current: known.translated_term,
+        translated: term.translated_term,
+        category: term.category,
+        notes: term.notes,
+        selected: true
+      });
+    }
+  }
+
   async function startTerms() {
     if (!beginRun("Модель переводит термины...")) return;
     reviewTranslations = [];
@@ -260,22 +340,7 @@
       const result = await invoke<AutofillResult<PanelTerm>>("autofill_glossary_terms", {
         target: targetFor(settings, "terms"),
         terms: $state.snapshot(termTargets),
-        onBatch: batchChannel<PanelTerm>((items) => {
-          for (const term of items) {
-            const known = terms.find((t) => t.id === term.id);
-            if (!known || reviewTranslations.some((row) => row.id === term.id)) continue;
-            if (known.translated_term === term.translated_term && known.category === term.category) continue;
-            reviewTranslations.push({
-              id: term.id,
-              source: term.source_term,
-              current: known.translated_term,
-              translated: term.translated_term,
-              category: term.category,
-              notes: term.notes,
-              selected: true
-            });
-          }
-        })
+        onBatch: batchChannel<PanelTerm>(addTerms)
       });
       if (result.failed_batches > 0) errorMessage = failedBatchesMessage(result.failed_batches);
     } catch (e) {
@@ -285,11 +350,34 @@
     }
   }
 
+  let chatTerms: PanelTerm[] = [];
+
+  async function requestTermsByChat() {
+    const chosen = $state.snapshot(termTargets);
+    if (await copyChatRequest("terms", invoke<string>("terms_chat_request", { terms: chosen }))) {
+      chatTerms = chosen;
+    }
+  }
+
+  async function readTermsAnswer() {
+    errorMessage = null;
+    doneMessage = "";
+    try {
+      const items = await invoke<PanelTerm[]>("read_terms_chat_answer", { terms: chatTerms, answer: chatAnswers.terms });
+      reviewTranslations = [];
+      translationsRun = true;
+      addTerms(items);
+    } catch (e) {
+      errorMessage = `Не удалось разобрать ответ: ${String(e)}`;
+    }
+  }
+
   function applyTranslations() {
     onterms(chosenTranslations.map(({ id, translated, category, notes }) => ({ id, translated: translated.trim(), category, notes })));
     doneMessage = `Обновлено терминов: ${chosenTranslations.length}`;
     reviewTranslations = [];
     translationsRun = false;
+    clearChat("terms");
   }
 
   // Токены без реплик модели показать нечего. Без явного выбора в запуске незаполненные, как у терминов
@@ -341,6 +429,26 @@
     <Sparkles size={13} />
     <span>{label}</span>
   </button>
+{/snippet}
+
+{#snippet chatButton(disabled: boolean, onclick: () => void)}
+  <button class="btn-run btn-chat" {onclick} disabled={disabled || llmRun.active} title="Перевод в чат-боте вручную, без API">
+    <ClipboardCopy size={13} />
+    <span>Скопировать запрос для чат-бота</span>
+  </button>
+{/snippet}
+
+{#snippet chatAnswer(section: ChatSection, onread: () => void)}
+  {#if chatRequests[section]}
+    <div class="ai-review">
+      <span class="ai-note">Запрос скопирован. Вставьте его в чат-бот, а ответ сюда.</span>
+      <textarea class="input ai-answer" rows="4" bind:value={chatAnswers[section]} placeholder="Ответ чат-бота с JSON" aria-label="Ответ чат-бота"></textarea>
+      <button class="btn-run btn-read" onclick={onread} disabled={!chatAnswers[section].trim() || llmRun.active}>
+        <ClipboardPaste size={13} />
+        <span>Разобрать ответ</span>
+      </button>
+    </div>
+  {/if}
 {/snippet}
 
 {#snippet categorySelect(row: { category: string }, label: string)}
@@ -421,7 +529,11 @@
           onchange={(next) => unselectedAliases = next}
           onempty={() => unselectedAliases = characters.filter((c) => translatedTitle(c)).map((c) => c.alias)}
         />
-        {@render runButton(`Перевести имена (${nameTargets.length})`, nameTargets.length === 0, startNames)}
+        <div class="ai-actions">
+          {@render runButton(`Перевести имена (${nameTargets.length})`, nameTargets.length === 0, startNames)}
+          {@render chatButton(nameTargets.length === 0, requestNamesByChat)}
+        </div>
+        {@render chatAnswer("names", readNamesAnswer)}
 
         {#if namesRequested > 0}
           <div class="ai-review">
@@ -463,7 +575,11 @@
           onchange={(next) => unselectedTerms = next}
           onempty={() => unselectedTerms = null}
         />
-        {@render runButton(`Перевести термины (${termTargets.length})`, termTargets.length === 0, startTerms)}
+        <div class="ai-actions">
+          {@render runButton(`Перевести термины (${termTargets.length})`, termTargets.length === 0, startTerms)}
+          {@render chatButton(termTargets.length === 0, requestTermsByChat)}
+        </div>
+        {@render chatAnswer("terms", readTermsAnswer)}
 
         {#if translationsRun && !isProcessing && reviewTranslations.length === 0 && !errorMessage}
           <p class="ai-note">Модель не предложила изменений.</p>
@@ -745,6 +861,30 @@
   }
 
   .btn-apply {
+    align-self: flex-end;
+    margin-top: 4px;
+  }
+
+  .ai-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* Запрос в чат-бот не запускает модель, поэтому кнопка тише запуска */
+  .btn-chat {
+    border-color: rgba(71, 85, 105, 0.6);
+    background: transparent;
+    color: #cbd5e1;
+  }
+
+  .ai-answer {
+    font-family: inherit;
+    resize: vertical;
+  }
+
+  /* Завершает блок ответа там же, где отбор завершает кнопка записи */
+  .btn-read {
     align-self: flex-end;
     margin-top: 4px;
   }

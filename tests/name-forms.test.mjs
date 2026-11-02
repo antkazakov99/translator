@@ -1,7 +1,7 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { allNames, baseNames, canonicalForms, characterTitle, cleanCharacterForms, cleanTermForms, defaultCanonicalName, formNames, formOwners, formTranslation, fullName, hasScriptCode, knownNames, nameTargetKey, newCharacterAlias, NO_CANONICAL_NAME, ownerOptions, translatedTitle, uniqueForms } from '../src/lib/name-forms.ts';
+import { allNames, baseNames, canonicalForms, characterTitle, chatNames, cleanCharacterForms, cleanTermForms, defaultCanonicalName, formNames, formOwners, formTranslation, fullName, hasScriptCode, knownNames, nameTargetKey, newCharacterAlias, NO_CANONICAL_NAME, ownerOptions, translatedTitle, uniqueForms } from '../src/lib/name-forms.ts';
 
 const term = (name, linked = []) => ({ kind: 'term', id: name, names: [name], linked });
 const owners = (found) => found.map((owner) => owner.id);
@@ -176,6 +176,21 @@ test('the second step builds forms on a filled name, then on the answer of the f
   ]);
   const fields = [...batch.targets.values()].flat().map(({ field, current }) => [field, current]);
   assert.deepEqual(fields, [['form', ''], ['form', 'Анечка'], ['form', '']]);
+});
+
+test('a chat bot gets both steps at once, forms built on the names it spells', () => {
+  const anna = person('a', 'Anna', { last_name: 'Karanovic', translated_first_name: 'Анна', forms: [form('Mrs. K')] });
+  const lisa = person('l', 'Lisa', { forms: [form('Liz')] });
+
+  const batch = chatNames([anna, lisa]);
+  assert.deepEqual(batch.requests.map(({ id, name, kind, base }) => [id, name, kind, base]), [
+    ['n0', 'Anna', 'name', ''],
+    ['n1', 'Karanovic', 'surname', ''],
+    ['n2', 'Lisa', 'name', ''],
+    ['f0', 'Mrs. K', 'form', 'Анна Karanovic'],
+    ['f1', 'Liz', 'form', 'Lisa']
+  ]);
+  assert.deepEqual(batch.targets.get('f1').map(({ alias, field, source }) => [alias, field, source]), [['l', 'form', 'Liz']]);
 });
 
 test('the owner search keeps groups in order and shows a suggested record once', () => {

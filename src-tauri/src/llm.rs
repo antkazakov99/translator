@@ -1538,6 +1538,48 @@ Respond ONLY with a valid JSON array of objects without markdown fences or expla
 /// С этого знака начинается внутренний номер персонажа без кода в скриптах (`name-forms.ts`).
 const NO_CODE_MARK: char = '~';
 
+const TERMS_SYSTEM_PROMPT: &str = r#"You are an expert game localization specialist translating English terms to Russian.
+Translate in-game terms, locations, factions, artifacts, ranks, items and events into authentic Russian.
+
+Rules:
+1. "id": EXACT same id as input.
+2. "translated_term": Accurate, authentic Russian translation.
+   Examples: "Demon Hunter" -> "Охотник на демонов", "PPF Headquarters" -> "Штаб ППФ", "Ancient Rune" -> "Древняя руна", "Silver Key" -> "Серебряный ключ".
+3. "category": One of "general", "location", "organization", "title", "item", "event". Use "organization" for companies, factions, agencies, gangs, schools as institutions and other groups of people. Use "event" for wars, battles, disasters, holidays, tournaments and other things that happen at a particular time.
+4. "notes": Brief context/commentary in Russian, or empty string.
+
+Respond ONLY with a valid JSON array of objects:
+[
+  {"id": "term-1", "translated_term": "Штаб ППФ", "category": "location", "notes": "Главная база"}
+]"#;
+
+/// Ответы модели по `id` термина.
+fn term_answers(items: Vec<TermLlmItem>) -> HashMap<String, TermLlmItem> {
+    items.into_iter().filter_map(|item| item.id.clone().map(|id| (id, item))).collect()
+}
+
+/// Переносит в термин ответ модели. Своё описание важнее предложенного.
+fn fill_term(term: &mut TermGlossaryEntry, item: &TermLlmItem) {
+    if let Some(trans) = &item.translated_term {
+        let trimmed = trans.trim();
+        if !trimmed.is_empty() {
+            term.translated_term = trimmed.to_string();
+        }
+    }
+    if let Some(cat) = &item.category {
+        let trimmed = cat.trim().to_lowercase();
+        if matches!(trimmed.as_str(), "general" | "location" | "organization" | "title" | "item" | "event") {
+            term.category = trimmed;
+        }
+    }
+    if let Some(n) = &item.notes {
+        let trimmed = n.trim();
+        if !trimmed.is_empty() && term.notes.trim().is_empty() {
+            term.notes = trimmed.to_string();
+        }
+    }
+}
+
 /// Автозаполнение и перевод терминов в глоссарии через LLM
 pub async fn autofill_terms(
     target: &ChatTarget,
@@ -1559,21 +1601,6 @@ pub async fn autofill_terms(
         indices_to_process.len(),
         target.model
     );
-
-    let system_prompt = r#"You are an expert game localization specialist translating English terms to Russian.
-Translate in-game terms, locations, factions, artifacts, ranks, items and events into authentic Russian.
-
-Rules:
-1. "id": EXACT same id as input.
-2. "translated_term": Accurate, authentic Russian translation.
-   Examples: "Demon Hunter" -> "Охотник на демонов", "PPF Headquarters" -> "Штаб ППФ", "Ancient Rune" -> "Древняя руна", "Silver Key" -> "Серебряный ключ".
-3. "category": One of "general", "location", "organization", "title", "item", "event". Use "organization" for companies, factions, agencies, gangs, schools as institutions and other groups of people.
-4. "notes": Brief context/commentary in Russian, or empty string.
-
-Respond ONLY with a valid JSON array of objects:
-[
-  {"id": "term-1", "translated_term": "Штаб ППФ", "category": "location", "notes": "Главная база"}
-]"#;
 
     const BATCH_SIZE: usize = 20;
     let total_batches = indices_to_process.len().div_ceil(BATCH_SIZE);
@@ -1597,7 +1624,7 @@ Respond ONLY with a valid JSON array of objects:
 
         let raw_response = match call_chat_completion(
             target,
-            system_prompt,
+            TERMS_SYSTEM_PROMPT,
             &user_prompt,
             0.2,
             2048,
@@ -1623,32 +1650,11 @@ Respond ONLY with a valid JSON array of objects:
             }
         };
 
-        let item_map: HashMap<String, TermLlmItem> = items
-            .into_iter()
-            .filter_map(|item| item.id.clone().map(|id| (id, item)))
-            .collect();
-
+        let item_map = term_answers(items);
         for &idx in chunk {
             let t = &mut terms[idx];
             if let Some(item) = item_map.get(&t.id) {
-                if let Some(trans) = &item.translated_term {
-                    let trimmed = trans.trim();
-                    if !trimmed.is_empty() {
-                        t.translated_term = trimmed.to_string();
-                    }
-                }
-                if let Some(cat) = &item.category {
-                    let trimmed = cat.trim().to_lowercase();
-                    if matches!(trimmed.as_str(), "general" | "location" | "organization" | "title" | "item" | "event") {
-                        t.category = trimmed;
-                    }
-                }
-                if let Some(n) = &item.notes {
-                    let trimmed = n.trim();
-                    if !trimmed.is_empty() && t.notes.trim().is_empty() {
-                        t.notes = trimmed.to_string();
-                    }
-                }
+                fill_term(t, item);
             }
         }
 
@@ -1697,19 +1703,25 @@ Respond ONLY with a valid JSON array, one object per name to spell, without mark
 ]
 "id" is the EXACT id as given. "origin" is the language of the name as one Russian word, or "описание" for roles and descriptions."#;
 
-/// Строка запроса: что это за имя и от какого написания оно строится.
-fn name_line(request: &NameRequest) -> String {
+/// Что это за имя и от какого написания оно строится.
+fn name_detail(request: &NameRequest) -> String {
     let person = match request.gender.as_str() {
         "female" => "a woman",
         "male" => "a man",
         _ => "a character",
     };
-    let detail = match request.kind {
+    match request.kind {
         NameKind::Name => String::new(),
-        NameKind::Surname => format!(", surname of {person}"),
-        NameKind::Form if request.base.is_empty() => format!(", name of {person}"),
-        NameKind::Form => format!(", name of {person}, form of {}", request.base),
-    };
+        NameKind::Surname => format!("surname of {person}"),
+        NameKind::Form if request.base.is_empty() => format!("name of {person}"),
+        NameKind::Form => format!("name of {person}, form of {}", request.base),
+    }
+}
+
+/// Строка запроса к модели.
+fn name_line(request: &NameRequest) -> String {
+    let detail = name_detail(request);
+    let detail = if detail.is_empty() { detail } else { format!(", {detail}") };
     format!("- id: \"{}\", name: \"{}\"{detail}\n", request.id, request.name)
 }
 
@@ -1728,6 +1740,25 @@ fn is_garbled(name: &str) -> bool {
     name.split_whitespace().any(|word| {
         word.chars().any(|c| c.is_ascii_alphabetic()) && word.chars().any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'))
     })
+}
+
+/// Оставляет в `items` годные написания из ответа. Имени, которого не было в `requests`, модель придумала сама.
+fn keep_names(answer: Vec<NameLlmItem>, requests: &[NameRequest], items: &mut Vec<NameSuggestion>) {
+    for item in answer {
+        let id = item.id.as_deref().unwrap_or_default().trim();
+        let translated = item.translated_name.as_deref().unwrap_or_default().trim();
+        let Some(request) = requests.iter().find(|request| request.id == id) else {
+            continue;
+        };
+        if translated.is_empty() || is_garbled(translated) || items.iter().any(|known| known.id == id) {
+            continue;
+        }
+        items.push(NameSuggestion {
+            id: request.id.clone(),
+            translated: translated.to_string(),
+            origin: item.origin.as_deref().unwrap_or_default().trim().to_string(),
+        });
+    }
 }
 
 /// Предлагает написание имён `names`. Модель видит весь состав игры `cast`, потому что
@@ -1773,26 +1804,82 @@ pub async fn translate_names(
         };
 
         let kept_before = items.len();
-        for item in answer {
-            let id = item.id.as_deref().unwrap_or_default().trim();
-            let translated = item.translated_name.as_deref().unwrap_or_default().trim();
-            // Имени, которого не было в списке, модель придумала сама
-            let Some(request) = chunk.iter().find(|request| request.id == id) else {
-                continue;
-            };
-            if translated.is_empty() || is_garbled(translated) || items.iter().any(|known| known.id == id) {
-                continue;
-            }
-            items.push(NameSuggestion {
-                id: request.id.clone(),
-                translated: translated.to_string(),
-                origin: item.origin.as_deref().unwrap_or_default().trim().to_string(),
-            });
-        }
+        keep_names(answer, chunk, &mut items);
         report(batch, failed_batches, items[kept_before..].to_vec());
     }
 
     Ok(AutofillResult { items, failed_batches })
+}
+
+/// Имя в запросе для чат-бота.
+#[derive(Serialize)]
+struct ChatName<'a> {
+    id: &'a str,
+    name: &'a str,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    about: String,
+}
+
+/// Термин в запросе для чат-бота.
+#[derive(Serialize)]
+struct ChatTerm<'a> {
+    id: &'a str,
+    source_term: &'a str,
+    current_category: &'a str,
+}
+
+/// Инструкция и данные одним текстом: в чате нет отдельного системного сообщения.
+fn chat_bot_text(prompt: &str, about_data: &str, data: serde_json::Value) -> Result<String, String> {
+    let data = serde_json::to_string_pretty(&data).map_err(|e| format!("Не удалось собрать запрос: {}", e))?;
+    Ok(format!("{prompt}\n\n{about_data}\n\n{data}"))
+}
+
+/// Записи из ответа чат-бота: вокруг JSON может быть обычный текст.
+fn chat_answer<T: serde::de::DeserializeOwned>(answer: &str) -> Result<Vec<T>, String> {
+    serde_json::from_str(extract_json_content(answer)).map_err(|e| format!("в ответе нет полного JSON-массива ({})", e))
+}
+
+/// Запрос на написание имён для ручной вставки в чат-бот. В один запрос входят имена и формы от них.
+pub fn names_chat_request(names: &[NameRequest], cast: &[String]) -> Result<String, String> {
+    let list: Vec<ChatName> = names
+        .iter()
+        .map(|request| ChatName { id: &request.id, name: &request.name, about: name_detail(request) })
+        .collect();
+    chat_bot_text(
+        NAMES_SYSTEM_PROMPT,
+        "The data is below. \"about\" says more about a name, as described above. \
+        If a form is built on names spelled in this same list, use the spelling you give them.",
+        serde_json::json!({ "all_names": unique_names(cast), "names_to_spell": list }),
+    )
+}
+
+/// Написания из ответа чат-бота на запрос `names`.
+pub fn read_names_answer(names: &[NameRequest], answer: &str) -> Result<Vec<NameSuggestion>, String> {
+    let mut items = Vec::new();
+    keep_names(chat_answer(answer)?, names, &mut items);
+    Ok(items)
+}
+
+/// Запрос на перевод терминов для ручной вставки в чат-бот.
+pub fn terms_chat_request(terms: &[TermGlossaryEntry]) -> Result<String, String> {
+    let list: Vec<ChatTerm> = terms
+        .iter()
+        .map(|term| ChatTerm { id: &term.id, source_term: &term.source_term, current_category: &term.category })
+        .collect();
+    chat_bot_text(TERMS_SYSTEM_PROMPT, "Terms to translate into Russian:", serde_json::json!(list))
+}
+
+/// Термины `terms`, на которые ответил чат-бот, с его переводом.
+pub fn read_terms_answer(mut terms: Vec<TermGlossaryEntry>, answer: &str) -> Result<Vec<TermGlossaryEntry>, String> {
+    let item_map = term_answers(chat_answer(answer)?);
+    terms.retain_mut(|term| match item_map.get(&term.id) {
+        Some(item) => {
+            fill_term(term, item);
+            true
+        }
+        None => false,
+    });
+    Ok(terms)
 }
 
 const TOKENS_SYSTEM_PROMPT: &str = r#"You study text variables of a visual novel that is being translated into Russian.
@@ -2015,6 +2102,62 @@ mod tests {
     fn chat_answer(content: &str) -> String {
         let body = serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string();
         http_response("200 OK", &body)
+    }
+
+    #[test]
+    fn test_names_request_for_chat_bot_holds_rules_and_data() {
+        let [name, mut surname]: [NameRequest; 2] = name_requests(&["Anna", "Kowalski \"K\""]).try_into().unwrap();
+        surname.kind = NameKind::Surname;
+        surname.gender = "female".to_string();
+
+        let request = names_chat_request(&[name, surname], &strings(&["Anna", "anna", "Vlado"])).unwrap();
+
+        assert!(request.starts_with(NAMES_SYSTEM_PROMPT), "{request}");
+        let data: serde_json::Value = serde_json::from_str(&request[request.find("{\n").unwrap()..]).unwrap();
+        assert_eq!(data["all_names"], serde_json::json!(["Anna", "Vlado"]));
+        assert_eq!(data["names_to_spell"][0], serde_json::json!({"id": "n0", "name": "Anna"}));
+        assert_eq!(data["names_to_spell"][1]["name"], "Kowalski \"K\"");
+        assert_eq!(data["names_to_spell"][1]["about"], "surname of a woman");
+    }
+
+    #[test]
+    fn test_names_answer_of_chat_bot_passes_the_same_checks_as_a_model() {
+        let answer = "Вот результат:\n```json\n[\n\
+            {\"id\":\"n0\",\"origin\":\"сербский\",\"translated_name\":\"Аня\"},\n\
+            {\"id\":\"n0\",\"translated_name\":\"Анья\"},\n\
+            {\"id\":\"n9\",\"translated_name\":\"Выдумка\"},\n\
+            {\"id\":\"n1\",\"translated_name\":\"Саarah\"}\n\
+            ]\n```\nГотово!";
+        let items = read_names_answer(&name_requests(&["Anja", "Sarah"]), answer).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].translated.as_str(), items[0].origin.as_str()), ("Аня", "сербский"));
+    }
+
+    #[test]
+    fn test_cut_answer_of_chat_bot_is_an_error() {
+        let error = read_names_answer(&name_requests(&["Anja"]), r#"[{"id":"n0","translated_name":"А"#).unwrap_err();
+        assert!(error.contains("JSON"), "{error}");
+        assert!(read_terms_answer(Vec::new(), "Не могу помочь").is_err());
+    }
+
+    #[test]
+    fn test_terms_go_through_a_chat_bot() {
+        let terms = vec![
+            TermGlossaryEntry { id: "t1".to_string(), source_term: "Revolutionary War".to_string(), category: "general".to_string(), notes: "Своё".to_string(), ..Default::default() },
+            TermGlossaryEntry { id: "t2".to_string(), source_term: "PPF".to_string(), category: "general".to_string(), ..Default::default() },
+        ];
+
+        let request = terms_chat_request(&terms).unwrap();
+        assert!(request.starts_with(TERMS_SYSTEM_PROMPT), "{request}");
+        let data: serde_json::Value = serde_json::from_str(&request[request.rfind("\n[\n").unwrap()..]).unwrap();
+        assert_eq!(data[0], serde_json::json!({"id": "t1", "source_term": "Revolutionary War", "current_category": "general"}));
+
+        let answer = r#"[{"id":"t1","translated_term":"Война за независимость","category":"event","notes":"Чужое"},{"id":"t9","translated_term":"Выдумка"}]"#;
+        let items = read_terms_answer(terms, answer).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].translated_term, "Война за независимость");
+        assert_eq!(items[0].category, "event");
+        assert_eq!(items[0].notes, "Своё");
     }
 
     fn strings(values: &[&str]) -> Vec<String> {

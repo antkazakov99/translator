@@ -289,3 +289,14 @@ export function formNames(characters: NamedCharacter[], spelled: Map<string, str
       .map((form) => ({ ...common, field: "form" as const, source: form.source.trim(), current: form.translated.trim() }));
   }), "f");
 }
+
+/**
+ * Оба шага одним запросом для чат-бота, где каждый шаг стоил бы ручной пересылки. Готового написания
+ * у формы ещё нет, поэтому она ссылается на оригинал, который чат-бот пишет в этом же ответе.
+ */
+export function chatNames(characters: NamedCharacter[]): NameBatch {
+  const base = baseNames(characters);
+  const spelled = new Map([...base.targets.values()].flat().map((target) => [nameTargetKey(target), target.source]));
+  const forms = formNames(characters, spelled);
+  return { requests: [...base.requests, ...forms.requests], targets: new Map([...base.targets, ...forms.targets]) };
+}
