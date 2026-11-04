@@ -3318,7 +3318,15 @@ mod tests {
         assert_eq!(std::fs::read(packed.join("other.rpyc")).unwrap(), b"kept");
         assert!(!packed.join("story.rpy").exists());
         assert_eq!(std::fs::read_to_string(&story).unwrap(), source);
-        assert!(compiled_text(&packed.join("translator_language.rpyc")).contains("config.language"));
+        // Выбор остаётся за игроком: config.language движок ставил бы при каждом запуске
+        let language = compiled_text(&packed.join("translator_language.rpyc"));
+        assert!(language.contains("define_screen"));
+        assert!(!language.contains("config.language"));
+        // Внутри блока только ASCII: движок 7.x компилирует его как код Python 2
+        let script = translation::language_script();
+        let code = script.lines().filter(|line| !line.starts_with('#'));
+        assert!(code.into_iter().all(|line| line.is_ascii()));
+        assert!(!script.contains("__LANG__"));
 
         // Язык, который игра предлагает сама, выбирает игрок
         let screens = game_dir.join("screens.rpy");

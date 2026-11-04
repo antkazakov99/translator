@@ -899,15 +899,13 @@ mod tests {
         let Ok(dir) = std::env::var("TRANSLATOR_RPYC_PROBE_DIR") else {
             return;
         };
+        let language = crate::translation::language_script();
         let sources = [
             (
                 "translator_saved_strings.rpy",
                 "translate russian strings:\n\n    old \"New Game\"\n    new \"Новая игра\"\n",
             ),
-            (
-                "translator_language.rpy",
-                "init python:\n    config.language = \"russian\"\n",
-            ),
+            ("translator_language.rpy", language.as_str()),
             (
                 "story.rpy",
                 concat!(

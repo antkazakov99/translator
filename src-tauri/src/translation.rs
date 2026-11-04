@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 /// Файл мода со строками для правок скриптов, у которых нет файла в `tl/<язык>`.
 const SAVED_STRINGS_FILE: &str = "translator_saved_strings.rpy";
-/// Файл мода, включающий язык перевода в играх без такого пункта в настройках.
+/// Файл мода с переключателем языка для игр без такого пункта в настройках.
 const LANGUAGE_FILE: &str = "translator_language.rpy";
 
 /// Идентификатор строки в хранилище правок. Не зависит от положения строки в файле
@@ -334,15 +334,19 @@ pub fn prepare_mod_export(
             .insert(SAVED_STRINGS_FILE.to_string(), render_strings_file(&strings));
     }
 
-    // Список языков в настройках задаёт экран игры, мод добавить в него пункт не может
+    // Список языков в настройках задаёт экран игры, поэтому мод показывает свой переключатель
     let has_translation = tl_dir.exists() || has_packed_translation || !export.files.is_empty();
     if has_translation && !game_offers_language(game_dir) {
-        export.files.insert(
-            LANGUAGE_FILE.to_string(),
-            format!("init python:\n    config.language = \"{}\"\n", TL_LANG).into_bytes(),
-        );
+        export
+            .files
+            .insert(LANGUAGE_FILE.to_string(), language_script().into_bytes());
     }
     Ok(export)
+}
+
+/// Скрипт мода с переключателем языка.
+pub(crate) fn language_script() -> String {
+    include_str!("translator_language.rpy").replace("__LANG__", TL_LANG)
 }
 
 /// Есть ли в скриптах игры действие, переключающее на язык перевода.
