@@ -1,3 +1,4 @@
+pub mod fonts;
 pub mod glossary;
 pub mod graph;
 pub mod parser;
@@ -1262,7 +1263,8 @@ fn build_mod_archive(
         });
     }
 
-    let files = translation::mod_archive_files(&tl_dir, packed, export.files, format)?;
+    let mut files = translation::mod_archive_files(&tl_dir, packed, export.files, format)?;
+    let fonts = fonts::apply_replacements(base_path, &mut files)?;
     rpa::RpaArchive::create_archive(out_path, &files)?;
 
     let mut message = format!(
@@ -1274,6 +1276,15 @@ fn build_mod_archive(
         message.push_str(&format!(
             ". Не перенесено правок: {} (их строки изменились или конфликтуют с tl/russian)",
             export.skipped
+        ));
+    }
+    if fonts.applied > 0 {
+        message.push_str(&format!(". Подменено шрифтов: {}", fonts.applied));
+    }
+    if !fonts.ineffective.is_empty() {
+        message.push_str(&format!(
+            ". Игра не увидит замену шрифтов: {}",
+            fonts.ineffective.join(", ")
         ));
     }
     Ok(message)
@@ -1337,6 +1348,61 @@ async fn install_mod(game_dir: String) -> Result<String, String> {
     })
     .await
     .map_err(|e| format!("Ошибка установки перевода: {}", e))?
+}
+
+#[tauri::command]
+async fn list_game_fonts(game_dir: String) -> Result<Vec<fonts::GameFont>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fonts::list_fonts(&effective_game_directory(Path::new(&game_dir)))
+    })
+    .await
+    .map_err(|e| format!("Ошибка чтения шрифтов: {}", e))?
+}
+
+/// Файл шрифта для предпросмотра: `replacement` выбирает замену вместо шрифта игры.
+#[tauri::command]
+async fn read_font_file(
+    game_dir: String,
+    name: String,
+    replacement: bool,
+) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let data = if replacement {
+            fonts::read_replacement(&base_path, &name)?
+        } else {
+            fonts::read_game_font(&base_path, &name)?
+        };
+        Ok(tauri::ipc::Response::new(data))
+    })
+    .await
+    .map_err(|e| format!("Ошибка чтения шрифта: {}", e))?
+}
+
+#[tauri::command]
+async fn set_font_replacement(
+    game_dir: String,
+    name: String,
+    source_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fonts::set_replacement(
+            &effective_game_directory(Path::new(&game_dir)),
+            &name,
+            Path::new(&source_path),
+        )
+    })
+    .await
+    .map_err(|e| format!("Ошибка замены шрифта: {}", e))?
+}
+
+#[tauri::command]
+async fn remove_font_replacement(game_dir: String, name: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fonts::remove_replacement(&effective_game_directory(Path::new(&game_dir)), &name)
+    })
+    .await
+    .map_err(|e| format!("Ошибка удаления замены шрифта: {}", e))?
 }
 
 #[tauri::command]
@@ -1545,12 +1611,16 @@ fn transfer_project(source: &Path, target: &Path) -> Result<String, String> {
         0
     };
     let edits = translation::transfer_edits(source, target)?;
+    let fonts = fonts::transfer_replacements(source, target)?;
     PARSED_FILE_CACHE.lock().clear();
 
     let mut message = format!(
         "Перенесено правок: {}, записей глоссария: {}",
         edits.added, glossary_terms
     );
+    if fonts > 0 {
+        message.push_str(&format!(", замен шрифтов: {}", fonts));
+    }
     if edits.kept > 0 {
         message.push_str(&format!(". Оставлены текущие правки: {}", edits.kept));
     }
@@ -2520,6 +2590,10 @@ pub fn run() {
             export_mod,
             install_mod,
             remove_mod,
+            list_game_fonts,
+            read_font_file,
+            set_font_replacement,
+            remove_font_replacement,
             unpack_rpa,
             clear_project_script_cache,
             decompile_rpyc_file,
@@ -3184,7 +3258,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
-    const TEST_FORMAT: rpyc_writer::ScriptFormat = rpyc_writer::ScriptFormat {
+    pub(crate) const TEST_FORMAT: rpyc_writer::ScriptFormat = rpyc_writer::ScriptFormat {
         layout: rpyc_writer::AstLayout::Python2,
         script_version: 5003000,
     };

@@ -28,7 +28,7 @@ cargo test --lib -- --ignored
 cargo clippy
 ```
 
-Тесты с `#[ignore]` работают на реальных играх и берут пути из переменных окружения: `TRANSLATOR_TEST_TRANSLATED_GAME`, `TRANSLATOR_TEST_RPA_GAME`, `TRANSLATOR_TEST_CHARACTERS_GAME`, `TRANSLATOR_TEST_RPA2_ARCHIVE`, `TRANSLATOR_TEST_FRAMED_ARCHIVE`, `TRANSLATOR_TEST_TL_DIR`, `TRANSLATOR_TEST_PACKED_TL_GAME`. Без переменной такой тест ничего не проверяет и проходит. `TRANSLATOR_RPYC_PROBE_DIR` включает запись архивов для проверки скомпилированных скриптов настоящим движком.
+Тесты с `#[ignore]` работают на реальных играх и берут пути из переменных окружения: `TRANSLATOR_TEST_TRANSLATED_GAME`, `TRANSLATOR_TEST_RPA_GAME`, `TRANSLATOR_TEST_CHARACTERS_GAME`, `TRANSLATOR_TEST_RPA2_ARCHIVE`, `TRANSLATOR_TEST_FRAMED_ARCHIVE`, `TRANSLATOR_TEST_TL_DIR`, `TRANSLATOR_TEST_PACKED_TL_GAME`, `TRANSLATOR_TEST_FONTS_GAME`. Без переменной такой тест ничего не проверяет и проходит. `TRANSLATOR_RPYC_PROBE_DIR` включает запись архивов для проверки скомпилированных скриптов настоящим движком.
 
 ## Архитектура
 
@@ -36,7 +36,7 @@ cargo clippy
 
 ### Главные инварианты
 
-- **Чтение игры и явная установка.** Правки, кэш и экспорт пишутся в `%LOCALAPPDATA%\TranslatorApp\projects_cache\<имя>_<хэш пути>`: `scripts/` (скрипты из RPA), `translations/*.json` (правки), `glossary.json`, `scene_notes.json` (заметки модели по частям сцен), `exports/`, `unpacked/`. Произвольный вывод в игру запрещает `ensure_output_outside_game`. Явные команды `install_mod` и `remove_mod` устанавливают/удаляют только `game/ru_lang.rpa`; установка атомарно заменяет архив, не трогая `tl/russian` и оригиналы.
+- **Чтение игры и явная установка.** Правки, кэш и экспорт пишутся в `%LOCALAPPDATA%\TranslatorApp\projects_cache\<имя>_<хэш пути>`: `scripts/` (скрипты из RPA), `translations/*.json` (правки), `glossary.json`, `scene_notes.json` (заметки модели по частям сцен), `fonts/` (замены шрифтов), `exports/`, `unpacked/`. Произвольный вывод в игру запрещает `ensure_output_outside_game`. Явные команды `install_mod` и `remove_mod` устанавливают/удаляют только `game/ru_lang.rpa`; установка атомарно заменяет архив, не трогая `tl/russian` и оригиналы.
 - **Панику в Rust нельзя допускать на данных игры.** В релизе `panic = "abort"`, поэтому паника закрывает приложение. Файлы игр считаются недоверенными: разбор возвращает `Err`, а архивы проверяются на выход за пределы папки (`safe_output_path`).
 - **Путь оценивается относительно корня игры.** Папка `tl` может встретиться и выше игры, поэтому файл перевода определяют `is_translation_path` и `tl_relative_name`, а не подстрока пути.
 - **CSP действует только в сборке.** В `tauri dev` страница грузится с dev-сервера напрямую, поэтому правила из `tauri.conf.json` проверяются на `tauri build`. Интерфейс не обращается к сети сам: запросы к нейросети идут из Rust.
@@ -55,6 +55,7 @@ cargo clippy
    - Правки файлов `tl/<язык>` подставляются в копии этих файлов.
    - Остальные правки становятся строковыми переводами в `translator_saved_strings.rpy`, потому что `id` блоков `translate` вычисляет сам Ren'Py.
    - `translator_language.rpy` включает язык, если в игре нет такого пункта.
+   - Замены шрифтов (`fonts.rs`, раздел «Подмена шрифтов») кладутся в `tl/<язык>/` под именем исходного файла: движок ищет любой файл сначала там, поэтому меняются и настройки, и теги `{font=...}`, причём только на этом языке. Содержимое файла движок определяет сам, поэтому формат может отличаться от исходного. Шрифт в `tl/russian` на диске или в архиве игры, который по имени важнее `ru_lang.rpa`, заменить нельзя (`locked`). Символы проверяет свой разбор таблицы `cmap` (`font_coverage`), а упоминания ищутся и в скомпилированных скриптах, потому что `rpyc.rs` оставляет от экранов только связи. В предпросмотре пропавшие символы заменяются на □ (`sampleSegments`), иначе браузер показал бы их системным шрифтом.
    - Всё компилируется и упаковывается в `ru_lang.rpa`, потому что из архивов Ren'Py читает только `.rpyc`.
    - Файлы `tl/russian` на диске Ren'Py читает раньше архива. Перекрывать их не нужно: чтобы применить мод, такой перевод удаляют.
 

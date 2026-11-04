@@ -167,11 +167,18 @@ impl RpaEntry {
         file: &mut File,
         archive_size: u64,
     ) -> Result<Vec<u8>, String> {
-        if self
-            .total_size()
-            .is_none_or(|size| size > MAX_COMPILED_SCRIPT)
-        {
-            return Err(format!("RPYC файл {} слишком велик", self.name));
+        self.read_up_to(file, archive_size, MAX_COMPILED_SCRIPT)
+    }
+
+    /// Читает запись в память, если она не больше `limit`
+    pub(crate) fn read_up_to(
+        &self,
+        file: &mut File,
+        archive_size: u64,
+        limit: u64,
+    ) -> Result<Vec<u8>, String> {
+        if self.total_size().is_none_or(|size| size > limit) {
+            return Err(format!("Файл {} слишком велик", self.name));
         }
         let mut payload = Vec::new();
         self.copy_to(file, archive_size, &mut payload)?;
@@ -720,7 +727,7 @@ impl RpaArchive {
 }
 
 /// Путь относительно `tl/<язык>`; `None` для файлов вне папки перевода.
-fn translation_file_name(name: &str) -> Option<&str> {
+pub(crate) fn translation_file_name(name: &str) -> Option<&str> {
     name.strip_prefix("tl/")?
         .strip_prefix(crate::TL_LANG)?
         .strip_prefix('/')
@@ -734,7 +741,7 @@ fn script_base(name: &str) -> &str {
 }
 
 /// Скрипты в папке игры по имени относительно неё. Переводы на другие языки не нужны.
-fn loose_scripts(game_dir: &Path) -> Vec<(String, PathBuf)> {
+pub(crate) fn loose_scripts(game_dir: &Path) -> Vec<(String, PathBuf)> {
     let mut paths = Vec::new();
     crate::collect_script_files(game_dir, &mut paths);
     let mut scripts: Vec<_> = paths
@@ -758,7 +765,7 @@ fn compiled_without_source(loose: &[(String, PathBuf)]) -> Vec<&(String, PathBuf
         .collect()
 }
 
-fn read_loose_script(name: &str, path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn read_loose_script(name: &str, path: &Path) -> Option<Vec<u8>> {
     let data = File::open(path)
         .map_err(|e| e.to_string())
         .and_then(|file| read_limited(file, MAX_COMPILED_SCRIPT as usize, name));
@@ -789,7 +796,7 @@ fn write_decompiled(payload: &[u8], name: &str, out_file: &Path) -> Result<bool,
 }
 
 /// Архивы игры в алфавитном порядке. Собственный архив мода не содержит её скриптов.
-fn game_archives(game_dir: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn game_archives(game_dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut archives = Vec::new();
     for entry in fs::read_dir(game_dir)
         .map_err(|e| format!("Не удалось прочитать папку игры {:?}: {}", game_dir, e))?

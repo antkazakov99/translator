@@ -15,6 +15,7 @@
   import NameRulesLibrary from "../lib/NameRulesLibrary.svelte";
   import { nameRules, dirtyNameRuleLanguages, saveNameRules } from "../lib/name-rules.svelte";
   import LlmSettingsModal from "../lib/LlmSettingsModal.svelte";
+  import FontReplacementModal from "../lib/FontReplacementModal.svelte";
   import ReadingDepthSettings from "../lib/ReadingDepthSettings.svelte";
   import RequestSlider from "../lib/RequestSlider.svelte";
   import { DEFAULT_READING_DEPTH, partsForDepth, partsToRead, type CharacterChunks, type ReadingDepth } from "../lib/character-parts";
@@ -72,7 +73,8 @@
     Braces,
     Film,
     MoreHorizontal,
-    SpellCheck
+    SpellCheck,
+    Type as FontIcon
   } from "lucide-svelte";
 
   // Стейт проекта на Svelte 5 (Runes)
@@ -2654,6 +2656,7 @@
 
   // Управление студией RPA и RPYC
   let showToolsModal = $state(false);
+  let showFontsModal = $state(false);
   let toolsActiveTab = $state<'rpa' | 'rpyc'>('rpa');
 
   let packingMod = $state(false);
@@ -3625,6 +3628,17 @@
             >
               <Archive size={16} class="text-sky-400" />
               <span><strong>Студия RPA / RPYC</strong><small>Архивы и декомпиляция</small></span>
+            </button>
+            <button
+              class="tools-menu-item"
+              disabled={!gameDir}
+              onclick={() => {
+                showToolsMenu = false;
+                showFontsModal = true;
+              }}
+            >
+              <FontIcon size={16} class="text-sky-400" />
+              <span><strong>Подмена шрифтов</strong><small>Шрифты игры и их замены в моде</small></span>
             </button>
 
             <div class="tools-menu-divider"></div>
@@ -6378,6 +6392,13 @@
   />
 
   <!-- НАСТРОЙКИ LLM: СЕРВЕРЫ И МОДЕЛЬ ДЛЯ КАЖДОГО ДЕЙСТВИЯ -->
+  <FontReplacementModal
+    show={showFontsModal}
+    gameDir={gameDir.trim()}
+    onclose={() => showFontsModal = false}
+    ontoast={showToast}
+  />
+
   <LlmSettingsModal
     show={showLlmSettings}
     settings={llmSettings}
