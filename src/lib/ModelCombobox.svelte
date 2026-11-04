@@ -22,12 +22,14 @@
   let editing = $state(false);
   let text = $derived(value || editing ? value : fallback);
 
-  // Выбранная модель не сужает список: иначе в нём осталась бы только она
+  // Сохранённое имя может быть алиасом, которого сервер не возвращает в списке.
+  // При открытии показываем все варианты, сужаем их только во время ввода.
   function options(all: boolean) {
+    const available = [...new Set([fallback.trim(), ...models].filter(Boolean))];
     const query = value.trim().toLowerCase();
-    const shown = all || models.includes(value.trim())
-      ? models
-      : models.filter((model) => model.toLowerCase().includes(query));
+    const shown = all || !editing || available.includes(value.trim())
+      ? available
+      : available.filter((model) => model.toLowerCase().includes(query));
     return shown.map((model) => ({ id: model, label: model }));
   }
 </script>
@@ -44,6 +46,9 @@
     editing = true;
     value = next;
   }}
-  onpick={(model) => value = model}
+  onpick={(model) => {
+    editing = false;
+    value = model;
+  }}
   onblur={() => editing = false}
 />

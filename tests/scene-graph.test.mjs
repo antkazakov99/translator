@@ -20,6 +20,22 @@ test('branches use actual edges and keep unrelated scenes disconnected', () => {
   assert.ok(!graph.links.some(e => e.to === 'unrelated'));
 });
 
+test('focused graph finds scenes by title as well as by label', () => {
+  const edges = [
+    { from: 'start', to: 'left', kind: 'jump', condition: null },
+    { from: 'start', to: 'right', kind: 'jump', condition: null },
+    { from: 'in_a', to: 'start', kind: 'jump', condition: null },
+    { from: 'in_b', to: 'start', kind: 'jump', condition: null }
+  ];
+  const titles = { right: 'Ссора в баре', in_a: 'Встреча' };
+  const names = (graph, role) => graph.nodes.filter(n => n.role === role).map(n => n.name);
+  const options = { focusName: 'start', sceneTitle: name => titles[name] ?? '' };
+  const scenes = ['start', 'left', 'right', 'in_a', 'in_b'].map(scene);
+  assert.deepEqual(names(buildFocusedSceneGraph(scenes, edges, { ...options, outgoingFilter: 'ссора' }), 'outgoing'), ['right']);
+  assert.deepEqual(names(buildFocusedSceneGraph(scenes, edges, { ...options, outgoingFilter: 'left' }), 'outgoing'), ['left']);
+  assert.deepEqual(names(buildFocusedSceneGraph(scenes, edges, { ...options, incomingFilter: 'встреча' }), 'incoming'), ['in_a']);
+});
+
 test('cycles, self loops, external labels and similar names remain distinct', () => {
   const graph = buildFullSceneGraph(['end', 'end_scene'].map(scene), [
     { from: 'end', to: 'end_scene', kind: 'jump', condition: null },

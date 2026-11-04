@@ -1,9 +1,10 @@
 <script lang="ts">
   import { Plus, X } from "lucide-svelte";
-  import type { NameForm } from "./name-forms";
+  import type { NameForm, CharacterNameOrigin } from "./name-forms";
 
   let {
     forms,
+    origins = [],
     label,
     hint,
     placeholder,
@@ -12,6 +13,7 @@
     onsplit
   }: {
     forms: NameForm[];
+    origins?: CharacterNameOrigin[];
     label: string;
     hint: string;
     placeholder: string;
@@ -35,6 +37,7 @@
   </div>
   {#each forms as form, index (index)}
     <div class="forms-row" class:no-split={!onsplit}>
+      <div class="forms-original">
       <input
         type="text"
         class="forms-input"
@@ -43,6 +46,10 @@
         aria-label={`${label}: оригинал`}
         oninput={(event) => edit(index, { source: event.currentTarget.value })}
       />
+      {#each origins.filter((origin) => origin.source.trim().toLowerCase() === form.source.trim().toLowerCase()) as origin}
+        <span class="forms-hint" title={origin.reason}>{origin.languages.join(", ")}</span>
+      {/each}
+      </div>
       <input
         type="text"
         class="forms-input"
@@ -73,6 +80,8 @@
 </div>
 
 <style>
+  .forms-original { display: grid; gap: 4px; min-width: 0; }
+  .forms-row > button { margin-top: 6px; }
   .forms {
     display: flex;
     flex-direction: column;
@@ -117,7 +126,7 @@
   .forms-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto;
-    align-items: center;
+    align-items: start;
     gap: 6px;
   }
 

@@ -20,6 +20,16 @@ pub struct NameForm {
     pub translated: String,
 }
 
+/// Гипотеза происхождения конкретного имени в контексте полного имени персонажа.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CharacterNameOrigin {
+    pub field: String,
+    pub source: String,
+    pub context: String,
+    pub languages: Vec<String>,
+    pub reason: String,
+}
+
 fn joined_name(first: &str, last: &str) -> String {
     [first.trim(), last.trim()].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" ")
 }
@@ -40,6 +50,8 @@ pub struct CharacterGlossaryEntry {
     pub excluded_notes: Vec<String>, // Заметки частей, которые не идут в итоговое описание
     #[serde(default)]
     pub forms: Vec<NameForm>, // Другие имена и обращения ("Miss Granger")
+    #[serde(default)]
+    pub name_origins: Vec<CharacterNameOrigin>,
     #[serde(default)]
     pub first_name: String, // Имя ("Lisa"). Вместе с фамилией это подпись записи и имя в запросах к модели
     #[serde(default)]
@@ -178,6 +190,8 @@ pub struct TermGlossaryEntry {
     pub excluded_scenes: Vec<String>, // Сцены, которые не передаются модели
     #[serde(default)]
     pub excluded_notes: Vec<String>, // Заметки частей, которые не идут в итоговое описание
+    #[serde(default)]
+    pub guess: bool, // Предположение модели при переводе реплик, пока его не подтвердит пользователь
 }
 
 impl TermGlossaryEntry {
@@ -198,9 +212,20 @@ impl TermGlossaryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TokenGlossaryEntry {
     pub name: String, // Имя переменной без скобок и флагов ("landlady", "friend.name")
-    pub note: String, // Что она значит: при переводе токен останется в тексте, и модели нужно это знать
+    pub note: String, // Что она значит: токен без значения останется в переводе, и модели нужно это знать
     #[serde(default)]
-    pub value: String, // Что подставить вместо токена при чтении сцен ("мать")
+    pub value: String, // Что подставить вместо токена при чтении сцен и переводе ("mother")
+}
+
+/// Описание сцены. Сцена опознаётся по метке: она одна на игру и не зависит от файла и номера строки
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SceneGlossaryEntry {
+    pub scene: String, // Метка сцены ("day1_morning")
+    pub notes: String, // Что происходит в сцене
+    #[serde(default)]
+    pub title: String, // Короткое название ("Ссора в баре")
+    #[serde(default)]
+    pub text_hash: String, // Какой текст сцены прочитала модель: после обновления игры описание могло устареть
 }
 
 /// Единый глоссарий проекта
@@ -210,6 +235,8 @@ pub struct ProjectGlossary {
     pub terms: Vec<TermGlossaryEntry>,
     #[serde(default)]
     pub tokens: Vec<TokenGlossaryEntry>,
+    #[serde(default)]
+    pub scenes: Vec<SceneGlossaryEntry>,
     #[serde(default)]
     pub removed_characters: Vec<MergedCharacter>, // Персонажи из скриптов, которых удалил пользователь: скан не возвращает их
     #[serde(default)]
@@ -324,6 +351,12 @@ impl ProjectGlossary {
                 merged += 1;
             }
         }
+        for scene in other.scenes {
+            if !self.scenes.iter().any(|own| own.scene == scene.scene) {
+                self.scenes.push(scene);
+                merged += 1;
+            }
+        }
         for removed in other.removed_characters {
             let known = self.is_removed(&removed.alias) || self.characters.iter().any(|own| own.has_alias(&removed.alias));
             if !known {
@@ -415,6 +448,22 @@ mod tests {
         ProjectGlossary::default().save_for_project(&game_dir).unwrap();
         assert!(ProjectGlossary::load_for_project(&game_dir).is_ok());
         let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn test_name_origins_are_optional_and_survive_serialization_and_rescan() {
+        let old: ProjectGlossary = serde_json::from_str(r#"{"characters":[{"alias":"a","gender":"female","notes":"","first_name":"Anna"}],"terms":[]}"#).unwrap();
+        assert!(old.characters[0].name_origins.is_empty());
+        let origin = CharacterNameOrigin { field: "first".into(), source: "Anna".into(), context: "Anna".into(), languages: vec!["немецкий".into(), "английский".into()], reason: "Несколько вариантов произношения".into() };
+        let mut glossary = old;
+        glossary.characters[0].name_origins.push(origin.clone());
+        let json = serde_json::to_string(&glossary).unwrap();
+        let mut loaded: ProjectGlossary = serde_json::from_str(&json).unwrap();
+        loaded.merge_with_scanned_characters(&[("a".into(), "Anna".into())]);
+        assert_eq!(loaded.characters[0].name_origins, [origin]);
+        let mut moved = ProjectGlossary::default();
+        moved.merge_from(loaded);
+        assert_eq!(moved.characters[0].name_origins.len(), 1);
     }
 
     #[test]
@@ -560,6 +609,18 @@ mod tests {
         let other = ProjectGlossary { tokens: vec![token("landlady", "чужое"), token("nick", "прозвище")], ..Default::default() };
         assert_eq!(own.merge_from(other), 1);
         assert_eq!(own.tokens, [token("landlady", "своё"), token("nick", "прозвище")]);
+    }
+
+    #[test]
+    fn test_scenes_are_optional_and_own_description_wins() {
+        let old: ProjectGlossary = serde_json::from_str(r#"{"characters": [], "terms": []}"#).unwrap();
+        assert!(old.scenes.is_empty());
+
+        let scene = |scene: &str, notes: &str| SceneGlossaryEntry { scene: scene.to_string(), notes: notes.to_string(), ..Default::default() };
+        let mut own = ProjectGlossary { scenes: vec![scene("day1", "своё")], ..Default::default() };
+        let other = ProjectGlossary { scenes: vec![scene("day1", "чужое"), scene("day2", "вечер в баре")], ..Default::default() };
+        assert_eq!(own.merge_from(other), 1);
+        assert_eq!(own.scenes, [scene("day1", "своё"), scene("day2", "вечер в баре")]);
     }
 
     #[test]

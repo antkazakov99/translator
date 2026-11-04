@@ -3,6 +3,23 @@
 Universal localization & translation tool for game engines (Ren'Py, RPG Maker, Unity) with local LLMs (LM Studio, Ollama).
 Built with Rust.
 
+Name translation in the character glossary has separate buttons: analyze probable origins
+and load or generate language rules, then translate and check spellings. A single model selector
+can be switched between these stages; translation reuses the completed analysis.
+The panel shows probable languages and proposed translations for selection. Rules are edited
+in the separate Rules tab. Saved rules are shared between
+projects in `%LOCALAPPDATA%\TranslatorApp\name_rules.json`. Ambiguous or unchecked spellings
+require manual selection before applying. Manual chatbot requests include saved rules and
+glossary spellings, but do not receive the separate API check.
+The glossary's Rules tab shows the whole language library, with search, manual editing and
+model-generated drafts. Its edits are shared with name translation and saved by Save glossary.
+Analysis automatically drafts missing rules as new languages are found. Translation and checking
+run one name at a time, including only its probable languages' rules and relevant glossary entries.
+Each character card shows the analyzed origins of its given name, surname and other forms.
+These hypotheses are saved with the glossary and hidden if the original name or owner context changes.
+Bulk analysis only fills missing origins and rules. A character card has separate name analysis
+and translation buttons; its analysis can explicitly refresh that character's origins.
+
 The game directory is read-only for Translator. Extracted scripts, the glossary, and
 default exports are stored under `%LOCALAPPDATA%\TranslatorApp\projects_cache` on
 Windows. Custom export and extraction destinations must be outside the game directory.

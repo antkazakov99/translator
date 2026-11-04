@@ -2,6 +2,7 @@
   import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+  import { sceneLabel } from "./scene-label";
   import {
     FileCode,
     FolderOpen,
@@ -43,6 +44,7 @@
     targetSceneName = null,
     targetLineNumber = null,
     scenes = [],
+    sceneTitle = () => "",
     onclose = () => {}
   }: {
     show: boolean;
@@ -50,6 +52,7 @@
     targetSceneName?: string | null;
     targetLineNumber?: number | null;
     scenes?: SceneItem[];
+    sceneTitle?: (name: string) => string;
     onclose: () => void;
   } = $props();
 
@@ -457,7 +460,7 @@
               <option value="">Выберите сцену...</option>
               {#each scenes as sc}
                 <option value={sc.name}>
-                  {sc.name}
+                  {sceneLabel(sc.name, sceneTitle(sc.name))}
                 </option>
               {/each}
             </select>
@@ -522,7 +525,7 @@
         <div class="footer-info">
           {#if targetSceneName}
             <span class="target-tag">
-              Сцена в фокусе: <strong>{targetSceneName}</strong>
+              Сцена в фокусе: <strong>{sceneLabel(targetSceneName, sceneTitle(targetSceneName))}</strong>
             </span>
           {/if}
           {#if targetLineNumber}

@@ -1,16 +1,23 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
   import SceneGraph from "../lib/SceneGraph.svelte";
+  import SceneName from "../lib/SceneName.svelte";
   import SceneNodeIcon from "../lib/SceneNodeIcon.svelte";
+  import { sceneLabel } from "../lib/scene-label";
+  import { hasWords } from "../lib/line-text";
   import SourceViewerModal from "../lib/SourceViewerModal.svelte";
   import EntryPicker from "../lib/EntryPicker.svelte";
   import FormsEditor from "../lib/FormsEditor.svelte";
+  import { currentNameOrigins, withNameOrigins, type CharacterNameOrigin } from "../lib/name-forms";
   import OwnerSelect from "../lib/OwnerSelect.svelte";
   import { allNames, canonicalForms, characterTitle, cleanCharacterForms, cleanTermForms, defaultCanonicalName, formOwners, formTranslation, hasScriptCode, knownNames, newCharacterAlias, ownerKey, translatedTitle, type CanonicalName, type FormOwner, type NameField, type NameForm } from "../lib/name-forms";
   import GlossaryAiPanel from "../lib/GlossaryAiPanel.svelte";
+  import NameRulesLibrary from "../lib/NameRulesLibrary.svelte";
+  import { nameRules, dirtyNameRuleLanguages, saveNameRules } from "../lib/name-rules.svelte";
   import LlmSettingsModal from "../lib/LlmSettingsModal.svelte";
+  import ReadingDepthSettings from "../lib/ReadingDepthSettings.svelte";
   import RequestSlider from "../lib/RequestSlider.svelte";
-  import { partsToRead, type CharacterChunks } from "../lib/character-parts";
+  import { DEFAULT_READING_DEPTH, partsForDepth, partsToRead, type CharacterChunks, type ReadingDepth } from "../lib/character-parts";
   import { beginLlmRun, endLlmRun, llmRun } from "../lib/llm-run.svelte";
   import LlmChoice from "../lib/LlmChoice.svelte";
   import { defaultLlmChoices, saveLlmSettings, loadLlmSettings, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings, type LlmTarget } from "../lib/llm-settings";
@@ -63,7 +70,9 @@
     ExternalLink,
     RotateCcw,
     Braces,
-    MoreHorizontal
+    Film,
+    MoreHorizontal,
+    SpellCheck
   } from "lucide-svelte";
 
   // Стейт проекта на Svelte 5 (Runes)
@@ -197,13 +206,13 @@
     let disposed = false;
     let closing = false;
     void window.onCloseRequested(async (event) => {
-      if (!glossaryDirty && !translationDirty) return;
+      if (!glossaryDirty && !translationDirty && !nameRulesDirty) return;
       event.preventDefault();
       if (closing) return;
       closing = true;
       try {
         const translationsSaved = await saveTranslations();
-        const glossarySaved = !glossaryDirty || await saveGlossary();
+        const glossarySaved = !(glossaryDirty || nameRulesDirty) || await saveGlossaryAndRules();
         // Ошибка сохранения не должна запирать пользователя в приложении
         const canClose = (translationsSaved && glossarySaved) || await ask(
           "Не удалось сохранить изменения. Закрыть приложение без них?",
@@ -379,6 +388,7 @@
     translated_text: string | null;
     status: string;
     scene_name: string;
+    draft: boolean; // Перевод модели, который ещё не проверен
   }
 
   interface ChoiceOption {
@@ -437,6 +447,7 @@
     merged: { alias: string; original_name: string }[];
     excluded_notes: string[];
     forms: NameForm[];
+    name_origins?: CharacterNameOrigin[];
   }
 
   interface CharacterPart {
@@ -459,6 +470,7 @@
     forms: NameForm[];
     excluded_scenes: string[];
     excluded_notes: string[];
+    guess?: boolean; // Предположение модели при переводе реплик, пока его не подтвердит пользователь
   }
 
   interface TermCandidate {
@@ -480,10 +492,59 @@
     example: string;
   }
 
+  interface SceneGlossaryEntry {
+    scene: string;
+    notes: string;
+    title: string;
+    text_hash?: string;
+  }
+
+  interface GameScene {
+    scene: string;
+    file: string;
+    lines: number;
+    text_hash: string;
+  }
+
+  // Ход перевода реплик. Реплики уже сохранены, а термины и описания сцен ещё нужно внести в глоссарий
+  interface LinesProgress {
+    batch: number;
+    total_batches: number;
+    reading: string | null;
+    lines: { key: string; text: string }[];
+    terms: TermGlossaryEntry[];
+    scene: { scene: string; summary: { description: string; title: string; text_hash: string } } | null;
+  }
+
+  interface LinesResult {
+    translated: number;
+    failed_lines: number;
+    failed_scenes: number;
+  }
+
+  interface ReviewProgress {
+    batch: number;
+    total_batches: number;
+    lines: { key: string; text: string }[];
+  }
+
+  interface ReviewResult {
+    checked: number;
+    fixed: number;
+    failed_lines: number;
+  }
+
+  // Сцена в общем пути описаний. Запись в глоссарии есть только у описанной сцены, а выбирать сцены и заметки внутри неё нечего
+  interface SceneTarget extends SceneGlossaryEntry {
+    excluded_scenes: string[];
+    excluded_notes: string[];
+  }
+
   interface ProjectGlossary {
     characters: CharacterGlossaryEntry[];
     terms: TermGlossaryEntry[];
     tokens: TokenGlossaryEntry[];
+    scenes: SceneGlossaryEntry[];
     removed_characters: { alias: string; original_name: string }[];
     discarded_terms: string[];
   }
@@ -658,7 +719,7 @@
   // Навигация и фильтрация
   let selectedSceneId = $state<string>("all");
   let searchQuery = $state("");
-  let filterStatus = $state<"all" | "untranslated" | "translated">("all");
+  let filterStatus = $state<"all" | "untranslated" | "translated" | "draft">("all");
   let selectedEntry = $state<DialogueEntry | null>(null);
   let viewMode = $state<"table" | "scenes">("table");
   let focusedSceneName = $state<string | null>(null);
@@ -683,7 +744,7 @@
     if (!currentFile) return [];
     const q = sceneSearchQuery.trim().toLowerCase();
     if (!q) return currentFile.scenes;
-    return currentFile.scenes.filter(s => s.name.toLowerCase().includes(q));
+    return currentFile.scenes.filter(s => s.name.toLowerCase().includes(q) || sceneTitle(s.name).toLowerCase().includes(q));
   });
 
   function selectScene(scene: Scene) {
@@ -746,10 +807,13 @@
   let llmSettings = $state<LlmSettings>(loadLlmSettings());
   // Заметки по сценам привязаны к модели, поэтому от неё зависит и подсчёт готовых частей
   let descriptionModel = $derived(targetFor(llmSettings, "descriptions").model);
-  let glossaryTab = $state<'characters' | 'terms' | 'tokens'>('characters');
+  let glossaryTab = $state<'characters' | 'terms' | 'tokens' | 'scenes'>('characters');
+  let showNameRules = $state(false);
+  let glossaryAiActions = $state<{ analyzeCharacter: (alias: string) => Promise<void>; translateCharacter: (alias: string) => Promise<void> } | null>(null);
+  let nameRulesDirty = $derived(dirtyNameRuleLanguages().length > 0);
   // Пустая карточка новой записи на текущей вкладке
   let addingEntry = $state(false);
-  let glossary = $state<ProjectGlossary>({ characters: [], terms: [], tokens: [], removed_characters: [], discarded_terms: [] });
+  let glossary = $state<ProjectGlossary>({ characters: [], terms: [], tokens: [], scenes: [], removed_characters: [], discarded_terms: [] });
   let loadingGlossary = $state(false);
   let savingGlossary = $state(false);
   let glossaryDirty = $state(false);
@@ -759,14 +823,19 @@
   // Новые: названия из текста игры, которых нет в глоссарии. Что из них взять, решает пользователь.
   // Раздел «Персонажи»: другие имена персонажей, там одно название связывается с несколькими
   let termView = $state<"terms" | "archive" | "trash">("terms");
-  // Описание обновляется одинаково у персонажа и термина: различаются команды и то, что записывается в итоге
-  type DescribedEntry = CharacterGlossaryEntry | TermGlossaryEntry;
+  // Описание обновляется одинаково у персонажа, термина и сцены: различаются команды и то, что записывается в итоге
+  type DescribedEntry = CharacterGlossaryEntry | TermGlossaryEntry | SceneTarget;
   const isCharacter = (entry: DescribedEntry): entry is CharacterGlossaryEntry => "alias" in entry;
-  const entryId = (entry: DescribedEntry) => (isCharacter(entry) ? entry.alias : entry.id);
-  const entryTitle = (entry: DescribedEntry) => (isCharacter(entry) ? characterTitle(entry) : entry.source_term);
-  let describedEntry = $derived<DescribedEntry | null>(
-    glossaryTab === "characters" ? selectedGlossaryChar : glossaryTab === "terms" && termView === "terms" ? selectedGlossaryTerm : null
-  );
+  const isScene = (entry: DescribedEntry): entry is SceneTarget => "scene" in entry;
+  const sceneTarget = (scene: string, own?: SceneGlossaryEntry): SceneTarget =>
+    ({ scene, notes: own?.notes ?? "", title: own?.title ?? "", excluded_scenes: [], excluded_notes: [] });
+  const entryId = (entry: DescribedEntry) => (isCharacter(entry) ? entry.alias : isScene(entry) ? `scene:${entry.scene}` : entry.id);
+  const entryTitle = (entry: DescribedEntry) => (isCharacter(entry) ? characterTitle(entry) : isScene(entry) ? sceneName(entry.scene) : entry.source_term);
+  let describedEntry = $derived.by<DescribedEntry | null>(() => {
+    if (glossaryTab === "characters") return selectedGlossaryChar;
+    if (glossaryTab === "scenes") return selectedSceneEntry;
+    return glossaryTab === "terms" && termView === "terms" ? selectedGlossaryTerm : null;
+  });
   let termCandidates = $state.raw<TermCandidate[]>([]);
   let termCandidatesLoading = $state(false);
   let singleWordsSkipped = $state(false);
@@ -785,15 +854,15 @@
     const timer = setTimeout(() => { showGlossarySkeleton = true; }, 180);
     return () => clearTimeout(timer);
   });
-  // Ползунок: готовые части входят в запуск всегда, поэтому ниже их числа он не опускается
   let scenePartsByAlias = $state<Record<string, number>>({});
   // План запуска группы не меняется: готовые записи выпадают из списка, и шкала по нему поползла бы
-  let groupPlan = $state.raw<{ tab: string; parts: number; maxParts: number; byEntry: Record<string, number> } | null>(null);
-  // Пока идёт обновление группы, её план важнее выбора пользователя: шкала показывает, что читается
-  let scenePartsWanted = $derived(describedEntry ? groupPlan?.byEntry[entryId(describedEntry)] ?? scenePartsByAlias[entryId(describedEntry)] ?? 1 : 1);
+  let groupPlan = $state.raw<{ tab: string; byEntry: Record<string, number> } | null>(null);
+  // Пока идёт обновление группы, карточка показывает число частей из её плана
+  let scenePartsWanted = $derived(describedEntry ? scenePartsByAlias[entryId(describedEntry)] ?? 1 : 1);
   let sceneChunkCount = $state<number | null>(null);
   let sceneReadyCount = $state(0);
-  let sceneParts = $derived(partsToRead({ total: sceneChunkCount ?? 1, ready: sceneReadyCount }, scenePartsWanted));
+  let sceneParts = $derived((describedEntry ? groupPlan?.byEntry[entryId(describedEntry)] : undefined)
+    ?? partsToRead({ total: sceneChunkCount ?? 1, ready: sceneReadyCount }, scenePartsWanted));
   // Всё прочитано: читать нечего, остаётся собрать описание из заметок
   let sceneAllRead = $derived(!!sceneChunkCount && sceneReadyCount >= sceneChunkCount);
   let scenePartsStatus = $derived.by(() => {
@@ -818,6 +887,7 @@
     if (!summaryBuild) return "Затем сборка описания";
     if (summaryBuild.stage === "single") return "Читаю часть и пишу описание...";
     if (summaryBuild.stage === "condense") return `Сжатие заметок: ${summaryBuild.done + 1} из ${summaryBuild.total}`;
+    if (summaryBuild.stage === "title") return "Пишу название сцены...";
     return "Пишу итоговое описание...";
   });
   let collapsedScenes = $state.raw(new Set<string>());
@@ -827,33 +897,49 @@
   let updatingCharacter = $derived(updatingAlias !== null);
   let otherCharacterUpdating = $derived(updatingAlias !== null && (describedEntry ? entryId(describedEntry) : null) !== updatingAlias);
   let thisCharacterUpdating = $derived(updatingCharacter && !otherCharacterUpdating);
-  let updatingCharacterEntry = $derived([...glossary.characters, ...glossary.terms].find((entry) => entryId(entry) === updatingAlias) ?? null);
+  let updatingCharacterEntry = $derived.by<DescribedEntry | null>(() => {
+    if (updatingAlias?.startsWith("scene:")) return sceneTarget(updatingAlias.slice("scene:".length));
+    return [...glossary.characters, ...glossary.terms].find((entry) => entryId(entry) === updatingAlias) ?? null;
+  });
   const characterScenesCache = new Map<string, CharacterScene[]>();
 
   // Обновление группы: записи вкладки идут по очереди тем же путём, что и отдельная запись
   let descriptionsOpen = $state(false);
   let groupUnselectedByTab = $state<Record<string, string[] | null>>({});
   let groupUnselected = $derived(groupUnselectedByTab[glossaryTab] ?? null);
-  let groupEntries = $derived<DescribedEntry[]>(glossaryTab === "terms" ? glossary.terms : glossary.characters);
+  let groupEntries = $derived.by<DescribedEntry[]>(() => {
+    if (glossaryTab === "terms") return glossary.terms;
+    if (glossaryTab === "scenes") return (gameScenes?.scenes ?? []).map((row) => sceneTarget(row.scene, sceneEntries.get(row.scene)));
+    return glossary.characters;
+  });
   let groupChunks = $state.raw<Record<string, CharacterChunks>>({});
   let groupCounting = $state(false);
-  let groupPartsWanted = $state(1);
+  let groupDepth = $state<ReadingDepth>({ ...DEFAULT_READING_DEPTH });
   let groupRun = $state<{ index: number; total: number; name: string } | null>(null);
   let groupPlanHere = $derived(groupPlan?.tab === glossaryTab ? groupPlan : null);
   let groupStopping = $state(false);
   let groupResult = $state<{ tab: string; updated: number; total: number; failed: string[] } | null>(null);
 
   const needsWork = (c: DescribedEntry) =>
-    !c.notes.trim() || (isCharacter(c) && (!translatedTitle(c) || c.gender === "unknown" || !c.gender.trim() || !c.speech.trim()));
+    !c.notes.trim() || (isScene(c) && !c.title.trim()) || (isCharacter(c) && (!translatedTitle(c) || c.gender === "unknown" || !c.gender.trim() || !c.speech.trim()));
 
-  // Без явного выбора в группе незаполненные: готовые описания нельзя переписать случайно
-  let groupDeselected = $derived(groupUnselected ?? groupEntries.filter((c) => !needsWork(c)).map(entryId));
-  let groupTargets = $derived(groupEntries.filter((c) => !groupDeselected.includes(entryId(c))));
+  let filledEntries = $derived(groupEntries.filter((c) => !needsWork(c)).map(entryId));
+  // Без явного выбора в группе незаполненные: готовые описания нельзя переписать случайно.
+  // У сцен группа пуста: их тысячи, и незаполненной оказалась бы почти вся игра
+  let groupDeselected = $derived(groupUnselected ?? (glossaryTab === "scenes" ? groupEntries.map(entryId) : filledEntries));
+  let groupTargets = $derived.by(() => {
+    const deselected = new Set(groupDeselected);
+    return groupEntries.filter((c) => !deselected.has(entryId(c)));
+  });
   // Записи без сцен читать нечего: они не входят в план
   let groupReadable = $derived(groupTargets.filter((c) => (groupChunks[entryId(c)]?.total ?? 0) > 0));
-  let groupMaxParts = $derived(Math.max(...groupReadable.map((c) => groupChunks[entryId(c)].total), 1));
-  let groupParts = $derived(Math.min(groupPartsWanted, groupMaxParts));
+  // Собранная запись, которой нечего дочитывать, только потратила бы запрос. Собрать её заново можно в карточке
+  let groupPending = $derived(groupReadable.filter((c) => needsWork(c) || partsForDepth(groupChunks[entryId(c)], groupDepth) > groupChunks[entryId(c)].ready));
+  let groupPlannedParts = $derived(groupPlanHere
+    ? Object.values(groupPlanHere.byEntry).reduce((sum, parts) => sum + parts, 0)
+    : groupPending.reduce((sum, c) => sum + partsForDepth(groupChunks[entryId(c)], groupDepth), 0));
   let groupWithoutScenes = $derived(groupCounting ? 0 : groupTargets.length - groupReadable.length);
+  let groupAlreadyDone = $derived(groupCounting ? 0 : groupReadable.length - groupPending.length);
 
   let characterSceneTotals = $derived({
     spoken: (characterScenes ?? []).reduce((sum, scene) => sum + scene.spoken, 0),
@@ -885,6 +971,7 @@
   let scenesTarget = $derived.by(() => {
     if (!showGlossaryModal || addingEntry) return null;
     if (glossaryTab === "tokens") return selectedToken ? JSON.stringify([gameDir, "token", selectedToken.name]) : null;
+    if (glossaryTab === "scenes") return selectedScene ? JSON.stringify([gameDir, "scene", selectedScene.scene]) : null;
     if (glossaryTab === "terms") {
       if (candidatesOpen) return selectedArchived ? JSON.stringify([gameDir, "term", [selectedArchived.term]]) : null;
       const term = selectedGlossaryTerm;
@@ -929,6 +1016,7 @@
     const timer = setTimeout(() => {
       const search =
         target === "token" ? invoke<CharacterScene[]>("get_token_scenes", { gameDir: targetDir, name: value })
+        : target === "scene" ? invoke<CharacterScene[]>("get_scene_lines", { gameDir: targetDir, scene: value })
         : target === "term" ? invoke<CharacterScene[]>("get_term_scenes", { gameDir: targetDir, forms: value })
         : invoke<CharacterScene[]>("get_character_scenes", { gameDir: targetDir, aliases: target, names: value });
       search
@@ -949,9 +1037,9 @@
   // Пауза нужна только галочкам: так не копятся запросы, а новый персонаж нужен сразу
   let sceneChunkTarget: string | null = null;
   const countChunks = (gameDir: string, model: string, entry: DescribedEntry, tokens: TokenGlossaryEntry[]) =>
-    isCharacter(entry)
-      ? invoke<CharacterChunks>("count_character_chunks", { gameDir, model, character: entry, tokens })
-      : invoke<CharacterChunks>("count_term_chunks", { gameDir, model, term: entry, tokens });
+    isCharacter(entry) ? invoke<CharacterChunks>("count_character_chunks", { gameDir, model, character: entry, tokens })
+    : isScene(entry) ? invoke<CharacterChunks>("count_scene_chunks", { gameDir, model, scene: entry.scene, tokens })
+    : invoke<CharacterChunks>("count_term_chunks", { gameDir, model, term: entry, tokens });
 
   $effect(() => {
     const char = describedEntry;
@@ -987,7 +1075,7 @@
   });
 
   // Ключ не меняется при вводе текста в карточке персонажа, поэтому части не пересчитываются зря
-  let groupCountKey = $derived(JSON.stringify(groupTargets.map((c) => [entryId(c), c.excluded_scenes, isCharacter(c) ? [] : formSources(c.forms)])));
+  let groupCountKey = $derived(JSON.stringify(groupTargets.map((c) => [entryId(c), c.excluded_scenes, isCharacter(c) || isScene(c) ? [] : formSources(c.forms)])));
   $effect(() => {
     if (!descriptionsOpen || !showGlossaryModal || groupPlanHere) return;
     void [groupCountKey, sceneNotesRevision];
@@ -1041,8 +1129,9 @@
     const timer = setTimeout(() => {
       characterPartsError = null;
       const entry = untrack(() => $state.snapshot(char)) as DescribedEntry;
-      const parts = isCharacter(entry)
-        ? invoke<CharacterPart[]>("list_character_parts", { gameDir: dir, model: descriptionModel, character: entry, hints })
+      const parts =
+        isCharacter(entry) ? invoke<CharacterPart[]>("list_character_parts", { gameDir: dir, model: descriptionModel, character: entry, hints })
+        : isScene(entry) ? invoke<CharacterPart[]>("list_scene_parts", { gameDir: dir, model: descriptionModel, scene: entry.scene, hints })
         : invoke<CharacterPart[]>("list_term_parts", { gameDir: dir, model: descriptionModel, term: entry, hints });
       parts
         .then((parts) => { if (current) characterParts = { target, parts }; })
@@ -1061,7 +1150,11 @@
     glossaryDirty = true;
   }
 
+  let resettingNotes = $state(false);
+
   async function resetNotes(char: DescribedEntry, keys: string[]) {
+    if (llmRun.active || resettingNotes || keys.length === 0) return;
+    resettingNotes = true;
     try {
       await invoke("reset_character_notes", { gameDir, keys });
       if (char.excluded_notes.some((key) => keys.includes(key))) {
@@ -1071,7 +1164,7 @@
       sceneNotesRevision += 1;
     } catch (e) {
       showToast(`Не удалось сбросить заметки: ${e}`, "error");
-    }
+    } finally { resettingNotes = false; }
   }
 
   function sceneCountLabel(scene: CharacterScene) {
@@ -1383,6 +1476,14 @@
   async function showEntry(entry: DescribedEntry) {
     if (isCharacter(entry)) return showCharacter(entry);
     glossarySearch = "";
+    if (isScene(entry)) {
+      openGlossaryTab("scenes");
+      sceneView = "all";
+      selectedSceneName = entry.scene;
+      await tick();
+      document.querySelector(".glossary-list-item.selected-row")?.scrollIntoView({ block: "nearest" });
+      return;
+    }
     hiddenCategories = [];
     openGlossaryTab("terms");
     selectedGlossaryTerm = entry;
@@ -1445,6 +1546,7 @@
 
   /** Читает `parts` частей сцен записи и пишет описание. Готовый перевод имени остаётся: его мог задать пользователь. */
   async function summarizeEntry(entry: DescribedEntry, parts: number, target: LlmTarget) {
+    const dir = gameDir;
     updatingAlias = entryId(entry);
     summaryRunning = true;
     try {
@@ -1463,13 +1565,25 @@
       if (isCharacter(entry)) {
         const character = $state.snapshot(entry);
         const summary = await invoke<CharacterGlossaryEntry | null>("summarize_glossary_character", { gameDir, target, character, hints, parts, onProgress });
-        if (!summary) return "stopped";
-        applyCharacterUpdate(entry, summary);
+        if (!summary || gameDir !== dir) return "stopped";
+        // Пока модель отвечала, глоссарий могли загрузить заново, и `entry` уже не его запись
+        const own = glossary.characters.find((char) => char.alias === entry.alias);
+        if (own) applyCharacterUpdate(own, summary);
+      } else if (isScene(entry)) {
+        const scene = entry.scene;
+        const needTitle = !sceneEntries.get(scene)?.title.trim();
+        const summary = await invoke<{ description: string; title: string; text_hash: string } | null>("summarize_glossary_scene", { gameDir, target, scene, needTitle, hints, parts, onProgress });
+        if (!summary || gameDir !== dir) return "stopped";
+        setSceneField(scene, "notes", summary.description);
+        setSceneField(scene, "text_hash", summary.text_hash);
+        // Готовое название остаётся, как и перевод имени: его мог задать пользователь
+        if (!sceneEntries.get(scene)?.title.trim()) setSceneField(scene, "title", summary.title);
       } else {
         const term = $state.snapshot(entry);
         const description = await invoke<string | null>("summarize_glossary_term", { gameDir, target, term, hints, parts, onProgress });
-        if (description === null) return "stopped";
-        entry.notes = description;
+        if (description === null || gameDir !== dir) return "stopped";
+        const own = glossary.terms.find((item) => item.id === entry.id);
+        if (own) own.notes = description;
         glossaryDirty = true;
       }
       return summaryStopping ? "partial" : "updated";
@@ -1498,12 +1612,10 @@
   /** Обновляет записи группы по очереди. Две ошибки подряд значат, что дело не в записи, а в сервере. */
   async function updateCharacterGroup() {
     if (!beginLlmRun("Обновляется группа записей")) return;
-    const plan = groupReadable.map((entry) => ({ entry, parts: partsToRead(groupChunks[entryId(entry)], groupParts) }));
+    const plan = groupPending.map((entry) => ({ entry, parts: partsForDepth(groupChunks[entryId(entry)], groupDepth) }));
     const tab = glossaryTab;
     groupPlan = {
       tab,
-      parts: groupParts,
-      maxParts: groupMaxParts,
       byEntry: Object.fromEntries(plan.map(({ entry, parts }) => [entryId(entry), parts]))
     };
     // Настройки LLM открываются и во время запуска, а вся группа идёт на одной модели
@@ -1560,6 +1672,18 @@
       }
     }
     glossaryDirty = true;
+  }
+
+  function applyPanelOrigins(rows: { alias: string; origin: CharacterNameOrigin }[], overwrite = false) {
+    for (const { alias, origin } of rows) {
+      const char = glossary.characters.find((c) => c.alias === alias);
+      if (!char) continue;
+      if (!overwrite && currentNameOrigins(char).some((own) => own.field === origin.field && own.source.trim().toLowerCase() === origin.source.trim().toLowerCase() && own.languages.some((language) => language.trim()))) continue;
+      const origins = withNameOrigins(char, [origin]);
+      if (JSON.stringify(origins) === JSON.stringify(char.name_origins ?? [])) continue;
+      char.name_origins = origins;
+      glossaryDirty = true;
+    }
   }
 
   function applyPanelTerms(rows: { id: string; translated: string; category: string; notes: string }[]) {
@@ -1765,7 +1889,7 @@
     // 1. Если сцена есть в текущем файле — моментальный фокус
     if (isInternalScene(targetName)) {
       focusScene(targetName);
-      showToast(`Сцена "${targetName}" в фокусе (текущий файл)`, "info");
+      showToast(`Сцена "${sceneName(targetName)}" в фокусе (текущий файл)`, "info");
       return;
     }
 
@@ -1819,8 +1943,8 @@
         await tick();
         focusScene(found.scene_name);
         showToast(isInternalScene(found.scene_name)
-          ? 'Открыт граф ' + found.short_name + ' → ' + found.scene_name
-          : 'Файл открыт, но метка отсутствует среди разобранных сцен: ' + targetName,
+          ? 'Открыт граф ' + found.short_name + ' → ' + sceneName(found.scene_name)
+          : 'Файл открыт, но метка отсутствует среди разобранных сцен: ' + sceneName(targetName),
           isInternalScene(found.scene_name) ? 'success' : 'warning');
       } else {
         showToast(`Сцена найдена в ${found.short_name}:${found.line_number}, но файл не найден`, "warning");
@@ -1887,7 +2011,8 @@
       const matchFilter = 
         filterStatus === "all" ||
         (filterStatus === "untranslated" && !isTranslated) ||
-        (filterStatus === "translated" && isTranslated);
+        (filterStatus === "translated" && isTranslated) ||
+        (filterStatus === "draft" && e.draft);
 
       return matchSearch && matchFilter;
     });
@@ -1932,8 +2057,419 @@
   function recordTranslationEdit(entry: DialogueEntry, text: string) {
     if (!editedEntries.has(entry.translation_key)) editedEntries = new Set(editedEntries).add(entry.translation_key);
     entry.translated_text = text;
+    entry.draft = false;
     translationEdits[entry.translation_key] = text;
     updateTranslationStats();
+  }
+
+  // Подтверждение это обычная правка того же текста: при сохранении она снимает пометку модели
+  function confirmDrafts(entries: DialogueEntry[]) {
+    editedEntries = new Set([...editedEntries, ...entries.map((entry) => entry.translation_key)]);
+    for (const entry of entries) {
+      entry.draft = false;
+      translationEdits[entry.translation_key] = entry.translated_text ?? "";
+    }
+  }
+
+  let filledLines = $derived(visibleScenes.reduce((sum, scene) => sum + scene.entries.filter((entry) => entry.translated_text?.trim()).length, 0));
+
+  /** Очищает перевод открытой сцены или файла. Пустая правка значит строку без перевода, как после ручной очистки. */
+  async function resetVisibleTranslation() {
+    if (!currentFile || llmRun.active) return;
+    const entries = visibleScenes.flatMap((scene) => scene.entries.filter((entry) => entry.translated_text?.trim()));
+    if (entries.length === 0) return;
+    const place = currentScene ? `сцены ${sceneName(currentScene.name)}` : `файла ${currentFile.file_name}`;
+    const confirmed = await ask(
+      `Очистить перевод ${place}? Строк с переводом: ${entries.length}. Сброс вступит в силу после сохранения.`,
+      { title: "Сброс перевода", kind: "warning", okLabel: "Очистить", cancelLabel: "Отмена" }
+    );
+    if (!confirmed) return;
+    editedEntries = new Set([...editedEntries, ...entries.map((entry) => entry.translation_key)]);
+    for (const entry of entries) {
+      entry.translated_text = "";
+      entry.draft = false;
+      translationEdits[entry.translation_key] = "";
+    }
+    updateTranslationStats();
+  }
+
+  let resettingProject = $state(false);
+
+  /** Очищает перевод всех файлов проекта. Файлов много, поэтому пустые правки сразу пишутся на диск. */
+  async function resetProjectTranslation() {
+    if (!project || llmRun.active || resettingProject) return;
+    const files = project.files.filter((file) => file.translated_lines > 0);
+    if (files.length === 0) return;
+    const confirmed = await ask(
+      `Очистить перевод всех строк проекта? Строк с переводом: ${project.total_translated}, файлов: ${files.length}. Сброс сразу сохраняется, вернуть перевод можно только заново.`,
+      { title: "Сброс перевода проекта", kind: "warning", okLabel: "Очистить всё", cancelLabel: "Отмена" }
+    );
+    if (!confirmed || !(await saveTranslations())) return;
+    const current = project;
+    resettingProject = true;
+    const broken: string[] = [];
+    try {
+      for (const file of files) {
+        if (project !== current) return;
+        try {
+          const parsed = await invoke<ParsedFile>("parse_file_entries", { filePath: file.path });
+          const keys = parsed.scenes.flatMap((scene) => scene.entries.filter((entry) => entry.translated_text?.trim()).map((entry) => entry.translation_key));
+          await invoke<void>("save_file_translations", { filePath: file.path, changes: keys.map((key) => ({ key, text: "" })) });
+          current.total_translated -= file.translated_lines;
+          file.translated_lines = 0;
+          if (currentFile?.file_path === file.path) {
+            const reset = new Set(keys);
+            for (const entry of allEntries.filter((entry) => reset.has(entry.translation_key))) {
+              entry.translated_text = "";
+              entry.draft = false;
+              delete translationEdits[entry.translation_key];
+            }
+            updateTranslationStats();
+          }
+        } catch (e) {
+          broken.push(`${file.name}: ${e}`);
+        }
+      }
+      if (broken.length > 0) showToast(`Перевод сброшен не везде, файлы с ошибкой: ${broken.join("; ")}`, "warning");
+      else showToast("Перевод проекта сброшен", "success");
+    } finally {
+      resettingProject = false;
+    }
+  }
+
+  let linePanelOpen = $state(false);
+  let lineRun = $state<{
+    done: number;
+    total: number;
+    reading: string | null;
+    stopping: boolean;
+    // Файл прохода по всему проекту
+    file: { index: number; count: number; name: string } | null;
+    // Идёт редактура готовых строк, а не перевод пустых
+    review: boolean;
+  } | null>(null);
+  let emptyLines = $derived(visibleScenes.reduce((sum, scene) => sum + scene.entries.filter((entry) => !entry.translated_text?.trim()).length, 0));
+  let projectEmptyLines = $derived(project ? project.total_lines - project.total_translated : 0);
+  let visibleDrafts = $derived(visibleScenes.flatMap((scene) => scene.entries.filter((entry) => entry.draft)));
+
+  function toggleLinePanel() {
+    // Как и в глоссарии, выбор разовый: текст игры не должен уйти на сервер, выбранный когда-то раньше
+    if (!linePanelOpen) llmSettings.actions.lines = { connection: "", model: "" };
+    linePanelOpen = !linePanelOpen;
+    if (linePanelOpen) reviewPanelOpen = false;
+  }
+
+  /** Показывает строки, которые уже лежат в правках. Строку могли заполнить, пока модель отвечала: такая правка важнее. */
+  function applyTranslatedLines(filePath: string, lines: LinesProgress["lines"]) {
+    if (currentFile?.file_path !== filePath) {
+      const summaryFile = project?.files.find((file) => file.path === filePath);
+      if (project && summaryFile) {
+        summaryFile.translated_lines += lines.length;
+        project.total_translated += lines.length;
+      }
+      return;
+    }
+    const texts = new Map(lines.map((line) => [line.key, line.text]));
+    for (const entry of allEntries) {
+      const text = texts.get(entry.translation_key);
+      if (text === undefined || entry.translated_text?.trim()) continue;
+      entry.translated_text = text;
+      entry.draft = true;
+      delete translationEdits[entry.translation_key];
+    }
+    updateTranslationStats();
+  }
+
+  function addGuessedTerms(terms: TermGlossaryEntry[]) {
+    const known = new Set(glossary.terms.map((term) => term.source_term.trim().toLowerCase()));
+    const fresh = terms.filter((term) => !known.has(term.source_term.trim().toLowerCase()));
+    if (fresh.length === 0) return;
+    glossary.terms.push(...fresh);
+    glossaryDirty = true;
+  }
+
+  // Описание и название идут только в пустые поля: заполненное мог написать пользователь
+  function applySceneNote({ scene, summary }: NonNullable<LinesProgress["scene"]>) {
+    const own = sceneEntries.get(scene);
+    if (!own?.notes.trim()) {
+      setSceneField(scene, "notes", summary.description);
+      setSceneField(scene, "text_hash", summary.text_hash);
+    }
+    if (!own?.title.trim() && summary.title) setSceneField(scene, "title", summary.title);
+  }
+
+  function linesOutcome(result: LinesResult, stopped: boolean) {
+    const parts = [`${stopped ? "Остановлено. " : ""}Переведено строк: ${result.translated}`];
+    if (result.failed_lines > 0) parts.push(`не удалось перевести: ${result.failed_lines}, они остались пустыми, следующий запуск возьмёт их снова`);
+    if (result.failed_scenes > 0) parts.push(`сцен без описания: ${result.failed_scenes}`);
+    return parts.join(", ");
+  }
+
+  // Модель получает то, что сохранено на диске: правки файла и глоссарий
+  async function saveForModel(dir: string) {
+    if (!(await saveTranslations())) return false;
+    if (glossaryProjectPath !== dir.trim() && !(await loadGlossary(true))) return false;
+    return !glossaryDirty || (await saveGlossary());
+  }
+
+  let translatingLine = $state<string | null>(null);
+
+  function lineButtonTitle() {
+    if (llmRun.active) return llmRun.note;
+    return ["Перевести эту строку через модель", outsideNote(llmSettings, "lines")].filter(Boolean).join(". ");
+  }
+
+  /** Переводит одну строку. Строку, которую правил или подтвердил пользователь, модель заменяет только с его согласия. */
+  async function translateLine(entry: DialogueEntry) {
+    if (!currentFile || llmRun.active) return;
+    const filePath = currentFile.file_path;
+    const key = entry.translation_key;
+    const dir = gameDir;
+    const filled = !!entry.translated_text?.trim();
+    const confirmed = !filled || entry.draft || await ask(
+      "Заменить готовый перевод строки ответом модели?",
+      { title: "Перевод строки", kind: "warning", okLabel: "Заменить", cancelLabel: "Оставить" }
+    );
+    if (!confirmed || !beginLlmRun(`Перевод строки #${entry.line_number}`)) return;
+    translatingLine = key;
+    try {
+      if (!(await saveForModel(dir))) return;
+      const answer = await invoke<{ text: string; terms: TermGlossaryEntry[] }>("translate_single_line", {
+        gameDir: dir,
+        filePath,
+        key,
+        target: targetFor(llmSettings, "lines"),
+        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) }
+      });
+      const own = currentFile?.file_path === filePath ? allEntries.find((line) => line.translation_key === key) : undefined;
+      if (own) {
+        own.translated_text = answer.text;
+        own.draft = true;
+        delete translationEdits[key];
+        updateTranslationStats();
+      } else if (!filled) {
+        applyTranslatedLines(filePath, [{ key, text: answer.text }]);
+      }
+      if (gameDir === dir) {
+        addGuessedTerms(answer.terms);
+        if (glossaryDirty) void saveGlossary();
+      }
+    } catch (e) {
+      showToast(`Не удалось перевести строку: ${e}`, "error");
+    } finally {
+      translatingLine = null;
+      endLlmRun();
+    }
+  }
+
+  /** Переводит пустые строки файла или его сцены. Каждый пакет сразу лежит в правках, поэтому остановка ничего не теряет. */
+  function translateFileLines(dir: string, filePath: string, scene: string | null) {
+    const onProgress = new Channel<LinesProgress>();
+    onProgress.onmessage = (step) => {
+      // Строки уже в правках своего проекта, а термины и описания чужому глоссарию не нужны
+      if (gameDir !== dir) {
+        void invoke("cancel_llm_run");
+        return;
+      }
+      applyTranslatedLines(filePath, step.lines);
+      addGuessedTerms(step.terms);
+      if (step.scene) applySceneNote(step.scene);
+      if (lineRun) {
+        lineRun.done = step.batch;
+        lineRun.total = step.total_batches;
+        lineRun.reading = step.reading;
+      } else if (glossaryDirty) {
+        // Итог пакета может отстать от итога команды
+        void saveGlossary();
+      }
+    };
+    return invoke<LinesResult>("translate_file_lines", {
+      gameDir: dir,
+      filePath,
+      scene,
+      target: targetFor(llmSettings, "lines"),
+      hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
+      onProgress
+    });
+  }
+
+  async function translateLines() {
+    if (!currentFile) return;
+    const filePath = currentFile.file_path;
+    const scene = currentScene?.name ?? null;
+    const dir = gameDir;
+    if (!beginLlmRun(`Перевод реплик: ${scene ? sceneName(scene) : currentFile.file_name}`)) return;
+    linePanelOpen = false;
+    lineRun = { done: 0, total: 0, reading: null, stopping: false, file: null, review: false };
+    try {
+      if (!(await saveForModel(dir))) return;
+      const result = await translateFileLines(dir, filePath, scene);
+      const failed = result.failed_lines > 0 || result.failed_scenes > 0;
+      showToast(linesOutcome(result, lineRun?.stopping ?? false), failed ? "warning" : "success");
+    } catch (e) {
+      showToast(`Не удалось перевести реплики: ${e}`, "error");
+    } finally {
+      lineRun = null;
+      endLlmRun();
+      if (glossaryDirty && gameDir === dir) void saveGlossary();
+    }
+  }
+
+  /** Переводит пустые строки всех файлов проекта по очереди. Сбой одного файла не останавливает остальные. */
+  async function translateProjectLines() {
+    if (!project) return;
+    const files = project.files.filter((file) => file.translated_lines < file.total_lines);
+    const dir = gameDir;
+    if (files.length === 0 || !beginLlmRun("Перевод реплик всего проекта")) return;
+    linePanelOpen = false;
+    lineRun = { done: 0, total: 0, reading: null, stopping: false, file: null, review: false };
+    const total: LinesResult = { translated: 0, failed_lines: 0, failed_scenes: 0 };
+    const broken: string[] = [];
+    try {
+      for (const [index, file] of files.entries()) {
+        if (!lineRun || lineRun.stopping || gameDir !== dir) break;
+        Object.assign(lineRun, { done: 0, total: 0, reading: null, file: { index, count: files.length, name: file.name } });
+        // Описания сцен и термины прошлого файла должны лечь на диск: следующий запуск читает глоссарий оттуда
+        if (!(await saveForModel(dir))) break;
+        try {
+          const result = await translateFileLines(dir, file.path, null);
+          total.translated += result.translated;
+          total.failed_lines += result.failed_lines;
+          total.failed_scenes += result.failed_scenes;
+        } catch (e) {
+          if (lineRun?.stopping) break;
+          broken.push(`${file.name}: ${e}`);
+        }
+      }
+      const failed = total.failed_lines > 0 || total.failed_scenes > 0 || broken.length > 0;
+      const outcome = [linesOutcome(total, lineRun?.stopping ?? false)];
+      if (broken.length > 0) outcome.push(`файлы с ошибкой: ${broken.join("; ")}`);
+      showToast(outcome.join(", "), failed ? "warning" : "success");
+    } catch (e) {
+      showToast(`Не удалось перевести реплики: ${e}`, "error");
+    } finally {
+      lineRun = null;
+      endLlmRun();
+      if (glossaryDirty && gameDir === dir) void saveGlossary();
+    }
+  }
+
+  function stopLineRun() {
+    if (lineRun) lineRun.stopping = true;
+    void invoke("cancel_llm_run");
+  }
+
+  let reviewPanelOpen = $state(false);
+  let reviewingLine = $state<string | null>(null);
+  // Реплику без слов вроде «...» или «[mc]!» вычитывать нечего
+  const isReviewable = (entry: DialogueEntry) => !!entry.translated_text?.trim() && hasWords(entry.original_text, glossary.tokens);
+  let reviewableLines = $derived(visibleScenes.reduce((sum, scene) => sum + scene.entries.filter(isReviewable).length, 0));
+
+  function toggleReviewPanel() {
+    // Выбор разовый, как у перевода
+    if (!reviewPanelOpen) llmSettings.actions.review = { connection: "", model: "" };
+    reviewPanelOpen = !reviewPanelOpen;
+    if (reviewPanelOpen) linePanelOpen = false;
+  }
+
+  function reviewButtonTitle() {
+    if (llmRun.active) return llmRun.note;
+    return ["Вычитать перевод этой строки через модель", outsideNote(llmSettings, "review")].filter(Boolean).join(". ");
+  }
+
+  /** Показывает исправления редактуры. Строку, которую пользователь правит прямо сейчас, она не трогает: его правка важнее. */
+  function applyReviewedLines(filePath: string, lines: ReviewProgress["lines"]) {
+    if (currentFile?.file_path !== filePath) return;
+    const texts = new Map(lines.map((line) => [line.key, line.text]));
+    for (const entry of allEntries) {
+      const text = texts.get(entry.translation_key);
+      if (text === undefined || entry.translation_key in translationEdits) continue;
+      entry.translated_text = text;
+      entry.draft = true;
+    }
+  }
+
+  /** Вычитывает переведённые строки открытой сцены или файла. Исправления сразу лежат в правках со статусом «Модель». */
+  async function reviewLines() {
+    if (!currentFile) return;
+    const filePath = currentFile.file_path;
+    const scene = currentScene?.name ?? null;
+    const dir = gameDir;
+    const confirmed = await ask(
+      `Модель вычитает переведённые строки (${reviewableLines}) и заменит те, где найдёт ошибки, в том числе подтверждённые. Исправленные строки получат статус «Модель».`,
+      { title: "Редактура", kind: "info", okLabel: "Начать", cancelLabel: "Отмена" }
+    );
+    if (!confirmed || !beginLlmRun(`Редактура: ${scene ? sceneName(scene) : currentFile.file_name}`)) return;
+    reviewPanelOpen = false;
+    lineRun = { done: 0, total: 0, reading: null, stopping: false, file: null, review: true };
+    try {
+      if (!(await saveForModel(dir))) return;
+      const onProgress = new Channel<ReviewProgress>();
+      onProgress.onmessage = (step) => {
+        if (gameDir !== dir) {
+          void invoke("cancel_llm_run");
+          return;
+        }
+        applyReviewedLines(filePath, step.lines);
+        if (lineRun) {
+          lineRun.done = step.batch;
+          lineRun.total = step.total_batches;
+        }
+      };
+      const result = await invoke<ReviewResult>("review_file_lines", {
+        gameDir: dir,
+        filePath,
+        scene,
+        target: targetFor(llmSettings, "review"),
+        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) },
+        onProgress
+      });
+      const parts = [`${lineRun?.stopping ? "Остановлено. " : ""}Вычитано строк: ${result.checked}, исправлено: ${result.fixed}`];
+      if (result.failed_lines > 0) parts.push(`не удалось вычитать: ${result.failed_lines}`);
+      showToast(parts.join(", "), result.failed_lines > 0 ? "warning" : "success");
+      if (result.fixed > 0 && filterStatus !== "draft") showToast("Исправленные строки отмечены статусом «Модель»", "info");
+    } catch (e) {
+      showToast(`Не удалось вычитать перевод: ${e}`, "error");
+    } finally {
+      lineRun = null;
+      endLlmRun();
+    }
+  }
+
+  /** Вычитывает одну строку. Исправление заменяет её сразу, а причина видна в уведомлении. */
+  async function reviewLine(entry: DialogueEntry) {
+    if (!currentFile || llmRun.active || !isReviewable(entry)) return;
+    const filePath = currentFile.file_path;
+    const key = entry.translation_key;
+    const dir = gameDir;
+    if (!beginLlmRun(`Редактура строки #${entry.line_number}`)) return;
+    reviewingLine = key;
+    try {
+      if (!(await saveForModel(dir))) return;
+      const answer = await invoke<{ text: string | null; issue: string | null }>("review_single_line", {
+        gameDir: dir,
+        filePath,
+        key,
+        target: targetFor(llmSettings, "review"),
+        hints: { tokens: $state.snapshot(glossary.tokens), names: characterNames, terms: $state.snapshot(glossary.terms) }
+      });
+      if (answer.text === null) {
+        showToast("Модель не нашла ошибок в этой строке", "success");
+        return;
+      }
+      const own = currentFile?.file_path === filePath ? allEntries.find((line) => line.translation_key === key) : undefined;
+      if (own) {
+        own.translated_text = answer.text;
+        own.draft = true;
+        delete translationEdits[key];
+      }
+      showToast(answer.issue ? `Исправлено: ${answer.issue}` : "Строка исправлена", "success");
+    } catch (e) {
+      showToast(`Не удалось вычитать строку: ${e}`, "error");
+    } finally {
+      reviewingLine = null;
+      endLlmRun();
+    }
   }
 
   async function saveTranslations(): Promise<boolean> {
@@ -1994,8 +2530,9 @@
     translationEdits = {};
     selectedEntry = null;
     selectedSceneId = "all";
-    glossary = { characters: [], terms: [], tokens: [], removed_characters: [], discarded_terms: [] };
+    glossary = { characters: [], terms: [], tokens: [], scenes: [], removed_characters: [], discarded_terms: [] };
     textTokens = null;
+    gameScenes = null;
     scenePartsByAlias = {};
     paneSearch = "";
     glossaryProjectPath = null;
@@ -2120,6 +2657,7 @@
   let toolsActiveTab = $state<'rpa' | 'rpyc'>('rpa');
 
   let packingMod = $state(false);
+  let changingInstalledMod = $state(false);
   let cleaningCache = $state(false);
   let unpackingRpa = $state(false);
   let decompilingRpyc = $state(false);
@@ -2137,6 +2675,7 @@
 
   // 1. Сборка архива мода, который игрок кладёт в папку game/
   async function exportMod(outputPath: string | null) {
+    if (packingMod || changingInstalledMod) return;
     if (!gameDir.trim()) {
       showToast("Укажите путь к папке игры", "warning");
       return;
@@ -2154,6 +2693,24 @@
       showToast(`Ошибка экспорта мода: ${e}`, "error");
     } finally {
       packingMod = false;
+    }
+  }
+
+  // Установить собранный архив в игру или удалить его.
+  async function changeInstalledMod(install: boolean) {
+    if (!gameDir.trim() || packingMod || changingInstalledMod || loadingProject) return;
+    const targetDir = gameDir.trim();
+    changingInstalledMod = true;
+    try {
+      if (install && !(await saveTranslations())) return;
+      const message = await invoke<string>(install ? "install_mod" : "remove_mod", {
+        gameDir: targetDir
+      });
+      showToast(message, "success");
+    } catch (e) {
+      showToast(`Ошибка ${install ? "установки" : "удаления"} перевода: ${e}`, "error");
+    } finally {
+      changingInstalledMod = false;
     }
   }
 
@@ -2372,6 +2929,70 @@
     glossaryDirty = true;
   }
 
+  // Сцены берутся из скриптов, а в глоссарии лежат только описания. Описание остаётся,
+  // даже если сцена пропала из игры: она могла исчезнуть только в этой версии
+  let gameScenes = $state.raw<{ dir: string; scenes: GameScene[] } | null>(null);
+  let sceneView = $state<"described" | "all">("described");
+  let sceneEntries = $derived(new Map(glossary.scenes.map((entry) => [entry.scene, entry])));
+  const sceneTitle = (scene: string) => sceneEntries.get(scene)?.title.trim() ?? "";
+  // Подпись сцены для текста. Метка нужна и рядом с названием: по ней сцену ищут в скриптах
+  const sceneName = (scene: string) => sceneLabel(scene, sceneTitle(scene));
+  let sceneRows = $derived.by(() => {
+    const found = gameScenes?.scenes ?? [];
+    const names = new Set(found.map((scene) => scene.scene));
+    const missing = glossary.scenes
+      .filter((entry) => !names.has(entry.scene))
+      .map((entry): GameScene => ({ scene: entry.scene, file: "", lines: 0, text_hash: "" }));
+    return [...found, ...missing];
+  });
+  let filteredSceneRows = $derived.by(() => {
+    const q = glossarySearch.trim().toLowerCase();
+    return sceneRows.filter((row) => {
+      const own = sceneEntries.get(row.scene);
+      if (sceneView === "described" && !own) return false;
+      return !q || [row.scene, row.file, own?.title ?? "", own?.notes ?? ""].some((text) => text.toLowerCase().includes(q));
+    });
+  });
+
+  $effect(() => {
+    if (glossaryTab !== "scenes" || !gameDir || gameScenes?.dir === gameDir) return;
+    const dir = gameDir;
+    invoke<GameScene[]>("list_game_scenes", { gameDir: dir })
+      .then((scenes) => { gameScenes = { dir, scenes }; })
+      .catch((e) => showToast(`Не удалось прочитать сцены: ${e}`, "error"));
+  });
+
+  // Выбор ищется среди всех сцен: стёртое описание не должно закрыть карточку посреди правки
+  let selectedSceneName = $state<string | null>(null);
+  let selectedScene = $derived(sceneRows.find((row) => row.scene === selectedSceneName) ?? filteredSceneRows[0] ?? null);
+  // Зависит только от метки: правка описания не должна заново считать части сцены
+  let selectedLabel = $derived(selectedScene?.scene ?? null);
+  let selectedSceneEntry = $derived(selectedLabel === null ? null : sceneTarget(selectedLabel));
+
+  function showSceneView(view: typeof sceneView) {
+    sceneView = view;
+    selectedSceneName = null;
+  }
+
+  /** Игра изменила текст сцены после того, как модель его прочитала. У описаний без отпечатка этого не узнать. */
+  function sceneOutdated(row: GameScene) {
+    const hash = sceneEntries.get(row.scene)?.text_hash;
+    return !!hash && !!row.text_hash && hash !== row.text_hash;
+  }
+
+  function setSceneField(scene: string, field: "notes" | "title" | "text_hash", text: string) {
+    const own = glossary.scenes.find((entry) => entry.scene === scene);
+    if (own) own[field] = text;
+    else glossary.scenes.push({ scene, notes: "", title: "", [field]: text });
+    glossary.scenes = glossary.scenes.filter((entry) => entry.notes || entry.title);
+    glossaryDirty = true;
+  }
+
+  function removeSceneEntry(scene: string) {
+    glossary.scenes = glossary.scenes.filter((entry) => entry.scene !== scene);
+    glossaryDirty = true;
+  }
+
   let glossaryStats = $derived.by(() => {
     const totalChars = glossary.characters.length;
     const translatedChars = glossary.characters.filter(c => translatedTitle(c).length > 0).length;
@@ -2399,6 +3020,8 @@
         scannedCharacters: characters
       });
       if (seq !== glossaryLoadSeq || gameDir.trim() !== path) return true;
+      // Итог запуска модели мог прийти, пока шла загрузка: прочитанное с диска его затёрло бы
+      if (glossaryDirty && glossaryProjectPath === path) return true;
       res.characters.forEach(cleanCharacterForms);
       res.terms.forEach(cleanTermForms);
       glossary = res;
@@ -2437,6 +3060,7 @@
       );
       if (match) {
         selectedGlossaryChar = match;
+        showNameRules = false;
         glossaryTab = 'characters';
         addingEntry = false;
         glossarySearch = "";
@@ -2473,8 +3097,18 @@
   }
 
   async function closeGlossary() {
-    if (glossaryDirty && !(await saveGlossary())) return;
+    if ((glossaryDirty || nameRulesDirty) && !(await saveGlossaryAndRules())) return;
     showGlossaryModal = false;
+  }
+
+  async function saveGlossaryAndRules(): Promise<boolean> {
+    try {
+      await saveNameRules();
+    } catch (e) {
+      showToast(`Ошибка сохранения правил: ${e}`, "error");
+      return false;
+    }
+    return await saveGlossary() && !nameRulesDirty;
   }
 
   function updateCharacterGender(char: CharacterGlossaryEntry, gender: "male" | "female" | "neuter" | "unknown") {
@@ -2483,6 +3117,7 @@
   }
 
   function openGlossaryTab(tab: typeof glossaryTab) {
+    showNameRules = false;
     glossaryTab = tab;
     addingEntry = false;
     termView = "terms";
@@ -2739,6 +3374,12 @@
 {/snippet}
 
 {#snippet termFields(term: TermGlossaryEntry)}
+                  {#if term.guess}
+                    <div class="entry-warning">
+                      <span>Предположение модели при переводе реплик. Запросы получают его с пометкой, пока вы его не подтвердите.</span>
+                      <button type="button" class="btn-toolbar-code" onclick={() => { term.guess = false; termEdited(term); }}>Подтвердить</button>
+                    </div>
+                  {/if}
                   <div class="edit-group">
                     <label class="edit-label" for="term-source">
                       <span>Исходный термин (EN):</span>
@@ -2933,7 +3574,7 @@
             <div class="tools-menu-heading">ИНСТРУМЕНТЫ ПРОЕКТА</div>
             <button
               class="tools-menu-item"
-              disabled={packingMod || !gameDir}
+              disabled={packingMod || changingInstalledMod || !gameDir || loadingProject}
               onclick={() => {
                 showToolsMenu = false;
                 exportMod(null);
@@ -2941,6 +3582,28 @@
             >
               {#if packingMod}<Loader2 size={16} class="spin text-amber-400" />{:else}<Package size={16} class="text-amber-400" />{/if}
               <span><strong>Собрать мод</strong><small>Архив ru_lang.rpa для папки game</small></span>
+            </button>
+            <button
+              class="tools-menu-item"
+              disabled={packingMod || changingInstalledMod || !gameDir || loadingProject}
+              onclick={() => {
+                showToolsMenu = false;
+                changeInstalledMod(true);
+              }}
+            >
+              {#if changingInstalledMod}<Loader2 size={16} class="spin text-emerald-400" />{:else}<Download size={16} class="text-emerald-400" />{/if}
+              <span><strong>Собрать перевод в папку игры</strong><small>Установить или обновить ru_lang.rpa</small></span>
+            </button>
+            <button
+              class="tools-menu-item"
+              disabled={packingMod || changingInstalledMod || !gameDir || loadingProject}
+              onclick={() => {
+                showToolsMenu = false;
+                changeInstalledMod(false);
+              }}
+            >
+              <Trash2 size={16} class="text-rose-400" />
+              <span><strong>Удалить перевод из игры</strong><small>Удалить только архив ru_lang.rpa</small></span>
             </button>
             <button
               class="tools-menu-item"
@@ -3339,12 +4002,17 @@
                     class="scene-sidebar-item" 
                     class:active={isSelected}
                     onclick={() => selectScene(scene)}
-                    title="{scene.name} • {scene.translated_lines}/{scene.total_lines} строк ({pctLabel})"
+                    title="{sceneName(scene.name)} • {scene.translated_lines}/{scene.total_lines} строк ({pctLabel})"
                   >
                     <div class="scene-sidebar-item-left">
                       <span class="scene-sidebar-seq">#{idx + 1}</span>
                       <SceneNodeIcon {scene} size={12} />
-                      <span class="scene-sidebar-name">{scene.name}</span>
+                      <span class="scene-sidebar-text">
+                        <span class="scene-sidebar-name">{sceneTitle(scene.name) || scene.name}</span>
+                        {#if sceneTitle(scene.name)}
+                          <span class="scene-sidebar-id">{scene.name}</span>
+                        {/if}
+                      </span>
                     </div>
                     <div class="scene-sidebar-item-right">
                       {#if scene.choices && scene.choices.length > 0}
@@ -3380,7 +4048,7 @@
                     onselect={(scene) => { selectedSceneId = scene.id; focusedSceneName = scene.name; }}
                     onnavigate={navigateOrFocusScene} onopen={openSceneInTable}
                     onviewcode={(scene) => openSourceViewer(currentFile?.file_path, scene.name)}
-                    onback={graphHistory.length > 0 ? backToGraph : null} />
+                    onback={graphHistory.length > 0 ? backToGraph : null} {sceneTitle} />
                 {/key}
               </div>
             </div>
@@ -3412,7 +4080,7 @@
                     <div class="table-scene-heading">
                       <SceneNodeIcon scene={currentScene} size={13} />
                       <span class="focus-title-badge">Сцена:</span>
-                      <strong class="focus-scene-name" title={currentScene.name}>{currentScene.name}</strong>
+                      <SceneName scene={currentScene.name} title={sceneTitle(currentScene.name)} />
                       <button
                         type="button"
                         class="btn-toolbar-code"
@@ -3450,6 +4118,110 @@
                 </div>
 
                 <div class="table-subtoolbar-right">
+                  <div class="line-run">
+                    {#if lineRun}
+                      <span class="scene-trans-stat">
+                        <Loader2 size={12} class="spin" />
+                        {#if lineRun.review && !lineRun.stopping}Редактура.{/if}
+                        {#if lineRun.file && !lineRun.stopping}
+                          Файл {lineRun.file.index + 1} из {lineRun.file.count} ({lineRun.file.name}).
+                        {/if}
+                        {#if lineRun.stopping}
+                          Останавливаемся...
+                        {:else if lineRun.reading}
+                          Читается сцена {sceneName(lineRun.reading)}
+                        {:else if lineRun.total > 0}
+                          Пакет {Math.min(lineRun.done + 1, lineRun.total)} из {lineRun.total}
+                        {:else}
+                          Подготовка...
+                        {/if}
+                      </span>
+                      <button type="button" class="btn-toolbar-code" onclick={stopLineRun} disabled={lineRun.stopping}>Остановить</button>
+                    {:else}
+                      <button
+                        type="button"
+                        class="btn-toolbar-code"
+                        onclick={toggleLinePanel}
+                        disabled={llmRun.active || resettingProject || (emptyLines === 0 && projectEmptyLines === 0)}
+                        title={llmRun.active ? llmRun.note : "Перевести пустые строки через модель"}
+                      >
+                        <Sparkles size={12} />
+                        <span>Перевести ({emptyLines})</span>
+                      </button>
+                      <button
+                        type="button"
+                        class="btn-toolbar-code"
+                        onclick={toggleReviewPanel}
+                        disabled={llmRun.active || resettingProject || reviewableLines === 0}
+                        title={llmRun.active ? llmRun.note : "Вычитать готовый перевод через модель и исправить ошибки"}
+                      >
+                        <SpellCheck size={12} />
+                        <span>Редактура ({reviewableLines})</span>
+                      </button>
+                    {/if}
+                    {#if reviewPanelOpen && !lineRun}
+                      <div class="line-run-panel">
+                        <strong>{currentScene ? `Сцена ${sceneName(currentScene.name)}` : `Файл ${currentFile.file_name}`}</strong>
+                        <span class="edit-hint">
+                          Модель вычитает переведённые строки ({reviewableLines}) и заменит те, где найдёт ошибки: смысл, род, грамматику, дословные обороты. Исправленные строки получат статус «Модель». Лучше всего здесь работает модель с размышлениями.
+                        </span>
+                        <LlmChoice action="review" settings={llmSettings} onselect={selectLlmModel} />
+                        {#if outsideNote(llmSettings, "review")}
+                          <p class="character-outside-note">{outsideNote(llmSettings, "review")}</p>
+                        {/if}
+                        <button type="button" class="btn-toolbar-code line-run-start" onclick={() => void reviewLines()} disabled={llmRun.active || reviewableLines === 0}>
+                          <SpellCheck size={12} />
+                          <span>{currentScene ? "Вычитать сцену" : "Вычитать файл"}</span>
+                        </button>
+                      </div>
+                    {/if}
+                    {#if linePanelOpen && !lineRun}
+                      <div class="line-run-panel">
+                        <strong>{currentScene ? `Сцена ${sceneName(currentScene.name)}` : `Файл ${currentFile.file_name}`}</strong>
+                        <span class="edit-hint">
+                          Модель заполнит только пустые строки ({emptyLines}), а заполненные не тронет. Сцены без описания она сначала прочитает целиком.
+                        </span>
+                        <LlmChoice action="lines" settings={llmSettings} onselect={selectLlmModel} />
+                        {#if outsideNote(llmSettings, "lines")}
+                          <p class="character-outside-note">{outsideNote(llmSettings, "lines")}</p>
+                        {/if}
+                        <button type="button" class="btn-toolbar-code line-run-start" onclick={translateLines} disabled={llmRun.active || emptyLines === 0}>
+                          <Sparkles size={12} />
+                          <span>{currentScene ? "Перевести сцену" : "Перевести файл"}</span>
+                        </button>
+                        <button
+                          type="button"
+                          class="btn-toolbar-code line-run-start"
+                          onclick={translateProjectLines}
+                          disabled={llmRun.active || projectEmptyLines === 0}
+                          title="Перевести пустые строки всех файлов проекта по очереди"
+                        >
+                          <Sparkles size={12} />
+                          <span>Весь проект ({projectEmptyLines})</span>
+                        </button>
+                      </div>
+                    {/if}
+                  </div>
+                  <button
+                    type="button"
+                    class="btn-toolbar-code"
+                    onclick={() => void resetVisibleTranslation()}
+                    disabled={llmRun.active || resettingProject || filledLines === 0}
+                    title={llmRun.active ? llmRun.note : `Очистить перевод ${currentScene ? "сцены" : "файла"}, чтобы перевести заново`}
+                  >
+                    <RotateCcw size={12} />
+                    <span>Сбросить ({filledLines})</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="btn-toolbar-code"
+                    onclick={() => void resetProjectTranslation()}
+                    disabled={llmRun.active || resettingProject || !project || project.total_translated === 0}
+                    title={llmRun.active ? llmRun.note : "Очистить перевод всех строк проекта, чтобы перевести заново"}
+                  >
+                    {#if resettingProject}<Loader2 size={12} class="spin" />{:else}<RotateCcw size={12} />{/if}
+                    <span>Сбросить проект ({project?.total_translated ?? 0})</span>
+                  </button>
                   <button
                     type="button"
                     class="btn-toolbar-code"
@@ -3488,6 +4260,17 @@
                       class:active={filterStatus === 'translated'} 
                       onclick={() => filterStatus = 'translated'}
                     >Переведенные</button>
+                    {#if visibleDrafts.length > 0 || filterStatus === 'draft'}
+                      <button
+                        type="button"
+                        class:active={filterStatus === 'draft'}
+                        onclick={() => filterStatus = 'draft'}
+                        title="Перевод модели, который ещё не проверен"
+                      >Модель ({visibleDrafts.length})</button>
+                    {/if}
+                    {#if filterStatus === 'draft' && visibleDrafts.length > 0}
+                      <button type="button" onclick={() => confirmDrafts(visibleDrafts)}>Подтвердить все</button>
+                    {/if}
                   </div>
                 </div>
               </div>
@@ -3522,7 +4305,7 @@
                         <div class="scene-section-left">
                           <SceneNodeIcon {scene} size={13} />
                           <span class="focus-title-badge">Сцена:</span>
-                          <strong class="focus-scene-name">{scene.name}</strong>
+                          <SceneName scene={scene.name} title={sceneTitle(scene.name)} />
                           <button
                             type="button"
                             class="btn-toolbar-code"
@@ -3618,7 +4401,7 @@
                                   class="table-trans-textarea"
                                   value={entry.translated_text ?? ""}
                                   oninput={(event) => recordTranslationEdit(entry, event.currentTarget.value)}
-                                  disabled={loadingFile || loadingProject || savingTranslations}
+                                  disabled={loadingFile || loadingProject || savingTranslations || translatingLine === entry.translation_key || reviewingLine === entry.translation_key}
                                   placeholder="Введите перевод..."
                                   rows="2"
                                   onfocus={() => selectedEntry = entry}
@@ -3627,11 +4410,42 @@
                               </div>
                             </td>
                             <td class="col-status">
-                              {#if entry.translated_text && entry.translated_text.trim() !== ""}
-                                <span class="status-pill status-ok">Готово</span>
-                              {:else}
-                                <span class="status-pill status-empty">Пусто</span>
-                              {/if}
+                              <div class="status-cell">
+                                {#if entry.draft}
+                                  <button
+                                    type="button"
+                                    class="status-pill status-draft"
+                                    title="Перевод модели. Нажмите, чтобы подтвердить"
+                                    onclick={(e) => { e.stopPropagation(); confirmDrafts([entry]); }}
+                                  >Модель</button>
+                                {:else if entry.translated_text && entry.translated_text.trim() !== ""}
+                                  <span class="status-pill status-ok">Готово</span>
+                                {:else}
+                                  <span class="status-pill status-empty">Пусто</span>
+                                {/if}
+                                <button
+                                  type="button"
+                                  class="btn-line-translate"
+                                  disabled={llmRun.active}
+                                  title={lineButtonTitle()}
+                                  aria-label="Перевести строку #{entry.line_number}"
+                                  onclick={(e) => { e.stopPropagation(); void translateLine(entry); }}
+                                >
+                                  {#if translatingLine === entry.translation_key}<Loader2 size={12} class="spin" />{:else}<Sparkles size={12} />{/if}
+                                </button>
+                                {#if isReviewable(entry)}
+                                  <button
+                                    type="button"
+                                    class="btn-line-translate"
+                                    disabled={llmRun.active}
+                                    title={reviewButtonTitle()}
+                                    aria-label="Вычитать строку #{entry.line_number}"
+                                    onclick={(e) => { e.stopPropagation(); void reviewLine(entry); }}
+                                  >
+                                    {#if reviewingLine === entry.translation_key}<Loader2 size={12} class="spin" />{:else}<SpellCheck size={12} />{/if}
+                                  </button>
+                                {/if}
+                              </div>
                             </td>
                           </tr>
                         {/each}
@@ -3671,7 +4485,7 @@
                       {/if}
                       <div class="empty-scene-info">
                         {#if sceneTotal === 0}
-                          <h3>Сцена «{scene.name}» не содержит диалоговых строк</h3>
+                          <h3>Сцена «{sceneName(scene.name)}» не содержит диалоговых строк</h3>
                           <p>
                             Эта метка используется в сценарии игры как меню выбора или маршрутизатор сюжета
                             {#if (scene.choices?.length ?? 0) > 0}
@@ -3692,7 +4506,7 @@
                             </button>
                           </div>
                         {:else if searchQuery}
-                          <h3>В сцене «{scene.name}» ничего не найдено по запросу «{searchQuery}»</h3>
+                          <h3>В сцене «{sceneName(scene.name)}» ничего не найдено по запросу «{searchQuery}»</h3>
                           <p>
                             {#if filterStatus === 'translated'}
                               Среди переведённых строк сцены (переведено: {sceneTrans} из {sceneTotal}) совпадений не найдено.
@@ -3711,7 +4525,7 @@
                             </button>
                           </div>
                         {:else if filterStatus === 'translated' && sceneTrans === 0}
-                          <h3>В сцене «{scene.name}» пока нет переведённых строк</h3>
+                          <h3>В сцене «{sceneName(scene.name)}» пока нет переведённых строк</h3>
                           <p>
                             Всего строк диалогов в этой сцене: {sceneTotal}.
                             Выберите фильтр «Все» или «Без перевода», чтобы приступить к переводу диалогов.
@@ -3729,7 +4543,7 @@
                             </button>
                           </div>
                         {:else if filterStatus === 'untranslated' && sceneUntrans === 0}
-                          <h3>Все строки в сцене «{scene.name}» уже переведены! 🎉</h3>
+                          <h3>Все строки в сцене «{sceneName(scene.name)}» уже переведены! 🎉</h3>
                           <p>
                             Все {sceneTotal} строк диалогов в этой сцене переведены (100%).
                             Переключитесь на «Все» или «Переведенные» для проверки.
@@ -3743,7 +4557,7 @@
                             </button>
                           </div>
                         {:else}
-                          <h3>В сцене «{scene.name}» нет строк, подходящих под выбранный фильтр</h3>
+                          <h3>В сцене «{sceneName(scene.name)}» нет строк, подходящих под выбранный фильтр</h3>
                           <div class="empty-scene-actions">
                             <button type="button" class="btn-return-graph" onclick={() => { filterStatus = 'all'; searchQuery = ''; }}>
                               <span>Показать все строки сцены</span>
@@ -3942,7 +4756,7 @@
                 <button 
                   class="btn-tool-action btn-pack-action" 
                   onclick={() => exportMod(packModCustomPath.trim() || null)}
-                  disabled={packingMod || !gameDir}
+                  disabled={packingMod || changingInstalledMod || !gameDir || loadingProject}
                 >
                   {#if packingMod}
                     <Loader2 size={15} class="spin" />
@@ -4141,16 +4955,16 @@
             </button>
             <button 
               class="btn-modal-save" 
-              class:dirty={glossaryDirty}
-              onclick={saveGlossary} 
-              disabled={savingGlossary}
+              class:dirty={glossaryDirty || nameRulesDirty}
+              onclick={saveGlossaryAndRules}
+              disabled={savingGlossary || nameRules.saving}
             >
               {#if savingGlossary}
                 <Loader2 size={14} class="spin" />
                 <span>Сохранение...</span>
               {:else}
                 <Save size={14} />
-                <span>{glossaryDirty ? 'Сохранить изменения *' : 'Сохранено'}</span>
+                <span>{glossaryDirty || nameRulesDirty ? 'Сохранить изменения *' : 'Сохранено'}</span>
               {/if}
             </button>
             <button class="btn-close-modal" onclick={closeGlossary} aria-label="Закрыть">
@@ -4171,7 +4985,7 @@
         <div class="tools-tab-bar">
           <button 
             class="tools-tab" 
-            class:tab-active={glossaryTab === 'characters'}
+            class:tab-active={!showNameRules && glossaryTab === 'characters'}
             onclick={() => openGlossaryTab('characters')}
           >
             <Users size={15} />
@@ -4182,7 +4996,7 @@
           </button>
           <button 
             class="tools-tab" 
-            class:tab-active={glossaryTab === 'terms'}
+            class:tab-active={!showNameRules && glossaryTab === 'terms'}
             onclick={() => openGlossaryTab('terms')}
           >
             <BookMarked size={15} />
@@ -4190,38 +5004,52 @@
           </button>
           <button
             class="tools-tab"
-            class:tab-active={glossaryTab === 'tokens'}
+            class:tab-active={!showNameRules && glossaryTab === 'tokens'}
             onclick={() => openGlossaryTab('tokens')}
           >
             <Braces size={15} />
             <span>Токены ({glossary.tokens.length})</span>
           </button>
+          <button
+            class="tools-tab"
+            class:tab-active={!showNameRules && glossaryTab === 'scenes'}
+            onclick={() => openGlossaryTab('scenes')}
+          >
+            <Film size={15} />
+            <span>Сцены ({glossary.scenes.length})</span>
+          </button>
+          <button class="tools-tab" class:tab-active={showNameRules} onclick={() => showNameRules = true}>
+            <Languages size={15} /><span>Правила ({nameRules.items.filter((rule) => rule.rules.trim()).length})</span>
+          </button>
+        </div>
+
+        <div class="glossary-rules-tab" hidden={!showNameRules}>
+          <NameRulesLibrary settings={llmSettings} onselect={selectLlmModel} />
         </div>
 
         {#snippet groupUpdate()}
+          {#if glossaryTab === "scenes"}
+            <p class="character-group-note">Сцены читаются по отдельности: каждая это хотя бы один запрос. Отметьте те, что нужны.</p>
+          {/if}
           <EntryPicker
             items={groupEntries.map((c) => ({ id: entryId(c), name: entryTitle(c) }))}
             unselected={groupDeselected}
             disabled={llmRun.active}
             onchange={(next) => groupUnselectedByTab[glossaryTab] = next}
-            onempty={() => groupUnselectedByTab[glossaryTab] = null}
+            onempty={() => groupUnselectedByTab[glossaryTab] = glossaryTab === "scenes" ? filledEntries : null}
           />
-          <RequestSlider
-            id="group-parts"
-            label={glossaryTab === "terms" ? "Частей на термин" : "Частей на персонажа"}
-            status={groupPlanHere ? `${groupPlanHere.parts} из ${groupPlanHere.maxParts}` : groupCounting ? "подсчёт..." : groupReadable.length === 0 ? "нет сцен" : `${groupParts} из ${groupMaxParts}`}
-            max={groupPlanHere?.maxParts ?? groupMaxParts}
-            value={groupPlanHere?.parts ?? groupParts}
-            onchange={(value) => groupPartsWanted = value}
-            disabled={llmRun.active || groupCounting || groupMaxParts < 2}
-          >
-            {#snippet ends()}
-              <span>1 часть</span>
-              <span>весь текст, долго</span>
-            {/snippet}
-          </RequestSlider>
+          <ReadingDepthSettings
+            value={groupDepth}
+            partsAvailable={groupReadable.reduce((max, c) => Math.max(max, groupChunks[entryId(c)].total), 50)}
+            onchange={(value) => groupDepth = value}
+            disabled={llmRun.active}
+          />
+          <p class="character-group-note">{groupCounting ? "Подсчёт частей..." : groupTargets.length === 0 ? "Ничего не выбрано" : `Частей в плане: ${groupPlannedParts} (включая готовые)`}</p>
           {#if groupWithoutScenes > 0}
             <p class="character-group-note">Без сцен, будут пропущены: {groupWithoutScenes}</p>
+          {/if}
+          {#if groupAlreadyDone > 0 && !groupPlanHere}
+            <p class="character-group-note">Уже собраны, дочитывать нечего: {groupAlreadyDone}</p>
           {/if}
           {#if groupRun && groupPlanHere}
             <div class="character-summary-progress">
@@ -4240,11 +5068,11 @@
           {:else}
             <button
               class="btn-modal-ai character-group-run"
-              disabled={llmRun.active || groupCounting || groupReadable.length === 0}
+              disabled={llmRun.active || groupCounting || groupPending.length === 0}
               onclick={updateCharacterGroup}
             >
               <Sparkles size={13} />
-              <span>Обновить описания ({groupReadable.length})</span>
+              <span>Обновить описания ({groupPending.length})</span>
             </button>
           {/if}
           {#if groupResult?.tab === glossaryTab}
@@ -4255,7 +5083,9 @@
           {/if}
         {/snippet}
 
+        <div class="glossary-project-tabs" hidden={showNameRules}>
         <GlossaryAiPanel
+          bind:this={glossaryAiActions}
           tab={glossaryTab}
           {gameDir}
           characters={glossary.characters}
@@ -4267,6 +5097,7 @@
           descriptions={groupUpdate}
           onselect={selectLlmModel}
           onnames={applyPanelNames}
+          onorigins={applyPanelOrigins}
           onterms={applyPanelTerms}
           ontokens={applyPanelTokens}
         />
@@ -4280,7 +5111,7 @@
                 <input 
                   type="text" 
                   bind:value={glossarySearch} 
-                  placeholder={glossaryTab === 'characters' ? "Поиск по коду, имени, переводу..." : candidatesOpen ? "Поиск по термину, реплике..." : glossaryTab === 'terms' ? "Поиск по термину, переводу..." : "Поиск по токену, реплике, значению..."}
+                  placeholder={glossaryTab === 'characters' ? "Поиск по коду, имени, переводу..." : candidatesOpen ? "Поиск по термину, реплике..." : glossaryTab === 'terms' ? "Поиск по термину, переводу..." : glossaryTab === 'scenes' ? "Поиск по метке, файлу, описанию..." : "Поиск по токену, реплике, значению..."}
                   class="glossary-search-input"
                 />
                 {#if glossarySearch}
@@ -4356,7 +5187,7 @@
                 </div>
               {/if}
 
-              {#if termView === 'terms'}
+              {#if termView === 'terms' && glossaryTab !== 'scenes'}
                 <button class="btn-toggle-add-char" class:active={addingEntry} onclick={() => addingEntry ? addingEntry = false : startAddingEntry()}>
                   <Plus size={14} />
                   <span>{addingEntry ? 'Отмена' : glossaryTab === 'characters' ? 'Персонаж' : glossaryTab === 'terms' ? 'Термин' : 'Токен'}</span>
@@ -4443,6 +5274,42 @@
                     </button>
                   {/each}
                 {/if}
+              {:else if glossaryTab === 'scenes'}
+                {#if gameScenes?.dir !== gameDir}
+                  <div class="glossary-empty-state">
+                    <Loader2 size={24} class="spin" />
+                  </div>
+                {:else if filteredSceneRows.length === 0}
+                  <div class="glossary-empty-state">
+                    <Film size={32} class="text-slate-600" />
+                    <p>{glossarySearch ? `Сцены не найдены по запросу «${glossarySearch}»` : sceneView === 'all' ? "В скриптах нет сцен с репликами" : "Описаний пока нет. Выберите сцену в разделе «Все сцены»."}</p>
+                  </div>
+                {:else}
+                  {#each filteredSceneRows as row (row.scene)}
+                    <button
+                      class="glossary-list-item"
+                      class:selected-row={selectedScene?.scene === row.scene}
+                      class:character-updating={updatingAlias === `scene:${row.scene}`}
+                      onclick={() => { selectedSceneName = row.scene; addingEntry = false; }}
+                    >
+                      <span class="glossary-item-text">
+                        <span class="char-name-en">{row.scene}</span>
+                        {#if sceneEntries.get(row.scene)}
+                          <span class="char-name-ru token-list-note">{sceneEntries.get(row.scene)?.title || sceneEntries.get(row.scene)?.notes}</span>
+                        {:else}
+                          <span class="char-name-empty">без описания</span>
+                        {/if}
+                      </span>
+                      {#if updatingAlias === `scene:${row.scene}`}
+                        <span class="character-updating-mark" title="Сцена обновляется"><Loader2 size={13} class="spin" /></span>
+                      {/if}
+                      {#if sceneOutdated(row)}
+                        <span class="category-badge category-warning" title="Текст сцены изменился после описания">!</span>
+                      {/if}
+                      <span class="category-badge category-general" title="Реплик в сцене">{row.lines}</span>
+                    </button>
+                  {/each}
+                {/if}
               {:else if candidatesOpen}
                 {#if termCandidatesLoading && visibleCandidates.length === 0}
                   <div class="glossary-empty-state">
@@ -4491,6 +5358,9 @@
                           <span class="char-name-empty">без перевода</span>
                         {/if}
                       </span>
+                      {#if term.guess}
+                        <span class="category-badge category-warning" title="Предположение модели, не подтверждено">?</span>
+                      {/if}
                       <span class="category-badge category-{term.category}">
                         {TERM_CATEGORIES.find((category) => category.value === term.category)?.label ?? 'Общий'}
                       </span>
@@ -4505,6 +5375,16 @@
                 <Users size={14} />
                 <span>Вернуть удалённых ({glossary.removed_characters.length})</span>
               </button>
+            {/if}
+            {#if glossaryTab === 'scenes'}
+              <div class="glossary-term-views">
+                <button class="glossary-archive-toggle" class:active={sceneView === 'described'} onclick={() => showSceneView('described')}>
+                  С описанием ({glossary.scenes.length})
+                </button>
+                <button class="glossary-archive-toggle" class:active={sceneView === 'all'} onclick={() => showSceneView('all')}>
+                  Все сцены ({gameScenes?.dir === gameDir ? gameScenes.scenes.length : "…"})
+                </button>
+              </div>
             {/if}
             {#if glossaryTab === 'terms'}
               <div class="glossary-term-views">
@@ -4691,6 +5571,10 @@
                         aria-label="Фамилия в оригинале"
                         class="sidebar-input"
                       />
+                      {#if currentNameOrigins(selectedGlossaryChar).some((origin) => origin.field === "first" || origin.field === "last")}
+                        <span class="edit-hint" title={currentNameOrigins(selectedGlossaryChar).find((origin) => origin.field === "first")?.reason}>{currentNameOrigins(selectedGlossaryChar).filter((origin) => origin.field === "first").flatMap((origin) => origin.languages).join(", ")}</span>
+                        <span class="edit-hint" title={currentNameOrigins(selectedGlossaryChar).find((origin) => origin.field === "last")?.reason}>{currentNameOrigins(selectedGlossaryChar).filter((origin) => origin.field === "last").flatMap((origin) => origin.languages).join(", ")}</span>
+                      {/if}
                       <input
                         id="character-translated-first-name"
                         type="text"
@@ -4711,10 +5595,15 @@
                       />
                     </div>
                     <span class="edit-hint">Имя подставляется само, фамилию внесите сами. Из них складывается название карточки, а модель строит от них остальные формы.</span>
+                    <div class="character-name-actions">
+                      <button class="character-scene-run" disabled={llmRun.active} title={`Анализ имени, фамилии и обращений. Модель: ${targetFor(llmSettings, "names").model}`} onclick={() => { if (selectedGlossaryChar) void glossaryAiActions?.analyzeCharacter(selectedGlossaryChar.alias); }}><Sparkles size={12} />Анализ имени</button>
+                      <button class="character-scene-run" disabled={llmRun.active} title={`Перевод имени, фамилии и обращений. Модель: ${targetFor(llmSettings, "names").model}`} onclick={() => { if (selectedGlossaryChar) void glossaryAiActions?.translateCharacter(selectedGlossaryChar.alias); }}><Languages size={12} />Перевести имя</button>
+                    </div>
                   </div>
 
                   <FormsEditor
                     forms={selectedGlossaryChar.forms}
+                    origins={currentNameOrigins(selectedGlossaryChar).filter((origin) => origin.field === "form")}
                     label="Другие имена и обращения:"
                     hint="Например, Miss Granger. Сцены с ними войдут в сцены персонажа, а модель получит их перевод."
                     placeholder="Miss Granger"
@@ -4831,7 +5720,7 @@
                       placeholder="напр. mother"
                       class="sidebar-input sidebar-input-primary"
                     />
-                    <span class="edit-hint">То, что показала бы игра, на языке её текста: mother, sister. Только для чтения сцен: при переводе токен останется в тексте.</span>
+                    <span class="edit-hint">То, что показала бы игра, на языке её текста: mother, sister. Подставляется и при чтении сцен, и при переводе: в переводе будет переведённое слово, а не токен. Без значения токен останется в тексте, его подставит игра.</span>
                   </div>
 
                   <div class="edit-group">
@@ -4853,6 +5742,70 @@
                 <div class="sidebar-edit-empty">
                   <Braces size={36} class="text-slate-600" />
                   <p>Выберите токен из списка слева</p>
+                </div>
+              {/if}
+            {:else if glossaryTab === 'scenes'}
+              {#if selectedScene}
+                <div class="sidebar-edit-header" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
+                  <div class="sidebar-char-headings">
+                    <h4>{sceneName(selectedScene.scene)}</h4>
+                    <span class="char-sub-label">{selectedScene.lines > 0 ? `${selectedScene.file} · реплик: ${selectedScene.lines}` : "Нет в текущей версии игры"}</span>
+                  </div>
+                </div>
+
+                <div class="sidebar-edit-content" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
+                  {#if sceneEntries.get(selectedScene.scene)}
+                    <div class="entry-toolbar">
+                      <div class="entry-actions">
+                        <button class="btn-delete-term" onclick={() => { if (selectedScene) removeSceneEntry(selectedScene.scene); }}>
+                          <Trash2 size={14} />
+                          <span>Очистить запись</span>
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
+                  {#if sceneOutdated(selectedScene)}
+                    <div class="entry-warning">
+                      <span>Игра изменила текст сцены после описания: оно могло устареть.</span>
+                      <button type="button" class="btn-toolbar-code" onclick={() => { if (selectedScene) setSceneField(selectedScene.scene, "text_hash", selectedScene.text_hash); }}>Описание верно</button>
+                    </div>
+                  {/if}
+                  {#if selectedSceneEntry && selectedScene.lines > 0}
+                    {@render descriptionBox(selectedSceneEntry)}
+                  {/if}
+                  <div class="edit-group">
+                    <label class="edit-label" for="scene-title">
+                      <span>Название:</span>
+                    </label>
+                    <input
+                      id="scene-title"
+                      type="text"
+                      value={sceneEntries.get(selectedScene.scene)?.title ?? ""}
+                      oninput={(event) => { if (selectedScene) setSceneField(selectedScene.scene, "title", event.currentTarget.value); }}
+                      placeholder="напр. Ссора в баре"
+                      class="sidebar-input sidebar-input-primary"
+                    />
+                    <span class="edit-hint">Пустое поле модель заполнит вместе с описанием, готовое название не заменит.</span>
+                  </div>
+                  <div class="edit-group">
+                    <label class="edit-label" for="scene-notes">
+                      <span>Описание:</span>
+                    </label>
+                    <textarea
+                      id="scene-notes"
+                      value={sceneEntries.get(selectedScene.scene)?.notes ?? ""}
+                      oninput={(event) => { if (selectedScene) setSceneField(selectedScene.scene, "notes", event.currentTarget.value); }}
+                      rows="8"
+                      placeholder="напр. Лиза ссорится с героем из-за долга и уходит из дома"
+                      class="sidebar-textarea"
+                    ></textarea>
+                    <span class="edit-hint">Что происходит, кто участвует и как герои обращаются друг к другу: на «ты» или на «вы».</span>
+                  </div>
+                </div>
+              {:else}
+                <div class="sidebar-edit-empty">
+                  <Film size={36} class="text-slate-600" />
+                  <p>Выберите сцену из списка слева</p>
                 </div>
               {/if}
             {:else}
@@ -4993,9 +5946,15 @@
                   <button
                     class="character-scene-link"
                     title="Сбросить заметки, в которых модель не нашла сведений. Эти части прочитаются заново"
-                    disabled={updatingCharacter || emptyParts.length === 0}
+                    disabled={llmRun.active || resettingNotes || emptyParts.length === 0}
                     onclick={() => { if (describedEntry) resetNotes(describedEntry, emptyParts.map((part) => part.key)); }}
                   >Сбросить пустые</button>
+                  <button
+                    class="character-scene-link"
+                    title="Сбросить все заметки текущей записи, включая скрытые поиском. Части прочитаются заново"
+                    disabled={llmRun.active || resettingNotes || readParts.length === 0}
+                    onclick={() => { if (describedEntry) resetNotes(describedEntry, readParts.map((part) => part.key)); }}
+                  >Сбросить все</button>
                 </div>
                 <div class="gender-filter-group">
                   <button class="btn-filter-pill" class:active={showUnreadParts} onclick={() => showUnreadParts = true}>Все части</button>
@@ -5010,6 +5969,8 @@
                         найдено реплик {foundLines} · сцен {visibleCharacterScenes.length}
                       {:else if glossaryTab === 'characters'}
                         {characterScenes.length} сцен · говорит {characterSceneTotals.spoken} · упомянут {characterSceneTotals.mentioned}
+                      {:else if glossaryTab === 'scenes'}
+                        реплик {characterSceneTotals.mentioned}
                       {:else}
                         {characterScenes.length} сцен · реплик {characterSceneTotals.mentioned}
                       {/if}
@@ -5017,7 +5978,7 @@
                   {/if}
                 </div>
                 <div class="character-scenes-tools">
-                  {#if describedEntry}
+                  {#if describedEntry && glossaryTab !== 'scenes'}
                     <button class="character-scene-link" disabled={updatingCharacter} title="Передавать модели все сцены" onclick={() => { if (describedEntry) setAllScenesForLlm(describedEntry, true); }}>Выбрать все</button>
                     <button class="character-scene-link" disabled={updatingCharacter} title="Не передавать модели ни одной сцены" onclick={() => { if (describedEntry) setAllScenesForLlm(describedEntry, false); }}>Снять все</button>
                   {/if}
@@ -5077,15 +6038,17 @@
                       {@const included = !describedEntry.excluded_notes.includes(part.key)}
                       <article class="character-part" class:character-part-off={part.note === null || part.empty || !included}>
                         <header class="character-part-head">
-                          <input
-                            type="checkbox"
-                            class="character-scene-check"
-                            checked={included && !part.empty && part.note !== null}
-                            disabled={updatingCharacter || part.note === null || part.empty}
-                            title="Учитывать заметку в итоговом описании"
-                            aria-label={`Учитывать заметку части ${part.index + 1} в итоговом описании`}
-                            onchange={(e) => { if (describedEntry) toggleNoteForDescription(describedEntry, part.key, e.currentTarget.checked); }}
-                          />
+                          {#if glossaryTab !== 'scenes'}
+                            <input
+                              type="checkbox"
+                              class="character-scene-check"
+                              checked={included && !part.empty && part.note !== null}
+                              disabled={updatingCharacter || part.note === null || part.empty}
+                              title="Учитывать заметку в итоговом описании"
+                              aria-label={`Учитывать заметку части ${part.index + 1} в итоговом описании`}
+                              onchange={(e) => { if (describedEntry) toggleNoteForDescription(describedEntry, part.key, e.currentTarget.checked); }}
+                            />
+                          {/if}
                           <strong>Часть {part.index + 1}</strong>
                           {#if part.note === null}
                             <span class="char-sub-label">не прочитана</span>
@@ -5098,7 +6061,7 @@
                             <button
                               class="character-scene-link"
                               title="Забыть заметку. Часть прочитается заново при следующем запуске"
-                              disabled={updatingCharacter}
+                              disabled={llmRun.active || resettingNotes}
                               onclick={() => { if (describedEntry) resetNotes(describedEntry, [part.key]); }}
                             >Сбросить</button>
                           {/if}
@@ -5111,7 +6074,7 @@
                           <dd class="character-part-links">
                             {#each part.scenes as scene (`${scene.path}::${scene.scene}`)}
                               <button class="character-part-link" title={`Открыть сцену в редакторе (${scene.file})`} onclick={() => openCharacterScene(scene)}>
-                                {scene.scene || "Вне сцен"}
+                                {sceneName(scene.scene) || "Вне сцен"}
                               </button>
                             {/each}
                           </dd>
@@ -5167,7 +6130,7 @@
                     {#if paneQuery}
                       Реплики не найдены по запросу «{paneSearch.trim()}»
                     {:else}
-                      {glossaryTab === 'characters' ? "В скриптах персонаж не найден." : "В репликах не встречается."}
+                      {glossaryTab === 'characters' ? "В скриптах персонаж не найден." : glossaryTab === 'scenes' ? "Этой сцены нет в текущей версии игры." : "В репликах не встречается."}
                     {/if}
                   </p>
                 {:else}
@@ -5175,21 +6138,21 @@
                     {@const included = !describedEntry?.excluded_scenes.includes(scene.key)}
                     <article class="character-scene" class:character-scene-off={!included}>
                       <header class="character-scene-head">
-                        {#if describedEntry}
+                        {#if describedEntry && glossaryTab !== 'scenes'}
                           <input
                             type="checkbox"
                             class="character-scene-check"
                             checked={included}
                             disabled={updatingCharacter}
                             title="Передавать эту сцену модели"
-                            aria-label={`Передавать модели сцену ${scene.scene}`}
+                            aria-label={`Передавать модели сцену ${sceneName(scene.scene)}`}
                             onchange={(e) => { if (describedEntry) toggleSceneForLlm(describedEntry, scene.key, e.currentTarget.checked); }}
                           />
                         {/if}
                         <button
                           class="character-scene-toggle"
                           aria-expanded={!shownCollapsedScenes.has(scene.key)}
-                          aria-label={`Свернуть или развернуть сцену ${scene.scene}`}
+                          aria-label={`Свернуть или развернуть сцену ${sceneName(scene.scene)}`}
                           title="Свернуть или развернуть сцену"
                           disabled={!!paneQuery}
                           onclick={() => toggleSceneCollapsed(scene.key)}
@@ -5201,7 +6164,7 @@
                           {/if}
                         </button>
                         <button class="character-scene-name" title="Открыть сцену в редакторе" onclick={() => openCharacterScene(scene)}>
-                          {scene.scene || "Вне сцен"}
+                          {sceneName(scene.scene) || "Вне сцен"}
                         </button>
                         <span class="character-scene-count">{sceneCountLabel(scene)}</span>
                         <button
@@ -5229,19 +6192,20 @@
             </section>
         </div>
 
+        </div>
         <!-- Подвал модального окна глоссария -->
         <div class="glossary-modal-footer">
           <div class="footer-path-info">
-            <span class="info-dot" class:dirty={glossaryDirty}></span>
-            {#if glossaryDirty}
-              <span class="text-amber-400">Есть несохраненные правки в глоссарии</span>
+            <span class="info-dot" class:dirty={glossaryDirty || nameRulesDirty}></span>
+            {#if glossaryDirty || nameRulesDirty}
+              <span class="text-amber-400">Есть несохраненные правки в глоссарии или правилах</span>
             {:else}
               <span class="text-slate-400">Все изменения сохранены в данных приложения</span>
             {/if}
           </div>
           <div class="footer-actions">
             <button class="btn-secondary" onclick={closeGlossary}>Закрыть</button>
-            <button class="btn-primary-save" onclick={saveGlossary} disabled={savingGlossary}>
+            <button class="btn-primary-save" onclick={saveGlossaryAndRules} disabled={savingGlossary || nameRules.saving}>
               {#if savingGlossary}
                 <Loader2 size={14} class="spin" />
                 <span>Сохранение...</span>
@@ -5409,6 +6373,7 @@
     targetSceneName={sourceViewerTargetScene}
     targetLineNumber={sourceViewerTargetLine}
     scenes={currentFile ? currentFile.scenes.map(s => ({ id: s.id, name: s.name })) : []}
+    {sceneTitle}
     onclose={() => showSourceViewer = false}
   />
 
@@ -7081,6 +8046,7 @@
     gap: 10px;
     flex: 1;
     min-width: 0;
+    overflow: hidden;
   }
 
   .table-subtoolbar-right {
@@ -7090,10 +8056,18 @@
     flex-shrink: 0;
   }
 
+  .table-subtoolbar-right .search-box {
+    width: 120px;
+  }
+
   .table-scene-heading {
     display: flex;
     align-items: center;
     gap: 6px;
+    min-width: 0;
+  }
+
+  .table-scene-heading > :global(*:not(.scene-name)) {
     flex-shrink: 0;
   }
 
@@ -7105,8 +8079,12 @@
     flex-shrink: 0;
   }
 
+  /* Прогресс сжимается раньше подписи сцены: он виден и в списке сцен */
   .table-subtoolbar-progress {
     display: flex;
+    flex: 0 100 auto;
+    min-width: 0;
+    overflow: hidden;
     align-items: center;
     gap: 8px;
     font-size: 11px;
@@ -7286,6 +8264,23 @@
     line-height: 1;
   }
 
+  .scene-sidebar-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .scene-sidebar-id {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: monospace;
+    font-size: 10px;
+    font-weight: 400;
+    line-height: 1.2;
+    color: #64748b;
+  }
+
   .scene-sidebar-name {
     font-size: 12px;
     line-height: 1.2;
@@ -7386,7 +8381,9 @@
     font-size: 13px;
     line-height: 1.45;
     padding: 6px 9px;
-    resize: vertical;
+    /* Высота идёт за текстом, чтобы длинный перевод не прятался за прокруткой */
+    field-sizing: content;
+    resize: none;
     outline: none;
     transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
     box-sizing: border-box;
@@ -7959,6 +8956,104 @@
   .status-empty {
     background: #27272a;
     color: #71717a;
+  }
+
+  .status-draft {
+    border: none;
+    background: #422006;
+    color: #fbbf24;
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  .status-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+  }
+
+  .btn-line-translate {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid #232935;
+    border-radius: 5px;
+    background: transparent;
+    color: #94a3b8;
+    cursor: pointer;
+  }
+
+  .btn-line-translate:hover:not(:disabled) {
+    border-color: #0284c7;
+    color: #38bdf8;
+  }
+
+  .btn-line-translate:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .line-run {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .line-run .scene-trans-stat {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .line-run-panel {
+    position: absolute;
+    top: calc(100% + 9px);
+    right: 0;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    width: 320px;
+    box-sizing: border-box;
+    padding: 12px;
+    border: 1px solid #232935;
+    border-radius: 8px;
+    background: #0e1219;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    font-size: 12px;
+    color: #f1f5f9;
+  }
+
+  .line-run-panel strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .line-run-start {
+    align-self: flex-end;
+  }
+
+  .entry-warning {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 10px;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    border-radius: 6px;
+    background: rgba(245, 158, 11, 0.08);
+    font-size: 12px;
+    color: #fbbf24;
+  }
+
+  .entry-warning button {
+    flex-shrink: 0;
   }
 
   /* INSPECTOR */
@@ -8910,6 +10005,10 @@
   }
 
   /* GLOSSARY MODAL */
+  .character-name-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  .glossary-project-tabs { display: contents; }
+  .glossary-project-tabs[hidden], .glossary-rules-tab[hidden] { display: none; }
+  .glossary-rules-tab { display: flex; flex: 1; min-height: 0; }
   .glossary-modal {
     width: 96vw;
     max-width: 1720px;
@@ -9369,9 +10468,13 @@
 
   .canonical-name-grid {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: start;
     gap: 6px;
   }
+
+  .canonical-name-grid > input { min-width: 0; }
+  .canonical-name-grid > .edit-hint { overflow-wrap: anywhere; }
 
   .category-badge {
     display: inline-block;
@@ -9382,6 +10485,7 @@
   }
 
   .category-general { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
+  .category-warning { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
   .category-location { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
   .category-organization { background: rgba(52, 211, 153, 0.15); color: #34d399; }
   .category-title { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }

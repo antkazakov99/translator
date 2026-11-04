@@ -14,7 +14,8 @@
   } = $props();
 
   // В снятых могут остаться записи, которых в глоссарии уже нет
-  let selected = $derived(items.filter((item) => !unselected.includes(item.id)).length);
+  let off = $derived(new Set(unselected));
+  let selected = $derived(items.filter((item) => !off.has(item.id)).length);
 </script>
 
 <details class="picker">
@@ -29,7 +30,7 @@
       <label class="picker-check" title={item.name}>
         <input
           type="checkbox"
-          checked={!unselected.includes(item.id)}
+          checked={!off.has(item.id)}
           {disabled}
           onchange={(e) => {
             onchange(e.currentTarget.checked

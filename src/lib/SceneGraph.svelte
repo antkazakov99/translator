@@ -1,7 +1,9 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { FileCode, Loader2, Clapperboard } from 'lucide-svelte';
+  import SceneName from './SceneName.svelte';
   import SceneNodeIcon from './SceneNodeIcon.svelte';
+  import { sceneLabel } from './scene-label';
   import {
     buildSceneGraph,
     NODE_WIDTH,
@@ -26,6 +28,7 @@
     ontogglesidebar = null,
     busy = false,
     busyTarget = null,
+    sceneTitle = () => '',
   }: {
     scenes: GraphScene[];
     edges: GraphEdge[];
@@ -39,6 +42,7 @@
     ontogglesidebar?: (() => void) | null;
     busy?: boolean;
     busyTarget?: string | null;
+    sceneTitle?: (name: string) => string;
   } = $props();
 
   let localBusyTarget = $state<string | null>(null);
@@ -86,6 +90,7 @@
       outgoingPage,
       outgoingPageSize: pageSize,
       outgoingFilter,
+      sceneTitle,
     })
   );
 
@@ -208,7 +213,7 @@
         <div class="toolbar-scene-heading">
           <SceneNodeIcon scene={selected} size={13} />
           <span class="focus-title-badge">Сцена:</span>
-          <strong class="focus-scene-name" title={selected.name}>{selected.name}</strong>
+          <SceneName scene={selected.name} title={sceneTitle(selected.name)} />
           {#if onviewcode}
             <button
               type="button"
@@ -511,7 +516,7 @@
               class:is-navigating={isThisNodeBusy}
               disabled={busy && isExternal}
               onclick={() => handleNodeClick(node)}
-              title={node.name}
+              title={sceneLabel(node.name, sceneTitle(node.name))}
             >
               <div class="node-badge-row">
                 {#if isCenter}
@@ -534,10 +539,13 @@
 
               <strong class="node-name">
                 <SceneNodeIcon scene={node.scene} isExternal={isExternal} size={13} />
-                <span>{node.name}</span>
+                <span>{sceneTitle(node.name) || node.name}</span>
               </strong>
+              {#if sceneTitle(node.name)}
+                <small class="node-id">{node.name}</small>
+              {/if}
 
-              <span class="preview">
+              <span class="preview" class:preview-short={sceneTitle(node.name)}>
                 {node.scene?.entries[0]?.original_text ||
                   (isExternal
                     ? (isThisNodeBusy ? 'Поиск перехода по файлам проекта...' : 'Метка в другом файле: нажмите для перехода')
@@ -640,7 +648,7 @@
               <text x="0" y="3.5" text-anchor="middle" class="label-text">
                 {displayText}
               </text>
-              <title>{edge.from} → {edge.to} ({edge.condition || edge.kind})</title>
+              <title>{sceneLabel(edge.from, sceneTitle(edge.from))} → {sceneLabel(edge.to, sceneTitle(edge.to))} ({edge.condition || edge.kind})</title>
             </g>
           {/each}
         </svg>
@@ -748,6 +756,7 @@
     gap: 10px;
     flex: 1;
     min-width: 0;
+    overflow: hidden;
     font-size: 11px;
     color: #94a3b8;
   }
@@ -760,7 +769,11 @@
     flex-shrink: 0;
   }
 
+  /* Счётчики сжимаются раньше подписи сцены */
   .info-stat {
+    flex: 0 100 auto;
+    min-width: 0;
+    overflow: hidden;
     font-size: 11px;
     color: #94a3b8;
     white-space: nowrap;
@@ -1299,6 +1312,15 @@
     white-space: nowrap;
   }
 
+  .node-id {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: monospace;
+    font-size: 10.5px;
+    color: #64748b;
+  }
+
   .preview {
     display: -webkit-box;
     line-clamp: 2;
@@ -1308,6 +1330,12 @@
     color: #94a3b8;
     font-size: 11px;
     line-height: 1.35;
+  }
+
+  /* Строка с меткой занимает место второй строки текста: высота узла постоянна */
+  .preview-short {
+    line-clamp: 1;
+    -webkit-line-clamp: 1;
   }
 
   .node-footer {
@@ -1342,18 +1370,17 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    min-width: 0;
+  }
+
+  .toolbar-scene-heading > :global(*:not(.scene-name)) {
+    flex-shrink: 0;
   }
 
   .focus-title-badge {
     color: #94a3b8;
     font-size: 11.5px;
     font-weight: 500;
-  }
-
-  .focus-scene-name {
-    color: #f1f5f9;
-    font-size: 13px;
-    font-weight: 700;
   }
 
   .btn-toolbar-code {

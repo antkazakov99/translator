@@ -20,6 +20,9 @@ static RE_CUSTOM_CHARS: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 // Имя метки может содержать точку, после него идут параметры и `hide`
+/// Сцена для реплик вне меток.
+pub const OUTSIDE_LABELS: &str = "Общие диалоги";
+
 static RE_LABEL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^\s*label\s+([\w.]+)\s*(?:\(.*\))?\s*(?:hide\s*)?:"#).unwrap()
 });
@@ -820,7 +823,7 @@ impl RenpyParser {
         let mut graph = ScenarioGraph::new();
         let file_path = path.to_string_lossy().to_string();
 
-        let mut current_scene_name = "Общие диалоги".to_string();
+        let mut current_scene_name = OUTSIDE_LABELS.to_string();
         let mut last_node_idx = None;
         let mut blocks = DefinitionBlocks::default();
 

@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
+  import { syncRange } from "./range-control";
 
   let {
     id,
@@ -38,7 +39,7 @@
   }
 
   function oninput(event: Event & { currentTarget: HTMLInputElement }) {
-    const wanted = Math.max(event.currentTarget.valueAsNumber, floor);
+    const wanted = Math.min(max, Math.max(event.currentTarget.valueAsNumber, floor));
     event.currentTarget.value = String(wanted);
     onchange(wanted);
   }
@@ -53,8 +54,7 @@
     {id}
     type="range"
     min="0"
-    {max}
-    {value}
+    use:syncRange={{ max, value }}
     style={`--ready-stop: ${stop(ready)}; --parts-stop: ${stop(value)}; --segment: calc((100% + 2px) / ${max})`}
     class:segmented={max <= MAX_SEGMENTS_WITH_GAPS}
     {disabled}

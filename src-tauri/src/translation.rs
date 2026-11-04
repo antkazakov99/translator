@@ -102,7 +102,7 @@ fn needs_migration(key: &str) -> bool {
     LegacyKey::parse(key).is_some() || respaced_key(key).is_some()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationEdit {
     pub key: String,
     pub text: String,
@@ -112,6 +112,9 @@ pub struct TranslationEdit {
 struct TranslationOverrides {
     source_path: String,
     entries: HashMap<String, String>,
+    /// Строки с переводом модели, которые пользователь ещё не проверил.
+    #[serde(default)]
+    drafts: HashSet<String>,
 }
 
 fn store_path(source: &Path) -> PathBuf {
@@ -133,7 +136,7 @@ fn read_store(source: &Path, path: &Path) -> Result<TranslationOverrides, String
     if !path.exists() {
         return Ok(TranslationOverrides {
             source_path: source.to_string_lossy().into_owned(),
-            entries: HashMap::new(),
+            ..Default::default()
         });
     }
     let bytes = fs::read(path)
@@ -170,6 +173,11 @@ pub fn load_for_graph(
         write_store(&path, &store)?;
     }
     Ok(store.entries)
+}
+
+/// Ключи строк файла с непроверенным переводом модели.
+pub fn draft_keys(source: &Path) -> Result<HashSet<String>, String> {
+    Ok(read_store(source, &store_path(source))?.drafts)
 }
 
 fn respace_keys(store: &mut TranslationOverrides) -> bool {
@@ -256,6 +264,7 @@ pub struct ModExport {
 struct SavedSource {
     source: PathBuf,
     entries: BTreeMap<String, String>,
+    drafts: HashSet<String>,
 }
 
 fn saved_sources(game_dir: &Path) -> Result<Vec<SavedSource>, String> {
@@ -281,6 +290,7 @@ fn saved_sources(game_dir: &Path) -> Result<Vec<SavedSource>, String> {
             sources.push(SavedSource {
                 source: PathBuf::from(store.source_path),
                 entries: store.entries.into_iter().collect(),
+                drafts: store.drafts,
             });
         }
     }
@@ -562,8 +572,60 @@ fn save_at(source: &Path, path: &Path, changes: &[TranslationEdit]) -> Result<()
         store
             .entries
             .insert(change.key.clone(), change.text.clone());
+        // Правка пользователя подтверждает строку
+        store.drafts.remove(&change.key);
     }
     write_store(path, &store)
+}
+
+/// Записывает перевод модели с пометкой о проверке. Он идёт только в пустые строки: пока модель
+/// отвечала, строку мог заполнить пользователь. Возвращает правки, которые попали в хранилище.
+pub fn save_drafts(source: &Path, drafts: Vec<TranslationEdit>) -> Result<Vec<TranslationEdit>, String> {
+    let path = store_path(source);
+    save_drafts_at(source, &path, drafts)
+}
+
+/// Записывает перевод одной строки, о котором попросил пользователь: заполненную строку он заменяет.
+pub fn replace_with_draft(source: &Path, draft: TranslationEdit) -> Result<(), String> {
+    replace_with_drafts(source, vec![draft])
+}
+
+/// Записывает исправления редактуры, которую запустил пользователь: заполненные строки они заменяют.
+pub fn replace_with_drafts(source: &Path, drafts: Vec<TranslationEdit>) -> Result<(), String> {
+    let path = store_path(source);
+    replace_with_drafts_at(source, &path, drafts)
+}
+
+fn replace_with_drafts_at(source: &Path, path: &Path, drafts: Vec<TranslationEdit>) -> Result<(), String> {
+    if drafts.is_empty() {
+        return Ok(());
+    }
+    let file_lock = path_lock(path);
+    let _guard = file_lock.lock();
+    let mut store = read_store(source, path)?;
+    for draft in drafts {
+        store.drafts.insert(draft.key.clone());
+        store.entries.insert(draft.key, draft.text);
+    }
+    write_store(path, &store)
+}
+
+fn save_drafts_at(source: &Path, path: &Path, drafts: Vec<TranslationEdit>) -> Result<Vec<TranslationEdit>, String> {
+    let file_lock = path_lock(path);
+    let _guard = file_lock.lock();
+    let mut store = read_store(source, path)?;
+    let written: Vec<TranslationEdit> = drafts
+        .into_iter()
+        .filter(|draft| store.entries.get(&draft.key).is_none_or(|text| text.trim().is_empty()))
+        .collect();
+    for draft in &written {
+        store.entries.insert(draft.key.clone(), draft.text.clone());
+        store.drafts.insert(draft.key.clone());
+    }
+    if !written.is_empty() {
+        write_store(path, &store)?;
+    }
+    Ok(written)
 }
 
 /// Итог копирования правок другого проекта.
@@ -611,6 +673,9 @@ pub fn transfer_edits(from: &Path, to: &Path) -> Result<TransferredEdits, String
         for (key, text) in saved.entries {
             match store.entries.get(&key) {
                 None => {
+                    if saved.drafts.contains(&key) {
+                        store.drafts.insert(key.clone());
+                    }
                     store.entries.insert(key, text);
                     added += 1;
                 }
@@ -719,6 +784,42 @@ mod tests {
         assert_eq!(loaded.get("line-2").unwrap(), "Второй");
         assert_eq!(fs::read(&source).unwrap(), b"original source");
         assert!(!game.join("translations").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_translation_stays_a_draft_until_edited_and_keeps_filled_lines() {
+        let root = std::env::temp_dir().join(format!("translator_drafts_{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("story.rpy");
+        let saved_path = root.join("translation.json");
+        fs::write(&source, b"original source").unwrap();
+        let edit = |key: &str, text: &str| TranslationEdit { key: key.into(), text: text.into() };
+
+        save_at(&source, &saved_path, &[edit("own", "Своё"), edit("cleared", " ")]).unwrap();
+        let written = save_drafts_at(
+            &source,
+            &saved_path,
+            vec![edit("own", "Модель"), edit("cleared", "Модель"), edit("new", "Модель")],
+        )
+        .unwrap();
+        let keys: Vec<&str> = written.iter().map(|draft| draft.key.as_str()).collect();
+        assert_eq!(keys, ["cleared", "new"]);
+
+        let store = read_store(&source, &saved_path).unwrap();
+        assert_eq!(store.entries["own"], "Своё");
+        assert_eq!(store.entries["new"], "Модель");
+        assert_eq!(store.drafts, HashSet::from(["cleared".to_string(), "new".to_string()]));
+
+        save_at(&source, &saved_path, &[edit("new", "Модель")]).unwrap();
+        let store = read_store(&source, &saved_path).unwrap();
+        assert_eq!(store.drafts, HashSet::from(["cleared".to_string()]));
+
+        // Перевод одной строки по просьбе пользователя заменяет и заполненную
+        replace_with_drafts_at(&source, &saved_path, vec![edit("own", "Новая")]).unwrap();
+        let store = read_store(&source, &saved_path).unwrap();
+        assert_eq!(store.entries["own"], "Новая");
+        assert!(store.drafts.contains("own"));
         let _ = fs::remove_dir_all(root);
     }
 }

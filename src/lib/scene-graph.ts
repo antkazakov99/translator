@@ -56,6 +56,7 @@ export interface FocusedGraphOptions {
   outgoingPage?: number;
   outgoingPageSize?: number;
   outgoingFilter?: string;
+  sceneTitle?: (name: string) => string;
 }
 
 export const NODE_WIDTH = 270;
@@ -140,11 +141,13 @@ export function buildFocusedSceneGraph(
   const incomingEdges = allEdges.filter(e => e.to === centerName && e.from !== centerName);
   const rawIncomingNames = Array.from(new Set(incomingEdges.map(e => e.from)));
   const incomingTotalRaw = rawIncomingNames.length;
+  const matches = (name: string, filter: string) =>
+    name.toLowerCase().includes(filter) || (opts.sceneTitle?.(name) ?? '').toLowerCase().includes(filter);
 
   // Фильтрация входящих
   const inFilter = (opts.incomingFilter ?? '').trim().toLowerCase();
   const filteredIncomingNames = inFilter
-    ? rawIncomingNames.filter(name => name.toLowerCase().includes(inFilter))
+    ? rawIncomingNames.filter(name => matches(name, inFilter))
     : rawIncomingNames;
 
   const inPageSize = Math.max(1, opts.incomingPageSize ?? 10);
@@ -164,7 +167,7 @@ export function buildFocusedSceneGraph(
   // Фильтрация исходящих
   const outFilter = (opts.outgoingFilter ?? '').trim().toLowerCase();
   const filteredOutgoingNames = outFilter
-    ? rawOutgoingNames.filter(name => name.toLowerCase().includes(outFilter))
+    ? rawOutgoingNames.filter(name => matches(name, outFilter))
     : rawOutgoingNames;
 
   const outPageSize = Math.max(1, opts.outgoingPageSize ?? 10);

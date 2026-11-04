@@ -37,7 +37,9 @@
       descriptions: { connection: "", model: "" },
       names: { connection: "", model: "" },
       terms: { connection: "", model: "" },
-      tokens: { connection: "", model: "" }
+      tokens: { connection: "", model: "" },
+      lines: { connection: "", model: "" },
+      review: { connection: "", model: "" }
     }
   });
   let checks = $state<Record<string, ServerCheck>>({});

@@ -1,6 +1,7 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { currentNameOrigins, withNameOrigins, savedNameAnalysis, missingNameAnalysis } from '../src/lib/name-forms.ts';
 import { allNames, baseNames, canonicalForms, characterTitle, chatNames, cleanCharacterForms, cleanTermForms, defaultCanonicalName, formNames, formOwners, formTranslation, fullName, hasScriptCode, knownNames, nameTargetKey, newCharacterAlias, NO_CANONICAL_NAME, ownerOptions, translatedTitle, uniqueForms } from '../src/lib/name-forms.ts';
 
 const term = (name, linked = []) => ({ kind: 'term', id: name, names: [name], linked });
@@ -61,6 +62,52 @@ const person = (alias, first_name, details = {}) => ({
   ...NO_CANONICAL_NAME, alias, first_name, gender: 'female', merged: [], forms: [], ...details
 });
 const form = (source, translated = '') => ({ source, translated });
+
+test('bulk name analysis skips filled fields and only sends missing owners of a shared surname', () => {
+  const anna = person('a', 'Anna', { last_name: 'Smith' });
+  const emma = person('e', 'Emma', { last_name: 'Smith' });
+  const origin = (char, field, source) => ({ field, source, context: fullName(char), languages: ['английский'], reason: 'Сохранено пользователем' });
+  anna.name_origins = [origin(anna, 'first', 'Anna'), origin(anna, 'last', 'Smith')];
+  emma.name_origins = [origin(emma, 'first', 'Emma')];
+  const before = JSON.stringify(anna.name_origins);
+  const pending = missingNameAnalysis([anna, emma]);
+  assert.equal(pending.requests.length, 1);
+  assert.equal(pending.requests[0].name, 'Smith');
+  assert.equal(pending.requests[0].context, 'Emma Smith');
+  assert.deepEqual(pending.targets.get(pending.requests[0].id).map((target) => target.alias), ['e']);
+  assert.equal(savedNameAnalysis([anna, emma]).complete, false);
+  emma.name_origins = withNameOrigins(emma, [origin(emma, 'last', 'Smith')]);
+  assert.equal(missingNameAnalysis([anna, emma]).requests.length, 0);
+  assert.equal(savedNameAnalysis([anna, emma]).complete, true);
+  assert.equal(JSON.stringify(anna.name_origins), before);
+});
+
+test('character origins belong to current name fields and survive translation edits', () => {
+  const char = person('a', 'Anna', { last_name: 'Smith', forms: [form('Annie')] });
+  const origin = (field, source) => ({ field, source, context: 'Anna Smith', languages: ['английский'], reason: 'Гипотеза' });
+  char.name_origins = withNameOrigins(char, [origin('first', 'Anna'), origin('last', 'Smith'), origin('form', 'Annie')]);
+  assert.equal(currentNameOrigins(char).length, 3);
+  char.translated_first_name = 'Анна';
+  assert.equal(currentNameOrigins(char).length, 3);
+  char.forms = [];
+  assert.deepEqual(currentNameOrigins(char).map((row) => row.field), ['first', 'last']);
+  char.first_name = 'Hannah';
+  assert.deepEqual(currentNameOrigins(char), []);
+  // Поздний ответ для прежнего имени не возвращает устаревшую гипотезу.
+  assert.deepEqual(withNameOrigins(char, [origin('first', 'Anna')]), []);
+  assert.deepEqual(currentNameOrigins(person('old', 'Anna')), []);
+});
+
+test('reanalyzing a name updates its hypothesis without duplicating it or affecting another owner', () => {
+  const char = person('a', 'Anna');
+  const origin = { field: 'first', source: 'Anna', context: 'Anna', languages: ['английский'], reason: 'Первый ответ' };
+  char.name_origins = withNameOrigins(char, [origin]);
+  char.name_origins = withNameOrigins(char, [{ ...origin, languages: ['немецкий'], reason: 'Другой контекст' }]);
+  assert.equal(char.name_origins.length, 1);
+  assert.deepEqual(char.name_origins[0].languages, ['немецкий']);
+  const other = person('b', 'Anna', { last_name: 'Smith' });
+  assert.deepEqual(withNameOrigins(other, char.name_origins), []);
+});
 
 test('the translated title is the translated first and last name', () => {
   assert.equal(translatedTitle(person('k', 'Kira', { translated_first_name: 'Кира', translated_last_name: 'Ковач' })), 'Кира Ковач');
@@ -153,6 +200,23 @@ test('the first step spells first and last names, a surname for each gender', ()
   const owners = batch.targets.get(batch.requests[1].id).map((target) => target.alias);
   assert.deepEqual(owners, ['a', 'z']);
   assert.deepEqual(batch.targets.get(batch.requests[0].id).map(({ alias, field, current }) => [alias, field, current]), [['a', 'first', 'Анна'], ['a2', 'first', 'Аня']]);
+});
+
+test('name requests retain the full original owner and gender for names and forms', () => {
+  const woman = person('i', 'Iris', { last_name: 'Kirillov', forms: [form('Miss Kirillov')] });
+  const batch = baseNames([woman]);
+  assert.deepEqual(batch.requests.map(({ name, gender, context }) => [name, gender, context]), [
+    ['Iris', 'female', 'Iris Kirillov'], ['Kirillov', 'female', 'Iris Kirillov']
+  ]);
+  const forms = formNames([woman], new Map());
+  assert.equal(forms.requests[0].context, 'Iris Kirillov');
+});
+
+test('a shared surname keeps the context of every owner', () => {
+  const batch = baseNames([person('a', 'Anna', { last_name: 'Karanovic' }), person('e', 'Emma', { last_name: 'Karanovic' })]);
+  const surname = batch.requests.find((request) => request.name === 'Karanovic');
+  assert.equal(surname.context, 'Anna Karanovic; Emma Karanovic');
+  assert.deepEqual(batch.targets.get(surname.id).map((target) => target.alias), ['a', 'e']);
 });
 
 test('the second step builds forms on a filled name, then on the answer of the first step', () => {

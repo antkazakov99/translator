@@ -7,6 +7,7 @@ pub mod rpyc;
 pub mod rpyc_writer;
 pub mod translation;
 pub mod llm;
+pub mod name_rules;
 pub mod scenes;
 pub mod terms;
 
@@ -439,6 +440,9 @@ pub struct DialogueEntryDto {
     pub translated_text: Option<String>,
     pub status: String,
     pub scene_name: String,
+    /// Перевод модели, который пользователь ещё не проверил.
+    #[serde(default)]
+    pub draft: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -840,6 +844,7 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
         .parse_file(path, &content)
         .map_err(|e| format!("Ошибка парсинга: {}", e))?;
     let saved_translations = translation::load_for_graph(path, &graph)?;
+    let drafts = translation::draft_keys(path)?;
 
     // 3. Извлекаем граф ветвлений, выборов и переходов из оригинального скрипта игры (с кэшированием структуры)
     let script_struct = if orig_path.exists() {
@@ -920,6 +925,7 @@ pub(crate) fn parse_project_file(file_path: String) -> Result<ParsedFileDto, Str
 
                     scene.entries.push(DialogueEntryDto {
                         id: d.id.clone(),
+                        draft: drafts.contains(&translation_key),
                         translation_key,
                         line_number: d.line_number,
                         target_lines: d.target_lines.clone(),
@@ -1298,6 +1304,58 @@ async fn export_mod(
     })
     .await
     .map_err(|e| format!("Ошибка экспорта мода: {}", e))?
+}
+
+/// Установка меняет только наш архив; сначала полностью собираем временный файл.
+fn install_mod_archive(
+    base_path: &Path,
+    format: rpyc_writer::ScriptFormat,
+) -> Result<String, String> {
+    if !base_path.is_dir() {
+        return Err("Папка игры не найдена".to_string());
+    }
+    let out_path = base_path.join(rpa::MOD_ARCHIVE_NAME);
+    let lock = path_lock(&out_path);
+    let _guard = lock.lock();
+    // create_archive уже записывает через временный файл с атомарной заменой.
+    let message = build_mod_archive(base_path, &out_path, format)?;
+    let instruction = format!("Положите {} в папку game игры", rpa::MOD_ARCHIVE_NAME);
+    let mut message = message.replace(&instruction, "Перевод установлен в папку игры");
+    if tl_lang_dir(base_path).exists() {
+        message.push_str(". Внимание: файлы tl/russian имеют приоритет над архивом, поэтому часть правок может не отображаться в игре");
+    }
+    Ok(message)
+}
+
+#[tauri::command]
+async fn install_mod(game_dir: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        register_project(&base_path);
+        let format = rpyc_writer::ScriptFormat::detect(&base_path)?;
+        install_mod_archive(&base_path, format)
+    })
+    .await
+    .map_err(|e| format!("Ошибка установки перевода: {}", e))?
+}
+
+#[tauri::command]
+async fn remove_mod(game_dir: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let out_path = base_path.join(rpa::MOD_ARCHIVE_NAME);
+        let lock = path_lock(&out_path);
+        let _guard = lock.lock();
+        match std::fs::remove_file(&out_path) {
+            Ok(()) => Ok("Перевод ru_lang.rpa удалён из папки игры".to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok("В папке игры нет установленного ru_lang.rpa".to_string())
+            }
+            Err(e) => Err(format!("Не удалось удалить ru_lang.rpa: {}", e)),
+        }
+    })
+    .await
+    .map_err(|e| format!("Ошибка удаления перевода: {}", e))?
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1715,6 +1773,26 @@ async fn get_term_scenes(game_dir: String, forms: Vec<String>) -> Result<Vec<sce
     .map_err(|e| format!("Ошибка поиска сцен термина: {}", e))
 }
 
+/// Все сцены с репликами, для списка в глоссарии.
+#[tauri::command]
+async fn list_game_scenes(game_dir: String) -> Result<Vec<scenes::GameScene>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scenes::game_scenes(&game_lines(&effective_game_directory(Path::new(&game_dir))))
+    })
+    .await
+    .map_err(|e| format!("Ошибка чтения сцен: {}", e))
+}
+
+/// Реплики одной сцены.
+#[tauri::command]
+async fn get_scene_lines(game_dir: String, scene: String) -> Result<Vec<scenes::CharacterScene>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scenes::scene_lines(&game_lines(&effective_game_directory(Path::new(&game_dir))), &scene)
+    })
+    .await
+    .map_err(|e| format!("Ошибка чтения реплик сцены: {}", e))
+}
+
 /// Просьба остановить пакетную обработку.
 static LLM_CANCEL: AtomicBool = AtomicBool::new(false);
 static LLM_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -1761,25 +1839,68 @@ async fn translate_character_names(
     target: llm::ChatTarget,
     names: Vec<llm::NameRequest>,
     cast: Vec<String>,
+    plan: name_rules::NamePlan,
     on_batch: Channel<llm::BatchProgress<llm::NameSuggestion>>,
-) -> Result<llm::AutofillResult<llm::NameSuggestion>, String> {
+    on_progress: Channel<name_rules::RequestProgress>,
+) -> Result<llm::NameAutofillResult, String> {
+    plan.validate(&names)?;
     let run = LlmRun::begin()?;
-    llm::translate_names(&target, &names, &cast, run.cancel(), |progress| {
+    llm::translate_names_with_progress(&target, &names, &cast, &plan, run.cancel(), |progress| {
         send_progress(&on_batch, progress)
-    })
+    }, |progress| { let _ = on_progress.send(progress); })
     .await
+}
+
+#[tauri::command]
+async fn analyze_character_names(target: llm::ChatTarget, names: Vec<llm::NameRequest>, cast: Vec<String>, known_languages: Vec<String>, on_progress: Channel<name_rules::RequestProgress>) -> Result<Vec<name_rules::NameOrigin>, String> {
+    let run = LlmRun::begin()?;
+    name_rules::analyze_with_languages(&target, &names, &cast, &known_languages, run.cancel(), |progress| { let _ = on_progress.send(progress); }).await
+}
+
+#[tauri::command]
+async fn generate_name_rules(target: llm::ChatTarget, language: String, existing_rules: Option<String>) -> Result<name_rules::LanguageRule, String> {
+    let _run = LlmRun::begin()?;
+    let existing = match existing_rules {
+        Some(rules) => rules,
+        None => {
+            let wanted = name_rules::language_key(&language);
+            tauri::async_runtime::spawn_blocking(move || {
+                name_rules::load(&app_data_dir().join("name_rules.json"))
+                    .map(|rules| rules.into_iter().find(|rule| rule.language == wanted).map(|rule| rule.rules).unwrap_or_default())
+            }).await.map_err(|e| format!("Ошибка чтения правил: {e}"))??
+        }
+    };
+    name_rules::generate_from_existing(&target, &language, &existing).await
+}
+
+#[tauri::command]
+async fn load_name_rules() -> Result<Vec<name_rules::LanguageRule>, String> {
+    tauri::async_runtime::spawn_blocking(|| name_rules::load(&app_data_dir().join("name_rules.json")))
+        .await.map_err(|e| format!("Ошибка чтения правил: {e}"))?
+}
+
+#[tauri::command]
+async fn save_name_rules(rules: Vec<name_rules::LanguageRule>, removed: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || name_rules::save(&app_data_dir().join("name_rules.json"), rules, &removed))
+        .await.map_err(|e| format!("Ошибка сохранения правил: {e}"))?
 }
 
 /// Запрос на написание имён для ручной вставки в чат-бот, в обход API.
 #[tauri::command]
-fn names_chat_request(names: Vec<llm::NameRequest>, cast: Vec<String>) -> Result<String, String> {
-    llm::names_chat_request(&names, &cast)
+fn names_chat_request(names: Vec<llm::NameRequest>, cast: Vec<String>, plan: name_rules::NamePlan) -> Result<String, String> {
+    let request = llm::names_chat_request(&names, &cast)?;
+    let plan = serde_json::to_string(&plan).map_err(|e| e.to_string())?;
+    Ok(format!("{request}\n\nSaved language rules, probable origins and glossary: {plan}\nApply saved rules before generic examples. Preserve confirmed glossary spellings. Analyze origin, use these rules, translate and check for violations and ambiguous spellings before answering."))
 }
 
 /// Написания из ответа чат-бота. Какие из них попадут в глоссарий, решает пользователь.
 #[tauri::command]
 fn read_names_chat_answer(names: Vec<llm::NameRequest>, answer: String) -> Result<Vec<llm::NameSuggestion>, String> {
-    llm::read_names_answer(&names, &answer)
+    let mut items = llm::read_names_answer(&names, &answer)?;
+    for item in &mut items {
+        item.issues.push("Ответ чат-бота: отдельная проверка не выполнялась.".into());
+    }
+    Ok(items)
 }
 
 /// Предлагает пояснения и значения токенов по репликам. В глоссарий их отбирает пользователь.
@@ -1930,6 +2051,332 @@ async fn summarize_glossary_term(
     .await
 }
 
+/// Части сцены. Имена говорящих берутся из сохранённого глоссария: передавать его ради каждой из
+/// выбранных сцен незачем, поэтому несохранённое переименование войдёт в запрос после сохранения.
+fn scene_parts_of(base_path: &Path, tokens: &[glossary::TokenGlossaryEntry], scene: &str) -> Vec<llm::ScenePart> {
+    let characters = glossary::ProjectGlossary::load_for_project(base_path)
+        .map(|glossary| glossary.characters)
+        .unwrap_or_default();
+    llm::game_scene_parts(&game_lines(base_path), &llm::token_notes(tokens), scene, &characters)
+}
+
+/// Сколько частей даёт сцена и сколько из них уже прочитано.
+#[tauri::command]
+async fn count_scene_chunks(
+    game_dir: String,
+    model: String,
+    scene: String,
+    tokens: Vec<glossary::TokenGlossaryEntry>,
+) -> Result<CharacterChunks, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let chunks: Vec<String> = scene_parts_of(&base_path, &tokens, &scene).into_iter().map(|part| part.text).collect();
+        let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+        let ready = llm::ready_chunks(&chunks, &model, &llm::scene_note_owner(&scene), &notes_file);
+        CharacterChunks { total: chunks.len(), ready: ready.iter().filter(|ready| **ready).count() }
+    })
+    .await
+    .map_err(|e| format!("Ошибка подсчёта частей сцены: {}", e))
+}
+
+/// Все части сцены с заметками от этой модели.
+#[tauri::command]
+async fn list_scene_parts(
+    game_dir: String,
+    model: String,
+    scene: String,
+    hints: llm::ModelHints,
+) -> Result<Vec<llm::CharacterPart>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let base_path = effective_game_directory(Path::new(&game_dir));
+        let parts = scene_parts_of(&base_path, &hints.tokens, &scene);
+        let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+        llm::character_parts(parts, &model, &llm::scene_note_owner(&scene), llm::SCENE_NAME, &notes_file, &hints)
+    })
+    .await
+    .map_err(|e| format!("Ошибка чтения заметок сцены: {}", e))
+}
+
+/// Пишет описание сцены по `parts` её частям и название, если оно нужно. Готовые части сохранены, и следующий
+/// запуск продолжит с того же места. `None` значит, что запуск остановлен раньше первой заметки.
+#[tauri::command]
+async fn summarize_glossary_scene(
+    game_dir: String,
+    target: llm::ChatTarget,
+    scene: String,
+    need_title: bool,
+    hints: llm::ModelHints,
+    parts: usize,
+    on_progress: Channel<llm::SummaryProgress>,
+) -> Result<Option<llm::SceneSummary>, String> {
+    let run = LlmRun::begin()?;
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+    let selected = scene.clone();
+    let notes = notes_file.clone();
+    let chosen_model = target.model.clone();
+    let tokens = hints.tokens.clone();
+    let (chunks, opening, text_hash) = tauri::async_runtime::spawn_blocking(move || {
+        // Реплики идут в порядке сюжета, поэтому первая сцена списка и есть начало игры
+        let found = scenes::game_scenes(&game_lines(&base_path));
+        let opening = found.first().is_some_and(|first| first.scene == selected);
+        let text_hash = found.into_iter().find(|scene| scene.scene == selected).map(|scene| scene.text_hash).unwrap_or_default();
+        let chunks: Vec<String> = scene_parts_of(&base_path, &tokens, &selected).into_iter().map(|part| part.text).collect();
+        let ready = llm::ready_chunks(&chunks, &chosen_model, &llm::scene_note_owner(&selected), &notes);
+        (llm::pick_chunks(chunks, parts, &ready), opening, text_hash)
+    })
+    .await
+    .map_err(|e| format!("Ошибка подготовки сцены: {}", e))?;
+
+    let request = llm::SceneRequest { scene: &scene, chunks, need_title, opening, text_hash };
+    llm::summarize_scene(&target, request, &hints, &notes_file, run.cancel(), |progress| {
+        if let Err(error) = on_progress.send(progress) {
+            tracing::warn!(%error, "Ход обработки не передан в интерфейс");
+        }
+    })
+    .await
+}
+
+fn source_lines(entries: Vec<DialogueEntryDto>) -> Vec<llm::SourceLine> {
+    entries
+        .into_iter()
+        .map(|entry| llm::SourceLine {
+            key: entry.translation_key,
+            speaker: entry.speaker,
+            alias: entry.speaker_alias,
+            text: entry.original_text,
+            translated: entry.translated_text,
+        })
+        .collect()
+}
+
+/// Сцены запуска перевода: те, где есть пустые реплики. Сцена без описания получает всё, что нужно
+/// для его написания, а реплики вне меток и строки интерфейса описывать незачем.
+fn line_jobs(
+    base_path: &Path,
+    parsed: ParsedFileDto,
+    only: Option<&str>,
+    glossary: &glossary::ProjectGlossary,
+    tokens: &[glossary::TokenGlossaryEntry],
+) -> Vec<llm::SceneJob> {
+    let game = game_lines(base_path);
+    let found = scenes::game_scenes(&game);
+    let notes = llm::token_notes(tokens);
+    let is_blank = |entry: &DialogueEntryDto| entry.translated_text.as_deref().is_none_or(|text| text.trim().is_empty());
+    parsed
+        .scenes
+        .into_iter()
+        .filter(|scene| only.is_none_or(|name| scene.name == name) && scene.entries.iter().any(is_blank))
+        .map(|scene| {
+            let own = glossary.scenes.iter().find(|entry| entry.scene == scene.name);
+            let description = own.map_or("", |entry| entry.notes.trim()).to_string();
+            let reading = found
+                .iter()
+                .position(|known| known.scene == scene.name)
+                .filter(|_| description.is_empty())
+                .map(|position| llm::SceneReading {
+                    chunks: llm::game_scene_parts(&game, &notes, &scene.name, &glossary.characters)
+                        .into_iter()
+                        .map(|part| part.text)
+                        .collect(),
+                    need_title: own.is_none_or(|entry| entry.title.trim().is_empty()),
+                    // Реплики идут в порядке сюжета, поэтому первая сцена списка и есть начало игры
+                    opening: position == 0,
+                    text_hash: found[position].text_hash.clone(),
+                });
+            llm::SceneJob { name: scene.name, description, lines: source_lines(scene.entries), reading }
+        })
+        .collect()
+}
+
+/// Сцена со строкой и её место в сцене. Описание берётся готовое: ради одной строки сцена не читается.
+fn line_job(parsed: ParsedFileDto, key: &str, glossary: &glossary::ProjectGlossary) -> Option<(llm::SceneJob, usize)> {
+    let scene = parsed.scenes.into_iter().find(|scene| scene.entries.iter().any(|entry| entry.translation_key == key))?;
+    let index = scene.entries.iter().position(|entry| entry.translation_key == key)?;
+    let own = glossary.scenes.iter().find(|entry| entry.scene == scene.name);
+    let description = own.map_or("", |entry| entry.notes.trim()).to_string();
+    let job = llm::SceneJob { name: scene.name, description, lines: source_lines(scene.entries), reading: None };
+    Some((job, index))
+}
+
+/// Переводит одну строку и сразу пишет её в правки с пометкой о проверке. Заполненную строку
+/// он заменяет: об этом попросил пользователь. Новые термины интерфейс сохраняет вместе с глоссарием.
+#[tauri::command]
+async fn translate_single_line(
+    game_dir: String,
+    file_path: String,
+    key: String,
+    target: llm::ChatTarget,
+    hints: llm::ModelHints,
+) -> Result<llm::LineAnswer, String> {
+    let _run = LlmRun::begin()?;
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let source = file_path.clone();
+    let line = key.clone();
+    let (found, glossary) = tauri::async_runtime::spawn_blocking(move || {
+        let parsed = parse_project_file(source)?;
+        let glossary = glossary::ProjectGlossary::load_for_project(&base_path)?;
+        Ok::<_, String>((line_job(parsed, &line, &glossary), glossary))
+    })
+    .await
+    .map_err(|e| format!("Ошибка подготовки перевода: {}", e))??;
+    let (job, index) = found.ok_or("Строка не найдена в файле: возможно, игра обновилась")?;
+
+    let answer = llm::translate_line(&target, job, index, &glossary.characters, &glossary.discarded_terms, &hints).await?;
+    let text = answer.text.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        translation::replace_with_draft(Path::new(&file_path), translation::TranslationEdit { key, text })?;
+        PARSED_FILE_CACHE.lock().remove(&file_path);
+        Ok::<_, String>(())
+    })
+    .await
+    .map_err(|e| format!("Ошибка сохранения перевода: {}", e))??;
+    Ok(answer)
+}
+
+/// Переводит пустые реплики файла или одной его сцены. Каждый пакет сразу попадает в правки с пометкой
+/// о проверке, а новые термины и описания сцен интерфейс сохраняет вместе с глоссарием.
+#[tauri::command]
+async fn translate_file_lines(
+    game_dir: String,
+    file_path: String,
+    scene: Option<String>,
+    target: llm::ChatTarget,
+    hints: llm::ModelHints,
+    on_progress: Channel<llm::LinesProgress>,
+) -> Result<llm::LinesResult, String> {
+    let run = LlmRun::begin()?;
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let notes_file = get_project_cache_dir(&base_path).join("scene_notes.json");
+    let source = file_path.clone();
+    let tokens = hints.tokens.clone();
+    let (scenes, glossary) = tauri::async_runtime::spawn_blocking(move || {
+        let parsed = parse_project_file(source)?;
+        let glossary = glossary::ProjectGlossary::load_for_project(&base_path)?;
+        let scenes = line_jobs(&base_path, parsed, scene.as_deref(), &glossary, &tokens);
+        Ok::<_, String>((scenes, glossary))
+    })
+    .await
+    .map_err(|e| format!("Ошибка подготовки перевода: {}", e))??;
+
+    let request = llm::LinesRequest {
+        scenes,
+        characters: glossary.characters,
+        discarded_terms: glossary.discarded_terms,
+        notes_file: &notes_file,
+    };
+    let save = |drafts: Vec<translation::TranslationEdit>| {
+        let path = file_path.clone();
+        async move {
+            tauri::async_runtime::spawn_blocking(move || {
+                let written = translation::save_drafts(Path::new(&path), drafts)?;
+                PARSED_FILE_CACHE.lock().remove(&path);
+                Ok(written)
+            })
+            .await
+            .map_err(|e| format!("Ошибка сохранения перевода: {}", e))?
+        }
+    };
+    llm::translate_scenes(&target, request, hints, run.cancel(), save, |progress| {
+        if let Err(error) = on_progress.send(progress) {
+            tracing::warn!(%error, "Ход перевода не передан в интерфейс");
+        }
+    })
+    .await
+}
+
+/// Сцены редактуры: те, где есть переведённые реплики. Описание берётся готовое, сцена ради него не читается.
+fn review_jobs(parsed: ParsedFileDto, only: Option<&str>, glossary: &glossary::ProjectGlossary) -> Vec<llm::SceneJob> {
+    let is_written = |entry: &DialogueEntryDto| entry.translated_text.as_deref().is_some_and(|text| !text.trim().is_empty());
+    parsed
+        .scenes
+        .into_iter()
+        .filter(|scene| only.is_none_or(|name| scene.name == name) && scene.entries.iter().any(is_written))
+        .map(|scene| {
+            let own = glossary.scenes.iter().find(|entry| entry.scene == scene.name);
+            let description = own.map_or("", |entry| entry.notes.trim()).to_string();
+            llm::SceneJob { name: scene.name, description, lines: source_lines(scene.entries), reading: None }
+        })
+        .collect()
+}
+
+/// Вычитывает переведённые реплики файла или одной его сцены. Исправления каждого пакета сразу
+/// заменяют строки в правках с пометкой о проверке, в том числе подтверждённые: запуск просил пользователь.
+#[tauri::command]
+async fn review_file_lines(
+    game_dir: String,
+    file_path: String,
+    scene: Option<String>,
+    target: llm::ChatTarget,
+    hints: llm::ModelHints,
+    on_progress: Channel<llm::ReviewProgress>,
+) -> Result<llm::ReviewResult, String> {
+    let run = LlmRun::begin()?;
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let source = file_path.clone();
+    let (scenes, glossary) = tauri::async_runtime::spawn_blocking(move || {
+        let parsed = parse_project_file(source)?;
+        let glossary = glossary::ProjectGlossary::load_for_project(&base_path)?;
+        Ok::<_, String>((review_jobs(parsed, scene.as_deref(), &glossary), glossary))
+    })
+    .await
+    .map_err(|e| format!("Ошибка подготовки редактуры: {}", e))??;
+
+    let save = |fixes: Vec<translation::TranslationEdit>| {
+        let path = file_path.clone();
+        async move {
+            tauri::async_runtime::spawn_blocking(move || {
+                translation::replace_with_drafts(Path::new(&path), fixes.clone())?;
+                PARSED_FILE_CACHE.lock().remove(&path);
+                Ok(fixes)
+            })
+            .await
+            .map_err(|e| format!("Ошибка сохранения редактуры: {}", e))?
+        }
+    };
+    llm::review_scenes(&target, scenes, &glossary.characters, &hints, run.cancel(), save, |progress| {
+        if let Err(error) = on_progress.send(progress) {
+            tracing::warn!(%error, "Ход редактуры не передан в интерфейс");
+        }
+    })
+    .await
+}
+
+/// Вычитывает одну строку и сразу записывает исправление с пометкой о проверке.
+#[tauri::command]
+async fn review_single_line(
+    game_dir: String,
+    file_path: String,
+    key: String,
+    target: llm::ChatTarget,
+    hints: llm::ModelHints,
+) -> Result<llm::ReviewAnswer, String> {
+    let _run = LlmRun::begin()?;
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let source = file_path.clone();
+    let line = key.clone();
+    let (found, glossary) = tauri::async_runtime::spawn_blocking(move || {
+        let parsed = parse_project_file(source)?;
+        let glossary = glossary::ProjectGlossary::load_for_project(&base_path)?;
+        Ok::<_, String>((line_job(parsed, &line, &glossary), glossary))
+    })
+    .await
+    .map_err(|e| format!("Ошибка подготовки редактуры: {}", e))??;
+    let (job, index) = found.ok_or("Строка не найдена в файле: возможно, игра обновилась")?;
+
+    let answer = llm::review_line(&target, job, index, &glossary.characters, &hints).await?;
+    if let Some(text) = answer.text.clone() {
+        tauri::async_runtime::spawn_blocking(move || {
+            translation::replace_with_draft(Path::new(&file_path), translation::TranslationEdit { key, text })?;
+            PARSED_FILE_CACHE.lock().remove(&file_path);
+            Ok::<_, String>(())
+        })
+        .await
+        .map_err(|e| format!("Ошибка сохранения редактуры: {}", e))??;
+    }
+    Ok(answer)
+}
+
 /// Сбрасывает заметки частей: следующий запуск прочитает их заново.
 #[tauri::command]
 async fn reset_character_notes(game_dir: String, keys: Vec<String>) -> Result<(), String> {
@@ -2071,6 +2518,8 @@ pub fn run() {
             parse_file_entries,
             find_scene_target,
             export_mod,
+            install_mod,
+            remove_mod,
             unpack_rpa,
             clear_project_script_cache,
             decompile_rpyc_file,
@@ -2083,6 +2532,10 @@ pub fn run() {
             reveal_in_system_explorer,
             check_llm_models,
             translate_character_names,
+            analyze_character_names,
+            generate_name_rules,
+            load_name_rules,
+            save_name_rules,
             suggest_glossary_tokens,
             autofill_glossary_terms,
             names_chat_request,
@@ -2101,7 +2554,16 @@ pub fn run() {
             reset_character_notes,
             get_character_scenes,
             get_token_scenes,
-            get_term_scenes
+            get_term_scenes,
+            list_game_scenes,
+            get_scene_lines,
+            count_scene_chunks,
+            list_scene_parts,
+            summarize_glossary_scene,
+            translate_file_lines,
+            translate_single_line,
+            review_file_lines,
+            review_single_line
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -2153,6 +2615,40 @@ mod tests {
         drop(run);
         let next = LlmRun::begin().unwrap();
         assert!(!next.cancel().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_install_update_and_remove_mod_preserve_game_files() {
+        let temp_dir = std::env::temp_dir()
+            .join(format!("translator_install_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        let tl_dir = tl_lang_dir(&game_dir);
+        std::fs::create_dir_all(&tl_dir).unwrap();
+        let story = tl_dir.join("story.rpy");
+        let source = "translate russian strings:\n    old \"Hello\"\n    new \"Привет\"\n";
+        std::fs::write(&story, source).unwrap();
+        std::fs::write(game_dir.join("original.rpy"), b"label start:\n    return\n").unwrap();
+        let archive = game_dir.join(rpa::MOD_ARCHIVE_NAME);
+        let message = install_mod_archive(&game_dir, TEST_FORMAT).unwrap();
+        assert!(message.contains("установлен") && message.contains("приоритет"));
+        let original_mod = std::fs::read(&archive).unwrap();
+        // Неудачная пересборка сохраняет работающий архив.
+        std::fs::write(&story, "label unsupported:\n").unwrap();
+        assert!(install_mod_archive(&game_dir, TEST_FORMAT).is_err());
+        assert_eq!(std::fs::read(&archive).unwrap(), original_mod);
+        std::fs::write(&story, source.replace("Привет", "Здравствуйте")).unwrap();
+        install_mod_archive(&game_dir, TEST_FORMAT).unwrap();
+        assert_ne!(std::fs::read(&archive).unwrap(), original_mod);
+        // Удаление принимает и корень установки с вложенной папкой game.
+        let remove = || tauri::async_runtime::block_on(remove_mod(temp_dir.to_string_lossy().into_owned())).unwrap();
+        assert!(remove().contains("удалён"));
+        assert!(!archive.exists());
+        assert!(remove().contains("нет установленного"));
+        assert_eq!(std::fs::read_to_string(&story).unwrap(), source.replace("Привет", "Здравствуйте"));
+        assert_eq!(std::fs::read(game_dir.join("original.rpy")).unwrap(), b"label start:\n    return\n");
+        assert_eq!(std::fs::read_dir(&game_dir).unwrap().count(), 2);
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        std::fs::remove_dir_all(&temp_dir).unwrap();
     }
 
     #[test]
@@ -2496,6 +2992,91 @@ mod tests {
             .unwrap()
             .translated_text
             .clone()
+    }
+
+    #[test]
+    fn test_line_jobs_take_empty_lines_and_read_scenes_without_description() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_line_jobs_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let story = game_dir.join("story.rpy");
+        let path = story.to_string_lossy().to_string();
+        std::fs::write(
+            &story,
+            concat!(
+                "label start:\n    e \"Hello\"\n    e \"Bye\"\n",
+                "label finished:\n    e \"Done\"\n",
+                "label noted:\n    e \"Noted\"\n",
+            ),
+        )
+        .unwrap();
+        save_edits(&story, &[("Done", "Готово")]);
+        let parsed = parse_project_file(path.clone()).unwrap();
+        let hello = parsed.scenes[0].entries[0].translation_key.clone();
+        let draft = translation::TranslationEdit { key: hello, text: "Привет".into() };
+        translation::save_drafts(&story, vec![draft]).unwrap();
+        PARSED_FILE_CACHE.lock().remove(&path);
+
+        let parsed = parse_project_file(path).unwrap();
+        assert!(parsed.scenes[0].entries[0].draft);
+        assert!(!parsed.scenes[0].entries[1].draft);
+        assert!(!parsed.scenes[1].entries[0].draft);
+
+        let glossary = glossary::ProjectGlossary {
+            scenes: vec![glossary::SceneGlossaryEntry {
+                scene: "noted".to_string(),
+                notes: "Описана вручную".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let jobs = line_jobs(&game_dir, parsed.clone(), None, &glossary, &[]);
+        let names: Vec<&str> = jobs.iter().map(|job| job.name.as_str()).collect();
+        assert_eq!(names, ["start", "noted"]);
+        assert_eq!(jobs[0].lines[0].translated.as_deref(), Some("Привет"));
+        let reading = jobs[0].reading.as_ref().unwrap();
+        assert!(reading.opening && reading.need_title);
+        assert!(reading.chunks[0].contains("Hello"));
+        assert!(!reading.text_hash.is_empty());
+        assert!(jobs[1].reading.is_none());
+        assert_eq!(jobs[1].description, "Описана вручную");
+
+        let noted = parsed.scenes[2].entries[0].translation_key.clone();
+        let (job, index) = line_job(parsed.clone(), &noted, &glossary).unwrap();
+        assert_eq!((job.name.as_str(), index, job.description.as_str()), ("noted", 0, "Описана вручную"));
+        assert!(job.reading.is_none());
+        assert!(line_job(parsed.clone(), "unknown", &glossary).is_none());
+
+        let jobs = line_jobs(&game_dir, parsed, Some("noted"), &glossary, &[]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "noted");
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    #[ignore = "Требуются локальные тестовые файлы игры"]
+    fn test_scenes_of_real_translation_are_found_in_originals() {
+        let Ok(tl_dir) = std::env::var("TRANSLATOR_TEST_TL_DIR") else {
+            return;
+        };
+        let tl_dir = PathBuf::from(tl_dir);
+        let game_dir = tl_dir.parent().and_then(Path::parent).unwrap().to_path_buf();
+        tauri::async_runtime::block_on(scan_game_project(game_dir.to_string_lossy().to_string())).unwrap();
+        let mut files = Vec::new();
+        collect_rpy_files(&tl_dir, &mut files);
+        let (mut scenes, mut readable) = (0, 0);
+        for file in files {
+            let mut parsed = parse_project_file(file.to_string_lossy().to_string()).unwrap();
+            for entry in parsed.scenes.iter_mut().flat_map(|scene| &mut scene.entries) {
+                entry.translated_text = None;
+            }
+            let jobs = line_jobs(&game_dir, parsed, None, &glossary::ProjectGlossary::default(), &[]);
+            scenes += jobs.iter().filter(|job| job.name != "Интерфейс и меню (strings)").count();
+            readable += jobs.iter().filter(|job| job.reading.as_ref().is_some_and(|reading| !reading.chunks.is_empty())).count();
+        }
+        println!("Сцен с репликами: {scenes}, найдено в оригиналах: {readable}");
+        assert!(readable > 0 && readable * 2 >= scenes);
     }
 
     #[test]

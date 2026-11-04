@@ -206,6 +206,37 @@ export function cleanTermForms(term: { source_term: string; translated_term: str
 /** Поле персонажа, в которое попадёт написание от модели. */
 export type NameField = "first" | "last" | "form";
 
+export interface CharacterNameOrigin {
+  field: NameField;
+  source: string;
+  context: string;
+  languages: string[];
+  reason: string;
+}
+
+type CharacterWithOrigins = FormCharacter & { name_origins?: CharacterNameOrigin[] };
+
+/** Не показываем гипотезу, если исходное имя или контекст владельца уже изменились. */
+export function currentNameOrigins(char: CharacterWithOrigins) {
+  return (char.name_origins ?? []).filter((origin) => {
+    if (!sameName(origin.context, fullName(char))) return false;
+    if (origin.field === "first") return sameName(origin.source, char.first_name);
+    if (origin.field === "last") return sameName(origin.source, char.last_name);
+    return origin.field === "form" && char.forms.some((form) => sameName(form.source, origin.source));
+  });
+}
+
+/** Принимаем только ответы для актуального имени; старый ответ не затирает правку пользователя. */
+export function withNameOrigins(char: CharacterWithOrigins, incoming: CharacterNameOrigin[]) {
+  const current = currentNameOrigins(char);
+  for (const origin of currentNameOrigins({ ...char, name_origins: incoming })) {
+    const index = current.findIndex((own) => own.field === origin.field && sameName(own.source, origin.source));
+    if (index < 0) current.push(origin);
+    else current[index] = origin;
+  }
+  return current;
+}
+
 /** Имя в запросе к модели. Одинаковые запросы объединены: написание нужно всем их `NameTarget`. */
 export interface NameRequest {
   id: string;
@@ -213,6 +244,8 @@ export interface NameRequest {
   kind: "name" | "surname" | "form";
   gender: string;
   base: string;
+  /** Полное исходное имя владельца: помогает выбрать язык отдельного имени или фамилии. */
+  context?: string;
 }
 
 /** Куда записать написание: у персонажа `alias` поле `field`, а у формы её `source`. */
@@ -233,26 +266,73 @@ interface NamedCharacter extends FormCharacter {
   gender: string;
 }
 
+export interface AnalyzedNameOrigin {
+  id: string;
+  name: string;
+  context: string;
+  languages: string[];
+  reason: string;
+}
+
+type AnalyzedCharacter = NamedCharacter & { name_origins?: CharacterNameOrigin[] };
+
+const savedOrigin = (char: AnalyzedCharacter, target: NameTarget) => currentNameOrigins(char)
+  .find((origin) => origin.field === target.field && sameName(origin.source, target.source) && origin.languages.some((language) => language.trim()));
+
+/** Сохранённые происхождения для запросов без нового обращения к модели. */
+export function savedNameAnalysis(characters: AnalyzedCharacter[]) {
+  const batch = chatNames(characters);
+  const origins: AnalyzedNameOrigin[] = [];
+  for (const request of batch.requests) {
+    const saved = (batch.targets.get(request.id) ?? []).map((target) => {
+      const char = characters.find((char) => char.alias === target.alias);
+      return char ? savedOrigin(char, target) : undefined;
+    });
+    if (saved.length === 0 || saved.some((origin) => !origin)) continue;
+    origins.push({ id: request.id, name: request.name, context: request.context || "", languages: [...new Set(saved.flatMap((origin) => origin!.languages))], reason: [...new Set(saved.map((origin) => origin!.reason))].join("; ") });
+  }
+  return { origins, complete: batch.requests.length > 0 && origins.length === batch.requests.length };
+}
+
+/** В массовый анализ входят только незаполненные поля, включая владельцев общего имени. */
+export function missingNameAnalysis(characters: AnalyzedCharacter[]): NameBatch {
+  const batch = chatNames(characters);
+  const pending: NameBatch = { requests: [], targets: new Map() };
+  for (const request of batch.requests) {
+    const targets = (batch.targets.get(request.id) ?? []).filter((target) => {
+      const char = characters.find((char) => char.alias === target.alias);
+      return char && !savedOrigin(char, target);
+    });
+    if (targets.length === 0) continue;
+    pending.targets.set(request.id, targets);
+    pending.requests.push({ ...request, context: [...new Set(targets.map((target) => fullName(characters.find((char) => char.alias === target.alias)!)))].filter(Boolean).join("; ") });
+  }
+  return pending;
+}
+
 export const nameTargetKey = (target: Pick<NameTarget, "alias" | "field" | "source">) =>
   `${target.alias}:${target.field}:${target.source.toLowerCase()}`;
 
-type WantedName = NameTarget & Pick<NameRequest, "kind" | "gender">;
+type WantedName = NameTarget & Pick<NameRequest, "kind" | "gender" | "context">;
 
 function nameBatch(wanted: WantedName[], prefix: string): NameBatch {
   const batch: NameBatch = { requests: [], targets: new Map() };
   const ids = new Map<string, string>();
   const seen = new Set<string>();
-  for (const { kind, gender, ...target } of wanted) {
+  for (const { kind, gender, context, ...target } of wanted) {
     if (seen.has(nameTargetKey(target))) continue;
     seen.add(nameTargetKey(target));
-    // Пол важен только фамилии и форме: у остальных одно написание на всех
-    const key = JSON.stringify([kind, target.source.toLowerCase(), kind === "name" ? "" : gender, target.base]);
+    const key = JSON.stringify([kind, target.source.toLowerCase(), gender, target.base]);
     let id = ids.get(key);
     if (!id) {
       id = `${prefix}${batch.requests.length}`;
       ids.set(key, id);
-      batch.requests.push({ id, name: target.source, kind, gender, base: target.base });
+      batch.requests.push({ id, name: target.source, kind, gender, base: target.base, context });
       batch.targets.set(id, []);
+    } else if (context) {
+      const request = batch.requests.find((request) => request.id === id)!;
+      const contexts = (request.context || "").split("; ").filter(Boolean);
+      if (!contexts.includes(context)) request.context = [...contexts, context].join("; ");
     }
     batch.targets.get(id)!.push(target);
   }
@@ -262,7 +342,7 @@ function nameBatch(wanted: WantedName[], prefix: string): NameBatch {
 /** Первый шаг: имена и фамилии. Они станут основой для форм. */
 export function baseNames(characters: NamedCharacter[]) {
   return nameBatch(characters.flatMap((char): WantedName[] => {
-    const common = { alias: char.alias, gender: char.gender, base: "" };
+    const common = { alias: char.alias, gender: char.gender, base: "", context: fullName(char) };
     const first = char.first_name.trim();
     const last = char.last_name.trim();
     return [
@@ -281,7 +361,7 @@ export function formNames(characters: NamedCharacter[], spelled: Map<string, str
     const known = (field: NameField, source: string, current: string) =>
       current.trim() || spelled.get(nameTargetKey({ alias: char.alias, field, source: source.trim() })) || "";
     const base = joinName(known("first", char.first_name, char.translated_first_name), known("last", char.last_name, char.translated_last_name));
-    const common = { alias: char.alias, gender: char.gender, base, kind: "form" as const };
+    const common = { alias: char.alias, gender: char.gender, base, context: fullName(char), kind: "form" as const };
     const taken = canonicalForms(char).map((form) => form.source);
     const isTaken = (source: string) => taken.some((name) => sameName(name, source));
     return char.forms

@@ -1,6 +1,6 @@
 //! Где персонаж встречается в игре: сцены, в которых он говорит или о нём говорят.
 
-use crate::parser::renpy::RenpyParser;
+use crate::parser::renpy::{RenpyParser, OUTSIDE_LABELS};
 use crate::terms::RE_WORD;
 use rayon::prelude::*;
 use regex::Regex;
@@ -35,6 +35,16 @@ pub struct CharacterScene {
     pub spoken: usize,
     pub mentioned: usize,
     pub lines: Vec<SceneLine>,
+}
+
+/// Сцена игры для списка в глоссарии.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct GameScene {
+    pub scene: String,
+    pub file: String,
+    pub lines: usize,
+    /// Отпечаток текста: по нему видно, что игра изменила сцену после её описания.
+    pub text_hash: String,
 }
 
 /// Реплика оригинального скрипта и её место в игре.
@@ -157,6 +167,37 @@ pub fn term_scenes(game: &GameLines, forms: &[String]) -> Vec<CharacterScene> {
     matching_scenes(game, &format!(r"(?i)(?:^|\W)(?:{})(?:$|\W)", forms.join("|")))
 }
 
+/// Все реплики сцены. Метка одна на игру, но локальная метка может повториться в другом файле.
+pub fn scene_lines(game: &GameLines, scene: &str) -> Vec<CharacterScene> {
+    scenes_with(game, |line| (line.scene == scene).then_some(false))
+}
+
+/// Сцены с репликами в порядке сюжета. Реплики вне меток сценой не считаются.
+pub fn game_scenes(game: &GameLines) -> Vec<GameScene> {
+    let mut positions: HashMap<&str, usize> = HashMap::new();
+    let mut scenes: Vec<GameScene> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    for line in game.lines.iter().filter(|line| line.scene != OUTSIDE_LABELS) {
+        let position = *positions.entry(&line.scene).or_insert_with(|| {
+            scenes.push(GameScene {
+                scene: line.scene.clone(),
+                file: line.file.clone(),
+                lines: 0,
+                text_hash: String::new(),
+            });
+            texts.push(String::new());
+            scenes.len() - 1
+        });
+        scenes[position].lines += 1;
+        texts[position].push_str(&line.text);
+        texts[position].push('\n');
+    }
+    for (scene, text) in scenes.iter_mut().zip(&texts) {
+        scene.text_hash = format!("{:016x}", crate::stable_hash_str(text));
+    }
+    scenes
+}
+
 fn matching_scenes(game: &GameLines, pattern: &str) -> Vec<CharacterScene> {
     let Ok(pattern) = Regex::new(pattern) else {
         return Vec::new();
@@ -224,6 +265,41 @@ mod tests {
         let game = GameLines::new(load_lines(&[path], |_| "story.rpy".to_string()), HashMap::new());
         let _ = fs::remove_dir_all(dir);
         game
+    }
+
+    #[test]
+    fn game_scenes_skip_lines_outside_labels() {
+        let game = game_of(concat!(
+            "m \"Before any label.\"\n",
+            "label home:\n",
+            "    m \"One.\"\n",
+            "    m \"Two.\"\n",
+            "label empty:\n",
+            "    pass\n",
+            "label bar:\n",
+            "    m \"Three.\"\n",
+        ));
+        let found = game_scenes(&game);
+        let found: Vec<(&str, usize)> = found.iter().map(|scene| (scene.scene.as_str(), scene.lines)).collect();
+        assert_eq!(found, [("home", 2), ("bar", 1)]);
+        assert!(scene_lines(&game, "empty").is_empty());
+
+        let home = scene_lines(&game, "home");
+        let texts: Vec<&str> = home[0].lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(texts, ["One.", "Two."]);
+    }
+
+    #[test]
+    fn text_hash_follows_only_the_text_of_its_scene() {
+        let hashes = |home: &str| {
+            let game = game_of(&format!("label home:\n    m \"{home}\"\nlabel bar:\n    m \"Same.\"\n"));
+            let found = game_scenes(&game);
+            (found[0].text_hash.clone(), found[1].text_hash.clone())
+        };
+        let (first_home, first_bar) = hashes("One.");
+        let (second_home, second_bar) = hashes("Changed.");
+        assert_ne!(first_home, second_home);
+        assert_eq!(first_bar, second_bar);
     }
 
     #[test]

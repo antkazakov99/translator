@@ -1,18 +1,22 @@
 <script lang="ts">
-  import { onDestroy, type Snippet } from "svelte";
+  import { onDestroy, tick, type Snippet } from "svelte";
   import { Channel, invoke } from "@tauri-apps/api/core";
   import { AlertCircle, Check, ChevronDown, ChevronRight, ClipboardCopy, ClipboardPaste, Loader2, Sparkles, Square } from "lucide-svelte";
   import EntryPicker from "./EntryPicker.svelte";
   import LlmChoice from "./LlmChoice.svelte";
-  import { baseNames, characterTitle, chatNames, formNames, nameTargetKey, translatedTitle, type CanonicalName, type NameBatch, type NameField, type NameForm, type NameTarget } from "./name-forms";
-  import { beginLlmRun, endLlmRun, llmRun } from "./llm-run.svelte";
+  import { baseNames, characterTitle, chatNames, currentNameOrigins, missingNameAnalysis, savedNameAnalysis, formNames, formTranslation, fullName, nameTargetKey, translatedTitle, type CanonicalName, type CharacterNameOrigin, type NameBatch, type NameField, type NameForm, type NameTarget } from "./name-forms";
+  import { beginLlmRun, endLlmRun, llmRun, setLlmProgress, type LlmRequestProgress } from "./llm-run.svelte";
+  import LlmProgress from "./LlmProgress.svelte";
+  import { nameOptions, nameCheckNotice, modelNameChoice, type NameVariant } from "./name-options";
   import { LLM_ACTIONS, outsideNote, targetFor, type LlmAction, type LlmActionSettings, type LlmSettings } from "./llm-settings";
+  import { nameRules, loadNameRules, setNameRule, missingNameRuleLanguages, normalizeLanguageName, type LanguageRule } from "./name-rules.svelte";
 
   interface PanelCharacter extends CanonicalName {
     alias: string;
     gender: string;
     merged: { alias: string; original_name: string }[];
     forms: NameForm[];
+    name_origins?: CharacterNameOrigin[];
   }
 
   interface PanelTerm {
@@ -34,6 +38,7 @@
   interface AutofillResult<T> {
     items: T[];
     failed_batches: number;
+    errors?: { name: string; reason: string }[];
   }
 
   interface BatchProgress<T> {
@@ -47,7 +52,19 @@
     id: string;
     translated: string;
     origin: string;
+    issues: string[];
+    variants?: NameVariant[];
+    glossary_variants?: NameVariant[];
   }
+
+  interface NameOrigin {
+    id: string;
+    name: string;
+    context: string;
+    languages: string[];
+    reason: string;
+  }
+
 
   interface TokenSuggestion {
     name: string;
@@ -55,7 +72,7 @@
     note: string;
   }
 
-  type GlossaryTab = "characters" | "terms" | "tokens";
+  type GlossaryTab = "characters" | "terms" | "tokens" | "scenes";
 
   let {
     tab,
@@ -69,6 +86,7 @@
     descriptions,
     onselect,
     onnames,
+    onorigins,
     onterms,
     ontokens
   }: {
@@ -83,6 +101,7 @@
     descriptions: Snippet;
     onselect: (action: LlmAction, choice: LlmActionSettings) => void;
     onnames: (rows: { alias: string; field: NameField; source: string; translated: string }[]) => void;
+    onorigins: (rows: { alias: string; origin: CharacterNameOrigin }[], overwrite?: boolean) => void;
     onterms: (rows: { id: string; translated: string; category: string; notes: string }[]) => void;
     ontokens: (rows: { name: string; value: string; note: string }[]) => void;
   } = $props();
@@ -90,11 +109,12 @@
   const SECTIONS: Record<GlossaryTab, LlmAction[]> = {
     characters: ["descriptions", "names"],
     terms: ["terms", "descriptions"],
-    tokens: ["tokens"]
+    tokens: ["tokens"],
+    scenes: ["descriptions"]
   };
 
   let panelOpen = $state(false);
-  let sectionByTab = $state<Record<GlossaryTab, LlmAction>>({ characters: "descriptions", terms: "terms", tokens: "tokens" });
+  let sectionByTab = $state<Record<GlossaryTab, LlmAction>>({ characters: "descriptions", terms: "terms", tokens: "tokens", scenes: "descriptions" });
   let openSection = $derived(sectionByTab[tab]);
   let openOutsideNote = $derived(outsideNote(settings, openSection));
 
@@ -105,6 +125,16 @@
   let stopRequested = $state(false);
   let errorMessage = $state<string | null>(null);
   let doneMessage = $state("");
+  let progressChannelSequence = 0;
+
+  function requestProgressChannel(transform = (message: LlmRequestProgress) => message) {
+    const sequence = ++progressChannelSequence;
+    const channel = new Channel<LlmRequestProgress>();
+    channel.onmessage = (message) => {
+      if (isProcessing && sequence === progressChannelSequence) setLlmProgress(transform(message));
+    };
+    return channel;
+  }
 
   $effect(() => { descriptionsOpen = panelOpen && openSection === "descriptions"; });
   // Сообщение относится к разделу, в котором появилось
@@ -127,6 +157,7 @@
     errorMessage = null;
     doneMessage = "";
     progress = null;
+    progressChannelSequence += 1;
     stopRequested = false;
     progressStep = step;
     return true;
@@ -187,7 +218,146 @@
   // Имена
   let unselectedAliases = $state<string[]>([]);
   let nameTargets = $derived(characters.filter((c) => !unselectedAliases.includes(c.alias)));
-  let reviewNames = $state<(NameTarget & { key: string; translated: string; origin: string; selected: boolean })[]>([]);
+  let reviewNames = $state<(NameTarget & { key: string; translated: string; origin: string; options: NameVariant[]; notice: string; recommended: string })[]>([]);
+  let nameOrigins = $state<NameOrigin[]>([]);
+  let analysisSignature = $state("");
+  let ruleDrafts = $derived(Object.fromEntries(nameRules.items.map((rule) => [rule.language, rule.rules])));
+  let nameSignature = $derived(JSON.stringify({ gameDir, characters: nameTargets.map((c) => ({ alias: c.alias, gender: c.gender, names: [c.first_name, c.last_name, c.translated_first_name, c.translated_last_name], forms: c.forms, merged: c.merged })), cast: gameCast() }));
+  let analysisReady = $derived(analysisSignature === nameSignature && nameOrigins.length > 0);
+  let originLanguages = $derived([...new Set(nameOrigins.flatMap((o) => o.languages).map(normalizeLanguageName))].filter((language) => language !== "описание" && language !== "неизвестно"));
+  let missingRules = $derived(originLanguages.filter((language) => !ruleDrafts[language]?.trim()));
+
+  // Готовый анализ живёт в карточках: закрытие глоссария не требует повторного запуска модели.
+  $effect(() => {
+    if (isProcessing) return;
+    const saved = savedNameAnalysis(nameTargets);
+    nameOrigins = saved.origins;
+    analysisSignature = saved.complete ? nameSignature : "";
+  });
+
+  async function analyzeNames(selected: PanelCharacter[], overwrite = false) {
+    const batch = overwrite ? chatNames(selected) : missingNameAnalysis(selected);
+    const requests = batch.requests;
+    analysisSignature = "";
+    nameOrigins = savedNameAnalysis(selected).origins;
+    const cast = gameCast();
+    const target = targetFor(settings, "names");
+    const failures: string[] = [];
+    const attemptedLanguages = new Set<string>();
+    let generated = 0;
+    const generateMissingRules = async (origins: { languages: string[] }[]) => {
+      const missing = missingNameRuleLanguages(origins).filter((language) => !attemptedLanguages.has(language));
+      progressChannelSequence += 1;
+      for (const [index, language] of missing.entries()) {
+        if (stopRequested) break;
+        attemptedLanguages.add(language);
+        progressStep = `2. Генерируем правила: ${language}...`;
+        llmRun.note = progressStep;
+        setLlmProgress({ phase: "rules", batch: index + 1, total_batches: missing.length, completed: index, total: missing.length, attempt: 1, names: [language] });
+        try {
+          const rule = await invoke<LanguageRule>("generate_name_rules", { target, language });
+          if (!stopRequested && !nameRules.items.some((own) => own.language === language && own.rules.trim())) {
+            setNameRule(language, rule.rules); generated += 1;
+          }
+        } catch (e) { failures.push(`${language}: ${String(e)}`); }
+      }
+    };
+    try {
+      await loadNameRules();
+      await generateMissingRules(selected.flatMap((char) => currentNameOrigins(char)));
+      // Между пакетами анализа освобождается модель для правил только что найденных языков.
+      const batchSize = 12;
+      for (let offset = 0; offset < requests.length && !stopRequested; offset += batchSize) {
+        progressStep = "1. Определяем происхождение имён...";
+        llmRun.note = progressStep;
+        const chunk = requests.slice(offset, offset + batchSize);
+        const origins = await invoke<NameOrigin[]>("analyze_character_names", {
+          target, names: chunk, cast, knownLanguages: nameRules.items.filter((rule) => rule.rules.trim()).map((rule) => rule.language),
+          onProgress: requestProgressChannel((message) => ({ ...message, batch: Math.floor(offset / batchSize) + message.batch, total_batches: Math.ceil(requests.length / batchSize), completed: offset + message.completed, total: requests.length }))
+        });
+        if (stopRequested) break;
+        nameOrigins.push(...origins);
+        onorigins(origins.flatMap((origin) => (batch.targets.get(origin.id) ?? []).map((target) => ({
+          alias: target.alias,
+          origin: { field: target.field, source: target.source, context: fullName(selected.find((c) => c.alias === target.alias)!), languages: [...origin.languages], reason: origin.reason }
+        }))), overwrite);
+        await generateMissingRules(origins);
+        if (origins.length !== chunk.length) break;
+      }
+    } catch (e) {
+      errorMessage = `Не удалось проанализировать имена: ${String(e)}`;
+    } finally {
+      if (generated > 0) doneMessage = `Подготовлены правила для новых языков: ${generated}.`;
+      else if (!stopRequested && failures.length === 0 && !errorMessage) doneMessage = requests.length > 0 ? "Анализ готов. Можно переключить модель и запустить перевод." : "Происхождения и правила уже заполнены. Изменений нет.";
+      if (failures.length > 0) errorMessage = [errorMessage, `Не удалось создать часть правил: ${failures.join("; ")}`].filter(Boolean).join(" ");
+    }
+  }
+
+  async function startNameAnalysis() {
+    await runNameAnalysis($state.snapshot(nameTargets));
+  }
+
+  async function runNameAnalysis(selected: PanelCharacter[], overwrite = false) {
+    if (selected.length === 0 || !beginRun("1. Определяем происхождение имён...")) return;
+    reviewNames = [];
+    unchangedNames = 0;
+    namesRequested = 0;
+    namesFinished = false;
+    try {
+      await analyzeNames(selected, overwrite);
+    } finally { endRun(); }
+  }
+
+  async function startNameTranslation() {
+    if (!analysisReady || missingRules.length > 0 || !beginRun("Переводим и проверяем имена...")) return;
+    try { await startNames(); } finally { endRun(); }
+  }
+
+  export async function analyzeCharacter(alias: string) {
+    const char = characters.find((char) => char.alias === alias);
+    if (!char || llmRun.active) return;
+    panelOpen = true;
+    sectionByTab.characters = "names";
+    await tick();
+    await runNameAnalysis([$state.snapshot(char)], true);
+  }
+
+  export async function translateCharacter(alias: string) {
+    const char = characters.find((char) => char.alias === alias);
+    if (!char || llmRun.active) return;
+    panelOpen = true;
+    sectionByTab.characters = "names";
+    await tick();
+    if (!beginRun(`Переводим имя: ${characterTitle(char)}...`)) return;
+    try {
+      await loadNameRules();
+      const chosen = [$state.snapshot(char)];
+      const analysis = savedNameAnalysis(chosen);
+      if (!analysis.complete) { errorMessage = "Сначала выполните анализ имени этого персонажа."; return; }
+      if (missingNameRuleLanguages(analysis.origins).length > 0) { errorMessage = "Для имени ещё нет правил. Запустите анализ имени, чтобы подготовить их."; return; }
+      await startNames(chosen);
+    } catch (e) { errorMessage = `Не удалось перевести имя: ${String(e)}`; }
+    finally { endRun(); }
+  }
+
+  function namePlan(origins: NameOrigin[] = analysisReady ? $state.snapshot(nameOrigins) : []) {
+    return {
+      origins,
+      rules: [...new Set(origins.flatMap((origin) => origin.languages))].filter((language) => ruleDrafts[language]?.trim()).map((language) => ({ language, rules: ruleDrafts[language] })),
+      glossary: [
+        ...characters.flatMap((c) => [
+          { source: c.first_name, translated: c.translated_first_name },
+          { source: c.last_name, translated: c.translated_last_name },
+          ...c.merged.map((part) => ({ source: part.original_name, translated: translatedTitle(c) })),
+          ...c.forms.map((form) => ({ source: form.source, translated: formTranslation(form, translatedTitle(c)) }))
+        ]),
+        ...terms.flatMap((term) => [
+          { source: term.source_term, translated: term.translated_term },
+          ...term.forms.map((form) => ({ source: form.source, translated: formTranslation(form, term.translated_term) }))
+        ])
+      ].filter((form) => form.source.trim() && form.translated.trim())
+    };
+  }
   const FIELD_LABELS: Record<NameField, string> = { first: "Имя", last: "Фамилия", form: "Другая форма" };
   // Формы показываются рядом со своим именем, в какой бы момент ни пришёл ответ
   let reviewGroups = $derived(characters.flatMap((character) => {
@@ -197,26 +367,26 @@
   let unchangedNames = $state(0);
   let namesRequested = $state(0);
   let namesFinished = $state(false);
-  let chosenNames = $derived(reviewNames.filter((row) => row.selected && row.translated.trim()));
+  let chosenNames = $derived(reviewNames.filter((row) => row.translated.trim() && row.translated !== row.current));
   // Итог команды может опередить последний пакет из канала, поэтому подпись считается по строкам
   let namesNote = $derived.by(() => {
     if (!namesFinished) return "Новые написания появляются здесь по мере ответа модели.";
-    const missing = namesRequested - reviewNames.length - unchangedNames;
-    const note = `Другое написание: ${reviewNames.length}, без изменений: ${unchangedNames}`;
+    const missing = namesRequested - reviewNames.length;
+    const note = `Обработано записей: ${reviewNames.length}, без изменений: ${unchangedNames}`;
     return missing > 0 ? `${note}, не получено ответов: ${missing}.` : `${note}.`;
   });
 
-  const gameCast = () => characters.flatMap((c) => [characterTitle(c), ...c.merged.map((m) => m.original_name)]);
+  function gameCast() { return characters.flatMap((c) => [characterTitle(c), ...c.merged.map((m) => m.original_name)]); }
 
   /** Кладёт написания в отбор. Модель получает повторы один раз, а написание нужно каждому их владельцу. */
   function addNames(items: NameSuggestion[], targets: NameBatch["targets"]) {
     for (const item of items) {
       for (const target of targets.get(item.id) ?? []) {
-        if (item.translated === (target.current || target.base)) {
+        const options = nameOptions(item, target.current);
+        if (options.length === 1 && options[0].translated === target.current) {
           unchangedNames += 1;
-        } else {
-          reviewNames.push({ ...target, key: nameTargetKey(target), translated: item.translated, origin: item.origin, selected: !target.current });
         }
+        if (options.length > 0) reviewNames.push({ ...target, key: nameTargetKey(target), translated: target.current || "", origin: item.origin, options, notice: nameCheckNotice(item.issues || []), recommended: modelNameChoice(item, options) });
       }
     }
   }
@@ -225,26 +395,45 @@
    * Модель пишет имена выбранных персонажей, видя весь состав игры, а затем от них их формы.
    * Заполненные тоже участвуют, но заменятся, только если их отметить.
    */
-  async function startNames() {
-    const chosen = nameTargets;
-    if (!beginRun("Модель пишет имена и фамилии...")) return;
+  async function startNames(selected?: PanelCharacter[]) {
+    const chosen = selected ?? $state.snapshot(nameTargets);
+    const analysis = savedNameAnalysis(chosen);
+    if (!analysis.complete || missingNameRuleLanguages(analysis.origins).length > 0) return;
+    const plan = namePlan(analysis.origins);
+    progressStep = "3–4. Переводим и проверяем имена и фамилии...";
+    llmRun.note = progressStep;
+    llmRun.progress = null;
+    doneMessage = "";
     reviewNames = [];
     unchangedNames = 0;
     namesRequested = 0;
     namesFinished = false;
     const spelled = new Map<string, string>();
     let failedBatches = 0;
+    const failures: { name: string; reason: string }[] = [];
 
     const spell = async ({ requests, targets }: NameBatch) => {
       if (requests.length === 0) return;
       namesRequested += [...targets.values()].flat().length;
+      const received = new Set<string>();
+      const receive = (items: NameSuggestion[]) => {
+        for (const item of items) {
+          if (received.has(item.id)) continue;
+          received.add(item.id);
+          addNames([item], targets);
+        }
+      };
       const result = await invoke<AutofillResult<NameSuggestion>>("translate_character_names", {
         target: targetFor(settings, "names"),
         names: requests,
         cast: gameCast(),
-        onBatch: batchChannel<NameSuggestion>((items) => addNames(items, targets))
+        plan,
+        onProgress: requestProgressChannel(),
+        onBatch: batchChannel<NameSuggestion>(receive)
       });
+      receive(result.items);
       failedBatches += result.failed_batches;
+      failures.push(...(result.errors ?? []));
       // Итог команды полный, а сообщения канала могут отстать от него
       for (const item of result.items) {
         for (const target of targets.get(item.id) ?? []) spelled.set(nameTargetKey(target), item.translated);
@@ -254,16 +443,18 @@
     try {
       await spell(baseNames(chosen));
       if (!stopRequested) {
-        progressStep = "Модель пишет другие формы имён...";
+        progressStep = "3–4. Переводим и проверяем другие формы имён...";
+        llmRun.note = progressStep;
         await spell(formNames(chosen, spelled));
       }
-      if (failedBatches > 0) errorMessage = failedBatchesMessage(failedBatches);
+      if (failedBatches > 0) errorMessage = failures.length > 0
+        ? failures.slice(0, 3).map((failure) => `${failure.name}: ${failure.reason}`).join("; ") + (failedBatches > failures.length ? ` Пропущено пакетов: ${failedBatches - failures.length}.` : "")
+        : failedBatchesMessage(failedBatches);
     } catch (e) {
       if (reviewNames.length === 0) namesRequested = 0;
       errorMessage = `Не удалось перевести имена: ${String(e)}`;
     } finally {
       namesFinished = true;
-      endRun();
     }
   }
 
@@ -276,7 +467,12 @@
       errorMessage = "У выбранных персонажей нет имён для перевода.";
       return;
     }
-    if (await copyChatRequest("names", invoke<string>("names_chat_request", { names: batch.requests, cast: gameCast() }))) {
+    if (await copyChatRequest("names", (async () => {
+      await loadNameRules();
+      const plan = namePlan();
+      if (!analysisReady) plan.rules = nameRules.items.filter((rule) => rule.rules.trim()).map((rule) => ({ ...rule }));
+      return invoke<string>("names_chat_request", { names: batch.requests, cast: gameCast(), plan });
+    })())) {
       chatNameBatch = batch;
     }
   }
@@ -477,7 +673,7 @@
       {#if isProcessing}
         <Loader2 size={13} class="spin" />
         <span class="ai-status-text">{progressStep}</span>
-        {#if progress}
+        {#if progress && !llmRun.progress}
           <span class="ai-count">Пакет {progress.batch} из {progress.total}</span>
         {/if}
         <button class="btn-stop" onclick={stopRun} disabled={stopRequested}>
@@ -491,6 +687,7 @@
     </div>
   </div>
 
+  {#if llmRun.active}<div class="ai-progress-detail"><LlmProgress /></div>{/if}
   {#if panelOpen}
     <div class="ai-tabs">
       {#each LLM_ACTIONS.filter(({ id }) => SECTIONS[tab].includes(id)) as section (section.id)}
@@ -521,7 +718,7 @@
       {#if openSection === "descriptions"}
         {@render descriptions()}
       {:else if openSection === "names"}
-        <p class="ai-note">Модель увидит все имена игры, определит их происхождение и напишет имена и фамилии выбранных персонажей, а от них остальные формы. Заполненные тоже участвуют, но заменятся, только если их отметить.</p>
+        <p class="ai-note">Массовый анализ заполняет только отсутствующие происхождения и правила. Затем можно переключить модель и запустить перевод.</p>
         <EntryPicker
           items={characters.map((c) => ({ id: c.alias, name: characterTitle(c) }))}
           unselected={unselectedAliases}
@@ -530,9 +727,11 @@
           onempty={() => unselectedAliases = characters.filter((c) => translatedTitle(c)).map((c) => c.alias)}
         />
         <div class="ai-actions">
-          {@render runButton(`Перевести имена (${nameTargets.length})`, nameTargets.length === 0, startNames)}
+          {@render runButton(`Анализ и правила (${nameTargets.length})`, nameTargets.length === 0, startNameAnalysis)}
+          {@render runButton(`Перевести имена (${nameTargets.length})`, !analysisReady || missingRules.length > 0, startNameTranslation)}
           {@render chatButton(nameTargets.length === 0, requestNamesByChat)}
         </div>
+        <p class="ai-note">В ручном чате этапы объединены в один запрос с сохранёнными правилами. Отдельная проверка через API выполняется при запуске «Перевести имена».</p>
         {@render chatAnswer("names", readNamesAnswer)}
 
         {#if namesRequested > 0}
@@ -541,21 +740,33 @@
               <span class="ai-note">{namesNote}</span>
               {#if reviewNames.length > 0}
                 <div class="ai-toggles">
-                  <button class="btn-link" onclick={() => { for (const row of reviewNames) row.selected = true; }}>Выбрать все</button>
-                  <button class="btn-link" onclick={() => { for (const row of reviewNames) row.selected = false; }}>Снять все</button>
+                  <button class="btn-link" onclick={() => { for (const row of reviewNames) row.translated = row.recommended; }}>Выбрать предложения модели</button>
+                  <button class="btn-link" onclick={() => { for (const row of reviewNames) row.translated = row.current || ""; }}>Снять выбор</button>
                 </div>
               {/if}
             </div>
             {#each reviewGroups as group (group.alias)}
               <span class="ai-group">{group.title}</span>
               {#each group.rows as row (row.key)}
-                <div class="ai-row" class:off={!row.selected}>
-                  <input type="checkbox" bind:checked={row.selected} aria-label={`Заменить имя ${row.source}`} />
+                <div class="ai-name-choice">
                   <div class="ai-source">
-                    <span class="ai-term">{row.source} <span class="ai-count">{FIELD_LABELS[row.field]}{row.origin ? `, ${row.origin}` : ""}</span></span>
+                    <span class="ai-term">{row.source} <span class="ai-count">{FIELD_LABELS[row.field]}</span></span>
+                    {#if row.origin}<span class="ai-example">{row.origin}</span>{/if}
                     <span class="ai-example">Сейчас: {row.current || "нет перевода"}</span>
+                    {#if row.notice}<span class="ai-example">{row.notice}</span>{/if}
                   </div>
-                  <input type="text" class="input" bind:value={row.translated} aria-label={`Новое имя ${row.source}`} />
+                  <fieldset class="ai-name-options">
+                    <legend class="sr-only">Написание {row.source}</legend>
+                    {#each row.options as option (option.translated)}
+                      <label class="ai-name-option">
+                        <input type="radio" name={`name-${row.key}`} value={option.translated} checked={row.translated === option.translated} onchange={() => row.translated = option.translated} />
+                        <span><strong>{option.translated}</strong><span class="ai-example">{option.description}</span></span>
+                      </label>
+                    {/each}
+                    {#if !row.current}
+                      <label class="ai-name-option"><input type="radio" name={`name-${row.key}`} value="" checked={row.translated === ""} onchange={() => row.translated = ""} /><span>Не применять</span></label>
+                    {/if}
+                  </fieldset>
                 </div>
               {/each}
             {/each}
@@ -642,6 +853,14 @@
 </div>
 
 <style>
+  .ai-progress-detail { padding: 7px 14px; border-top: 1px solid rgba(99, 102, 241, .25); }
+  .ai-name-choice { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(220px, 2fr); gap: 16px; padding: 12px 0; border-bottom: 1px solid #263247; }
+  .ai-name-options { border: 0; margin: 0; padding: 0; display: grid; gap: 8px; min-width: 0; }
+  .ai-name-option { display: flex; align-items: flex-start; gap: 9px; cursor: pointer; font-size: 12px; color: #cbd5e1; }
+  .ai-name-option input { margin-top: 3px; accent-color: #818cf8; }
+  .ai-name-option strong { display: block; font-weight: 500; color: #e2e8f0; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  @media (max-width: 700px) { .ai-name-choice { grid-template-columns: 1fr; } }
   /* Цвет запусков модели, как у кнопки обновления персонажа: панель не должна сливаться с вкладками и списком */
   .ai-panel {
     flex-shrink: 0;
