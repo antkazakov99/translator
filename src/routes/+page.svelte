@@ -574,7 +574,6 @@
   }
 
   let fileSearchFilter = $state("");
-  let charactersExpanded = $state(false);
   let expandedFolders = $state<Record<string, boolean>>({
     "script": true,
     "script/locations": true
@@ -3668,7 +3667,7 @@
   {/if}
 
   <div class="main-layout">
-    <!-- ЛЕВАЯ КОЛОНКА (Сайдбар файлов и персонажей) -->
+    <!-- ЛЕВАЯ КОЛОНКА (Сайдбар файлов) -->
     <aside class="sidebar">
       {#if loadingProject}
         <!-- Скелетоны при сканировании файлов -->
@@ -3683,17 +3682,6 @@
                 <div class="skeleton-shimmer skeleton-line w-75"></div>
                 <div class="skeleton-shimmer skeleton-line w-45"></div>
               </div>
-            {/each}
-          </div>
-        </div>
-        <div class="sidebar-section characters-section">
-          <div class="sidebar-header">
-            <Users size={14} />
-            <span>ПЕРСОНАЖИ...</span>
-          </div>
-          <div class="skeleton-chips">
-            {#each Array(6) as _}
-              <div class="skeleton-shimmer skeleton-chip-item"></div>
             {/each}
           </div>
         </div>
@@ -3826,60 +3814,6 @@
             </button>
           {/if}
         {/snippet}
-
-        <!-- Спикеры / Персонажи (компактный аккордеон с глоссарием) -->
-        <div class="sidebar-section characters-section">
-          <div class="characters-header-wrap">
-            <button 
-              class="characters-toggle-header" 
-              onclick={() => charactersExpanded = !charactersExpanded}
-              title={charactersExpanded ? "Свернуть список персонажей" : "Развернуть список персонажей"}
-            >
-              <div class="header-left">
-                <span class="tree-caret">
-                  {#if charactersExpanded}
-                    <ChevronDown size={12} />
-                  {:else}
-                    <ChevronRight size={12} />
-                  {/if}
-                </span>
-                <Users size={13} class="text-sky-400" />
-                <span>ПЕРСОНАЖИ ({project.characters.length})</span>
-              </div>
-            </button>
-            <button 
-              class="btn-sidebar-glossary" 
-              onclick={() => openGlossary()} 
-              title="Открыть глоссарий персонажей и терминов"
-            >
-              <BookOpen size={11} class="text-emerald-400" />
-              <span>Глоссарий</span>
-            </button>
-          </div>
-
-          {#if charactersExpanded}
-            <div class="char-chips">
-              {#each project.characters as [alias, name]}
-                {@const gl = glossaryCharByAlias.get(alias.toLowerCase())}
-                <button 
-                  class="char-chip char-chip-interactive" 
-                  onclick={() => openGlossary(alias)}
-                  title="Открыть [{alias}] в глоссарии"
-                >
-                  <span class="char-alias">[{alias}]</span>
-                  <span class="char-name">{(gl && translatedTitle(gl)) || name}</span>
-                  {#if gl?.gender === 'male'}
-                    <span class="gender-pill gender-male" title="Мужской род">М</span>
-                  {:else if gl?.gender === 'female'}
-                    <span class="gender-pill gender-female" title="Женский род">Ж</span>
-                  {:else if gl?.gender === 'neuter'}
-                    <span class="gender-pill gender-neuter" title="Средний род (существо)">Ср</span>
-                  {/if}
-                </button>
-              {/each}
-            </div>
-          {/if}
-        </div>
       {:else}
         <div class="empty-sidebar">
           <p>Выберите папку игры кнопкой «Обзор»</p>
@@ -7690,51 +7624,6 @@
     animation: fileGlowPulse 1.2s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
-  /* СЕКЦИЯ ПЕРСОНАЖЕЙ (КОМПАКТНЫЙ АККОРДЕОН) */
-  .characters-section {
-    border-top: 1px solid #1a202c;
-    padding: 4px 6px;
-    flex-shrink: 0;
-    background: #0f1217;
-  }
-
-  .characters-toggle-header {
-    width: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 8px;
-    background: transparent;
-    border: none;
-    color: #94a3b8;
-    cursor: pointer;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    border-radius: 4px;
-    transition: background 0.1s, color 0.1s;
-  }
-
-  .characters-toggle-header:hover {
-    background: #161c24;
-    color: #e2e8f0;
-  }
-
-  .characters-state-hint {
-    font-size: 10px;
-    color: #475569;
-    text-transform: lowercase;
-  }
-
-  .char-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    padding: 6px 8px 8px 8px;
-    max-height: 140px;
-    overflow-y: auto;
-  }
-
   .char-chip {
     display: inline-flex;
     align-items: center;
@@ -9269,19 +9158,6 @@
     gap: 8px;
   }
 
-  .skeleton-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    padding: 8px;
-  }
-
-  .skeleton-chip-item {
-    height: 22px;
-    width: 65px;
-    border-radius: 4px;
-  }
-
   .skeleton-table-wrapper {
     display: flex;
     flex-direction: column;
@@ -9984,34 +9860,6 @@
 
   .btn-micro-glossary:hover {
     background: rgba(16, 185, 129, 0.25);
-    color: #ffffff;
-  }
-
-  .characters-header-wrap {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding-right: 8px;
-  }
-
-  .btn-sidebar-glossary {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    background: rgba(16, 185, 129, 0.12);
-    border: 1px solid rgba(16, 185, 129, 0.3);
-    color: #34d399;
-    padding: 2px 7px;
-    border-radius: 4px;
-    font-size: 11px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.15s ease;
-  }
-
-  .btn-sidebar-glossary:hover {
-    background: rgba(16, 185, 129, 0.25);
-    border-color: #34d399;
     color: #ffffff;
   }
 
