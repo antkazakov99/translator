@@ -20,8 +20,7 @@ tauri-plugin-opener = "2"
 
 # Графы и структуры данных
 petgraph = { version = "0.7", features = ["serde-1"] }
-uuid = { version = "1.10", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde", "v7"] }
 rayon = "1.10"
 parking_lot = "0.12"
 
@@ -35,7 +34,6 @@ anyhow = "1.0"
 
 # Логирование
 tracing = "0.1"
-tracing-subscriber = "0.3"
 
 # Парсинг
 regex = "1.11"
@@ -43,8 +41,14 @@ flate2 = "1.0"
 
 # Сеть и LLM
 reqwest = { version = "0.12", features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 md5 = "0.7"
+
+# Хранилище 2.0
+rusqlite = { version = "0.41", features = ["bundled"] }
+
+# Сравнение имён (NameKey)
+unicode-normalization = "0.1"
+caseless = "0.2"
 
 [profile.release]
 codegen-units = 1

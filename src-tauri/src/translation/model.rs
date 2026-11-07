@@ -1,0 +1,124 @@
+//! Сцена для перевода, черновик модели и подсказки глоссария.
+
+use serde::Serialize;
+
+use crate::common::{Gender, ValidationError};
+use crate::engines::ContainerKey;
+use crate::scan::{FileId, SegmentId};
+
+/// Что переводить или вычитывать.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranslationScope {
+    Scenes(Vec<ContainerKey>),
+    File(FileId),
+    Line(SegmentId),
+    /// Все файлы с пустыми репликами по очереди.
+    Project,
+}
+
+/// Состояние реплики в таблице.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineState {
+    /// Нет перевода.
+    Empty,
+    /// Перевод модели, который пользователь не проверил («Модель»).
+    Draft,
+    /// Перевод пользователя или подтверждённый.
+    Done,
+    /// Перевод, который уже есть в игре.
+    Game,
+}
+
+/// Реплика сцены в порядке сюжета.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneLine {
+    pub id: SegmentId,
+    /// Подпись говорящего для модели: имя из глоссария, иначе подпись из игры.
+    pub speaker: Option<String>,
+    pub speaker_gender: Option<Gender>,
+    pub source_text: String,
+    pub source_hash: String,
+    /// Действующий текст: `translations.text`, без строки `game_text`.
+    pub text: String,
+    pub state: LineState,
+}
+
+impl SceneLine {
+    pub fn is_blank(&self) -> bool {
+        self.text.trim().is_empty()
+    }
+
+    /// Что ушло модели: по этому репозиторий проверит, что пользователь не успел поправить реплику.
+    pub fn sent(&self) -> SentState {
+        SentState { text: self.text.clone(), source_hash: self.source_hash.clone() }
+    }
+}
+
+/// Сцена для перевода.
+#[derive(Debug, Clone)]
+pub struct Scene {
+    pub key: Option<ContainerKey>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub lines: Vec<SceneLine>,
+}
+
+/// Действующий текст и `source_hash` реплики в момент отправки модели.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentState {
+    pub text: String,
+    pub source_hash: String,
+}
+
+/// Перевод или исправление модели. Пишется, только если реплика осталась такой же, какой ушла.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub line: SegmentId,
+    pub text: String,
+    pub sent: SentState,
+}
+
+/// Подсказки глоссария в запрос: имена с родом, термины, токены, правила имён.
+#[derive(Debug, Clone, Default)]
+pub struct Hints {
+    /// Оригинал, перевод и род.
+    pub names: Vec<(String, String, Option<Gender>)>,
+    /// Оригинал, перевод и признак предположения (`unconfirmed`).
+    pub terms: Vec<(String, String, bool)>,
+    /// Токен без значения и его пояснение: модель видит токен в тексте.
+    pub tokens: Vec<(String, String)>,
+    pub name_rules: Vec<String>,
+}
+
+/// Вид строки истории.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RevisionKind {
+    User,
+    Llm,
+    Rollback,
+    /// Перенос при считывании: откат запуска его не считает.
+    Transfer,
+}
+
+impl RevisionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Llm => "llm",
+            Self::Rollback => "rollback",
+            Self::Transfer => "transfer",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, ValidationError> {
+        match text {
+            "user" => Ok(Self::User),
+            "llm" => Ok(Self::Llm),
+            "rollback" => Ok(Self::Rollback),
+            "transfer" => Ok(Self::Transfer),
+            _ => Err(ValidationError::UnknownValue { field: "revisions.kind", value: text.to_string() }),
+        }
+    }
+}
