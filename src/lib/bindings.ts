@@ -5,6 +5,14 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 
 /** Commands */
 export const commands = {
+	/**  Файлы проекта с репликами и прогресс. */
+	translationFiles: (project: string) => __TAURI_INVOKE<FileDto[]>("translation_files", { project }),
+	/**  Реплики файла по сценам. */
+	fileLines: (project: string, file: RowRef) => __TAURI_INVOKE<SceneDto_Serialize[]>("file_lines", { project, file }),
+	/**  Правка пользователя. Пустой текст очищает реплику. Возвращает реплику после правки. */
+	saveLine: (project: string, line: RowRef, text: string) => __TAURI_INVOKE<LineDto_Serialize>("save_line", { project, line, text }),
+	/**  Подтверждает черновики модели. Возвращает число подтверждённых. */
+	confirmLines: (project: string, lines: RowRef[]) => __TAURI_INVOKE<number>("confirm_lines", { project, lines }),
 	/**  Готовые проекты: основной список, архивные в конце. */
 	listProjects: () => __TAURI_INVOKE<ProjectDto_Serialize[]>("list_projects"),
 	/**  Проекты, уже привязанные к папке: окно предлагает открыть их вместо нового. */
@@ -22,6 +30,55 @@ export const commands = {
 };
 
 /* Types */
+/**  Файл с репликами и прогресс по нему. */
+export type FileDto = {
+	id: RowRef,
+	path: string,
+	total: number,
+	translated: number,
+	drafts: number,
+};
+
+/**  Реплика таблицы. */
+export type LineDto = LineDto_Serialize | LineDto_Deserialize;
+
+/**  Реплика таблицы. */
+export type LineDto_Deserialize = {
+	id: RowRef,
+	speaker?: string | null,
+	sourceText: string,
+	/**  Действующий текст: перевод, черновик модели или перевод из игры. */
+	text: string,
+	state: LineState,
+	/**  Перевод сделан для другого оригинала: игра изменила реплику. */
+	sourceChanged: boolean,
+	location?: string | null,
+};
+
+/**  Реплика таблицы. */
+export type LineDto_Serialize = {
+	id: RowRef,
+	speaker: string | null,
+	sourceText: string,
+	/**  Действующий текст: перевод, черновик модели или перевод из игры. */
+	text: string,
+	state: LineState,
+	/**  Перевод сделан для другого оригинала: игра изменила реплику. */
+	sourceChanged: boolean,
+	location: string | null,
+};
+
+/**  Состояние реплики в таблице. */
+export type LineState = 
+/**  Нет перевода. */
+"empty" | 
+/**  Перевод модели, который пользователь не проверил («Модель»). */
+"draft" | 
+/**  Перевод пользователя или подтверждённый. */
+"done" | 
+/**  Перевод, который уже есть в игре. */
+"game";
+
 /**  Проект для окна. */
 export type ProjectDto = ProjectDto_Serialize | ProjectDto_Deserialize;
 
@@ -51,5 +108,27 @@ export type ProjectDto_Serialize = {
 	createdAt: number,
 	openedAt: number | null,
 	archived: boolean,
+};
+
+/**  Номер строки базы для окна. В JavaScript это `number`: точности до 2^53 номерам строк хватает. */
+export type RowRef = number;
+
+/**  Подряд идущие реплики одной сцены файла. */
+export type SceneDto = SceneDto_Serialize | SceneDto_Deserialize;
+
+/**  Подряд идущие реплики одной сцены файла. */
+export type SceneDto_Deserialize = {
+	/**  Ключ сцены от движка. `None`: реплики вне сцен. */
+	key?: string | null,
+	title?: string | null,
+	lines: LineDto_Deserialize[],
+};
+
+/**  Подряд идущие реплики одной сцены файла. */
+export type SceneDto_Serialize = {
+	/**  Ключ сцены от движка. `None`: реплики вне сцен. */
+	key: string | null,
+	title: string | null,
+	lines: LineDto_Serialize[],
 };
 

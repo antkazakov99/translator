@@ -33,9 +33,14 @@ const BINDINGS: &str = "../src/lib/bindings.ts";
 /// Команды окна. Типы TypeScript к ним генерируются из этого же списка.
 fn commands() -> tauri_specta::Builder<tauri::Wry> {
     use projects::commands::*;
+    use translation::commands::*;
     tauri_specta::Builder::<tauri::Wry>::new()
         .error_handling(ErrorHandlingMode::Throw)
         .commands(collect_commands![
+            translation_files,
+            file_lines,
+            save_line,
+            confirm_lines,
             list_projects,
             find_projects,
             create_project,

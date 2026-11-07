@@ -17,7 +17,7 @@ pub enum TranslationScope {
 }
 
 /// Состояние реплики в таблице.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum LineState {
     /// Нет перевода.
@@ -42,6 +42,34 @@ pub struct SceneLine {
     /// Действующий текст: `translations.text`, без строки `game_text`.
     pub text: String,
     pub state: LineState,
+    /// Строка в файле, только для показа.
+    pub location: Option<String>,
+    /// Перевод сделан для другого оригинала: игра изменила реплику после перевода.
+    pub source_changed: bool,
+}
+
+impl LineState {
+    /// Состояние по строке `translations` (текст и `draft`) и переводу из игры.
+    pub fn of(row: Option<(&str, bool)>, game_text: Option<&str>) -> Self {
+        match row {
+            Some((text, _)) if text.trim().is_empty() => Self::Empty,
+            Some((_, true)) => Self::Draft,
+            Some((_, false)) => Self::Done,
+            None if game_text.is_some_and(|text| !text.trim().is_empty()) => Self::Game,
+            None => Self::Empty,
+        }
+    }
+}
+
+/// Файл с репликами текущего снимка и прогресс перевода в нём.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileProgress {
+    pub id: FileId,
+    pub path: String,
+    pub total: usize,
+    /// Реплики с действующим текстом: перевод, черновик или перевод из игры.
+    pub translated: usize,
+    pub drafts: usize,
 }
 
 impl SceneLine {
