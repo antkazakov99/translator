@@ -6,7 +6,7 @@ Translator: настольное приложение на Tauri 2 (Rust) и Sve
 
 ## Состояние
 
-Идёт переход на 2.0: проект один раз считывает игру и дальше работает со своей копией в SQLite. Код 1.0 в Rust удалён. Классы 2.0 описаны, но команды Tauri ещё не подключены: окно Svelte вызывает команды 1.0, которых больше нет. Тела с `todo!()` ждут реализации. Атрибут `allow(dead_code, unused_variables, unused_imports)` в `lib.rs` снимается вместе с подключением команд.
+Идёт переход на 2.0: проект один раз считывает игру и дальше работает со своей копией в SQLite. Код 1.0 в Rust удалён. Готовы хранилище, проекты, ключи API и считывание Ren'Py. Окно 2.0 пока состоит из стартового экрана (`src/routes/+page.svelte`, `src/lib/StartScreen.svelte`): список проектов, создание по папке игры, открытие, архив, удаление. Страница 1.0 удалена, компоненты в `src/lib` остались и ждут переноса. Остальные классы с телами `todo!()` ждут реализации, поэтому в `lib.rs` стоит `allow(dead_code, unused_variables, unused_imports)`.
 
 Проектная документация лежит не в репозитории, а в Docmost: страница «Структура приложения» (слои, классы, сценарии) и раздел «Хранилище 2.0» (схемы app.db, project.db, cache.db). Код следует им. Если решение меняется, сначала обновляется страница.
 
@@ -31,8 +31,11 @@ node --test --test-name-pattern="focused mode" tests/scene-graph.test.mjs
 cargo test --lib
 cargo test --lib test_corrupt_segment_sizes_do_not_overflow
 cargo test --lib -- --ignored
+cargo test --lib export_bindings
 cargo clippy --lib --tests
 ```
+
+`export_bindings` пересобирает `src/lib/bindings.ts`: типы и вызовы команд для окна из `commands()` в `lib.rs` (`tauri-specta`). После правки команд или их типов файл пересобирают и коммитят вместе с ними. `build.rs` передаёт манифест Windows (`windows-app-manifest.xml`) компоновщику для всех целей: без Common Controls v6 тестовые `.exe`, которые тянут код окна, падают с `STATUS_ENTRYPOINT_NOT_FOUND`.
 
 Тесты с `#[ignore]` в `engines/renpy` работают на реальных играх и берут пути из переменных окружения: `TRANSLATOR_TEST_TRANSLATED_GAME`, `TRANSLATOR_TEST_RPA_GAME`, `TRANSLATOR_TEST_CHARACTERS_GAME`, `TRANSLATOR_TEST_RPA2_ARCHIVE`, `TRANSLATOR_TEST_FRAMED_ARCHIVE`, `TRANSLATOR_TEST_TL_DIR`, `TRANSLATOR_TEST_PACKED_TL_GAME`. Без переменной такой тест ничего не проверяет и проходит. `TRANSLATOR_RPYC_PROBE_DIR` включает запись архивов для проверки скомпилированных скриптов настоящим движком.
 
@@ -71,5 +74,5 @@ cargo clippy --lib --tests
 ## Соглашения
 
 - Комментарии и сообщения для пользователя пишутся на русском.
-- Команды Tauri возвращают `Result<_, String>` (`AppError` превращается в текст), работу с диском и базой выполняют в `spawn_blocking`.
+- Команды Tauri лежат в `<фича>/commands.rs`, помечены `#[specta::specta]`, регистрируются в `commands()` в `lib.rs` и возвращают `Result<_, String>`. Работа идёт через `state::blocking`: вне потока окна, а `AppError` становится текстом. Типы для окна это DTO с `specta::Type`, `i64` в них помечается `#[specta(type = specta_typescript::Number)]`. В окне ошибка команды приходит исключением со строкой (`ErrorHandlingMode::Throw`).
 - Сообщения коммитов следуют Conventional Commits на английском.

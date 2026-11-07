@@ -54,6 +54,11 @@ keyring = "4"
 unicode-normalization = "0.1"
 caseless = "0.2"
 
+# Типы TypeScript для окна из Rust
+tauri-specta = { version = "=2.0.0-rc.26", features = ["typescript"] }
+specta = { version = "=2.0.0-rc.26", features = ["derive"] }
+specta-typescript = "=0.0.13"
+
 [profile.release]
 codegen-units = 1
 lto = true

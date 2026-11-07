@@ -1,6 +1,7 @@
 //! Сценарии проектов: порядок шагов, диск и транзакции.
 
 use std::collections::hash_map::Entry;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{GameRoot, Project, ProjectId, ProjectRepo, Title};
@@ -114,6 +115,13 @@ impl ProjectService<'_> {
         Ok(self.state.app.read(|tx| ProjectRepo { conn: tx }.find_by_root(root))?)
     }
 
+    /// Путь из окна в корень игры: абсолютный, с регистром как на диске. Вложенную папку на родителя
+    /// не исправляет: что в ней игра, решает движок.
+    pub fn resolve_root(path: &Path) -> Result<GameRoot, AppError> {
+        let canonical = std::fs::canonicalize(path)?;
+        Ok(GameRoot::new(&without_verbatim_prefix(canonical))?)
+    }
+
     fn get(&self, id: ProjectId) -> Result<Project, AppError> {
         self.state.app.read(|tx| ProjectRepo { conn: tx }.get(id)).map_err(not_found)
     }
@@ -135,6 +143,18 @@ impl ProjectService<'_> {
             })
             .map_err(not_found)?;
         result.map(|()| project)
+    }
+}
+
+/// `canonicalize` в Windows отдаёт путь с `\\?\`: такой путь пользователь не узнает, а сравнение с его вводом не совпадёт.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path
     }
 }
 

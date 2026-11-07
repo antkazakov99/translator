@@ -1,9 +1,9 @@
 //! Translator 2.0: проект не зависит от папки игры, данные лежат в SQLite.
 //!
 //! Слои и классы описаны на странице «Структура приложения» в Docmost, схемы баз в разделе «Хранилище 2.0».
-//! Команды Tauri ещё не подключены. Тела с `todo!()` ждут своей очереди.
+//! Подключены команды списка проектов, остальные фичи ещё с телами `todo!()`.
 
-// Снять вместе с подключением команд: пока реэкспорты и параметры заглушек никто не использует.
+// Снять, когда заглушки получат реализацию: пока реэкспорты и параметры заглушек никто не использует.
 #![allow(dead_code, unused_variables, unused_imports)]
 
 pub mod common;
@@ -21,11 +21,62 @@ pub mod state;
 pub mod storage;
 pub mod translation;
 
+use tauri::Manager;
+use tauri_specta::{ErrorHandlingMode, collect_commands};
+
+use crate::secrets::SecretStore;
+use crate::state::AppState;
+
+/// Куда пишутся типы и вызовы команд для окна.
+const BINDINGS: &str = "../src/lib/bindings.ts";
+
+/// Команды окна. Типы TypeScript к ним генерируются из этого же списка.
+fn commands() -> tauri_specta::Builder<tauri::Wry> {
+    use projects::commands::*;
+    tauri_specta::Builder::<tauri::Wry>::new()
+        .error_handling(ErrorHandlingMode::Throw)
+        .commands(collect_commands![
+            list_projects,
+            find_projects,
+            create_project,
+            open_project,
+            close_project,
+            archive_project,
+            unarchive_project,
+            rename_project,
+            unbind_project,
+            delete_project,
+        ])
+}
+
+fn typescript() -> specta_typescript::Typescript {
+    specta_typescript::Typescript::default()
+        .header("// Сгенерировано из Rust (tauri-specta), руками не править: cargo test --lib export_bindings")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let builder = commands();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .invoke_handler(builder.invoke_handler())
+        .setup(move |app| {
+            builder.mount_events(app);
+            let data_dir = app.path().app_local_data_dir()?;
+            let state = AppState::start(data_dir, SecretStore::detect())?;
+            app.manage(state);
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    /// Пересобирает `src/lib/bindings.ts`. Изменения файла видны в git: их коммитят вместе с командами.
+    #[test]
+    fn export_bindings() {
+        super::commands().export(super::typescript(), super::BINDINGS).expect("типы для окна");
+    }
 }

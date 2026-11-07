@@ -132,6 +132,18 @@ fn recover(dir: &Path, id: ProjectId) -> Result<Project, AppError> {
     Ok(Project::restore(row)?)
 }
 
+/// Работа команды вне потока окна: диск и базы блокируют. Ошибка становится текстом для окна.
+pub async fn blocking<T: Send + 'static>(
+    app: tauri::AppHandle,
+    work: impl FnOnce(&AppState) -> Result<T, AppError> + Send + 'static,
+) -> Result<T, String> {
+    use tauri::Manager;
+    tauri::async_runtime::spawn_blocking(move || work(&app.state::<AppState>()))
+        .await
+        .map_err(|error| format!("Задача прервалась: {error}"))?
+        .map_err(String::from)
+}
+
 /// Удаляет папку целиком. Отсутствие папки не ошибка.
 pub(crate) fn remove_dir(dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(dir) {
