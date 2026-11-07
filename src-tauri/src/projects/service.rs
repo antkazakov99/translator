@@ -221,6 +221,60 @@ mod tests {
     }
 
     #[test]
+    fn create_reads_the_game_into_a_ready_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir.path().join("data"));
+        let service = ProjectService { state: &state };
+        let root = crate::engines::renpy::snapshot::tests::sample_game(&dir.path().join("Sample Game"));
+
+        let project = service.create(root.clone()).unwrap();
+        assert_eq!(project.title().as_str(), "Sample Game");
+        assert_eq!(project.engine(), crate::engines::EngineId::Renpy);
+        assert_eq!(service.find_by_root(&root).unwrap().len(), 1);
+
+        service.open(project.id()).unwrap();
+        let open = state.open_project(project.id()).unwrap();
+        let (segments, speakers, scenes, search_rev): (i64, i64, i64, i64) = open
+            .project
+            .read(|tx| {
+                Ok(tx.query_row(
+                    "SELECT (SELECT count(*) FROM segments), (SELECT count(*) FROM speakers),
+                            (SELECT count(*) FROM containers WHERE kind = 'scene'), (SELECT search_rev FROM project)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )?)
+            })
+            .unwrap();
+        assert!(segments >= 6);
+        assert!(speakers >= 2);
+        assert_eq!(scenes, 2);
+        assert_eq!(search_rev, 1);
+
+        let (files, scan) = open
+            .project
+            .read(|tx| {
+                let repo = ScanRepo { conn: tx };
+                Ok((repo.current_files()?, repo.latest()?))
+            })
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|file| open.files.contains(&file.hash)));
+        let scan = scan.unwrap();
+        assert_eq!(scan.game_root.as_ref(), Some(&root));
+        assert_eq!(scan.game_info.version.as_deref(), Some("8.1.3.23091805"));
+    }
+
+    #[test]
+    fn folder_without_a_game_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir.path().join("data"));
+        let service = ProjectService { state: &state };
+        let root = GameRoot::new(dir.path()).unwrap();
+        assert!(matches!(service.create(root), Err(AppError::UnknownGame)));
+        assert!(service.list().unwrap().is_empty());
+    }
+
+    #[test]
     fn unfinished_project_cannot_be_opened() {
         let dir = tempfile::tempdir().unwrap();
         let state = state(dir.path());
