@@ -47,6 +47,9 @@ md5 = "0.7"
 rusqlite = { version = "0.41", features = ["bundled", "functions"] }
 sha2 = "0.11"
 
+# Ключи API в хранилище ОС
+keyring = "4"
+
 # Сравнение имён (NameKey)
 unicode-normalization = "0.1"
 caseless = "0.2"

@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 
 use super::common::{AppError, Timestamp};
 use super::files::FileStore;
-use super::llm::{LlmRunRepo, ProviderRepo, RunSlot};
+use super::llm::{LlmRunRepo, RunSlot};
 use super::projects::{Project, ProjectId, ProjectInfoRepo, ProjectRepo, ProjectRow, ProjectStatus};
 use super::secrets::SecretStore;
 use super::storage::{AppDb, CacheDb, DbError, ProjectDb};
@@ -52,7 +52,7 @@ impl AppState {
     const APP_DB: &str = "app.db";
 
     /// Запуск приложения: app.db с миграциями, дочистка проектов `creating` и `deleting`,
-    /// восстановление папок без строки, удаление ключей без провайдера.
+    /// восстановление папок без строки. Хранилище ключей передаёт вызывающий: `SecretStore::detect` в приложении.
     pub fn start(data_dir: PathBuf, secrets: SecretStore) -> Result<Self, AppError> {
         let app = AppDb::open(&data_dir.join(Self::APP_DB))?;
         let state = Self {
@@ -64,9 +64,6 @@ impl AppState {
         };
         state.finish_unfinished()?;
         state.restore_orphans()?;
-        let providers = state.app.read(|tx| ProviderRepo { conn: tx }.list())?;
-        let ids: Vec<_> = providers.iter().map(|provider| provider.id()).collect();
-        state.secrets.delete_except(&ids);
         Ok(state)
     }
 
@@ -147,11 +144,10 @@ pub(crate) fn remove_dir(dir: &Path) -> std::io::Result<()> {
 pub(crate) mod tests {
     use super::*;
     use crate::engines::EngineId;
-    use crate::llm::{ApiKey, Provider, ProviderKind};
     use crate::projects::{GameRoot, Title};
 
-    fn memory_secrets() -> SecretStore {
-        SecretStore::Memory(Mutex::new(HashMap::new()))
+    pub(crate) fn memory_secrets() -> SecretStore {
+        SecretStore::memory()
     }
 
     /// Готовый проект с папкой и базами, как после создания.
@@ -198,23 +194,6 @@ pub(crate) mod tests {
         assert_eq!(projects[0].id(), lost.id());
         assert_eq!(projects[0].engine(), EngineId::Renpy);
         assert!(!projects[0].is_bound());
-    }
-
-    #[test]
-    fn start_forgets_keys_of_missing_providers() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = AppState::start(dir.path().to_path_buf(), memory_secrets()).unwrap();
-        let provider = Provider::new("Claude", ProviderKind::Claude, "https://api.anthropic.com", 0).unwrap();
-        state.app.write(|tx| ProviderRepo { conn: tx }.save(&provider)).unwrap();
-        let secrets = memory_secrets();
-        let orphan = crate::llm::ProviderId::generate();
-        secrets.set(orphan, ApiKey::new("ключ").unwrap());
-        secrets.set(provider.id(), ApiKey::new("свой").unwrap());
-        drop(state);
-
-        let state = AppState::start(dir.path().to_path_buf(), secrets).unwrap();
-        assert!(state.secrets.get(orphan).is_none());
-        assert!(state.secrets.get(provider.id()).is_some());
     }
 
     #[test]

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::engines::{EngineError, EngineId};
+use super::secrets::SecretError;
 use super::storage::DbError;
 
 /// Unix-время в секундах.
@@ -65,6 +66,8 @@ pub enum AppError {
     Engine(#[from] EngineError),
     #[error("Ошибка диска: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Secret(#[from] SecretError),
     #[error("Ни один движок не узнал игру в этой папке")]
     UnknownGame,
     #[error("Движок «{0}» не поддерживается этой версией")]
