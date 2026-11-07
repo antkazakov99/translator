@@ -18,11 +18,25 @@ export interface GraphNode {
   role: "center" | "incoming" | "outgoing";
 }
 
-export interface GraphLink extends GraphEdge {
+/**
+ * Линия между двумя сценами. Все переходы пары рисуются одной линией: у сцен-хабов между двумя
+ * сценами бывают десятки условий, и отдельные линии с подписями слипались бы.
+ */
+export interface GraphLink {
   id: number;
+  from: string;
+  to: string;
+  /** Вид перехода, если он у всех переходов пары один. Иначе `mixed`. */
+  kind: string;
+  edges: GraphEdge[];
   path: string;
+  /** Подпись у внешней сцены: так подписи идут по строкам карточек и не наезжают друг на друга. */
+  label: string;
   labelX: number;
   labelY: number;
+  labelAnchor: "start" | "middle" | "end";
+  /** Все переходы пары для подсказки. */
+  title: string;
 }
 
 export interface Column {
@@ -122,33 +136,44 @@ export function layoutGraph(scenes: GraphScene[], edges: GraphEdge[], options: L
   const outgoing = place(right.shown, rightX, "outgoing");
 
   const links: GraphLink[] = [];
-  // Несколько переходов между одной парой сцен расходятся по высоте, чтобы подписи не легли друг на друга.
-  const connect = (group: GraphEdge[], from: GraphNode, to: GraphNode) => {
-    group.forEach((edge, index) => {
-      const offset = (index - (group.length - 1) / 2) * 14;
-      const sx = from.x + NODE_WIDTH;
-      const sy = from.y + NODE_HEIGHT / 2 + offset;
-      const tx = to.x - 2;
-      const ty = to.y + NODE_HEIGHT / 2 + offset;
-      links.push({ ...edge, id: links.length, path: curve(sx, sy, tx, ty), labelX: (sx + tx) / 2, labelY: (sy + ty) / 2 });
+  const link = (group: GraphEdge[], path: string, label: { x: number; y: number; anchor: GraphLink["labelAnchor"] }) => {
+    const kinds = new Set(group.map((edge) => edge.kind));
+    links.push({
+      id: links.length,
+      from: group[0].from,
+      to: group[0].to,
+      kind: kinds.size === 1 ? group[0].kind : "mixed",
+      edges: group,
+      path,
+      label: group.length === 1 ? edgeLabel(group[0]) : `переходов: ${group.length}`,
+      labelX: label.x,
+      labelY: label.y,
+      labelAnchor: label.anchor,
+      title: group.map((edge) => edgeLabel(edge) || "переход").join("\n"),
     });
   };
-  for (const node of incoming) connect(into.filter((edge) => edge.from === node.key), node, centerNode);
-  for (const node of outgoing) connect(out.filter((edge) => edge.to === node.key), centerNode, node);
-  loops.forEach((edge, index) => {
-    const half = 36 + index * 18;
-    const lift = 44 + index * 18;
+  // У центра концы линий расходятся по высоте карточки, у соседей входят в середину.
+  const spread = (index: number, count: number) => centerNode.y + (NODE_HEIGHT * (index + 1)) / (count + 1);
+  incoming.forEach((node, index) => {
+    const sx = node.x + NODE_WIDTH;
+    const sy = node.y + NODE_HEIGHT / 2;
+    const path = curve(sx, sy, centerNode.x - 2, spread(index, incoming.length));
+    link(into.filter((edge) => edge.from === node.key), path, { x: sx + 8, y: sy - 8, anchor: "start" });
+  });
+  outgoing.forEach((node, index) => {
+    const ty = node.y + NODE_HEIGHT / 2;
+    const path = curve(centerNode.x + NODE_WIDTH, spread(index, outgoing.length), node.x - 2, ty);
+    link(out.filter((edge) => edge.to === node.key), path, { x: node.x - 8, y: ty - 8, anchor: "end" });
+  });
+  if (loops.length > 0) {
+    const half = 36;
+    const lift = 44;
     const sx = centerNode.x + NODE_WIDTH / 2 + half;
     const tx = centerNode.x + NODE_WIDTH / 2 - half;
     const y = centerNode.y;
-    links.push({
-      ...edge,
-      id: links.length,
-      path: `M ${sx} ${y} C ${sx + 4} ${y - lift}, ${tx - 4} ${y - lift}, ${tx} ${y - 2}`,
-      labelX: centerNode.x + NODE_WIDTH / 2,
-      labelY: y - lift + 6,
-    });
-  });
+    const path = `M ${sx} ${y} C ${sx + 4} ${y - lift}, ${tx - 4} ${y - lift}, ${tx} ${y - 2}`;
+    link(loops, path, { x: centerNode.x + NODE_WIDTH / 2, y: y - lift + 4, anchor: "middle" });
+  }
 
   return {
     nodes: [...incoming, centerNode, ...outgoing],

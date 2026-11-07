@@ -6,9 +6,7 @@
   import {
     NODE_HEIGHT,
     NODE_WIDTH,
-    edgeLabel,
     layoutGraph,
-    sceneLabel,
     sceneName,
     type Column,
     type GraphEdge,
@@ -37,6 +35,7 @@
     { kind: "branch", label: "Условие" },
     { kind: "call", label: "Вызов" },
     { kind: "screen", label: "Экран" },
+    { kind: "mixed", label: "Разные виды" },
   ];
 
   let scenes = $state<GraphScene[]>([]);
@@ -192,39 +191,52 @@
     style:width="{NODE_WIDTH}px"
     style:height="{NODE_HEIGHT}px"
   >
-    <button
-      class="node-main"
-      onclick={() => node.role !== "center" && onFocus(node.key)}
-      disabled={node.role === "center"}
-      title={node.role === "center" ? sceneName(node.key, scene) : `Перейти к сцене ${sceneName(node.key, scene)}`}
-    >
-      <span class="node-name">
-        {#if scene && scene.total > 0}<Clapperboard size={13} />{:else}<Route size={13} />{/if}
-        <span>{sceneName(node.key, scene)}</span>
-      </span>
-      <span class="node-line">
-        {#if !scene}
-          Сцены нет в снимке
-        {:else if scene.firstLine}
-          {scene.firstLine}
-        {:else}
-          Без реплик: только переходы
-        {/if}
-      </span>
-      {#if scene && scene.total > 0}
-        <span class="node-progress">
-          <span class="track"><span class="fill" style:width="{percent(scene)}%"></span></span>
-          <span class="count">{scene.translated}/{scene.total}{scene.drafts ? ` · модель: ${scene.drafts}` : ""}</span>
+    {#if node.role === "center"}
+      <!-- Центр не кнопка: в нём своя кнопка «Реплики», а кнопки не вкладываются друг в друга. -->
+      <div class="node-main">
+        <span class="node-head">
+          {@render nodeName(node, scene)}
+          {#if scene}
+            <button class="btn small" onclick={() => onOpen(scene)} disabled={!scene.file} title={scene.file ? "Открыть реплики сцены в таблице" : "У сцены нет реплик"}>
+              <TableProperties size={13} />
+              <span>Реплики</span>
+            </button>
+          {/if}
         </span>
-      {/if}
-    </button>
-    {#if node.role === "center" && scene}
-      <button class="btn small open" onclick={() => onOpen(scene)} disabled={!scene.file} title={scene.file ? "Открыть реплики сцены в таблице" : "У сцены нет реплик"}>
-        <TableProperties size={13} />
-        <span>Реплики</span>
+        {@render nodeBody(scene)}
+      </div>
+    {:else}
+      <button class="node-main" onclick={() => onFocus(node.key)} title={`Перейти к сцене ${sceneName(node.key, scene)}`}>
+        <span class="node-head">{@render nodeName(node, scene)}</span>
+        {@render nodeBody(scene)}
       </button>
     {/if}
   </div>
+{/snippet}
+
+{#snippet nodeName(node: GraphNode, scene: GraphScene | undefined)}
+  <span class="node-name">
+    {#if scene && scene.total > 0}<Clapperboard size={13} />{:else}<Route size={13} />{/if}
+    <span>{sceneName(node.key, scene)}</span>
+  </span>
+{/snippet}
+
+{#snippet nodeBody(scene: GraphScene | undefined)}
+  <span class="node-line">
+    {#if !scene}
+      Сцены нет в снимке
+    {:else if scene.firstLine}
+      {scene.firstLine}
+    {:else}
+      Без реплик: только переходы
+    {/if}
+  </span>
+  {#if scene && scene.total > 0}
+    <span class="node-progress">
+      <span class="track"><span class="fill" style:width="{percent(scene)}%"></span></span>
+      <span class="count">{scene.translated}/{scene.total}{scene.drafts ? ` · модель: ${scene.drafts}` : ""}</span>
+    </span>
+  {/if}
 {/snippet}
 
 <section class="graph">
@@ -313,10 +325,10 @@
               <path class="link {link.kind}" d={link.path} />
             {/each}
             {#each graph.links as link (link.id)}
-              {@const label = edgeLabel(link)}
-              {#if label}
-                <text class="link-label" x={link.labelX} y={link.labelY - 6} text-anchor="middle">
-                  {label.length > 34 ? `${label.slice(0, 33)}…` : label}
+              {#if link.label}
+                <text class="link-label" x={link.labelX} y={link.labelY} text-anchor={link.labelAnchor}>
+                  <title>{link.title}</title>
+                  {link.label.length > 30 ? `${link.label.slice(0, 29)}…` : link.label}
                 </text>
               {/if}
             {/each}
@@ -408,6 +420,10 @@
     border-color: var(--success);
   }
 
+  .swatch.mixed {
+    border-color: var(--text-muted);
+  }
+
   .swatch.screen {
     border-top-style: dashed;
     border-color: var(--accent-text);
@@ -480,12 +496,18 @@
     stroke-dasharray: 5 4;
   }
 
+  .link.mixed {
+    stroke: var(--text-muted);
+  }
+
   .link-label {
     fill: var(--text-soft);
     font-size: 11px;
     paint-order: stroke;
     stroke: var(--bg);
     stroke-width: 4px;
+    pointer-events: auto;
+    cursor: help;
   }
 
   .column-head {
@@ -552,11 +574,6 @@
     text-align: left;
   }
 
-  .node-main:disabled {
-    opacity: 1;
-    cursor: default;
-  }
-
   .node-name {
     display: flex;
     align-items: center;
@@ -611,14 +628,15 @@
     white-space: nowrap;
   }
 
-  /* Кнопка в углу центральной сцены */
-  .open {
-    position: absolute;
-    top: 6px;
-    right: 6px;
+  /* Название и кнопка «Реплики» в одну строку: кнопка не ложится на текст реплики. */
+  .node-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
   }
 
-  .center .node-name {
-    padding-right: 84px;
+  .node-head .node-name {
+    flex: 1;
   }
 </style>

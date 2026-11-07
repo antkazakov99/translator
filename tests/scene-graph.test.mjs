@@ -48,11 +48,33 @@ test('without a focus the first scene is the centre', () => {
   assert.deepEqual(names(graph, 'outgoing'), ['end']);
 });
 
-test('several edges between the same scenes keep their own lines', () => {
-  const graph = layoutGraph([scene('a'), scene('b')], [edge('a', 'b', 'choice', 'Yes'), edge('a', 'b', 'jump')], { focus: 'label:a' });
-  assert.equal(graph.nodes.filter(n => n.role === 'outgoing').length, 1);
-  assert.equal(graph.links.length, 2);
-  assert.notEqual(graph.links[0].path, graph.links[1].path);
+test('all edges between two scenes become one line with a count', () => {
+  const edges = [edge('a', 'b', 'branch', 'x > 1'), edge('a', 'b', 'branch', 'y > 2'), edge('a', 'b', 'jump')];
+  const graph = layoutGraph([scene('a'), scene('b')], edges, { focus: 'label:a' });
+  assert.equal(graph.links.length, 1);
+  const [line] = graph.links;
+  assert.equal(line.edges.length, 3);
+  assert.equal(line.kind, 'mixed');
+  assert.equal(line.label, 'переходов: 3');
+  assert.equal(line.title, 'если x > 1\nесли y > 2\nпереход');
+
+  const single = layoutGraph([scene('a'), scene('b')], [edge('a', 'b', 'branch', 'x > 1')], { focus: 'label:a' });
+  assert.equal(single.links[0].kind, 'branch');
+  assert.equal(single.links[0].label, 'если x > 1');
+});
+
+test('labels sit next to the outer scene so rows never overlap', () => {
+  const scenes = ['in1', 'in2', 'hub', 'out1', 'out2'].map(name => scene(name));
+  const edges = [edge('in1', 'hub', 'choice', 'A'), edge('in2', 'hub', 'choice', 'B'), edge('hub', 'out1', 'choice', 'C'), edge('hub', 'out2', 'choice', 'D')];
+  const graph = layoutGraph(scenes, edges, { focus: 'label:hub' });
+  const node = key => graph.nodes.find(n => n.key === `label:${key}`);
+  for (const link of graph.links) {
+    const outer = link.from === 'label:hub' ? node(link.to.replace('label:', '')) : node(link.from.replace('label:', ''));
+    assert.ok(link.labelY > outer.y && link.labelY < outer.y + 112, 'подпись в строке своей карточки');
+  }
+  const outLabels = graph.links.filter(l => l.from === 'label:hub');
+  assert.ok(outLabels.every(l => l.labelAnchor === 'end'));
+  assert.notEqual(outLabels[0].labelY, outLabels[1].labelY);
 });
 
 test('self loops are drawn above the centre', () => {
