@@ -143,8 +143,8 @@
           autofocus
           onkeydown={(event) => { if (event.key === "Escape") renaming = null; }}
         />
-        <button type="submit" class="small primary" disabled={!renaming.title.trim()}>Сохранить</button>
-        <button type="button" class="small" onclick={() => (renaming = null)}>Отмена</button>
+        <button type="submit" class="btn small primary" disabled={!renaming.title.trim()}>Сохранить</button>
+        <button type="button" class="btn small" onclick={() => (renaming = null)}>Отмена</button>
       </form>
     {:else}
       <button class="open" disabled={busy || creatingRoot !== null} onclick={() => openProject(project)}>
@@ -159,19 +159,19 @@
         <span class="when">{when(project)}</span>
       </button>
       <div class="actions">
-        <button class="icon-button" title="Переименовать" onclick={() => (renaming = { id: project.id, title: project.title })}>
+        <button class="icon-button" aria-label="Переименовать" title="Переименовать" onclick={() => (renaming = { id: project.id, title: project.title })}>
           <Pencil size={14} />
         </button>
         {#if project.archived}
-          <button class="icon-button" title="Вернуть из архива" onclick={() => run(() => commands.unarchiveProject(project.id))}>
+          <button class="icon-button" aria-label="Вернуть из архива" title="Вернуть из архива" onclick={() => run(() => commands.unarchiveProject(project.id))}>
             <ArchiveRestore size={14} />
           </button>
         {:else}
-          <button class="icon-button" title="В архив" onclick={() => run(() => commands.archiveProject(project.id))}>
+          <button class="icon-button" aria-label="В архив" title="В архив" onclick={() => run(() => commands.archiveProject(project.id))}>
             <Archive size={14} />
           </button>
         {/if}
-        <button class="icon-button danger" title="Удалить проект" onclick={() => (deleting = project)}>
+        <button class="icon-button danger" aria-label="Удалить проект" title="Удалить проект" onclick={() => (deleting = project)}>
           <Trash2 size={14} />
         </button>
       </div>
@@ -183,14 +183,14 @@
   <header class="head">
     <div>
       <h1>Проекты</h1>
-      <p>Проект один раз считывает игру и дальше работает со своей копией.</p>
+      <p>Проект один раз считывает игру и дальше работает со своей копией</p>
     </div>
     <div class="head-actions">
-      <button class="small" onclick={onSettings} title="Провайдеры, модели и настройки действий">
+      <button class="btn" onclick={onSettings} title="Провайдеры, модели и настройки действий">
         <Bot size={15} />
         <span>Модели</span>
       </button>
-      <button class="primary" disabled={creatingRoot !== null || busy} onclick={chooseFolder}>
+      <button class="btn primary" disabled={creatingRoot !== null || busy} onclick={chooseFolder}>
         <FolderPlus size={16} />
         <span>Новый проект</span>
       </button>
@@ -215,35 +215,35 @@
   {#if existing}
     <div class="banner choice">
       <div class="choice-text">
-        <strong>К этой папке уже привязан проект.</strong>
+        <strong>К этой папке уже привязан проект</strong>
         <span>{existing.root}</span>
       </div>
       <div class="choice-actions">
         {#each existing.projects as project (project.id)}
-          <button class="small primary" onclick={() => { existing = null; openProject(project); }}>Открыть «{project.title}»</button>
+          <button class="btn small primary" onclick={() => { existing = null; openProject(project); }}>Открыть «{project.title}»</button>
         {/each}
-        <button class="small" onclick={() => existing && create(existing.root)}>Создать ещё один</button>
-        <button class="small" onclick={() => (existing = null)}>Отмена</button>
+        <button class="btn small" onclick={() => existing && create(existing.root)}>Создать ещё один</button>
+        <button class="btn small" onclick={() => (existing = null)}>Отмена</button>
       </div>
     </div>
   {/if}
 
   {#if deleting}
-    <div class="banner danger-zone">
+    <div class="banner choice danger-zone">
       <div class="choice-text">
         <strong>Удалить проект «{deleting.title}»?</strong>
         <span>Удалятся перевод, глоссарий и копия файлов игры. Папку самой игры это не затронет.</span>
       </div>
       <div class="choice-actions">
         <button
-          class="small danger-button"
+          class="btn small danger"
           onclick={() => {
             const id = deleting?.id;
             deleting = null;
             if (id) run(() => commands.deleteProject(id));
           }}
         >Удалить</button>
-        <button class="small" onclick={() => (deleting = null)}>Отмена</button>
+        <button class="btn small" onclick={() => (deleting = null)}>Отмена</button>
       </div>
     </div>
   {/if}
@@ -262,7 +262,7 @@
     <div class="empty">
       <FolderOpen size={30} />
       <strong>Проектов пока нет</strong>
-      <span>Выберите корневую папку игры: ту, где лежат <code>game</code> и <code>renpy</code>.</span>
+      <span>Выберите корневую папку игры: ту, где лежат <code>game</code> и <code>renpy</code></span>
     </div>
   {:else}
     {#if active.length > 0}
@@ -296,7 +296,6 @@
     margin: 0 auto;
     padding: 40px 24px;
     box-sizing: border-box;
-    font-family: Inter, "Segoe UI", system-ui, sans-serif;
   }
 
   .head {
@@ -308,141 +307,21 @@
 
   h1 {
     margin: 0;
-    color: #f1f5f9;
+    color: var(--text-strong);
     font-size: 22px;
     font-weight: 650;
+  }
+
+  .head p {
+    margin: 6px 0 0;
+    color: var(--text-muted);
+    font-size: 12px;
   }
 
   .head-actions {
     display: flex;
     align-items: center;
     gap: 8px;
-  }
-
-  .head-actions .small {
-    padding: 8px 12px;
-    font-size: 12px;
-  }
-
-  .head p {
-    margin: 6px 0 0;
-    color: #8492a8;
-    font-size: 12px;
-  }
-
-  button {
-    font: inherit;
-    cursor: pointer;
-  }
-
-  button:disabled {
-    opacity: 0.55;
-    cursor: default;
-  }
-
-  .primary,
-  .small {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    border: 1px solid #34445d;
-    border-radius: 8px;
-    background: #1a2433;
-    color: #d4deeb;
-    padding: 8px 12px;
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  .primary {
-    border-color: #2563eb;
-    background: #1d4ed8;
-    color: #f8fafc;
-  }
-
-  .primary:hover:not(:disabled) {
-    background: #2563eb;
-  }
-
-  .small {
-    padding: 6px 10px;
-    font-size: 11px;
-  }
-
-  .small:hover:not(:disabled) {
-    border-color: #3b82f6;
-    background: #20334f;
-  }
-
-  .danger-button {
-    border-color: #b91c1c;
-    background: #7f1d1d;
-    color: #fee2e2;
-  }
-
-  .danger-button:hover:not(:disabled) {
-    border-color: #ef4444;
-    background: #991b1b;
-  }
-
-  .icon-button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    color: #8290a5;
-  }
-
-  .icon-button:hover {
-    background: #252e3d;
-    color: #f1f5f9;
-  }
-
-  .icon-button.danger:hover {
-    background: #3b1820;
-    color: #fca5a5;
-  }
-
-  .banner {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 12px;
-    border: 1px solid #2a3548;
-    border-radius: 10px;
-    background: #11151d;
-    color: #cbd5e1;
-    font-size: 12px;
-  }
-
-  .banner.error {
-    border-color: #7f1d1d;
-    background: #1f1013;
-    color: #fecaca;
-  }
-
-  .banner.error span {
-    flex: 1;
-  }
-
-  .banner.progress {
-    border-color: #1e3a5f;
-    background: #0f1a2a;
-    color: #bfdbfe;
-  }
-
-  .banner.choice,
-  .banner.danger-zone {
-    flex-wrap: wrap;
-    justify-content: space-between;
-  }
-
-  .banner.danger-zone {
-    border-color: #7f1d1d;
   }
 
   .choice-text {
@@ -453,7 +332,7 @@
   }
 
   .choice-text span {
-    color: #8492a8;
+    color: var(--text-muted);
     overflow-wrap: anywhere;
   }
 
@@ -466,29 +345,32 @@
   .search {
     display: flex;
     align-items: center;
-    gap: 9px;
+    gap: 8px;
     padding: 8px 10px;
-    border: 1px solid #2a3547;
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: #0c1017;
-    color: #74839b;
+    background: var(--bg-sunken);
+    color: var(--text-faint);
   }
 
   .search:focus-within {
-    border-color: #3b82f6;
-    box-shadow: 0 0 0 2px #3b82f622;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-ring);
   }
 
-  .search input,
-  .rename input {
+  .search input {
     min-width: 0;
     flex: 1;
     border: 0;
     outline: 0;
     background: transparent;
-    color: #e2e8f0;
+    color: var(--text-strong);
     font: inherit;
     font-size: 12px;
+  }
+
+  .search input::placeholder {
+    color: var(--text-ghost);
   }
 
   .list {
@@ -506,12 +388,12 @@
     gap: 4px;
     padding-right: 6px;
     border: 1px solid transparent;
-    border-radius: 9px;
+    border-radius: 8px;
   }
 
   .row:hover {
-    border-color: #273b58;
-    background: #182131;
+    border-color: var(--border-selected);
+    background: var(--hover);
   }
 
   .open {
@@ -520,7 +402,7 @@
     gap: 12px;
     min-width: 0;
     flex: 1;
-    padding: 10px 9px;
+    padding: 10px;
     border: 0;
     background: transparent;
     color: inherit;
@@ -529,7 +411,7 @@
 
   .icon {
     display: inline-flex;
-    color: #60a5fa;
+    color: var(--accent-icon);
   }
 
   .info {
@@ -548,7 +430,7 @@
   }
 
   .title {
-    color: #e2e8f0;
+    color: var(--text);
     font-size: 13px;
     font-weight: 600;
   }
@@ -556,18 +438,18 @@
   .path {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    color: #74839b;
+    gap: 4px;
+    color: var(--text-faint);
     font-size: 11px;
   }
 
   .row.missing .path {
-    color: #d6a35c;
+    color: var(--warning-strong);
   }
 
   .when {
     flex: 0 0 auto;
-    color: #617087;
+    color: var(--text-faint);
     font-size: 11px;
   }
 
@@ -587,14 +469,20 @@
     align-items: center;
     gap: 8px;
     flex: 1;
-    padding: 8px 9px;
+    padding: 8px 10px;
   }
 
   .rename input {
+    min-width: 0;
+    flex: 1;
     padding: 6px 8px;
-    border: 1px solid #3b82f6;
+    border: 1px solid var(--accent);
     border-radius: 6px;
-    background: #0c1017;
+    outline: 0;
+    background: var(--bg-sunken);
+    color: var(--text-strong);
+    font: inherit;
+    font-size: 12px;
   }
 
   .archive-toggle {
@@ -603,14 +491,15 @@
     gap: 6px;
     align-self: flex-start;
     margin-top: 8px;
+    padding: 0;
     border: 0;
     background: transparent;
-    color: #8492a8;
+    color: var(--text-muted);
     font-size: 12px;
   }
 
   .archive-toggle:hover {
-    color: #e2e8f0;
+    color: var(--text);
   }
 
   .empty {
@@ -619,31 +508,18 @@
     align-items: center;
     gap: 8px;
     padding: 48px 16px;
-    color: #74839b;
+    color: var(--text-faint);
     font-size: 12px;
     text-align: center;
   }
 
   .empty strong {
-    color: #cbd5e1;
+    color: var(--text-soft);
     font-size: 14px;
+    font-weight: 600;
   }
 
   .small-empty {
-    padding: 20px;
-  }
-
-  code {
-    color: #93c5fd;
-  }
-
-  :global(.spin) {
-    animation: spin 1s linear infinite;
-  }
-
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
+    padding: 24px;
   }
 </style>

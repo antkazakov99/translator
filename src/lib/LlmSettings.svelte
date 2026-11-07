@@ -421,7 +421,7 @@
 {#snippet modelStatus(provider: ProviderDraft | undefined)}
   {@const list = provider ? modelLists[provider.uid] : undefined}
   {#if provider}
-    <button class="small" onclick={() => loadModels(provider)} disabled={list?.loading || !canAsk(provider)} title={canAsk(provider) ? "" : "Нужны адрес и ключ"}>
+    <button class="btn small" onclick={() => loadModels(provider)} disabled={list?.loading || !canAsk(provider)} title={canAsk(provider) ? "" : "Нужны адрес и ключ"}>
       {#if list?.loading}<LoaderCircle size={13} class="spin" />{:else}<RefreshCw size={13} />{/if}
       <span>Проверить</span>
     </button>
@@ -437,8 +437,8 @@
   {#if target.confirmDelete}
     <span class="confirm">
       <span>Удалить?</span>
-      <button class="small danger" onclick={remove} disabled={target.busy}>Да</button>
-      <button class="small" onclick={() => (target.confirmDelete = false)}>Нет</button>
+      <button class="btn small danger" onclick={remove} disabled={target.busy}>Да</button>
+      <button class="btn small" onclick={() => (target.confirmDelete = false)}>Нет</button>
     </span>
   {:else}
     <button class="icon-button danger" aria-label={label} title={label} onclick={() => (target.confirmDelete = true)} disabled={target.busy}>
@@ -457,9 +457,9 @@
   <div class="dialog" role="dialog" aria-modal="true" aria-label="Настройки моделей">
     <header class="dialog-head">
       <h2>Настройки моделей</h2>
-      <nav class="tabs" aria-label="Разделы">
+      <nav class="segmented tabs" aria-label="Разделы">
         {#each TABS as item (item.id)}
-          <button class="tab" class:active={tab === item.id} onclick={() => (tab = item.id)}>{item.label}</button>
+          <button class:on={tab === item.id} onclick={() => (tab = item.id)}>{item.label}</button>
         {/each}
       </nav>
       <button class="icon-button" aria-label="Закрыть" onclick={requestClose}><X size={16} /></button>
@@ -469,7 +469,7 @@
       {#if !keysPersistent}
         <div class="banner warn" role="status">
           <TriangleAlert size={15} />
-          <span>Хранилище ключей системы недоступно: ключи API забудутся при закрытии приложения.</span>
+          <span>Хранилище ключей системы недоступно: ключи API забудутся при закрытии приложения</span>
         </div>
       {/if}
       {#if loadError}
@@ -515,16 +515,16 @@
             </div>
             {#if kind.keyHint}<p class="hint">{kind.keyHint}</p>{/if}
             {#if draft.url.trim().startsWith("http://") && draft.kind !== "local" && (draft.key.trim() || draft.saved?.hasKey)}
-              <p class="hint warn-text">По адресу http:// ключ уходит открытым текстом.</p>
+              <p class="hint warn-text">По адресу http:// ключ уходит открытым текстом</p>
             {/if}
             <div class="card-foot">
               {@render modelStatus(draft)}
               <span class="spacer"></span>
               {#if draft.saved?.hasKey}
-                <button class="small" onclick={() => forgetKey(draft)} disabled={draft.busy}>Забыть ключ</button>
+                <button class="btn small" onclick={() => forgetKey(draft)} disabled={draft.busy}>Забыть ключ</button>
               {/if}
               {#if providerDirty(draft)}
-                <button class="small primary" onclick={() => saveProvider(draft)} disabled={draft.busy}>
+                <button class="btn small primary" onclick={() => saveProvider(draft)} disabled={draft.busy}>
                   {#if draft.busy}<LoaderCircle size={13} class="spin" />{:else}<Check size={13} />{/if}
                   <span>Сохранить</span>
                 </button>
@@ -533,18 +533,18 @@
             {#if draft.error}<p class="error-text">{draft.error}</p>{/if}
           </section>
         {:else}
-          <p class="muted">Провайдеров пока нет.</p>
+          <p class="muted">Провайдеров пока нет</p>
         {/each}
         <div class="add-row">
           <span class="muted">Добавить:</span>
           {#each PROVIDER_KINDS as kind (kind.id)}
-            <button class="small" onclick={() => addProvider(kind.id)}><Plus size={12} /><span>{kind.label}</span></button>
+            <button class="btn small" onclick={() => addProvider(kind.id)}><Plus size={12} /><span>{kind.label}</span></button>
           {/each}
         </div>
       {:else if tab === "profiles"}
         <p class="hint">Модель это профиль: провайдер, имя модели и лимиты. Первую в списке берут действия, у которых своя не выбрана.</p>
         {#if savedProviders.length === 0}
-          <p class="muted">Сначала сохраните провайдера на вкладке «Провайдеры».</p>
+          <p class="muted">Сначала сохраните провайдера на вкладке «Провайдеры»</p>
         {/if}
         {#each profiles as draft, index (draft.uid)}
           {@const provider = providerOf(draft.providerId)}
@@ -612,13 +612,13 @@
                 <span>Дополнительные поля запроса, JSON</span>
                 <textarea class="input mono" rows="3" bind:value={draft.params} placeholder={'{ "top_p": 0.9 }'}></textarea>
               </label>
-              <p class="hint">Поля приложения (модель, сообщения, температура, лимит ответа) отсюда не переопределяются.</p>
+              <p class="hint">Поля приложения (модель, сообщения, температура, лимит ответа) отсюда не переопределяются</p>
             {/if}
             <div class="card-foot">
               {@render modelStatus(provider)}
               <span class="spacer"></span>
               {#if profileDirty(draft)}
-                <button class="small primary" onclick={() => saveProfile(draft)} disabled={draft.busy || !draft.model.trim()}>
+                <button class="btn small primary" onclick={() => saveProfile(draft)} disabled={draft.busy || !draft.model.trim()}>
                   {#if draft.busy}<LoaderCircle size={13} class="spin" />{:else}<Check size={13} />{/if}
                   <span>Сохранить</span>
                 </button>
@@ -629,7 +629,7 @@
         {/each}
         {#if savedProviders.length > 0}
           <div class="add-row">
-            <button class="small" onclick={addProfile}><Plus size={12} /><span>Добавить модель</span></button>
+            <button class="btn small" onclick={addProfile}><Plus size={12} /><span>Добавить модель</span></button>
           </div>
         {/if}
       {:else}
@@ -678,11 +678,11 @@
 
     <footer class="dialog-foot">
       {#if confirmClose}
-        <span class="warn-text">Есть несохранённые изменения.</span>
-        <button class="small" onclick={() => (confirmClose = false)}>Остаться</button>
-        <button class="small danger" onclick={onClose}>Закрыть без сохранения</button>
+        <span class="warn-text">Есть несохранённые изменения</span>
+        <button class="btn small" onclick={() => (confirmClose = false)}>Остаться</button>
+        <button class="btn small danger" onclick={onClose}>Закрыть без сохранения</button>
       {:else}
-        <button class="small primary" onclick={requestClose}>Готово</button>
+        <button class="btn small primary" onclick={requestClose}>Готово</button>
       {/if}
     </footer>
   </div>
@@ -697,7 +697,7 @@
     align-items: center;
     justify-content: center;
     padding: 24px;
-    background: rgba(5, 7, 10, 0.72);
+    background: var(--backdrop);
   }
 
   .dialog {
@@ -707,12 +707,10 @@
     max-width: 820px;
     height: min(720px, 100%);
     overflow: hidden;
-    border: 1px solid #2a3548;
+    border: 1px solid var(--border);
     border-radius: 12px;
-    background: #0d0f12;
-    color: #d4deeb;
-    color-scheme: dark;
-    font-family: Inter, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
     box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.7);
   }
 
@@ -722,50 +720,28 @@
     align-items: center;
     gap: 12px;
     padding: 12px 16px;
-    background: #11151d;
+    background: var(--surface);
   }
 
   .dialog-head {
-    border-bottom: 1px solid #2a3548;
+    border-bottom: 1px solid var(--divider);
   }
 
   .dialog-foot {
     justify-content: flex-end;
-    border-top: 1px solid #2a3548;
+    border-top: 1px solid var(--divider);
   }
 
   h2 {
     margin: 0;
-    color: #f1f5f9;
+    color: var(--text-strong);
     font-size: 15px;
     font-weight: 650;
   }
 
   .tabs {
-    display: flex;
-    gap: 4px;
-    flex: 1;
     margin-left: 12px;
-  }
-
-  .tab {
-    padding: 6px 12px;
-    border: 1px solid transparent;
-    border-radius: 7px;
-    background: transparent;
-    color: #8492a8;
-    font-size: 12px;
-    font-weight: 600;
-  }
-
-  .tab:hover {
-    color: #f1f5f9;
-  }
-
-  .tab.active {
-    border-color: #2a3548;
-    background: #1a2433;
-    color: #f1f5f9;
+    margin-right: auto;
   }
 
   .dialog-body {
@@ -775,84 +751,6 @@
     flex: 1;
     padding: 14px 16px 18px;
     overflow-y: auto;
-  }
-
-  button {
-    font: inherit;
-    cursor: pointer;
-  }
-
-  button:disabled {
-    opacity: 0.55;
-    cursor: default;
-  }
-
-  .small {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 10px;
-    border: 1px solid #34445d;
-    border-radius: 8px;
-    background: #1a2433;
-    color: #d4deeb;
-    font-size: 11px;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-
-  .small:hover:not(:disabled) {
-    border-color: #3b82f6;
-    background: #20334f;
-  }
-
-  .small.primary {
-    border-color: #2563eb;
-    background: #1d4ed8;
-    color: #f8fafc;
-  }
-
-  .small.primary:hover:not(:disabled) {
-    background: #2563eb;
-  }
-
-  .small.danger:hover:not(:disabled) {
-    border-color: #f87171;
-    background: #3b1820;
-    color: #fca5a5;
-  }
-
-  .icon-button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    flex-shrink: 0;
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    color: #8290a5;
-  }
-
-  .icon-button:hover:not(:disabled) {
-    background: #252e3d;
-    color: #f1f5f9;
-  }
-
-  .icon-button.danger:hover:not(:disabled) {
-    background: #3b1820;
-    color: #fca5a5;
-  }
-
-  .card {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 12px;
-    border: 1px solid #2a3548;
-    border-radius: 10px;
-    background: #11151d;
   }
 
   .card-head,
@@ -870,27 +768,12 @@
   }
 
   .confirm {
+    color: var(--danger);
     font-size: 12px;
-    color: #fca5a5;
   }
 
   .spacer {
     flex: 1;
-  }
-
-  .badge {
-    padding: 3px 9px;
-    border-radius: 999px;
-    background: #1a2433;
-    color: #9fb0c8;
-    font-size: 11px;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-
-  .badge.accent {
-    background: rgba(59, 130, 246, 0.18);
-    color: #93c5fd;
   }
 
   .fields {
@@ -907,54 +790,16 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    min-width: 0;
-    color: #8492a8;
-    font-size: 11px;
-  }
-
   .key-set {
     display: inline-flex;
     align-items: center;
-    gap: 3px;
+    gap: 4px;
     margin-left: 6px;
-    color: #6ee7b7;
-  }
-
-  .input {
-    box-sizing: border-box;
-    min-width: 0;
-    padding: 7px 10px;
-    border: 1px solid #2a3548;
-    border-radius: 7px;
-    outline: none;
-    background: #0b0e13;
-    color: #f1f5f9;
-    font: inherit;
-    font-size: 12px;
-  }
-
-  .input:focus {
-    border-color: #3b82f6;
-  }
-
-  .input:disabled {
-    opacity: 0.5;
+    color: var(--success);
   }
 
   .grow {
     flex: 1;
-  }
-
-  .mono {
-    font-family: ui-monospace, monospace;
-  }
-
-  textarea.input {
-    resize: vertical;
   }
 
   .disclosure {
@@ -965,19 +810,19 @@
     padding: 2px 0;
     border: 0;
     background: transparent;
-    color: #8492a8;
+    color: var(--text-muted);
     font-size: 11px;
     font-weight: 600;
   }
 
   .disclosure:hover {
-    color: #f1f5f9;
+    color: var(--text-strong);
   }
 
   .status {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
     min-width: 0;
     overflow: hidden;
     font-size: 12px;
@@ -986,11 +831,11 @@
   }
 
   .status.ok {
-    color: #6ee7b7;
+    color: var(--success);
   }
 
   .status.failed {
-    color: #fca5a5;
+    color: var(--danger);
   }
 
   .hint,
@@ -999,7 +844,7 @@
     align-items: center;
     gap: 6px;
     margin: 0;
-    color: #6b7a90;
+    color: var(--text-faint);
     font-size: 11px;
   }
 
@@ -1008,7 +853,7 @@
   }
 
   .warn-text {
-    color: #fbbf24;
+    color: var(--warning);
     font-size: 12px;
   }
 
@@ -1016,44 +861,12 @@
     font-size: 11px;
   }
 
-  .error-text {
-    margin: 0;
-    color: #fca5a5;
-    font-size: 12px;
-  }
-
-  .banner {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 12px;
-    border: 1px solid #2a3548;
-    border-radius: 10px;
-    background: #11151d;
-    color: #cbd5e1;
-    font-size: 12px;
-  }
-
-  .banner span {
-    flex: 1;
-  }
-
-  .banner.warn {
-    border-color: #5b4a1c;
-    color: #fcd34d;
-  }
-
-  .banner.error {
-    border-color: #5b2330;
-    color: #fca5a5;
-  }
-
   .actions {
     display: flex;
     flex-direction: column;
-    border: 1px solid #2a3548;
+    border: 1px solid var(--border);
     border-radius: 10px;
-    background: #11151d;
+    background: var(--surface);
   }
 
   .actions-head,
@@ -1066,14 +879,14 @@
   }
 
   .actions-head {
-    border-bottom: 1px solid #2a3548;
-    color: #6b7a90;
+    border-bottom: 1px solid var(--divider);
+    color: var(--text-faint);
     font-size: 11px;
     font-weight: 600;
   }
 
   .action-row + .action-row {
-    border-top: 1px solid #1c2433;
+    border-top: 1px solid var(--divider-row);
   }
 
   .action-row.busy {
@@ -1081,21 +894,11 @@
   }
 
   .action-title {
-    color: #d4deeb;
+    color: var(--text);
     font-size: 12px;
   }
 
   .wide {
     grid-column: 1 / -1;
-  }
-
-  :global(.spin) {
-    animation: spin 1s linear infinite;
-  }
-
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
   }
 </style>

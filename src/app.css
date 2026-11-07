@@ -1,0 +1,376 @@
+/*
+ * Общие стили окна 2.0. Значения и правила описаны на странице «Правила интерфейса» в Docmost:
+ * новое значение сначала появляется там, потом здесь. Компоненты берут цвета и размеры из токенов,
+ * а общие элементы (кнопки, поля, баннеры) из классов ниже.
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* Поверхности */
+  --bg: #0d0f12;
+  --bg-sunken: #0c1017;
+  --surface: #11151d;
+  --surface-side: #0f1319;
+  --raised: #1a2433;
+  --hover: #182131;
+  --hover-row: #11161f;
+  --hover-icon: #252e3d;
+  --selected: #1d2c44;
+  --backdrop: rgba(5, 7, 10, 0.72);
+
+  /* Рамки */
+  --border: #2a3548;
+  --border-strong: #34445d;
+  --border-selected: #273b58;
+  --divider: #202937;
+  --divider-row: #161c26;
+
+  /* Текст */
+  --text-strong: #f1f5f9;
+  --text: #e2e8f0;
+  --text-soft: #cbd5e1;
+  --text-button: #d4deeb;
+  --text-muted: #8492a8;
+  --text-faint: #74839b;
+  --text-ghost: #4b5870;
+
+  /* Акцент */
+  --accent: #3b82f6;
+  --accent-ring: #3b82f622;
+  --accent-hover: #20334f;
+  --accent-text: #93c5fd;
+  --accent-icon: #60a5fa;
+  --primary: #1d4ed8;
+  --primary-hover: #2563eb;
+  --primary-text: #f8fafc;
+
+  /* Состояния */
+  --success: #6ee7b7;
+  --warning: #fcd58a;
+  --warning-bg: #2a2111;
+  --warning-border: #6d4f1c;
+  --warning-strong: #f59e0b;
+  --danger: #fca5a5;
+  --danger-hover-bg: #3b1820;
+  --danger-banner: #fecaca;
+  --danger-bg: #1f1013;
+  --danger-border: #7f1d1d;
+  --danger-fill: #7f1d1d;
+  --danger-fill-border: #b91c1c;
+  --danger-fill-text: #fee2e2;
+  --danger-fill-hover: #991b1b;
+  --danger-fill-hover-border: #ef4444;
+  --info: #bfdbfe;
+  --info-bg: #0f1a2a;
+  --info-border: #1e3a5f;
+  --track: #1e2638;
+
+  /* Бейджи */
+  --badge-text: #9fb0c8;
+  --badge-accent-bg: rgba(59, 130, 246, 0.18);
+
+  --font: Inter, "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, monospace;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--track) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background-color: var(--track);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: #334155;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+code {
+  color: var(--accent-text);
+  font-family: var(--font-mono);
+}
+
+/* Кнопки: обычная, малая, главная, предупреждающая, опасная */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--raised);
+  color: var(--text-button);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-hover);
+}
+
+.btn.small {
+  padding: 6px 10px;
+  font-size: 11px;
+}
+
+.btn.primary {
+  border-color: var(--primary-hover);
+  background: var(--primary);
+  color: var(--primary-text);
+}
+
+.btn.primary:hover:not(:disabled) {
+  border-color: var(--primary-hover);
+  background: var(--primary-hover);
+}
+
+.btn.warning {
+  border-color: var(--warning-border);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.btn.warning:hover:not(:disabled) {
+  border-color: var(--warning-strong);
+  background: var(--warning-bg);
+}
+
+.btn.danger {
+  border-color: var(--danger-fill-border);
+  background: var(--danger-fill);
+  color: var(--danger-fill-text);
+}
+
+.btn.danger:hover:not(:disabled) {
+  border-color: var(--danger-fill-hover-border);
+  background: var(--danger-fill-hover);
+}
+
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.icon-button:hover:not(:disabled) {
+  background: var(--hover-icon);
+  color: var(--text-strong);
+}
+
+.icon-button.danger:hover:not(:disabled) {
+  background: var(--danger-hover-bg);
+  color: var(--danger);
+}
+
+/* Поля */
+
+.input {
+  box-sizing: border-box;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  outline: none;
+  background: var(--bg-sunken);
+  color: var(--text-strong);
+  font: inherit;
+  font-size: 12px;
+}
+
+.input::placeholder {
+  color: var(--text-ghost);
+}
+
+.input:focus {
+  border-color: var(--accent);
+}
+
+.input:disabled {
+  opacity: 0.5;
+}
+
+.input.mono {
+  font-family: var(--font-mono);
+}
+
+textarea.input {
+  resize: vertical;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+/* Вкладки и переключатели */
+
+.segmented {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-sunken);
+}
+
+.segmented button {
+  padding: 5px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.segmented button:hover {
+  color: var(--text);
+}
+
+.segmented button.on {
+  background: var(--selected);
+  color: var(--text);
+}
+
+/* Баннеры */
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.banner > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.banner .icon-button {
+  color: inherit;
+}
+
+.banner.error {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger-banner);
+}
+
+.banner.warn {
+  border-color: var(--warning-border);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.banner.progress {
+  border-color: var(--info-border);
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+.banner.choice {
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+
+.banner.choice.danger-zone {
+  border-color: var(--danger-border);
+}
+
+/* Карточки и бейджи */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.badge {
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--badge-text);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.badge.accent {
+  background: var(--badge-accent-bg);
+  color: var(--accent-text);
+}
+
+/* Текст ошибки у поля или карточки */
+.error-text {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

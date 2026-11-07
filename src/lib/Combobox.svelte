@@ -170,21 +170,10 @@
     min-width: 0;
   }
 
+  /* Вид поля из общего класса .input, здесь только место под стрелку */
   .input {
-    box-sizing: border-box;
     width: 100%;
-    min-width: 0;
-    padding: 6px 28px 6px 10px;
-    border: 1px solid rgba(51, 65, 85, 0.8);
-    border-radius: 6px;
-    outline: none;
-    background: #090d16;
-    font-size: 12px;
-    color: #f1f5f9;
-  }
-
-  .input:focus {
-    border-color: #10b981;
+    padding-right: 28px;
   }
 
   .toggle {
@@ -194,21 +183,14 @@
     bottom: 0;
     display: flex;
     align-items: center;
-    padding: 0 7px;
+    padding: 0 8px;
     border: none;
     background: transparent;
-    color: #64748b;
-    cursor: pointer;
+    color: var(--text-faint);
   }
 
   .toggle:hover:not(:disabled) {
-    color: #f1f5f9;
-  }
-
-  .input:disabled,
-  .toggle:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+    color: var(--text-strong);
   }
 
   .toggle.flipped :global(svg) {
@@ -224,49 +206,48 @@
     max-height: 240px;
     overflow-y: auto;
     padding: 4px;
-    border: 1px solid #334155;
+    border: 1px solid var(--border-strong);
     border-radius: 8px;
-    background: #141824;
+    background: var(--surface);
     box-shadow: 0 12px 28px -8px rgba(0, 0, 0, 0.8);
   }
 
   .option {
     flex-shrink: 0;
-    padding: 5px 8px;
+    padding: 6px 8px;
     border: none;
-    border-radius: 5px;
+    border-radius: 6px;
     background: transparent;
     overflow: hidden;
+    color: var(--text-soft);
     font-size: 12px;
-    color: #cbd5e1;
     text-align: left;
     text-overflow: ellipsis;
     white-space: nowrap;
-    cursor: pointer;
   }
 
   .option.active {
-    color: #f8fafc;
-    background: rgba(99, 102, 241, 0.25);
+    background: var(--selected);
+    color: var(--text-strong);
   }
 
   .option.selected {
-    color: #34d399;
+    color: var(--accent-text);
   }
 
   .group {
     flex-shrink: 0;
     margin: 0;
-    padding: 6px 8px 3px;
+    padding: 6px 8px 4px;
+    color: var(--text-faint);
     font-size: 11px;
     font-weight: 600;
-    color: #64748b;
   }
 
   .empty {
     margin: 0;
     padding: 6px 8px;
+    color: var(--text-muted);
     font-size: 11px;
-    color: #94a3b8;
   }
 </style>

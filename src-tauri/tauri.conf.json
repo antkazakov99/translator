@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Translator — Game Localization Studio",
+        "title": "Translator",
         "width": 1280,
         "height": 840,
         "minWidth": 900,

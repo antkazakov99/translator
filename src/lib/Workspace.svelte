@@ -155,7 +155,7 @@
 
 <main class="workspace">
   <header class="bar">
-    <button class="back" onclick={onBack}>
+    <button class="btn small" onclick={onBack}>
       <ArrowLeft size={15} />
       <span>Проекты</span>
     </button>
@@ -171,7 +171,7 @@
         {/if}
       </span>
     </div>
-    <button class="back settings" onclick={onSettings} title="Провайдеры, модели и настройки действий">
+    <button class="btn small settings" onclick={onSettings} title="Провайдеры, модели и настройки действий">
       <Bot size={15} />
       <span>Модели</span>
     </button>
@@ -184,7 +184,7 @@
           <span class="file-name"><FileText size={13} /> {item.path.replace(/^game\//, "")}</span>
           <span class="file-progress">
             <span class="bar-track"><span class="bar-fill" style:width="{percent(item)}%"></span></span>
-            <span class="file-count">{item.translated}/{item.total}{item.drafts ? ` · ${item.drafts} модель` : ""}</span>
+            <span class="file-count">{item.translated}/{item.total}{item.drafts ? ` · модель: ${item.drafts}` : ""}</span>
           </span>
         </button>
       {:else}
@@ -199,7 +199,7 @@
             <strong>{file.path}</strong>
             <span>{file.translated} из {file.total} · {percent(file)}%</span>
           </div>
-          <div class="filters" role="tablist">
+          <div class="segmented" role="tablist" aria-label="Какие реплики показать">
             {#each [["all", "Все"], ["empty", "Пустые"], ["draft", "Модель"]] as [value, label] (value)}
               <button role="tab" aria-selected={filter === value} class:on={filter === value} onclick={() => (filter = value as Filter)}>
                 {label}
@@ -207,7 +207,7 @@
             {/each}
           </div>
           {#if fileDrafts.length > 0}
-            <button class="confirm-all" onclick={() => confirm(fileDrafts)}>
+            <button class="btn small warning" onclick={() => confirm(fileDrafts)}>
               <CheckCheck size={14} />
               <span>Подтвердить модель · {fileDrafts.length}</span>
             </button>
@@ -216,10 +216,10 @@
       {/if}
 
       {#if error}
-        <div class="error" role="alert">
+        <div class="banner error page-error" role="alert">
           <TriangleAlert size={14} />
           <span>{error}</span>
-          <button aria-label="Скрыть ошибку" onclick={() => (error = "")}><X size={13} /></button>
+          <button class="icon-button" aria-label="Скрыть ошибку" onclick={() => (error = "")}><X size={14} /></button>
         </div>
       {/if}
 
@@ -259,7 +259,7 @@
                     <span class="changed" title="Игра изменила оригинал после перевода"><TriangleAlert size={11} /></span>
                   {/if}
                   {#if line.state === "draft"}
-                    <button class="confirm" title="Подтвердить перевод модели" onclick={() => confirm([line])}>
+                    <button class="confirm" aria-label="Подтвердить перевод модели" title="Подтвердить перевод модели" onclick={() => confirm([line])}>
                       <Check size={12} />
                     </button>
                   {/if}
@@ -278,12 +278,6 @@
     display: flex;
     flex-direction: column;
     height: 100vh;
-    font-family: Inter, "Segoe UI", system-ui, sans-serif;
-  }
-
-  button {
-    font: inherit;
-    cursor: pointer;
   }
 
   .bar {
@@ -291,25 +285,8 @@
     align-items: center;
     gap: 14px;
     padding: 10px 16px;
-    border-bottom: 1px solid #202937;
-    background: #11151d;
-  }
-
-  .back {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    border: 1px solid #34445d;
-    border-radius: 8px;
-    background: #1a2433;
-    color: #d4deeb;
-    padding: 6px 10px;
-    font-size: 12px;
-  }
-
-  .back:hover {
-    border-color: #3b82f6;
-    background: #20334f;
+    border-bottom: 1px solid var(--divider);
+    background: var(--surface);
   }
 
   .settings {
@@ -324,16 +301,17 @@
   }
 
   .title strong {
-    color: #f1f5f9;
+    color: var(--text-strong);
     font-size: 14px;
+    font-weight: 600;
   }
 
   .title span {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
     overflow: hidden;
-    color: #74839b;
+    color: var(--text-faint);
     font-size: 11px;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -353,29 +331,26 @@
     flex: 0 0 auto;
     overflow-y: auto;
     padding: 10px 8px;
-    border-right: 1px solid #202937;
-    background: #0f1319;
+    border-right: 1px solid var(--divider);
+    background: var(--surface-side);
   }
 
   .file {
     display: flex;
     flex-direction: column;
     gap: 6px;
-    padding: 8px 9px;
+    padding: 8px 10px;
     border: 1px solid transparent;
     border-radius: 8px;
     background: transparent;
-    color: #cbd5e1;
+    color: var(--text-soft);
     text-align: left;
   }
 
-  .file:hover {
-    background: #161d29;
-  }
-
+  .file:hover,
   .file.active {
-    border-color: #273b58;
-    background: #182131;
+    border-color: var(--border-selected);
+    background: var(--hover);
   }
 
   .file-name {
@@ -399,17 +374,17 @@
     height: 4px;
     overflow: hidden;
     border-radius: 999px;
-    background: #1e2638;
+    background: var(--track);
   }
 
   .bar-fill {
     display: block;
     height: 100%;
-    background: #3b82f6;
+    background: var(--accent);
   }
 
   .file-count {
-    color: #74839b;
+    color: var(--text-faint);
     font-size: 10px;
     white-space: nowrap;
   }
@@ -426,7 +401,7 @@
     align-items: center;
     gap: 14px;
     padding: 10px 16px;
-    border-bottom: 1px solid #202937;
+    border-bottom: 1px solid var(--divider);
   }
 
   .toolbar-title {
@@ -439,78 +414,21 @@
 
   .toolbar-title strong {
     overflow: hidden;
-    color: #e2e8f0;
+    color: var(--text);
     font-size: 13px;
+    font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .toolbar-title span,
   .muted {
-    color: #74839b;
+    color: var(--text-faint);
     font-size: 11px;
   }
 
-  .filters {
-    display: flex;
-    gap: 2px;
-    padding: 2px;
-    border: 1px solid #2a3547;
-    border-radius: 8px;
-    background: #0c1017;
-  }
-
-  .filters button {
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    color: #8492a8;
-    padding: 5px 10px;
-    font-size: 11px;
-  }
-
-  .filters button.on {
-    background: #1d2c44;
-    color: #e2e8f0;
-  }
-
-  .confirm-all {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    border: 1px solid #6d4f1c;
-    border-radius: 8px;
-    background: #2a2111;
-    color: #fcd58a;
-    padding: 6px 10px;
-    font-size: 11px;
-  }
-
-  .confirm-all:hover {
-    border-color: #d69e2e;
-  }
-
-  .error {
-    display: flex;
-    align-items: center;
-    gap: 8px;
+  .page-error {
     margin: 10px 16px 0;
-    padding: 8px 10px;
-    border: 1px solid #7f1d1d;
-    border-radius: 8px;
-    background: #1f1013;
-    color: #fecaca;
-    font-size: 12px;
-  }
-
-  .error span {
-    flex: 1;
-  }
-
-  .error button {
-    border: 0;
-    background: transparent;
-    color: inherit;
   }
 
   .empty {
@@ -518,14 +436,14 @@
     flex: 1;
     align-items: center;
     justify-content: center;
-    color: #74839b;
+    color: var(--text-faint);
     font-size: 12px;
   }
 
   .table {
     flex: 1;
     overflow-y: auto;
-    padding: 0 16px 40px;
+    padding: 0 16px 24px;
   }
 
   .scene {
@@ -534,8 +452,8 @@
     z-index: 1;
     margin: 0;
     padding: 14px 0 6px;
-    background: #0d0f12;
-    color: #93c5fd;
+    background: var(--bg);
+    color: var(--accent-text);
     font-size: 12px;
     font-weight: 600;
   }
@@ -545,34 +463,34 @@
     grid-template-columns: 44px 120px minmax(0, 1fr) minmax(0, 1fr) 96px;
     gap: 10px;
     align-items: start;
-    padding: 7px 6px;
-    border-bottom: 1px solid #161c26;
+    padding: 6px;
+    border-bottom: 1px solid var(--divider-row);
     font-size: 12px;
     line-height: 1.45;
   }
 
   .row:hover,
   .row.editing {
-    background: #11161f;
+    background: var(--hover-row);
   }
 
   .where {
-    color: #4b5870;
+    padding-top: 2px;
+    color: var(--text-ghost);
     font-size: 10px;
     text-align: right;
-    padding-top: 2px;
   }
 
   .speaker {
     overflow: hidden;
-    color: #a5b4cb;
+    color: var(--text-soft);
     font-weight: 600;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .source {
-    color: #cbd5e1;
+    color: var(--text-soft);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
@@ -590,18 +508,18 @@
     border: 1px solid transparent;
     border-radius: 6px;
     background: transparent;
-    color: #e2e8f0;
+    color: var(--text);
     text-align: left;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
   }
 
   .text:hover {
-    border-color: #2a3547;
+    border-color: var(--border);
   }
 
   .text.placeholder {
-    color: #4b5870;
+    color: var(--text-ghost);
     font-style: italic;
   }
 
@@ -610,11 +528,11 @@
     width: 100%;
     margin: -3px 0;
     padding: 3px 6px;
-    border: 1px solid #3b82f6;
+    border: 1px solid var(--accent);
     border-radius: 6px;
     outline: 0;
-    background: #0c1017;
-    color: #f1f5f9;
+    background: var(--bg-sunken);
+    color: var(--text-strong);
     font: inherit;
     line-height: 1.45;
     resize: vertical;
@@ -624,27 +542,27 @@
   .state {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: 4px;
     justify-self: start;
-    color: #74839b;
+    color: var(--text-faint);
     font-size: 11px;
   }
 
   .state.done {
-    color: #6ee7b7;
+    color: var(--success);
   }
 
   .state.draft {
-    color: #fcd58a;
+    color: var(--warning);
   }
 
   .state.game {
-    color: #93c5fd;
+    color: var(--accent-text);
   }
 
   .changed {
     display: inline-flex;
-    color: #f59e0b;
+    color: var(--warning-strong);
   }
 
   .confirm {
@@ -653,23 +571,14 @@
     justify-content: center;
     width: 20px;
     height: 20px;
-    border: 1px solid #6d4f1c;
-    border-radius: 5px;
+    padding: 0;
+    border: 1px solid var(--warning-border);
+    border-radius: 6px;
     background: transparent;
-    color: #fcd58a;
+    color: var(--warning);
   }
 
   .confirm:hover {
-    background: #2a2111;
-  }
-
-  :global(.spin) {
-    animation: spin 1s linear infinite;
-  }
-
-  @keyframes spin {
-    to {
-      transform: rotate(360deg);
-    }
+    background: var(--warning-bg);
   }
 </style>
