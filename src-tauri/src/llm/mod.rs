@@ -2,6 +2,7 @@
 
 pub mod action;
 pub mod client;
+pub mod commands;
 pub mod model;
 pub mod repo;
 pub mod run;

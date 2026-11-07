@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import StartScreen from "$lib/StartScreen.svelte";
   import Workspace from "$lib/Workspace.svelte";
+  import LlmSettings from "$lib/LlmSettings.svelte";
   import { commands, type ProjectDto_Serialize as Project } from "$lib/bindings";
 
   /** Проект, который нужно открыть заново после перезагрузки страницы. Не настройка, поэтому не в базе. */
@@ -9,6 +10,7 @@
 
   let project = $state<Project | null>(null);
   let restoring = $state(true);
+  let showLlmSettings = $state(false);
 
   function remember(id: string | null) {
     try {
@@ -53,10 +55,14 @@
   <div class="blank"></div>
 {:else if project}
   {#key project.id}
-    <Workspace {project} onBack={backToProjects} />
+    <Workspace {project} onBack={backToProjects} onSettings={() => (showLlmSettings = true)} />
   {/key}
 {:else}
-  <StartScreen onOpen={opened} />
+  <StartScreen onOpen={opened} onSettings={() => (showLlmSettings = true)} />
+{/if}
+
+{#if showLlmSettings}
+  <LlmSettings onClose={() => (showLlmSettings = false)} />
 {/if}
 
 <style>

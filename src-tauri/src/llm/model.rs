@@ -19,7 +19,7 @@ pub const DEFAULT_REASONING_TOKENS: u32 = 8192;
 pub const DEFAULT_TIMEOUT_SECS: u32 = 300;
 
 /// Вид запроса.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     /// Локальный сервер (LM Studio, Ollama): Chat Completions без прокси.
@@ -222,6 +222,16 @@ impl Profile {
 
     pub fn reasoning_tokens(&self) -> u32 {
         self.reasoning_tokens.unwrap_or(DEFAULT_REASONING_TOKENS)
+    }
+
+    /// Запас на размышления, как задан в профиле.
+    pub fn reasoning_limit(&self) -> Option<u32> {
+        self.reasoning_tokens
+    }
+
+    /// Таймаут в секундах, как задан в профиле.
+    pub fn timeout_limit(&self) -> Option<u32> {
+        self.timeout_secs
     }
 
     pub fn timeout(&self) -> Duration {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { ArrowLeft, Check, CheckCheck, FileText, LoaderCircle, TriangleAlert, X } from "lucide-svelte";
+  import { ArrowLeft, Bot, Check, CheckCheck, FileText, LoaderCircle, TriangleAlert, X } from "lucide-svelte";
   import {
     commands,
     type FileDto,
@@ -9,7 +9,7 @@
     type SceneDto_Serialize as Scene,
   } from "$lib/bindings";
 
-  let { project, onBack }: { project: Project; onBack: () => void } = $props();
+  let { project, onBack, onSettings }: { project: Project; onBack: () => void; onSettings: () => void } = $props();
 
   type Filter = "all" | "empty" | "draft";
 
@@ -171,6 +171,10 @@
         {/if}
       </span>
     </div>
+    <button class="back settings" onclick={onSettings} title="Провайдеры, модели и настройки действий">
+      <Bot size={15} />
+      <span>Модели</span>
+    </button>
   </header>
 
   <div class="body">
@@ -306,6 +310,10 @@
   .back:hover {
     border-color: #3b82f6;
     background: #20334f;
+  }
+
+  .settings {
+    margin-left: auto;
   }
 
   .title {

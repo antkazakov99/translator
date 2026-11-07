@@ -51,6 +51,8 @@ pub enum ValidationError {
     OtherEngine,
     #[error("Действие недоступно в статусе проекта «{0}»")]
     WrongStatus(&'static str),
+    #[error("Дополнительные параметры не разобраны: {0}")]
+    BadParams(String),
     #[error("Форма «{0}» совпадает с именем или другой формой")]
     DuplicateForm(String),
 }

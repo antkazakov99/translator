@@ -5,6 +5,26 @@ import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 
 /** Commands */
 export const commands = {
+	/**  Провайдеры, профили и настройки действий. */
+	llmSettings: () => __TAURI_INVOKE<LlmSettingsDto_Serialize>("llm_settings"),
+	/**  Создаёт или меняет провайдера. Ключ сохраняется, только если передан. */
+	saveLlmProvider: (provider: ProviderInput_Deserialize) => __TAURI_INVOKE<ProviderDto>("save_llm_provider", { provider }),
+	/**  Удаляет провайдера с ключом и его профилями. */
+	deleteLlmProvider: (id: string) => __TAURI_INVOKE<null>("delete_llm_provider", { id }),
+	/**  Убирает ключ провайдера. */
+	forgetLlmKey: (id: string) => __TAURI_INVOKE<null>("forget_llm_key", { id }),
+	/**  Создаёт или меняет профиль. */
+	saveLlmProfile: (profile: ProfileInput_Deserialize) => __TAURI_INVOKE<ProfileDto_Serialize>("save_llm_profile", { profile }),
+	deleteLlmProfile: (id: string) => __TAURI_INVOKE<null>("delete_llm_profile", { id }),
+	/**  Новый порядок профилей: первый берут действия без своего профиля. */
+	reorderLlmProfiles: (ids: string[]) => __TAURI_INVOKE<null>("reorder_llm_profiles", { ids }),
+	/**  Настройки действия в приложении. */
+	saveLlmAction: (action: Action, settings: ActionInput_Deserialize) => __TAURI_INVOKE<ActionDto_Serialize>("save_llm_action", { action, settings }),
+	/**
+	 *  Модели провайдера: и сохранённого, и того, что ещё правится в окне.
+	 *  Без нового ключа берётся сохранённый ключ провайдера.
+	 */
+	llmModels: (provider: ProviderInput_Deserialize) => __TAURI_INVOKE<string[]>("llm_models", { provider }),
 	/**  Файлы проекта с репликами и прогресс. */
 	translationFiles: (project: string) => __TAURI_INVOKE<FileDto[]>("translation_files", { project }),
 	/**  Реплики файла по сценам. */
@@ -30,6 +50,51 @@ export const commands = {
 };
 
 /* Types */
+/**  Действие модели. Совпадает со справочником `llm_actions`: новое действие это новый вариант и новая миграция. */
+export type Action = "descriptions" | "names" | "terms" | "tokens" | "speakers" | "lines" | "review";
+
+/**  Настройки действия в приложении и значения из кода, которые действуют при пустом поле. */
+export type ActionDto = ActionDto_Serialize | ActionDto_Deserialize;
+
+/**  Настройки действия в приложении и значения из кода, которые действуют при пустом поле. */
+export type ActionDto_Deserialize = {
+	id: Action,
+	title: string,
+	profile?: string | null,
+	temperature?: number | null,
+	batchSize?: number | null,
+	defaultTemperature: number | null,
+	defaultBatchSize: number,
+};
+
+/**  Настройки действия в приложении и значения из кода, которые действуют при пустом поле. */
+export type ActionDto_Serialize = {
+	id: Action,
+	title: string,
+	profile: string | null,
+	temperature: number | null,
+	batchSize: number | null,
+	defaultTemperature: number | null,
+	defaultBatchSize: number,
+};
+
+/**  Настройки действия из окна. Пустое поле: значение из кода. */
+export type ActionInput = ActionInput_Serialize | ActionInput_Deserialize;
+
+/**  Настройки действия из окна. Пустое поле: значение из кода. */
+export type ActionInput_Deserialize = {
+	profile?: string | null,
+	temperature?: number | null,
+	batchSize?: number | null,
+};
+
+/**  Настройки действия из окна. Пустое поле: значение из кода. */
+export type ActionInput_Serialize = {
+	profile: string | null,
+	temperature: number | null,
+	batchSize: number | null,
+};
+
 /**  Файл с репликами и прогресс по нему. */
 export type FileDto = {
 	id: RowRef,
@@ -79,6 +144,93 @@ export type LineState =
 /**  Перевод, который уже есть в игре. */
 "game";
 
+/**  Всё окно настроек LLM. */
+export type LlmSettingsDto = LlmSettingsDto_Serialize | LlmSettingsDto_Deserialize;
+
+/**  Всё окно настроек LLM. */
+export type LlmSettingsDto_Deserialize = {
+	providers: ProviderDto[],
+	/**  Общий список по порядку: первый берут действия без своего профиля. */
+	profiles: ProfileDto_Deserialize[],
+	/**  Все действия в порядке меню. */
+	actions: ActionDto_Deserialize[],
+	/**  Ключи лежат в хранилище системы. Иначе они живут до закрытия приложения. */
+	keysPersistent: boolean,
+	defaultReasoningTokens: number,
+	defaultTimeoutSecs: number,
+};
+
+/**  Всё окно настроек LLM. */
+export type LlmSettingsDto_Serialize = {
+	providers: ProviderDto[],
+	/**  Общий список по порядку: первый берут действия без своего профиля. */
+	profiles: ProfileDto_Serialize[],
+	/**  Все действия в порядке меню. */
+	actions: ActionDto_Serialize[],
+	/**  Ключи лежат в хранилище системы. Иначе они живут до закрытия приложения. */
+	keysPersistent: boolean,
+	defaultReasoningTokens: number,
+	defaultTimeoutSecs: number,
+};
+
+/**  Профиль. Пустое поле значит значение из кода. */
+export type ProfileDto = ProfileDto_Serialize | ProfileDto_Deserialize;
+
+/**  Профиль. Пустое поле значит значение из кода. */
+export type ProfileDto_Deserialize = {
+	id: string,
+	providerId: string,
+	name: string,
+	model: string,
+	contextTokens?: number | null,
+	reasoningTokens?: number | null,
+	timeoutSecs?: number | null,
+	/**  Дополнительные поля тела запроса, JSON-объект с отступами. Пустая строка: полей нет. */
+	params: string,
+};
+
+/**  Профиль. Пустое поле значит значение из кода. */
+export type ProfileDto_Serialize = {
+	id: string,
+	providerId: string,
+	name: string,
+	model: string,
+	contextTokens: number | null,
+	reasoningTokens: number | null,
+	timeoutSecs: number | null,
+	/**  Дополнительные поля тела запроса, JSON-объект с отступами. Пустая строка: полей нет. */
+	params: string,
+};
+
+/**  Профиль из окна. Без `id` создаётся новый в конце списка. */
+export type ProfileInput = ProfileInput_Serialize | ProfileInput_Deserialize;
+
+/**  Профиль из окна. Без `id` создаётся новый в конце списка. */
+export type ProfileInput_Deserialize = {
+	id?: string | null,
+	providerId: string,
+	name: string,
+	model: string,
+	contextTokens?: number | null,
+	reasoningTokens?: number | null,
+	timeoutSecs?: number | null,
+	/**  JSON-объект или пустая строка. */
+	params: string,
+};
+
+/**  Профиль из окна. Без `id` создаётся новый в конце списка. */
+export type ProfileInput_Serialize = {
+	id: string | null,
+	providerId: string,
+	name: string,
+	model: string,
+	contextTokens: number | null,
+	reasoningTokens: number | null,
+	timeoutSecs: number | null,
+	/**  JSON-объект или пустая строка. */
+	params: string,
+};
+
 /**  Проект для окна. */
 export type ProjectDto = ProjectDto_Serialize | ProjectDto_Deserialize;
 
@@ -109,6 +261,55 @@ export type ProjectDto_Serialize = {
 	openedAt: number | null,
 	archived: boolean,
 };
+
+/**  Провайдер для окна. Ключа нет, только признак, что он задан. */
+export type ProviderDto = {
+	id: string,
+	name: string,
+	kind: ProviderKind,
+	url: string,
+	hasKey: boolean,
+	/**  Без ключа запрос не уйдёт. */
+	needsKey: boolean,
+	/**  ChatGPT температуру не принимает. */
+	takesTemperature: boolean,
+};
+
+/**  Провайдер из окна. Без `id` создаётся новый. */
+export type ProviderInput = ProviderInput_Serialize | ProviderInput_Deserialize;
+
+/**  Провайдер из окна. Без `id` создаётся новый. */
+export type ProviderInput_Deserialize = {
+	id?: string | null,
+	name: string,
+	kind: ProviderKind,
+	url: string,
+	/**  Новый ключ. Пусто: прежний ключ остаётся. */
+	key?: string | null,
+};
+
+/**  Провайдер из окна. Без `id` создаётся новый. */
+export type ProviderInput_Serialize = {
+	id: string | null,
+	name: string,
+	kind: ProviderKind,
+	url: string,
+	/**  Новый ключ. Пусто: прежний ключ остаётся. */
+	key: string | null,
+};
+
+/**  Вид запроса. */
+export type ProviderKind = 
+/**  Локальный сервер (LM Studio, Ollama): Chat Completions без прокси. */
+"local" | 
+/**  ChatGPT: `max_completion_tokens` без `temperature`. */
+"openai" | 
+/**  Claude: Messages API. */
+"claude" | 
+/**  Gemini: OpenAI-совместимый адрес. */
+"gemini" | 
+/**  Другой OpenAI-совместимый сервер. */
+"compatible";
 
 /**  Номер строки базы для окна. В JavaScript это `number`: точности до 2^53 номерам строк хватает. */
 export type RowRef = number;

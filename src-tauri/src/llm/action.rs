@@ -8,7 +8,7 @@ use super::ProfileId;
 use crate::common::ValidationError;
 
 /// Действие модели. Совпадает со справочником `llm_actions`: новое действие это новый вариант и новая миграция.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
     Descriptions,
@@ -51,13 +51,13 @@ impl Action {
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::Descriptions => "Описания",
-            Self::Names => "Имена",
-            Self::Terms => "Термины",
-            Self::Tokens => "Токены",
-            Self::Speakers => "Подписи говорящих",
+            Self::Descriptions => "Обновление описаний",
+            Self::Names => "Перевод имён",
+            Self::Terms => "Перевод терминов",
+            Self::Tokens => "Обновление пояснений",
+            Self::Speakers => "Перевод подписей",
             Self::Lines => "Перевод реплик",
-            Self::Review => "Редактура",
+            Self::Review => "Редактура реплик",
         }
     }
 
@@ -101,6 +101,11 @@ impl Temperature {
 
     pub fn get(self) -> f32 {
         self.0
+    }
+
+    /// Кратчайшая запись `f32` в `f64`: 0.3 остаётся 0.3, а не 0.30000001192.
+    pub fn as_f64(self) -> f64 {
+        self.0.to_string().parse().unwrap_or(f64::from(self.0))
     }
 }
 

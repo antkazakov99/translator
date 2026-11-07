@@ -3,6 +3,7 @@
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import {
     Archive,
+    Bot,
     ArchiveRestore,
     ChevronDown,
     ChevronRight,
@@ -17,7 +18,7 @@
   } from "lucide-svelte";
   import { commands, type ProjectDto_Serialize as Project } from "$lib/bindings";
 
-  let { onOpen }: { onOpen: (project: Project) => void } = $props();
+  let { onOpen, onSettings }: { onOpen: (project: Project) => void; onSettings: () => void } = $props();
 
   let projects = $state<Project[]>([]);
   let loading = $state(true);
@@ -184,10 +185,16 @@
       <h1>Проекты</h1>
       <p>Проект один раз считывает игру и дальше работает со своей копией.</p>
     </div>
-    <button class="primary" disabled={creatingRoot !== null || busy} onclick={chooseFolder}>
-      <FolderPlus size={16} />
-      <span>Новый проект</span>
-    </button>
+    <div class="head-actions">
+      <button class="small" onclick={onSettings} title="Провайдеры, модели и настройки действий">
+        <Bot size={15} />
+        <span>Модели</span>
+      </button>
+      <button class="primary" disabled={creatingRoot !== null || busy} onclick={chooseFolder}>
+        <FolderPlus size={16} />
+        <span>Новый проект</span>
+      </button>
+    </div>
   </header>
 
   {#if error}
@@ -304,6 +311,17 @@
     color: #f1f5f9;
     font-size: 22px;
     font-weight: 650;
+  }
+
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .head-actions .small {
+    padding: 8px 12px;
+    font-size: 12px;
   }
 
   .head p {
