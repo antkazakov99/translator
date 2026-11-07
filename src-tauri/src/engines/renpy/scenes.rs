@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::script::{SceneEdgeDto, ScreenLinks, ScriptStructure};
+use crate::engines::{ContainerKey, SnapshotEdge};
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NaturalPart {
@@ -106,7 +107,7 @@ pub(crate) fn screen_targets<'a>(
         .collect()
 }
 
-/// Переходы сцен через кнопки показанных экранов.
+/// Переходы сцен через кнопки показанных экранов. Условие это имя экрана.
 pub(crate) fn screen_edges(structure: &ScriptStructure, screens: &HashMap<String, Vec<String>>) -> Vec<SceneEdgeDto> {
     let mut seen = HashSet::new();
     let mut edges = Vec::new();
@@ -116,9 +117,37 @@ pub(crate) fn screen_edges(structure: &ScriptStructure, screens: &HashMap<String
                 edges.push(SceneEdgeDto {
                     from: scene.clone(),
                     to: target.clone(),
-                    kind: "choice".to_string(),
-                    condition: Some(format!("Экран: {}", screen)),
+                    kind: "screen".to_string(),
+                    condition: Some(screen.clone()),
                 });
+            }
+        }
+    }
+    edges
+}
+
+/// Переходы между метками для графа: переходы скриптов и кнопок экранов, без повторов.
+/// Переход на метку, которой нет в скриптах (имя из переменной, метка движка), не входит:
+/// у такого конца нет контейнера.
+pub(crate) fn scene_edges(structures: &[ScriptStructure]) -> Vec<SnapshotEdge> {
+    let labels: HashSet<&str> =
+        structures.iter().flat_map(|structure| structure.labels.iter().map(|label| label.name.as_str())).collect();
+    let screens = screen_targets(structures.iter());
+    let mut seen = HashSet::new();
+    let mut edges = Vec::new();
+    for structure in structures {
+        for edge in structure.edges.iter().cloned().chain(screen_edges(structure, &screens)) {
+            if edge.from == edge.to || !labels.contains(edge.from.as_str()) || !labels.contains(edge.to.as_str()) {
+                continue;
+            }
+            let (Ok(from), Ok(to)) =
+                (ContainerKey::new(format!("label:{}", edge.from)), ContainerKey::new(format!("label:{}", edge.to)))
+            else {
+                continue;
+            };
+            let edge = SnapshotEdge { from, to, kind: edge.kind, condition: edge.condition.unwrap_or_default() };
+            if seen.insert(edge.clone()) {
+                edges.push(edge);
             }
         }
     }
@@ -159,5 +188,49 @@ mod tests {
         let order = story_order(&[first, second]);
         assert!(order["start"] < order["ending"]);
         assert!(order["ending"] < order["intro"]);
+    }
+
+    #[test]
+    fn edges_join_labels_through_jumps_menus_and_screens() {
+        let script = "\
+screen map():
+    textbutton \"Beach\" action Jump(\"beach\")
+
+label start:
+    menu:
+        \"Left\":
+            jump left
+        \"Right\":
+            jump right
+    jump nowhere_label_from_variable
+
+label left:
+    call screen map
+    return
+
+label right:
+    if met:
+        jump left
+    jump beach
+
+label beach:
+    return
+";
+        let structure = RenpyParser::parse_script_structure(script);
+        let edges = scene_edges(&[structure]);
+        let has = |from: &str, to: &str, kind: &str| {
+            edges.iter().any(|edge| {
+                edge.from.as_str() == format!("label:{from}") && edge.to.as_str() == format!("label:{to}") && edge.kind == kind
+            })
+        };
+        assert!(has("start", "left", "choice"), "{edges:#?}");
+        assert!(has("start", "right", "choice"));
+        assert!(has("right", "left", "branch"));
+        assert!(has("right", "beach", "jump"));
+        assert!(has("left", "beach", "screen"), "{edges:#?}");
+        // Метки, которой нет в скриптах, на графе нет.
+        assert!(edges.iter().all(|edge| !edge.to.as_str().contains("nowhere")));
+        let choice = edges.iter().find(|edge| edge.to.as_str() == "label:left" && edge.kind == "choice").unwrap();
+        assert!(choice.condition.contains("Left"));
     }
 }

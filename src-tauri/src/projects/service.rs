@@ -39,7 +39,7 @@ impl ProjectService<'_> {
         let snapshot = engine.read(&GameSource::Folder(root.clone()), &info, &files)?;
 
         let db = ProjectDb::create(&dir, &project)?;
-        db.write(|tx| ScanRepo { conn: tx }.save(&snapshot, Some(&root), engine.parser_version()).map(|_| ()))?;
+        db.write(|tx| ScanRepo { conn: tx }.save(&snapshot, Some(&root), engine.parser_version(), engine.edges_version()).map(|_| ()))?;
 
         project.ready()?;
         self.state.app.write(|tx| ProjectRepo { conn: tx }.save(&project))?;

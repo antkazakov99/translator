@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{MatchPlan, MatchSegment, MissingSegment, Scan, ScanId, SegmentId};
 use crate::common::Timestamp;
-use crate::engines::{FileKind, GameInfo, GameSnapshot, SnapshotFile};
+use crate::engines::{ContainerKey, FileKind, GameInfo, GameSnapshot, SnapshotEdge, SnapshotFile};
 use crate::files::ContentHash;
 use crate::glossary::NameKey;
 use crate::projects::GameRoot;
@@ -18,8 +18,14 @@ pub struct ScanRepo<'c> {
 }
 
 impl ScanRepo<'_> {
-    /// Пишет первый снимок: строка `scans` и все записи с её `last_seen_scan`. Поднимает `project.search_rev`.
-    pub fn save(&self, snapshot: &GameSnapshot, root: Option<&GameRoot>, parser_version: u32) -> Result<ScanId, DbError> {
+    /// Пишет первый снимок: строка `scans`, все записи с её `last_seen_scan` и переходы `edges`. Поднимает `project.search_rev`.
+    pub fn save(
+        &self,
+        snapshot: &GameSnapshot,
+        root: Option<&GameRoot>,
+        parser_version: u32,
+        edges_version: u32,
+    ) -> Result<ScanId, DbError> {
         let info = serde_json::to_string(&snapshot.info).map_err(|error| DbError::Corrupt(error.to_string()))?;
         let root = root.map(|root| root.as_path().to_string_lossy().into_owned());
         self.conn.execute(
@@ -113,6 +119,7 @@ impl ScanRepo<'_> {
             }
         }
 
+        EdgeRepo { conn: self.conn }.replace(&snapshot.edges, edges_version, scan)?;
         self.conn.execute("UPDATE project SET search_rev = search_rev + 1", [])?;
         Ok(scan)
     }
@@ -194,5 +201,66 @@ impl ScanRepo<'_> {
         let mut statement = self.conn.prepare("SELECT key FROM segments WHERE missing = 0")?;
         let keys = statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
         Ok(keys)
+    }
+}
+
+/// Имя таблицы переходов в `derived`.
+const EDGES: &str = "edges";
+
+/// `edges` и её строка в `derived`: переходы текущего снимка, пересобираются без игры.
+pub struct EdgeRepo<'c> {
+    pub conn: &'c Connection,
+}
+
+impl EdgeRepo<'_> {
+    /// Версия сборки и считывание, по которому собрана таблица. `None`: таблица ещё не собиралась.
+    pub fn state(&self) -> Result<Option<(u32, ScanId)>, DbError> {
+        let row = self
+            .conn
+            .query_row("SELECT version, scan_id FROM derived WHERE name = ?1", [EDGES], |row| {
+                Ok((row.get::<_, u32>(0)?, ScanId::from_row(row.get(1)?)))
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Заменяет переходы целиком и отмечает, по какому считыванию и версии они собраны.
+    pub fn replace(&self, edges: &[SnapshotEdge], version: u32, scan: ScanId) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM edges", [])?;
+        let mut insert = self.conn.prepare(
+            "INSERT INTO edges (from_container, to_container, kind, condition) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT DO NOTHING",
+        )?;
+        for edge in edges {
+            insert.execute(params![edge.from.as_str(), edge.to.as_str(), edge.kind, edge.condition])?;
+        }
+        self.conn.execute(
+            "INSERT INTO derived (name, version, scan_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT (name) DO UPDATE SET version = excluded.version, scan_id = excluded.scan_id",
+            params![EDGES, version, scan.get()],
+        )?;
+        Ok(())
+    }
+
+    /// Все переходы.
+    pub fn list(&self) -> Result<Vec<SnapshotEdge>, DbError> {
+        let mut statement =
+            self.conn.prepare("SELECT from_container, to_container, kind, condition FROM edges ORDER BY id")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(from, to, kind, condition)| {
+                let bad = |column| move |error| DbError::bad_value("edges", column, error);
+                Ok(SnapshotEdge {
+                    from: ContainerKey::new(from).map_err(bad("from_container"))?,
+                    to: ContainerKey::new(to).map_err(bad("to_container"))?,
+                    kind,
+                    condition,
+                })
+            })
+            .collect()
     }
 }

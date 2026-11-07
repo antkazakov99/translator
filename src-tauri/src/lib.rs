@@ -12,6 +12,7 @@ pub mod export;
 pub mod files;
 pub mod fonts;
 pub mod glossary;
+pub mod graph;
 pub mod llm;
 pub mod name_rules;
 pub mod projects;
@@ -32,6 +33,7 @@ const BINDINGS: &str = "../src/lib/bindings.ts";
 
 /// Команды окна. Типы TypeScript к ним генерируются из этого же списка.
 fn commands() -> tauri_specta::Builder<tauri::Wry> {
+    use graph::commands::*;
     use llm::commands::*;
     use projects::commands::*;
     use translation::commands::*;
@@ -47,6 +49,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             reorder_llm_profiles,
             save_llm_action,
             llm_models,
+            scene_graph,
             translation_files,
             file_lines,
             save_line,

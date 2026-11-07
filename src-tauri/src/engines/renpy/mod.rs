@@ -18,7 +18,7 @@ use regex::Regex;
 
 use super::{
     EngineError, EngineId, FileKind, GameEngine, GameInfo, GameSnapshot, GameSource, ModArchive, ModInput,
-    SnapshotFile,
+    SnapshotEdge, SnapshotFile,
 };
 use crate::files::FileStore;
 use crate::projects::GameRoot;
@@ -28,6 +28,9 @@ pub struct RenpyEngine;
 
 /// Версия разбора: заменяет `CACHE_VERSION` из `rpa.rs`. Выросла: снимок пересобирается из `files/`.
 const PARSER_VERSION: u32 = 1;
+
+/// Версия сборки переходов между метками (`scenes::scene_edges`). Выросла: таблица `edges` пересобирается.
+const EDGES_VERSION: u32 = 1;
 
 /// Версия движка в `renpy/vc_version.py`: `version = '8.1.3.23091805'`.
 static RE_ENGINE_VERSION: LazyLock<Regex> =
@@ -72,6 +75,15 @@ impl GameEngine for RenpyEngine {
             GameSource::Stored(stored) => stored.clone(),
         };
         snapshot::analyze(collected, files, info)
+    }
+
+    fn edges_version(&self) -> u32 {
+        EDGES_VERSION
+    }
+
+    /// Переходы `jump`, `call`, по условию, из пунктов меню и через кнопки экранов. Нужны только скрипты.
+    fn read_edges(&self, files: &[SnapshotFile], store: &FileStore) -> Result<Vec<SnapshotEdge>, EngineError> {
+        snapshot::read_edges(files, store)
     }
 
     /// Файл перевода в `.rpyc` восстанавливается по репликам оригинала, найденным по `id` в скомпилированных скриптах.

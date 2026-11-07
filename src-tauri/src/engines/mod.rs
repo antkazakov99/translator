@@ -161,6 +161,17 @@ pub struct SnapshotSpeaker {
     pub label: Option<String>,
 }
 
+/// Переход между контейнерами: граф сюжета. Оба конца это контейнеры снимка.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SnapshotEdge {
+    pub from: ContainerKey,
+    pub to: ContainerKey,
+    /// Значения задаёт движок. У Ren'Py: `jump`, `call`, `branch` (по условию), `choice` (пункт меню), `screen` (кнопка экрана).
+    pub kind: String,
+    /// Условие или текст пункта для показа. Пусто: без условия.
+    pub condition: String,
+}
+
 /// Считанная игра. Содержимое файлов движок пишет в `FileStore` по мере чтения, в памяти его нет.
 #[derive(Debug, Clone)]
 pub struct GameSnapshot {
@@ -169,6 +180,8 @@ pub struct GameSnapshot {
     pub containers: Vec<SnapshotContainer>,
     pub segments: Vec<SnapshotSegment>,
     pub speakers: Vec<SnapshotSpeaker>,
+    /// Переходы между контейнерами, без повторов.
+    pub edges: Vec<SnapshotEdge>,
 }
 
 /// Откуда читать игру.
@@ -227,6 +240,12 @@ pub trait GameEngine: Sync {
 
     /// Считывает игру. Содержимое файлов пишет в `files` по мере чтения.
     fn read(&self, source: &GameSource, info: &GameInfo, files: &FileStore) -> Result<GameSnapshot, EngineError>;
+
+    /// Версия сборки переходов. Выросла: таблица `edges` пересобирается из `files/` без считывания игры.
+    fn edges_version(&self) -> u32;
+
+    /// Переходы между контейнерами по файлам снимка, те же, что в `GameSnapshot::edges`.
+    fn read_edges(&self, files: &[SnapshotFile], store: &FileStore) -> Result<Vec<SnapshotEdge>, EngineError>;
 
     /// Файлы, от которых зависит разбор `file`. По их хэшам cache.db видит, что разбор устарел.
     fn parse_dependencies(&self, file: &SnapshotFile, all: &[SnapshotFile]) -> Vec<String>;

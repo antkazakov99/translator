@@ -7,5 +7,5 @@ pub mod service;
 
 pub use matching::{MatchKind, MatchPlan, MatchedPair, Matcher, MatchSegment};
 pub use model::{FileId, MissingSegment, Scan, ScanId, SegmentId};
-pub use repo::ScanRepo;
+pub use repo::{EdgeRepo, ScanRepo};
 pub use service::ScanService;

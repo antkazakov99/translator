@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { ArrowLeft, Bot, Check, CheckCheck, FileText, LoaderCircle, TriangleAlert, X } from "lucide-svelte";
+  import { ArrowLeft, Bot, Check, CheckCheck, FileText, LoaderCircle, TriangleAlert, Waypoints, X } from "lucide-svelte";
+  import SceneGraph from "./SceneGraph.svelte";
+  import type { GraphScene } from "$lib/scene-graph";
   import {
     commands,
     type FileDto,
@@ -21,6 +23,9 @@
   let filter = $state<Filter>("all");
   let editing = $state<{ id: number; text: string } | null>(null);
   let saving = $state(false);
+  let view = $state<"table" | "graph">("table");
+  /** Сцена в центре графа: переживает переключение вида. */
+  let graphFocus = $state<string | null>(null);
 
   const file = $derived(files.find((item) => item.id === fileId) ?? null);
   const visible = (line: Line) =>
@@ -135,6 +140,25 @@
     }
   }
 
+  /** Из графа в таблицу: файл сцены, все реплики, прокрутка к сцене. */
+  async function openScene(scene: GraphScene) {
+    view = "table";
+    filter = "all";
+    graphFocus = scene.key;
+    if (scene.file === null) return;
+    if (scene.file !== fileId) await selectFile(scene.file);
+    await tick();
+    const header = [...document.querySelectorAll<HTMLElement>("h3.scene")].find((item) => item.dataset.scene === scene.key);
+    header?.scrollIntoView({ block: "start" });
+  }
+
+  /** Из таблицы в граф: сцена в центре. */
+  function showOnGraph(key: string | null) {
+    if (!key) return;
+    graphFocus = key;
+    view = "graph";
+  }
+
   function percent(item: FileDto) {
     return item.total === 0 ? 0 : Math.round((item.translated / item.total) * 100);
   }
@@ -171,12 +195,21 @@
         {/if}
       </span>
     </div>
-    <button class="btn small settings" onclick={onSettings} title="Провайдеры, модели и настройки действий">
+    <div class="segmented view-switch" role="tablist" aria-label="Вид">
+      <button role="tab" aria-selected={view === "table"} class:on={view === "table"} onclick={() => (view = "table")}>Таблица</button>
+      <button role="tab" aria-selected={view === "graph"} class:on={view === "graph"} onclick={() => (view = "graph")}>Граф</button>
+    </div>
+    <button class="btn small" onclick={onSettings} title="Провайдеры, модели и настройки действий">
       <Bot size={15} />
       <span>Модели</span>
     </button>
   </header>
 
+  {#if view === "graph"}
+    <div class="body">
+      <SceneGraph projectId={project.id} focus={graphFocus} onFocus={(key) => (graphFocus = key)} onOpen={openScene} />
+    </div>
+  {:else}
   <div class="body">
     <nav class="files" aria-label="Файлы">
       {#each files as item (item.id)}
@@ -230,7 +263,14 @@
       {:else}
         <div class="table">
           {#each shown as scene, index (scene.key ?? `outside-${index}`)}
-            <h3 class="scene">{sceneName(scene)}</h3>
+            <h3 class="scene" data-scene={scene.key}>
+              <span>{sceneName(scene)}</span>
+              {#if scene.key}
+                <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(scene.key)}>
+                  <Waypoints size={13} />
+                </button>
+              {/if}
+            </h3>
             {#each scene.lines as line (line.id)}
               <div class="row" class:editing={editing?.id === line.id}>
                 <span class="where">{line.location ?? ""}</span>
@@ -271,6 +311,7 @@
       {/if}
     </section>
   </div>
+  {/if}
 </main>
 
 <style>
@@ -289,7 +330,7 @@
     background: var(--surface);
   }
 
-  .settings {
+  .view-switch {
     margin-left: auto;
   }
 
@@ -451,7 +492,10 @@
     top: 0;
     z-index: 1;
     margin: 0;
-    padding: 14px 0 6px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 10px 0 4px;
     background: var(--bg);
     color: var(--accent-text);
     font-size: 12px;

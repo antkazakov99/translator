@@ -1,27 +1,21 @@
-export interface GraphScene {
-  id: string;
-  name: string;
-  total_lines: number;
-  translated_lines: number;
-  choices: { prompt: string | null; options: { text: string; target_jump: string | null }[] }[];
-  jumps: string[];
-  entries: { original_text: string }[];
-}
+import type { GraphEdgeDto, GraphSceneDto_Serialize } from "./bindings";
 
-export interface GraphEdge {
-  from: string;
-  to: string;
-  kind: string;
-  condition: string | null;
-}
+/**
+ * Раскладка графа сцен вокруг выбранной: слева сцены, из которых в неё приходят, справа те, куда из неё
+ * уходят. Весь граф игры на экран не помещается: у сцен-хабов бывают тысячи переходов, поэтому колонки
+ * листаются страницами и ищутся по имени и названию.
+ */
+
+export type GraphScene = GraphSceneDto_Serialize;
+export type GraphEdge = GraphEdgeDto;
 
 export interface GraphNode {
-  id: string;
-  name: string;
+  key: string;
+  /** Нет у сцены, которой нет в снимке: такой конец перехода показывается без прогресса. */
   scene?: GraphScene;
   x: number;
   y: number;
-  role?: 'center' | 'incoming' | 'outgoing';
+  role: "center" | "incoming" | "outgoing";
 }
 
 export interface GraphLink extends GraphEdge {
@@ -31,444 +25,154 @@ export interface GraphLink extends GraphEdge {
   labelY: number;
 }
 
-export interface GraphData {
+export interface Column {
+  /** Сцен в колонке без фильтра. */
+  total: number;
+  /** Сцен после фильтра. */
+  found: number;
+  pages: number;
+  page: number;
+}
+
+export interface GraphLayout {
   nodes: GraphNode[];
   links: GraphLink[];
   width: number;
   height: number;
-  focusName?: string;
-  incomingCount: number;
-  incomingTotalRaw: number;
-  incomingTotalPages: number;
-  incomingCurrentPage: number;
-  outgoingCount: number;
-  outgoingTotalRaw: number;
-  outgoingTotalPages: number;
-  outgoingCurrentPage: number;
+  center: string | null;
+  incoming: Column;
+  outgoing: Column;
 }
 
-export interface FocusedGraphOptions {
-  mode?: 'focused' | 'all';
-  focusName?: string | null;
+export interface LayoutOptions {
+  focus?: string | null;
+  pageSize?: number;
   incomingPage?: number;
-  incomingPageSize?: number;
   incomingFilter?: string;
   outgoingPage?: number;
-  outgoingPageSize?: number;
   outgoingFilter?: string;
-  sceneTitle?: (name: string) => string;
 }
 
-export const NODE_WIDTH = 270;
-export const NODE_HEIGHT = 140;
-export const GAP_X = 210;
-export const GAP_Y = 24;
+export const NODE_WIDTH = 260;
+export const NODE_HEIGHT = 112;
+export const GAP_X = 180;
+export const GAP_Y = 20;
+/** Место над колонками под их заголовки и поиск. */
+const TOP = 96;
+const LEFT = 40;
 
-export function collectAllEdges(scenes: GraphScene[], sourceEdges: GraphEdge[]): GraphEdge[] {
-  const edges = [...sourceEdges];
-  for (const scene of scenes) {
-    for (const choice of scene.choices ?? []) {
-      for (const option of choice.options) {
-        if (
-          option.target_jump &&
-          !edges.some(
-            e => e.from === scene.name && e.to === option.target_jump && e.condition?.includes(option.text)
-          )
-        ) {
-          edges.push({ from: scene.name, to: option.target_jump, kind: 'choice', condition: option.text });
-        }
-      }
-    }
-    for (const target of scene.jumps ?? []) {
-      if (!edges.some(e => e.from === scene.name && e.to === target)) {
-        edges.push({ from: scene.name, to: target, kind: 'jump', condition: null });
-      }
-    }
-  }
-  return edges.filter(
-    (edge, i) =>
-      edges.findIndex(
-        e =>
-          e.from === edge.from &&
-          e.to === edge.to &&
-          e.kind === edge.kind &&
-          e.condition === edge.condition
-      ) === i
-  );
+/** Имя сцены без вида ключа: `label:day1` → `day1`. */
+export const sceneLabel = (key: string) => key.replace(/^[a-z]+:/, "");
+
+/** Подпись сцены: название, если есть, и имя метки. */
+export function sceneName(key: string, scene?: GraphScene) {
+  const label = sceneLabel(key);
+  return scene?.title ? `${scene.title} · ${label}` : label;
 }
 
-/**
- * Строит локальный сфокусированный граф сцены:
- * Слева: входящие узлы (с пагинацией и поиском)
- * По центру: текущая выбранная сцена
- * Справа: исходящие развилки (с пагинацией и поиском)
- */
-export function buildFocusedSceneGraph(
-  scenes: GraphScene[],
-  sourceEdges: GraphEdge[],
-  options?: FocusedGraphOptions | string | null
-): GraphData {
-  const opts: FocusedGraphOptions =
-    typeof options === 'string'
-      ? { focusName: options }
-      : options ?? {};
+const emptyColumn = (): Column => ({ total: 0, found: 0, pages: 1, page: 1 });
 
-  if (scenes.length === 0) {
-    return {
-      nodes: [],
-      links: [],
-      width: 600,
-      height: 400,
-      incomingCount: 0,
-      incomingTotalRaw: 0,
-      incomingTotalPages: 1,
-      incomingCurrentPage: 1,
-      outgoingCount: 0,
-      outgoingTotalRaw: 0,
-      outgoingTotalPages: 1,
-      outgoingCurrentPage: 1,
-    };
+/** Соседи по одну сторону: без повторов, фильтр по имени и названию, страница. */
+function column(keys: string[], scenes: Map<string, GraphScene>, filter: string, page: number, size: number) {
+  const unique = [...new Set(keys)];
+  const query = filter.trim().toLowerCase();
+  const found = query
+    ? unique.filter((key) => sceneName(key, scenes.get(key)).toLowerCase().includes(query))
+    : unique;
+  const pages = Math.max(1, Math.ceil(found.length / size));
+  const current = Math.min(Math.max(1, page), pages);
+  return {
+    shown: found.slice((current - 1) * size, current * size),
+    info: { total: unique.length, found: found.length, pages, page: current } satisfies Column,
+  };
+}
+
+/** Кривая от правого края одного узла к левому краю другого. */
+function curve(sx: number, sy: number, tx: number, ty: number) {
+  const bend = GAP_X / 2;
+  return `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`;
+}
+
+export function layoutGraph(scenes: GraphScene[], edges: GraphEdge[], options: LayoutOptions = {}): GraphLayout {
+  const byKey = new Map(scenes.map((scene) => [scene.key, scene]));
+  const center = (options.focus && byKey.has(options.focus) ? options.focus : scenes[0]?.key) ?? null;
+  if (!center) {
+    return { nodes: [], links: [], width: 600, height: 400, center: null, incoming: emptyColumn(), outgoing: emptyColumn() };
   }
 
-  const allEdges = collectAllEdges(scenes, sourceEdges);
-  const sceneMap = new Map(scenes.map(s => [s.name, s]));
+  const size = Math.max(1, options.pageSize ?? 10);
+  const into = edges.filter((edge) => edge.to === center && edge.from !== center);
+  const out = edges.filter((edge) => edge.from === center && edge.to !== center);
+  const loops = edges.filter((edge) => edge.from === center && edge.to === center);
+  const left = column(into.map((edge) => edge.from), byKey, options.incomingFilter ?? "", options.incomingPage ?? 1, size);
+  const right = column(out.map((edge) => edge.to), byKey, options.outgoingFilter ?? "", options.outgoingPage ?? 1, size);
 
-  // Определяем центральную сцену
-  const targetScene = (opts.focusName && sceneMap.get(opts.focusName)) || scenes[0];
-  const centerName = targetScene.name;
-
-  // 1. Входящие ребра (кроме self-loops)
-  const incomingEdges = allEdges.filter(e => e.to === centerName && e.from !== centerName);
-  const rawIncomingNames = Array.from(new Set(incomingEdges.map(e => e.from)));
-  const incomingTotalRaw = rawIncomingNames.length;
-  const matches = (name: string, filter: string) =>
-    name.toLowerCase().includes(filter) || (opts.sceneTitle?.(name) ?? '').toLowerCase().includes(filter);
-
-  // Фильтрация входящих
-  const inFilter = (opts.incomingFilter ?? '').trim().toLowerCase();
-  const filteredIncomingNames = inFilter
-    ? rawIncomingNames.filter(name => matches(name, inFilter))
-    : rawIncomingNames;
-
-  const inPageSize = Math.max(1, opts.incomingPageSize ?? 10);
-  const inTotalPages = Math.max(1, Math.ceil(filteredIncomingNames.length / inPageSize));
-  const inCurrentPage = Math.min(Math.max(1, opts.incomingPage ?? 1), inTotalPages);
-
-  const pagedIncomingNames = filteredIncomingNames.slice(
-    (inCurrentPage - 1) * inPageSize,
-    inCurrentPage * inPageSize
-  );
-
-  // 2. Исходящие ребра (кроме self-loops)
-  const outgoingEdges = allEdges.filter(e => e.from === centerName && e.to !== centerName);
-  const rawOutgoingNames = Array.from(new Set(outgoingEdges.map(e => e.to)));
-  const outgoingTotalRaw = rawOutgoingNames.length;
-
-  // Фильтрация исходящих
-  const outFilter = (opts.outgoingFilter ?? '').trim().toLowerCase();
-  const filteredOutgoingNames = outFilter
-    ? rawOutgoingNames.filter(name => matches(name, outFilter))
-    : rawOutgoingNames;
-
-  const outPageSize = Math.max(1, opts.outgoingPageSize ?? 10);
-  const outTotalPages = Math.max(1, Math.ceil(filteredOutgoingNames.length / outPageSize));
-  const outCurrentPage = Math.min(Math.max(1, opts.outgoingPage ?? 1), outTotalPages);
-
-  const pagedOutgoingNames = filteredOutgoingNames.slice(
-    (outCurrentPage - 1) * outPageSize,
-    outCurrentPage * outPageSize
-  );
-
-  // Петли в себя
-  const selfLoops = allEdges.filter(e => e.from === centerName && e.to === centerName);
-
-  const numIn = pagedIncomingNames.length;
-  const numOut = pagedOutgoingNames.length;
-
-  const heightIn = numIn > 0 ? numIn * NODE_HEIGHT + (numIn - 1) * GAP_Y : 0;
-  const heightOut = numOut > 0 ? numOut * NODE_HEIGHT + (numOut - 1) * GAP_Y : 0;
-  const maxContentHeight = Math.max(NODE_HEIGHT, heightIn, heightOut);
-
-  const startX = 60;
-  const centerX = startX + NODE_WIDTH + GAP_X;
+  const columnHeight = (count: number) => (count > 0 ? count * NODE_HEIGHT + (count - 1) * GAP_Y : 0);
+  const contentHeight = Math.max(NODE_HEIGHT, columnHeight(left.shown.length), columnHeight(right.shown.length));
+  const middle = TOP + contentHeight / 2;
+  const centerX = LEFT + NODE_WIDTH + GAP_X;
   const rightX = centerX + NODE_WIDTH + GAP_X;
 
-  const topPadding = 135;
-  const midY = topPadding + maxContentHeight / 2;
-
-  // Центральный узел
-  const centerNode: GraphNode = {
-    id: `node-${centerName}`,
-    name: centerName,
-    scene: sceneMap.get(centerName),
-    x: centerX,
-    y: midY - NODE_HEIGHT / 2,
-    role: 'center',
+  const centerNode: GraphNode = { key: center, scene: byKey.get(center), x: centerX, y: middle - NODE_HEIGHT / 2, role: "center" };
+  const place = (keys: string[], x: number, role: GraphNode["role"]): GraphNode[] => {
+    const top = middle - columnHeight(keys.length) / 2;
+    return keys.map((key, index) => ({ key, scene: byKey.get(key), x, y: top + index * (NODE_HEIGHT + GAP_Y), role }));
   };
+  const incoming = place(left.shown, LEFT, "incoming");
+  const outgoing = place(right.shown, rightX, "outgoing");
 
-  // Входящие узлы текущей страницы
-  const inStartY = midY - heightIn / 2;
-  const incomingNodes: GraphNode[] = pagedIncomingNames.map((name, idx) => ({
-    id: `node-in-${name}`,
-    name,
-    scene: sceneMap.get(name),
-    x: startX,
-    y: inStartY + idx * (NODE_HEIGHT + GAP_Y),
-    role: 'incoming',
-  }));
-
-  // Исходящие узлы текущей страницы
-  const outStartY = midY - heightOut / 2;
-  const outgoingNodes: GraphNode[] = pagedOutgoingNames.map((name, idx) => ({
-    id: `node-out-${name}`,
-    name,
-    scene: sceneMap.get(name),
-    x: rightX,
-    y: outStartY + idx * (NODE_HEIGHT + GAP_Y),
-    role: 'outgoing',
-  }));
-
-  const nodes = [...incomingNodes, centerNode, ...outgoingNodes];
   const links: GraphLink[] = [];
-
-  // Связи: Входящие (видимые на странице) -> Центр
-  const inSet = new Set(pagedIncomingNames);
-  const visibleInEdges = incomingEdges.filter(e => inSet.has(e.from));
-
-  const inGroups = new Map<string, GraphEdge[]>();
-  for (const edge of visibleInEdges) {
-    if (!inGroups.has(edge.from)) inGroups.set(edge.from, []);
-    inGroups.get(edge.from)!.push(edge);
-  }
-
-  for (const fromNode of incomingNodes) {
-    const edgesGroup = inGroups.get(fromNode.name) ?? [];
-    edgesGroup.forEach((edge, groupIdx) => {
-      const offset = (groupIdx - (edgesGroup.length - 1) / 2) * 14;
-      const sx = fromNode.x + NODE_WIDTH;
-      const sy = fromNode.y + NODE_HEIGHT / 2 + offset;
-      const tx = centerNode.x - 2;
-      const ty = centerNode.y + NODE_HEIGHT / 2 + offset;
-      const bend = GAP_X / 2;
-      const path = `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`;
-      const staggerX = edgesGroup.length > 1 ? (groupIdx - (edgesGroup.length - 1) / 2) * 16 : 0;
-      links.push({
-        ...edge,
-        id: links.length,
-        path,
-        labelX: (sx + tx) / 2 + staggerX,
-        labelY: (sy + ty) / 2,
-      });
+  // Несколько переходов между одной парой сцен расходятся по высоте, чтобы подписи не легли друг на друга.
+  const connect = (group: GraphEdge[], from: GraphNode, to: GraphNode) => {
+    group.forEach((edge, index) => {
+      const offset = (index - (group.length - 1) / 2) * 14;
+      const sx = from.x + NODE_WIDTH;
+      const sy = from.y + NODE_HEIGHT / 2 + offset;
+      const tx = to.x - 2;
+      const ty = to.y + NODE_HEIGHT / 2 + offset;
+      links.push({ ...edge, id: links.length, path: curve(sx, sy, tx, ty), labelX: (sx + tx) / 2, labelY: (sy + ty) / 2 });
     });
-  }
-
-  // Связи: Центр -> Исходящие (видимые на странице)
-  const outSet = new Set(pagedOutgoingNames);
-  const visibleOutEdges = outgoingEdges.filter(e => outSet.has(e.to));
-
-  const outGroups = new Map<string, GraphEdge[]>();
-  for (const edge of visibleOutEdges) {
-    if (!outGroups.has(edge.to)) outGroups.set(edge.to, []);
-    outGroups.get(edge.to)!.push(edge);
-  }
-
-  for (const toNode of outgoingNodes) {
-    const edgesGroup = outGroups.get(toNode.name) ?? [];
-    edgesGroup.forEach((edge, groupIdx) => {
-      const offset = (groupIdx - (edgesGroup.length - 1) / 2) * 14;
-      const sx = centerNode.x + NODE_WIDTH;
-      const sy = centerNode.y + NODE_HEIGHT / 2 + offset;
-      const tx = toNode.x - 2;
-      const ty = toNode.y + NODE_HEIGHT / 2 + offset;
-      const bend = GAP_X / 2;
-      const path = `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`;
-      const staggerX = edgesGroup.length > 1 ? (groupIdx - (edgesGroup.length - 1) / 2) * 16 : 0;
-      links.push({
-        ...edge,
-        id: links.length,
-        path,
-        labelX: (sx + tx) / 2 + staggerX,
-        labelY: (sy + ty) / 2,
-      });
-    });
-  }
-
-  // Петли в себя (Self-loops): плавные концентрические арки сверху с вертикальным вхождением
-  selfLoops.forEach((edge, loopIdx) => {
-    const halfSpan = 38 + loopIdx * 20;
-    const loopHeight = 48 + loopIdx * 20;
-    const sx = centerNode.x + NODE_WIDTH / 2 + halfSpan;
-    const sy = centerNode.y;
-    const tx = centerNode.x + NODE_WIDTH / 2 - halfSpan;
-    const ty = centerNode.y - 2;
-    const path = `M ${sx} ${sy} C ${sx + 4} ${sy - loopHeight * 1.05}, ${tx - 4} ${ty - loopHeight * 1.05}, ${tx} ${ty}`;
+  };
+  for (const node of incoming) connect(into.filter((edge) => edge.from === node.key), node, centerNode);
+  for (const node of outgoing) connect(out.filter((edge) => edge.to === node.key), centerNode, node);
+  loops.forEach((edge, index) => {
+    const half = 36 + index * 18;
+    const lift = 44 + index * 18;
+    const sx = centerNode.x + NODE_WIDTH / 2 + half;
+    const tx = centerNode.x + NODE_WIDTH / 2 - half;
+    const y = centerNode.y;
     links.push({
       ...edge,
       id: links.length,
-      path,
+      path: `M ${sx} ${y} C ${sx + 4} ${y - lift}, ${tx - 4} ${y - lift}, ${tx} ${y - 2}`,
       labelX: centerNode.x + NODE_WIDTH / 2,
-      labelY: centerNode.y - loopHeight - 2,
+      labelY: y - lift + 6,
     });
   });
 
-  const width = rightX + NODE_WIDTH + 80;
-  const height = Math.max(520, midY + maxContentHeight / 2 + 80);
-
   return {
-    nodes,
+    nodes: [...incoming, centerNode, ...outgoing],
     links,
-    width,
-    height,
-    focusName: centerName,
-    incomingCount: filteredIncomingNames.length,
-    incomingTotalRaw,
-    incomingTotalPages: inTotalPages,
-    incomingCurrentPage: inCurrentPage,
-    outgoingCount: filteredOutgoingNames.length,
-    outgoingTotalRaw,
-    outgoingTotalPages: outTotalPages,
-    outgoingCurrentPage: outCurrentPage,
+    width: rightX + NODE_WIDTH + LEFT,
+    height: Math.max(420, middle + contentHeight / 2 + 48),
+    center,
+    incoming: left.info,
+    outgoing: right.info,
   };
 }
 
-/**
- * Строит полный топологический граф файла (BFS по слоям)
- */
-export function buildFullSceneGraph(scenes: GraphScene[], sourceEdges: GraphEdge[]): GraphData {
-  if (scenes.length === 0) {
-    return {
-      nodes: [],
-      links: [],
-      width: 600,
-      height: 400,
-      incomingCount: 0,
-      incomingTotalRaw: 0,
-      incomingTotalPages: 1,
-      incomingCurrentPage: 1,
-      outgoingCount: 0,
-      outgoingTotalRaw: 0,
-      outgoingTotalPages: 1,
-      outgoingCurrentPage: 1,
-    };
+/** Короткая подпись перехода на линии. */
+export function edgeLabel(edge: GraphEdge) {
+  switch (edge.kind) {
+    case "choice":
+      return edge.condition ? edge.condition.replace(/^Выбор:\s*/, "") : "выбор";
+    case "branch":
+      return edge.condition ? `если ${edge.condition}` : "условие";
+    case "screen":
+      return edge.condition ? `экран ${edge.condition}` : "экран";
+    case "call":
+      return "call";
+    default:
+      return "";
   }
-
-  const uniqueEdges = collectAllEdges(scenes, sourceEdges);
-  const sceneMap = new Map(scenes.map(scene => [scene.name, scene]));
-  const internalNames = new Set(sceneMap.keys());
-
-  // В полном графе файла отображаем внутренние связи файла, а также прямые исходящие переходы.
-  // Внешние входящие переходы (которых могут быть сотни/тысячи в хаб-ноды вроде house) не должны раздувать топологию всего файла!
-  const fileEdges = uniqueEdges.filter(edge => {
-    if (internalNames.has(edge.from) && internalNames.has(edge.to)) return true;
-    if (internalNames.has(edge.from)) return true;
-    return false;
-  });
-
-  const names = [...sceneMap.keys()];
-  for (const edge of fileEdges) {
-    if (!names.includes(edge.from)) names.push(edge.from);
-    if (!names.includes(edge.to)) names.push(edge.to);
-  }
-
-  const outgoing = new Map(names.map(name => [name, [] as string[]]));
-  const incoming = new Set<string>();
-  for (const edge of fileEdges) {
-    outgoing.get(edge.from)!.push(edge.to);
-    incoming.add(edge.to);
-  }
-
-  const ranks = new Map<string, number>();
-  const rows = new Map<number, number>();
-  const roots = [...names.filter(name => !incoming.has(name)), ...names];
-  for (const root of roots) {
-    if (ranks.has(root)) continue;
-    const queue = [root];
-    ranks.set(root, 0);
-    for (let i = 0; i < queue.length; i++) {
-      const name = queue[i];
-      for (const target of outgoing.get(name) ?? []) {
-        if (!ranks.has(target)) {
-          ranks.set(target, ranks.get(name)! + 1);
-          queue.push(target);
-        }
-      }
-    }
-  }
-
-  const nodes: GraphNode[] = names.map(name => {
-    const rank = ranks.get(name) ?? 0;
-    const row = rows.get(rank) ?? 0;
-    rows.set(rank, row + 1);
-    return {
-      id: `node-${name}`,
-      name,
-      scene: sceneMap.get(name),
-      x: 70 + rank * (NODE_WIDTH + GAP_X),
-      y: 70 + row * (NODE_HEIGHT + GAP_Y + 40),
-    };
-  });
-
-  const byName = new Map(nodes.map(node => [node.name, node]));
-  const links: GraphLink[] = fileEdges.map((edge, index) => {
-    const from = byName.get(edge.from)!;
-    const to = byName.get(edge.to)!;
-    if (edge.from === edge.to) {
-      const halfSpan = 38;
-      const loopHeight = 48;
-      const loopSx = from.x + NODE_WIDTH / 2 + halfSpan;
-      const loopSy = from.y;
-      const loopTx = from.x + NODE_WIDTH / 2 - halfSpan;
-      const loopTy = from.y - 2;
-      return {
-        ...edge,
-        id: index,
-        path: `M ${loopSx} ${loopSy} C ${loopSx + 4} ${loopSy - loopHeight * 1.05}, ${loopTx - 4} ${loopTy - loopHeight * 1.05}, ${loopTx} ${loopTy}`,
-        labelX: from.x + NODE_WIDTH / 2,
-        labelY: from.y - loopHeight - 2,
-      };
-    }
-    const sx = from.x + NODE_WIDTH;
-    const sy = from.y + NODE_HEIGHT / 2;
-    const tx = to.x - 2;
-    const ty = to.y + NODE_HEIGHT / 2;
-    const lane = 32 + (index % 5) * 14;
-    const forward = tx > sx;
-    const bend = Math.max(60, (tx - sx) / 2);
-    const path = forward
-      ? `M ${sx} ${sy} C ${sx + bend} ${sy}, ${tx - bend} ${ty}, ${tx} ${ty}`
-      : `M ${sx} ${sy} C ${sx + lane} ${sy}, ${sx + lane} ${from.y - lane}, ${sx} ${from.y - lane} L ${tx - lane} ${from.y - lane} C ${tx - lane * 2} ${from.y - lane}, ${tx - lane} ${ty}, ${tx} ${ty}`;
-    return {
-      ...edge,
-      id: index,
-      path,
-      labelX: forward ? (sx + tx) / 2 : from.x + NODE_WIDTH / 2,
-      labelY: forward ? (sy + ty) / 2 : from.y - lane - 8,
-    };
-  });
-
-  return {
-    nodes,
-    links,
-    width: Math.max(600, ...nodes.map(n => n.x + NODE_WIDTH + 100)),
-    height: Math.max(400, ...nodes.map(n => n.y + NODE_HEIGHT + 70)),
-    incomingCount: 0,
-    incomingTotalRaw: 0,
-    incomingTotalPages: 1,
-    incomingCurrentPage: 1,
-    outgoingCount: 0,
-    outgoingTotalRaw: 0,
-    outgoingTotalPages: 1,
-    outgoingCurrentPage: 1,
-  };
-}
-
-/**
- * Основная точка входа построения графа (всегда сфокусированный граф окрестности)
- */
-export function buildSceneGraph(
-  scenes: GraphScene[],
-  sourceEdges: GraphEdge[],
-  options?: FocusedGraphOptions
-): GraphData {
-  return buildFocusedSceneGraph(scenes, sourceEdges, options);
 }

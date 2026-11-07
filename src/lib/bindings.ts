@@ -25,6 +25,8 @@ export const commands = {
 	 *  Без нового ключа берётся сохранённый ключ провайдера.
 	 */
 	llmModels: (provider: ProviderInput_Deserialize) => __TAURI_INVOKE<string[]>("llm_models", { provider }),
+	/**  Граф сцен проекта. Первый запрос после считывания может пересобрать переходы из файлов снимка. */
+	sceneGraph: (project: string) => __TAURI_INVOKE<SceneGraphDto_Serialize>("scene_graph", { project }),
 	/**  Файлы проекта с репликами и прогресс. */
 	translationFiles: (project: string) => __TAURI_INVOKE<FileDto[]>("translation_files", { project }),
 	/**  Реплики файла по сценам. */
@@ -102,6 +104,45 @@ export type FileDto = {
 	total: number,
 	translated: number,
 	drafts: number,
+};
+
+/**  Переход между сценами. */
+export type GraphEdgeDto = {
+	from: string,
+	to: string,
+	/**  Вид от движка: `jump`, `call`, `branch`, `choice`, `screen`. */
+	kind: string,
+	/**  Условие, текст пункта меню или имя экрана. Пусто: без условия. */
+	condition: string,
+};
+
+/**  Сцена графа. */
+export type GraphSceneDto = GraphSceneDto_Serialize | GraphSceneDto_Deserialize;
+
+/**  Сцена графа. */
+export type GraphSceneDto_Deserialize = {
+	/**  Ключ сцены от движка, как у сцен таблицы. */
+	key: string,
+	title?: string | null,
+	/**  Файл таблицы, где лежат реплики сцены. `None`: реплик нет. */
+	file?: RowRef | null,
+	total: number,
+	translated: number,
+	drafts: number,
+	firstLine?: string | null,
+};
+
+/**  Сцена графа. */
+export type GraphSceneDto_Serialize = {
+	/**  Ключ сцены от движка, как у сцен таблицы. */
+	key: string,
+	title: string | null,
+	/**  Файл таблицы, где лежат реплики сцены. `None`: реплик нет. */
+	file: RowRef | null,
+	total: number,
+	translated: number,
+	drafts: number,
+	firstLine: string | null,
 };
 
 /**  Реплика таблицы. */
@@ -331,5 +372,19 @@ export type SceneDto_Serialize = {
 	key: string | null,
 	title: string | null,
 	lines: LineDto_Serialize[],
+};
+
+export type SceneGraphDto = SceneGraphDto_Serialize | SceneGraphDto_Deserialize;
+
+export type SceneGraphDto_Deserialize = {
+	/**  В порядке сюжета. */
+	scenes: GraphSceneDto_Deserialize[],
+	edges: GraphEdgeDto[],
+};
+
+export type SceneGraphDto_Serialize = {
+	/**  В порядке сюжета. */
+	scenes: GraphSceneDto_Serialize[],
+	edges: GraphEdgeDto[],
 };
 

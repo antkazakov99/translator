@@ -10,12 +10,12 @@ use serde::Serialize;
 use super::graph::{DialogueData, ScenarioNode};
 use super::rpa::{self, RpaArchive};
 use super::rpyc::RpycParser;
-use super::scenes::{choice_scenes, natural_key, story_order};
+use super::scenes::{choice_scenes, natural_key, scene_edges, story_order};
 use super::script::{OUTSIDE_LABELS, RenpyParser, ScriptStructure};
 use super::{TL_LANG, collect_game_files};
 use crate::engines::{
     ContainerKey, EngineError, FileKind, GameInfo, GameSnapshot, SegmentKey, SnapshotContainer, SnapshotFile,
-    SnapshotSegment, SnapshotSpeaker, SpeakerKey,
+    SnapshotEdge, SnapshotSegment, SnapshotSpeaker, SpeakerKey,
 };
 use crate::files::{ContentHash, FileStore};
 use crate::projects::GameRoot;
@@ -202,24 +202,25 @@ struct ScriptText<'a> {
 }
 
 /// Собирает снимок из файлов в `FileStore`. Папка игры здесь уже не нужна.
-pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameInfo) -> Result<GameSnapshot, EngineError> {
+/// Тексты скриптов оригинала в порядке файлов: `.rpy` как есть, `.rpyc` декомпилированный.
+/// С `originals` заодно собирает реплики оригинала из `.rpyc`: по ним восстанавливается перевод в `.rpyc`.
+fn script_texts<'a>(
+    files: &'a [SnapshotFile],
+    store: &FileStore,
+    mut originals: Option<&mut HashMap<String, String>>,
+) -> Result<Vec<ScriptText<'a>>, EngineError> {
     let mut scripts: Vec<&SnapshotFile> = files.iter().filter(|f| f.kind == FileKind::Script).collect();
     scripts.sort_by_cached_key(|f| natural_key(&f.path));
-    let mut translations: Vec<&SnapshotFile> =
-        files.iter().filter(|f| f.kind == FileKind::Translation && is_script(&f.path)).collect();
-    translations.sort_by_cached_key(|f| natural_key(&f.path));
-
-    // Файл перевода в .rpyc восстанавливается по репликам оригинала, найденным по id.
-    let needs_originals = translations.iter().any(|f| f.path.ends_with(".rpyc"));
-    let mut originals = HashMap::new();
     let mut texts = Vec::new();
-    for file in &scripts {
+    for file in scripts {
         let data = store.read(&file.hash)?;
         if !file.path.ends_with(".rpyc") {
             texts.push(ScriptText { file, text: decode_text(&data) });
             continue;
         }
-        if needs_originals && let Err(error) = RpycParser::collect_original_dialogue(&data, &mut originals) {
+        if let Some(originals) = originals.as_deref_mut()
+            && let Err(error) = RpycParser::collect_original_dialogue(&data, originals)
+        {
             tracing::warn!(file = %file.path, %error, "Реплики оригинала не прочитаны");
         }
         match RpycParser::parse_rpyc_bytes(&data) {
@@ -227,6 +228,25 @@ pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameIn
             Err(error) => tracing::warn!(file = %file.path, %error, "RPYC не декомпилирован"),
         }
     }
+    Ok(texts)
+}
+
+/// Переходы между метками по скриптам снимка: то же, что `GameSnapshot::edges`, без разбора реплик.
+pub(crate) fn read_edges(files: &[SnapshotFile], store: &FileStore) -> Result<Vec<SnapshotEdge>, EngineError> {
+    let texts = script_texts(files, store, None)?;
+    let structures: Vec<ScriptStructure> = texts.iter().map(|s| RenpyParser::parse_script_structure(&s.text)).collect();
+    Ok(scene_edges(&structures))
+}
+
+pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameInfo) -> Result<GameSnapshot, EngineError> {
+    let mut translations: Vec<&SnapshotFile> =
+        files.iter().filter(|f| f.kind == FileKind::Translation && is_script(&f.path)).collect();
+    translations.sort_by_cached_key(|f| natural_key(&f.path));
+
+    // Файл перевода в .rpyc восстанавливается по репликам оригинала, найденным по id.
+    let needs_originals = translations.iter().any(|f| f.path.ends_with(".rpyc"));
+    let mut originals = HashMap::new();
+    let texts = script_texts(&files, store, needs_originals.then_some(&mut originals))?;
 
     let mut codes: HashMap<String, String> = HashMap::new();
     for script in &texts {
@@ -242,6 +262,7 @@ pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameIn
 
     let structures: Vec<ScriptStructure> = texts.iter().map(|s| RenpyParser::parse_script_structure(&s.text)).collect();
     let order = story_order(&structures);
+    let edges = scene_edges(&structures);
     let mut containers = Vec::new();
     let mut container_keys = HashSet::new();
     let mut choices: HashMap<String, String> = HashMap::new();
@@ -395,7 +416,7 @@ pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameIn
     if let Some(details) = info.details.as_object_mut() {
         details.insert("offers_language".to_string(), offers_language.into());
     }
-    Ok(GameSnapshot { info, files, containers, segments, speakers: speakers.into_values().collect() })
+    Ok(GameSnapshot { info, files, containers, segments, speakers: speakers.into_values().collect(), edges })
 }
 
 #[cfg(test)]
