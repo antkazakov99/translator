@@ -243,6 +243,21 @@ struct TokenLlmItem {
 }
 
 #[derive(Debug, Deserialize)]
+struct SpeakerLlmItem {
+    id: Option<String>,
+    translated: Option<String>,
+    gender: Option<String>,
+}
+
+/// Перевод подписи говорящего-строки от модели. В глоссарий попадает после проверки пользователем.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeakerSuggestion {
+    pub name: String,
+    pub translated: String,
+    pub gender: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TermLlmItem {
     id: Option<String>,
     translated_term: Option<String>,
@@ -2424,6 +2439,103 @@ pub async fn suggest_tokens(
     Ok(AutofillResult { items, failed_batches })
 }
 
+const SPEAKER_BATCH: usize = 15;
+pub const SPEAKER_SAMPLES: usize = 4;
+const SPEAKER_ANSWER_TOKENS: u32 = 1536;
+
+const SPEAKERS_SYSTEM_PROMPT: &str = r#"You translate speaker labels of a visual novel from English into Russian.
+A speaker label is the name the game shows above a line when the speaker is not a regular character: a role ("Waitress"), a device ("Radio Chatter", "Cell phone"), a crowd ("Students") or several people at once ("Celia & Katy").
+
+For each label output:
+1. "id": EXACT id as given.
+2. "translated": A short Russian label in the nominative case, written the way a Russian game would show it above the line: "Waitress" is "Официантка", "Radio Chatter" is "Радио", "Man 1" is "Мужчина 1", "???" stays "???". Keep [square bracket] variables exactly as written. Keep the capitalization style of the original: "RADIO" is "РАДИО".
+3. "gender": "male", "female" or "unknown", the grammatical gender verbs must agree with when this speaker says "I". Use the lines to decide; "unknown" for a group, a device or when the lines do not settle it.
+
+A line starting with "Russian names:" gives the exact spelling of names: use it inside labels like "Celia & Katy". A line starting with "Known terms:" gives established translations.
+
+Respond ONLY with a valid JSON array, without markdown fences or explanations:
+[
+  {"id": "s0", "translated": "Официантка", "gender": "female"},
+  {"id": "s1", "translated": "Радио", "gender": "unknown"}
+]"#;
+
+/// Переводит подписи говорящих-строк по их репликам. `samples` даёт реплики по подписи.
+pub async fn suggest_speakers(
+    target: &ChatTarget,
+    names: &[String],
+    samples: &HashMap<String, Vec<String>>,
+    hints: &ModelHints,
+    cancel: &AtomicBool,
+    on_batch: impl Fn(BatchProgress<SpeakerSuggestion>) + Send + Sync,
+) -> Result<AutofillResult<SpeakerSuggestion>, String> {
+    let total_batches = names.len().div_ceil(SPEAKER_BATCH);
+    let mut failed_batches = 0;
+    let mut items: Vec<SpeakerSuggestion> = Vec::new();
+    let report = |batch: usize, failed_batches: usize, items: Vec<SpeakerSuggestion>| {
+        on_batch(BatchProgress { batch: batch + 1, total_batches, failed_batches, items })
+    };
+    let notes = token_notes(&hints.tokens);
+    let none = HashMap::new();
+    for (batch, chunk) in names.chunks(SPEAKER_BATCH).enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let lines = |name: &String| -> Vec<String> {
+            samples
+                .get(name)
+                .into_iter()
+                .flatten()
+                .map(|line| resolve_variables(&line.replace('\n', " "), &none, &notes))
+                .collect()
+        };
+        let text: String = chunk.iter().flat_map(|name| std::iter::once(name.clone()).chain(lines(name))).map(|line| format!("{line}\n")).collect();
+        let mut user_prompt: String = glossary_hints(&text, hints).iter().map(|hint| format!("{hint}\n")).collect();
+        for (index, name) in chunk.iter().enumerate() {
+            user_prompt.push_str(&format!("\nid: s{index}\nLabel: {name}\nLines:\n"));
+            for line in lines(name) {
+                user_prompt.push_str(&format!("{line}\n"));
+            }
+        }
+        user_prompt.push_str("\nProvide JSON array now:");
+
+        let raw_response = match call_chat_completion(target, SPEAKERS_SYSTEM_PROMPT, &user_prompt, 0.2, SPEAKER_ANSWER_TOKENS).await {
+            Ok(response) => response,
+            Err(error) => {
+                failed_batches += remaining_batches(error, batch, total_batches)?;
+                report(total_batches - 1, failed_batches, Vec::new());
+                break;
+            }
+        };
+        let answer: Vec<SpeakerLlmItem> = match serde_json::from_str(extract_json_content(&raw_response)) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!("Не удалось распарсить JSON подписей от LLM: {}. Сырой ответ:\n{}", e, raw_response);
+                failed_batches += 1;
+                report(batch, failed_batches, Vec::new());
+                continue;
+            }
+        };
+
+        let kept_before = items.len();
+        for item in answer {
+            let id = item.id.as_deref().unwrap_or_default().trim();
+            let Some(name) = id.strip_prefix('s').and_then(|index| index.parse::<usize>().ok()).and_then(|index| chunk.get(index)) else {
+                continue;
+            };
+            let translated = item.translated.as_deref().unwrap_or_default().trim();
+            // Переменные в подписи подставит игра: перевод без них показал бы не того
+            if translated.is_empty() || text_markers(name) != text_markers(translated) || items.iter().any(|known| &known.name == name) {
+                continue;
+            }
+            let gender = item.gender.as_deref().and_then(gender_word).filter(|gender| *gender != "neuter").unwrap_or("unknown");
+            items.push(SpeakerSuggestion { name: name.clone(), translated: translated.to_string(), gender: gender.to_string() });
+        }
+        report(batch, failed_batches, items[kept_before..].to_vec());
+    }
+
+    Ok(AutofillResult { items, failed_batches })
+}
+
 /// Предел реплик и текста на запрос: русский ответ длиннее оригинала и должен уместиться целиком.
 const MAX_BATCH_LINES: usize = 30;
 const MAX_BATCH_TEXT: usize = 3000;
@@ -2444,7 +2556,7 @@ Rules:
 2. Write as people really speak, not word for word, but keep everything the original says: do not drop, add or reinterpret anything. Keep the tone and the register, including rude language. "you" in narration usually means the protagonist. Every Russian sentence must be grammatical.
 3. Idioms, set phrases and terms of endearment are translated by meaning, the way a Russian speaker would say it in that situation, never word by word: "Sleep well, honey." is "Спокойной ночи, милый." (or "милая", by the gender of the listener), not "Спи хорошо, медок."
 4. Verbs and adjectives must agree with the gender of the speaker and of the person they speak to.
-5. Text in [square brackets] is an in-game variable and text in {curly brackets} is a text tag. Copy each of them exactly as written, the same number of times, and never translate them. The game replaces a variable with its value, so build the sentence so that it reads correctly without declining the variable. Still translate the words around it: "My [roommate] Katy" is "Моя [roommate] Кэти", with the gender taken from the person the variable names.
+5. Text in [square brackets] is an in-game variable and text in {curly brackets} is a text tag. Copy each of them exactly as written, the same number of times, and never translate them. Never add a variable or tag the line does not have: a name written as plain text, like "MC", stays plain text. The game replaces a variable with its value, so build the sentence so that it reads correctly without declining the variable. Still translate the words around it: "My [roommate] Katy" is "Моя [roommate] Кэти", with the gender taken from the person the variable names.
 6. Translate every line, including short ones and interjections. "..." stays "...". Nonsense words, scat singing, onomatopoeia and deliberately garbled speech have no hidden meaning: render them as similar-sounding Russian nonsense, never replace them with words you guessed.
 7. A line starting with "Scene:" describes what happens. A line starting with "Speakers:" describes who talks. A line starting with "Tokens:" explains the variables. They are context: never translate or quote them.
 8. A line starting with "Russian names:" gives the exact spelling of names: always use it, declining the name as Russian grammar requires. A line starting with "Gender:" tells who is male or female.
@@ -2692,12 +2804,19 @@ fn is_wordless(text: &str) -> bool {
     !RE_TEXT_VARIABLE.replace_all(&text, "").chars().any(char::is_alphabetic)
 }
 
-/// Можно ли взять перевод. Реплика без букв совпадает с оригиналом законно.
+/// Можно ли взять перевод. Реплика без букв совпадает с оригиналом законно, как и смайлик вроде «=D»
+/// с одной буквой: модель возвращала его без изменений, и строка оставалась пустой.
 fn usable_translation(original: &str, translated: &str) -> bool {
     let translated = translated.trim();
     !translated.is_empty()
         && text_markers(original) == text_markers(translated)
-        && (translated != original.trim() || is_wordless(original))
+        && (translated != original.trim() || is_emoticon(original))
+}
+
+/// Реплика, где вне токенов и тегов не больше одной буквы, вроде «=D» или «:P». Реплики без букв тоже такие.
+fn is_emoticon(text: &str) -> bool {
+    let text = RE_TEXT_TAG.replace_all(text, "");
+    RE_TEXT_VARIABLE.replace_all(&text, "").chars().filter(|c| c.is_alphabetic()).count() <= 1
 }
 
 /// Подпись говорящего в запросе. Код модель не видит: как и имени токена, она поверила бы ему больше, чем тексту.
@@ -4280,6 +4399,9 @@ mod tests {
         assert!(!usable_translation("Hello there.", "Hello there."));
         assert!(usable_translation("...", "..."));
         assert!(usable_translation("[mc]!", "[mc]!"));
+        assert!(usable_translation("=D ", "=D"));
+        assert!(!usable_translation("Hm.", "Hm."));
+        assert!(!usable_translation("I-I...", "I-I..."));
     }
 
     #[test]

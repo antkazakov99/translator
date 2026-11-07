@@ -1,11 +1,12 @@
+use crate::glossary::ProjectGlossary;
 use crate::graph::{DialogueData, ScenarioGraph};
 use crate::parser::renpy::RenpyParser;
 use crate::rpa::collect_folder_files_for_mod;
 use crate::rpyc_writer::{ScriptFormat, compile_script};
 use crate::{
     TL_LANG, collect_rpy_files, find_game_root, get_project_cache_dir,
-    get_project_scripts_cache_dir, parse_project_file, path_lock, path_within, stable_hash_str,
-    tl_relative_name,
+    get_project_scripts_cache_dir, is_translation_path, parse_project_file, path_lock, path_within,
+    stable_hash_str, tl_relative_name,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -328,6 +329,12 @@ pub fn prepare_mod_export(
     let before = strings.len();
     strings.retain(|original, _| !translated.contains(original));
     export.skipped += before - strings.len();
+    // Правка той же строки важнее имени из глоссария
+    for (name, text) in character_name_strings(game_dir)? {
+        if !translated.contains(&name) {
+            strings.entry(name).or_insert(text);
+        }
+    }
     if !strings.is_empty() {
         export
             .files
@@ -342,6 +349,106 @@ pub fn prepare_mod_export(
             .insert(LANGUAGE_FILE.to_string(), language_script().into_bytes());
     }
     Ok(export)
+}
+
+/// Переводы подписей говорящих из глоссария. Подпись движок тоже переводит строковым переводом,
+/// поэтому имя из `Character("Celia")` и говорящий-строка `"Radio Chatter" "..."` получают перевод
+/// записи. Имя с переменной или тегом пропускается, как и имя, которое записи переводят по-разному.
+fn character_name_strings(game_dir: &Path) -> Result<BTreeMap<String, String>, String> {
+    let glossary = ProjectGlossary::load_for_project(game_dir)?;
+    if glossary.characters.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut files = Vec::new();
+    collect_rpy_files(game_dir, &mut files);
+    collect_rpy_files(&get_project_scripts_cache_dir(game_dir), &mut files);
+    let mut names: Vec<(Option<String>, String)> = Vec::new();
+    for path in files.iter().filter(|path| !is_translation_path(path, game_dir)) {
+        let Ok(content) = fs::read_to_string(path) else {
+            continue;
+        };
+        names.extend(RenpyParser::extract_speakers(&content).into_iter().map(|(alias, name)| (Some(alias), name)));
+        names.extend(RenpyParser::string_speakers(&content).into_iter().map(|name| (None, name)));
+    }
+
+    let mut variants: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    for (alias, name) in names {
+        if name.trim().is_empty() || name.contains('{') || is_whole_token(&name) {
+            continue;
+        }
+        let found = name_translations(&glossary, alias.as_deref(), &name);
+        variants.entry(name).or_default().extend(found);
+    }
+    Ok(variants
+        .into_iter()
+        .filter(|(_, found)| found.len() == 1)
+        .filter_map(|(name, found)| found.into_iter().next().filter(|text| *text != name).map(|text| (name, text)))
+        .collect())
+}
+
+/// Подпись целиком из одной переменной вроде `[player]`: её значение задаёт игра.
+fn is_whole_token(name: &str) -> bool {
+    let name = name.trim();
+    name.starts_with('[') && name.ends_with(']') && name[1..name.len() - 1].chars().all(|c| c != '[' && c != ']')
+}
+
+/// Варианты перевода подписи. Запись с кодом говорящего точнее: другая запись может носить то же имя.
+/// Подпись-строку переводит своя запись во вкладке говорящих, затем подходят персонаж
+/// и подтверждённый термин («Guard»), а подпись на двоих вроде
+/// «Celia & Katy» переводится по частям, если переведена каждая.
+fn name_translations(glossary: &ProjectGlossary, alias: Option<&str>, name: &str) -> HashSet<String> {
+    if is_whole_token(name) {
+        return HashSet::from([name.trim().to_string()]);
+    }
+    if let Some(text) = alias
+        .and_then(|alias| glossary.characters.iter().find(|entry| entry.has_alias(alias)))
+        .and_then(|entry| entry.translation_of(name))
+    {
+        return HashSet::from([text]);
+    }
+    let same = |source: &str| source.trim().eq_ignore_ascii_case(name.trim());
+    let found: HashSet<String> = glossary
+        .speakers
+        .iter()
+        .filter(|speaker| same(&speaker.name))
+        .map(|speaker| speaker.translated.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect();
+    if !found.is_empty() {
+        return found;
+    }
+    let found: HashSet<String> =
+        glossary.characters.iter().filter_map(|entry| entry.translation_of(name)).collect();
+    if !found.is_empty() {
+        return found;
+    }
+    let found: HashSet<String> = glossary
+        .terms
+        .iter()
+        .filter(|term| !term.guess)
+        .filter_map(|term| {
+            let text = if same(&term.source_term) {
+                &term.translated_term
+            } else {
+                &term.forms.iter().find(|form| same(&form.source))?.translated
+            };
+            Some(text.trim().to_string()).filter(|text| !text.is_empty())
+        })
+        .collect();
+    if !found.is_empty() {
+        return found;
+    }
+    for (separator, translated) in [(" & ", " & "), (" and ", " и ")] {
+        if let Some((first, second)) = name.split_once(separator) {
+            let first = name_translations(glossary, None, first);
+            let second = name_translations(glossary, None, second);
+            return first
+                .iter()
+                .flat_map(|first| second.iter().map(move |second| format!("{first}{translated}{second}")))
+                .collect();
+        }
+    }
+    HashSet::new()
 }
 
 /// Скрипт мода с переключателем языка.
@@ -521,6 +628,12 @@ fn collect_string_edits(
             *skipped += 1;
             continue;
         };
+        // Пустую строку движок переводит в префиксе и суффиксе каждого имени и реплики,
+        // поэтому `old ""` приклеил бы этот текст ко всей игре. Такие правки оставались от реплик `mc ""`
+        if original.trim().is_empty() {
+            *skipped += 1;
+            continue;
+        }
         if strings.entry(original).or_insert_with(|| text.clone()) != text {
             *skipped += 1;
         }
@@ -722,6 +835,29 @@ fn write_store(path: &Path, store: &TranslationOverrides) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_originals_do_not_become_strings() {
+        let key = |text: &str| {
+            LineKey::Script { label: "start".into(), text: text.into(), repeat: 0 }.encode().unwrap()
+        };
+        let saved = SavedSource {
+            source: PathBuf::from("story.rpy"),
+            entries: [
+                (key(""), "Сил просто нет.".to_string()),
+                (key("  "), "Пусто".to_string()),
+                (key("Start"), "Начать".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            drafts: HashSet::new(),
+        };
+        let mut strings = BTreeMap::new();
+        let mut skipped = 0;
+        collect_string_edits(&saved, &mut strings, &mut skipped).unwrap();
+        assert_eq!(strings, BTreeMap::from([("Start".to_string(), "Начать".to_string())]));
+        assert_eq!(skipped, 2);
+    }
 
     #[test]
     fn transferred_edits_follow_file_between_archive_and_disk() {

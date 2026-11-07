@@ -71,6 +71,7 @@
     ExternalLink,
     RotateCcw,
     Braces,
+    Megaphone,
     Film,
     MoreHorizontal,
     SpellCheck,
@@ -542,11 +543,25 @@
     excluded_notes: string[];
   }
 
+  // Подпись говорящего, заданного строкой (`"Radio Chatter" "..."`): роль, а не персонаж
+  interface SpeakerGlossaryEntry {
+    name: string;
+    translated: string;
+    gender: string;
+  }
+
+  interface TextSpeaker {
+    name: string;
+    lines: number;
+    example: string;
+  }
+
   interface ProjectGlossary {
     characters: CharacterGlossaryEntry[];
     terms: TermGlossaryEntry[];
     tokens: TokenGlossaryEntry[];
     scenes: SceneGlossaryEntry[];
+    speakers: SpeakerGlossaryEntry[];
     removed_characters: { alias: string; original_name: string }[];
     discarded_terms: string[];
   }
@@ -808,13 +823,13 @@
   let llmSettings = $state<LlmSettings>(loadLlmSettings());
   // Заметки по сценам привязаны к модели, поэтому от неё зависит и подсчёт готовых частей
   let descriptionModel = $derived(targetFor(llmSettings, "descriptions").model);
-  let glossaryTab = $state<'characters' | 'terms' | 'tokens' | 'scenes'>('characters');
+  let glossaryTab = $state<'characters' | 'terms' | 'tokens' | 'scenes' | 'speakers'>('characters');
   let showNameRules = $state(false);
   let glossaryAiActions = $state<{ analyzeCharacter: (alias: string) => Promise<void>; translateCharacter: (alias: string) => Promise<void> } | null>(null);
   let nameRulesDirty = $derived(dirtyNameRuleLanguages().length > 0);
   // Пустая карточка новой записи на текущей вкладке
   let addingEntry = $state(false);
-  let glossary = $state<ProjectGlossary>({ characters: [], terms: [], tokens: [], scenes: [], removed_characters: [], discarded_terms: [] });
+  let glossary = $state<ProjectGlossary>({ characters: [], terms: [], tokens: [], scenes: [], speakers: [], removed_characters: [], discarded_terms: [] });
   let loadingGlossary = $state(false);
   let savingGlossary = $state(false);
   let glossaryDirty = $state(false);
@@ -972,6 +987,7 @@
   let scenesTarget = $derived.by(() => {
     if (!showGlossaryModal || addingEntry) return null;
     if (glossaryTab === "tokens") return selectedToken ? JSON.stringify([gameDir, "token", selectedToken.name]) : null;
+    if (glossaryTab === "speakers") return selectedSpeaker ? JSON.stringify([gameDir, "speaker", selectedSpeaker.name]) : null;
     if (glossaryTab === "scenes") return selectedScene ? JSON.stringify([gameDir, "scene", selectedScene.scene]) : null;
     if (glossaryTab === "terms") {
       if (candidatesOpen) return selectedArchived ? JSON.stringify([gameDir, "term", [selectedArchived.term]]) : null;
@@ -1017,6 +1033,7 @@
     const timer = setTimeout(() => {
       const search =
         target === "token" ? invoke<CharacterScene[]>("get_token_scenes", { gameDir: targetDir, name: value })
+        : target === "speaker" ? invoke<CharacterScene[]>("get_speaker_scenes", { gameDir: targetDir, name: value })
         : target === "scene" ? invoke<CharacterScene[]>("get_scene_lines", { gameDir: targetDir, scene: value })
         : target === "term" ? invoke<CharacterScene[]>("get_term_scenes", { gameDir: targetDir, forms: value })
         : invoke<CharacterScene[]>("get_character_scenes", { gameDir: targetDir, aliases: target, names: value });
@@ -1703,6 +1720,13 @@
     for (const { name, value, note } of rows) {
       if (value) setTokenField(name, "value", value);
       if (note) setTokenField(name, "note", note);
+    }
+  }
+
+  function applyPanelSpeakers(rows: { name: string; translated: string; gender: string }[]) {
+    for (const { name, translated, gender } of rows) {
+      if (translated) setSpeakerField(name, "translated", translated);
+      if (gender && gender !== "unknown") setSpeakerField(name, "gender", gender);
     }
   }
 
@@ -2531,8 +2555,9 @@
     translationEdits = {};
     selectedEntry = null;
     selectedSceneId = "all";
-    glossary = { characters: [], terms: [], tokens: [], scenes: [], removed_characters: [], discarded_terms: [] };
+    glossary = { characters: [], terms: [], tokens: [], scenes: [], speakers: [], removed_characters: [], discarded_terms: [] };
     textTokens = null;
+    textSpeakers = null;
     gameScenes = null;
     scenePartsByAlias = {};
     paneSearch = "";
@@ -2850,9 +2875,13 @@
     });
   });
 
-  // Модель пишет имена так же, как они записаны в глоссарии
-  let characterNames = $derived(knownNames(
-    glossary.characters.flatMap((char) => {
+  // Модель пишет имена так же, как они записаны в глоссарии. Подпись говорящего-строки идёт тем же
+  // путём: перевод реплик получает её написание и род для согласования глаголов
+  let characterNames = $derived(knownNames([
+    ...glossary.speakers
+      .filter((speaker) => speaker.translated.trim())
+      .map((speaker) => ({ original: speaker.name, translated: speaker.translated.trim(), gender: speaker.gender })),
+    ...glossary.characters.flatMap((char) => {
       const main = translatedTitle(char);
       const own = canonicalForms(char).map((form) => form.source.toLowerCase());
       return [
@@ -2867,7 +2896,7 @@
         }))
       ].filter((name) => name.translated);
     })
-  ));
+  ]));
 
   // Токены ищутся в репликах, а в глоссарии лежат только пояснения. Пояснение остаётся,
   // даже если токен пропал из игры: он мог исчезнуть только в этой версии
@@ -2928,6 +2957,64 @@
 
   function removeToken(name: string) {
     glossary.tokens = glossary.tokens.filter((token) => token.name !== name);
+    glossaryDirty = true;
+  }
+
+  // Говорящие-строки ищутся в репликах, а в глоссарии лежат только их переводы. Перевод остаётся,
+  // даже если подпись пропала из игры: она могла исчезнуть только в этой версии
+  let textSpeakers = $state<{ dir: string; speakers: TextSpeaker[] } | null>(null);
+  let speakerRows = $derived.by(() => {
+    const found = textSpeakers?.speakers ?? [];
+    const names = new Set(found.map((speaker) => speaker.name));
+    const missing = glossary.speakers
+      .filter((speaker) => !names.has(speaker.name))
+      .map((speaker): TextSpeaker => ({ name: speaker.name, lines: 0, example: "" }));
+    return [...found, ...missing];
+  });
+  let speakerView = $state<"all" | "empty">("all");
+  let filteredSpeakerRows = $derived.by(() => {
+    const q = glossarySearch.trim().toLowerCase();
+    return speakerRows.filter((speaker) => {
+      const own = speakerEntry(speaker.name);
+      if (speakerView === "empty" && own?.translated.trim()) return false;
+      return !q || [speaker.name, speaker.example, own?.translated ?? ""].some((text) => text.toLowerCase().includes(q));
+    });
+  });
+
+  $effect(() => {
+    if (glossaryTab !== "speakers" || !gameDir || textSpeakers?.dir === gameDir) return;
+    const dir = gameDir;
+    invoke<TextSpeaker[]>("list_text_speakers", { gameDir: dir })
+      .then((speakers) => { textSpeakers = { dir, speakers }; })
+      .catch((e) => showToast(`Не удалось найти говорящих: ${e}`, "error"));
+  });
+
+  // Выбор ищется среди всех строк: стёртый перевод не должен закрыть карточку посреди правки
+  let selectedSpeakerName = $state<string | null>(null);
+  let selectedSpeaker = $derived(speakerRows.find((speaker) => speaker.name === selectedSpeakerName) ?? filteredSpeakerRows[0] ?? null);
+
+  let panelSpeakers = $derived(
+    speakerRows.map(({ name, lines }) => {
+      const own = speakerEntry(name);
+      return { name, lines, translated: own?.translated ?? "", gender: own?.gender ?? "unknown" };
+    })
+  );
+
+  function speakerEntry(name: string) {
+    return glossary.speakers.find((speaker) => speaker.name === name);
+  }
+
+  /** Запись держится, пока у неё есть перевод или известен род. */
+  function setSpeakerField(name: string, field: "translated" | "gender", text: string) {
+    const own = speakerEntry(name);
+    if (own) own[field] = text;
+    else glossary.speakers.push({ name, translated: "", gender: "unknown", [field]: text });
+    glossary.speakers = glossary.speakers.filter((speaker) => speaker.translated.trim() || (speaker.gender && speaker.gender !== "unknown"));
+    glossaryDirty = true;
+  }
+
+  function removeSpeaker(name: string) {
+    glossary.speakers = glossary.speakers.filter((speaker) => speaker.name !== name);
     glossaryDirty = true;
   }
 
@@ -4960,6 +5047,14 @@
           </button>
           <button
             class="tools-tab"
+            class:tab-active={!showNameRules && glossaryTab === 'speakers'}
+            onclick={() => openGlossaryTab('speakers')}
+          >
+            <Megaphone size={15} />
+            <span>Говорящие ({glossary.speakers.length})</span>
+          </button>
+          <button
+            class="tools-tab"
             class:tab-active={!showNameRules && glossaryTab === 'scenes'}
             onclick={() => openGlossaryTab('scenes')}
           >
@@ -5039,6 +5134,7 @@
           characters={glossary.characters}
           terms={glossary.terms}
           tokens={panelTokens}
+          speakers={panelSpeakers}
           hints={panelHints}
           settings={llmSettings}
           bind:descriptionsOpen
@@ -5048,6 +5144,7 @@
           onorigins={applyPanelOrigins}
           onterms={applyPanelTerms}
           ontokens={applyPanelTokens}
+          onspeakers={applyPanelSpeakers}
         />
 
         <!-- СПИСОК СЛЕВА, ОСНОВНОЕ МЕСТО ОТДАНО ВЫБРАННОЙ ЗАПИСИ -->
@@ -5059,7 +5156,7 @@
                 <input 
                   type="text" 
                   bind:value={glossarySearch} 
-                  placeholder={glossaryTab === 'characters' ? "Поиск по коду, имени, переводу..." : candidatesOpen ? "Поиск по термину, реплике..." : glossaryTab === 'terms' ? "Поиск по термину, переводу..." : glossaryTab === 'scenes' ? "Поиск по метке, файлу, описанию..." : "Поиск по токену, реплике, значению..."}
+                  placeholder={glossaryTab === 'characters' ? "Поиск по коду, имени, переводу..." : candidatesOpen ? "Поиск по термину, реплике..." : glossaryTab === 'terms' ? "Поиск по термину, переводу..." : glossaryTab === 'scenes' ? "Поиск по метке, файлу, описанию..." : glossaryTab === 'speakers' ? "Поиск по подписи, переводу, реплике..." : "Поиск по токену, реплике, значению..."}
                   class="glossary-search-input"
                 />
                 {#if glossarySearch}
@@ -5135,7 +5232,7 @@
                 </div>
               {/if}
 
-              {#if termView === 'terms' && glossaryTab !== 'scenes'}
+              {#if termView === 'terms' && glossaryTab !== 'scenes' && glossaryTab !== 'speakers'}
                 <button class="btn-toggle-add-char" class:active={addingEntry} onclick={() => addingEntry ? addingEntry = false : startAddingEntry()}>
                   <Plus size={14} />
                   <span>{addingEntry ? 'Отмена' : glossaryTab === 'characters' ? 'Персонаж' : glossaryTab === 'terms' ? 'Термин' : 'Токен'}</span>
@@ -5219,6 +5316,40 @@
                         {/if}
                       </span>
                       <span class="category-badge category-general" title="Реплик с токеном">{token.lines}</span>
+                    </button>
+                  {/each}
+                {/if}
+              {:else if glossaryTab === 'speakers'}
+                {#if textSpeakers?.dir !== gameDir}
+                  <div class="glossary-empty-state">
+                    <Loader2 size={24} class="spin" />
+                  </div>
+                {:else if filteredSpeakerRows.length === 0}
+                  <div class="glossary-empty-state">
+                    <Megaphone size={32} class="text-slate-600" />
+                    <p>{glossarySearch ? `Говорящие не найдены по запросу «${glossarySearch}»` : speakerView === 'empty' ? "У всех подписей есть перевод" : "В игре нет говорящих, заданных строкой"}</p>
+                  </div>
+                {:else}
+                  {#each filteredSpeakerRows as speaker (speaker.name)}
+                    <button
+                      class="glossary-list-item"
+                      class:selected-row={selectedSpeaker?.name === speaker.name}
+                      onclick={() => { selectedSpeakerName = speaker.name; addingEntry = false; }}
+                    >
+                      <span class="glossary-item-text">
+                        <span class="char-name-en">{speaker.name}</span>
+                        {#if speakerEntry(speaker.name)?.translated}
+                          <span class="char-name-ru">{speakerEntry(speaker.name)?.translated}</span>
+                        {:else}
+                          <span class="char-name-empty">без перевода</span>
+                        {/if}
+                      </span>
+                      {#if speakerEntry(speaker.name)?.gender === 'male'}
+                        <span class="gender-pill gender-male" title="Мужской род (он)">М</span>
+                      {:else if speakerEntry(speaker.name)?.gender === 'female'}
+                        <span class="gender-pill gender-female" title="Женский род (она)">Ж</span>
+                      {/if}
+                      <span class="category-badge category-general" title="Реплик с этой подписью">{speaker.lines}</span>
                     </button>
                   {/each}
                 {/if}
@@ -5323,6 +5454,16 @@
                 <Users size={14} />
                 <span>Вернуть удалённых ({glossary.removed_characters.length})</span>
               </button>
+            {/if}
+            {#if glossaryTab === 'speakers'}
+              <div class="glossary-term-views">
+                <button class="glossary-archive-toggle" class:active={speakerView === 'all'} onclick={() => speakerView = 'all'}>
+                  Все ({speakerRows.length})
+                </button>
+                <button class="glossary-archive-toggle" class:active={speakerView === 'empty'} onclick={() => speakerView = 'empty'}>
+                  Без перевода ({speakerRows.filter((speaker) => !speakerEntry(speaker.name)?.translated.trim()).length})
+                </button>
+              </div>
             {/if}
             {#if glossaryTab === 'scenes'}
               <div class="glossary-term-views">
@@ -5692,6 +5833,57 @@
                   <p>Выберите токен из списка слева</p>
                 </div>
               {/if}
+            {:else if glossaryTab === 'speakers'}
+              {#if selectedSpeaker}
+                {@const speaker = speakerEntry(selectedSpeaker.name)}
+                <div class="sidebar-edit-header">
+                  <div class="sidebar-char-headings">
+                    <h4>{selectedSpeaker.name}</h4>
+                    <span class="char-sub-label">{selectedSpeaker.lines > 0 ? `Подпись говорящего · реплик: ${selectedSpeaker.lines}` : "Нет в текущей версии игры"}</span>
+                  </div>
+                </div>
+
+                <div class="sidebar-edit-content">
+                  {#if speaker}
+                    <div class="entry-toolbar">
+                      <div class="entry-actions">
+                        <button class="btn-delete-term" onclick={() => { if (selectedSpeaker) removeSpeaker(selectedSpeaker.name); }}>
+                          <Trash2 size={14} />
+                          <span>Очистить запись</span>
+                        </button>
+                      </div>
+                    </div>
+                  {/if}
+
+                  <div class="edit-group">
+                    <label class="edit-label" for="speaker-translated">
+                      <span>Перевод подписи:</span>
+                    </label>
+                    <input
+                      id="speaker-translated"
+                      type="text"
+                      value={speaker?.translated ?? ""}
+                      oninput={(event) => { if (selectedSpeaker) setSpeakerField(selectedSpeaker.name, "translated", event.currentTarget.value); }}
+                      placeholder="напр. Радио"
+                      class="sidebar-input sidebar-input-primary"
+                    />
+                    <span class="edit-hint">Так игра покажет имя над репликой. Подпись задана в скриптах строкой, а не персонажем, поэтому мод переводит её строковым переводом. Без перевода подпись на двоих вроде «Celia & Katy» соберётся из имён персонажей.</span>
+                  </div>
+
+                  <div class="edit-group">
+                    <div class="edit-label">
+                      <span>Род:</span>
+                    </div>
+                    {@render genderPicker(speaker?.gender ?? "unknown", (gender) => { if (selectedSpeaker) setSpeakerField(selectedSpeaker.name, "gender", gender); })}
+                    <span class="edit-hint">С ним согласуются глаголы в репликах этого говорящего при переводе.</span>
+                  </div>
+                </div>
+              {:else}
+                <div class="sidebar-edit-empty">
+                  <Megaphone size={36} class="text-slate-600" />
+                  <p>Выберите говорящего из списка слева</p>
+                </div>
+              {/if}
             {:else if glossaryTab === 'scenes'}
               {#if selectedScene}
                 <div class="sidebar-edit-header" class:character-card-locked={otherCharacterUpdating} inert={otherCharacterUpdating}>
@@ -5919,6 +6111,8 @@
                         {characterScenes.length} сцен · говорит {characterSceneTotals.spoken} · упомянут {characterSceneTotals.mentioned}
                       {:else if glossaryTab === 'scenes'}
                         реплик {characterSceneTotals.mentioned}
+                      {:else if glossaryTab === 'speakers'}
+                        {characterScenes.length} сцен · реплик {characterSceneTotals.spoken}
                       {:else}
                         {characterScenes.length} сцен · реплик {characterSceneTotals.mentioned}
                       {/if}

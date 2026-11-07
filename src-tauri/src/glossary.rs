@@ -97,6 +97,34 @@ impl CharacterGlossaryEntry {
         joined_name(&self.translated_first_name, &self.translated_last_name)
     }
 
+    /// Перевод написания, если оно совпадает с именем, фамилией, полным именем или формой записи.
+    /// Полное имя переводится, только если переведены обе его части.
+    pub fn translation_of(&self, name: &str) -> Option<String> {
+        let name = name.trim();
+        let same = |own: &str| !own.trim().is_empty() && own.trim().eq_ignore_ascii_case(name);
+        let filled = |text: &str| Some(text.trim().to_string()).filter(|text| !text.is_empty());
+        let has_both = !self.first_name.trim().is_empty() && !self.last_name.trim().is_empty();
+        if same(&self.first_name) {
+            filled(&self.translated_first_name)
+        } else if same(&self.last_name) {
+            filled(&self.translated_last_name)
+        } else if has_both && same(&joined_name(&self.first_name, &self.last_name)) {
+            filled(&self.translated_first_name)?;
+            filled(&self.translated_last_name)?;
+            filled(&self.translated_full_name())
+        } else if let Some(form) = self.forms.iter().find(|form| same(&form.source)) {
+            filled(&form.translated)
+        } else if self.merged.iter().any(|merged| same(&merged.original_name)) {
+            // У имени из игры вошедшей записи своего перевода нет: это тот же герой
+            match name.split_whitespace().count() {
+                1 => filled(&self.translated_first_name),
+                _ => filled(&self.translated_full_name()),
+            }
+        } else {
+            None
+        }
+    }
+
     /// Записывает перевод полного имени от модели. Разделить на имя и фамилию можно только два слова.
     pub fn take_translation(&mut self, name: &str) {
         let words: Vec<&str> = name.split_whitespace().collect();
@@ -217,6 +245,16 @@ pub struct TokenGlossaryEntry {
     pub value: String, // Что подставить вместо токена при чтении сцен и переводе ("mother")
 }
 
+/// Перевод подписи говорящего, заданного строкой (`"Radio Chatter" "..."`). Это роль, а не персонаж:
+/// кода, сцен и описания у неё нет, а игра показывает подпись как есть
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SpeakerGlossaryEntry {
+    pub name: String,       // Подпись в игре ("Radio Chatter")
+    pub translated: String, // Перевод подписи ("Радио")
+    #[serde(default)]
+    pub gender: String,     // Как с ним согласуются глаголы: "male" | "female" | "unknown"
+}
+
 /// Описание сцены. Сцена опознаётся по метке: она одна на игру и не зависит от файла и номера строки
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SceneGlossaryEntry {
@@ -237,6 +275,8 @@ pub struct ProjectGlossary {
     pub tokens: Vec<TokenGlossaryEntry>,
     #[serde(default)]
     pub scenes: Vec<SceneGlossaryEntry>,
+    #[serde(default)]
+    pub speakers: Vec<SpeakerGlossaryEntry>,
     #[serde(default)]
     pub removed_characters: Vec<MergedCharacter>, // Персонажи из скриптов, которых удалил пользователь: скан не возвращает их
     #[serde(default)]
@@ -357,6 +397,12 @@ impl ProjectGlossary {
                 merged += 1;
             }
         }
+        for speaker in other.speakers {
+            if !self.speakers.iter().any(|own| own.name == speaker.name) {
+                self.speakers.push(speaker);
+                merged += 1;
+            }
+        }
         for removed in other.removed_characters {
             let known = self.is_removed(&removed.alias) || self.characters.iter().any(|own| own.has_alias(&removed.alias));
             if !known {
@@ -429,6 +475,34 @@ fn auto_detect_gender(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_translation_comes_from_matching_field() {
+        let entry = CharacterGlossaryEntry {
+            alias: "lj".into(),
+            first_name: "Lilijana".into(),
+            last_name: "Ruznic".into(),
+            translated_first_name: "Лиляна".into(),
+            translated_last_name: "Ружнич".into(),
+            forms: vec![
+                NameForm { source: "Lili".into(), translated: "Лили".into() },
+                NameForm { source: "Saint-Saens".into(), translated: String::new() },
+            ],
+            merged: vec![MergedCharacter { alias: "lj2".into(), original_name: "Ljijana".into() }],
+            ..Default::default()
+        };
+        let of = |name: &str| entry.translation_of(name);
+        assert_eq!(of("Lilijana").as_deref(), Some("Лиляна"));
+        assert_eq!(of(" ruznic ").as_deref(), Some("Ружнич"));
+        assert_eq!(of("Lilijana Ruznic").as_deref(), Some("Лиляна Ружнич"));
+        assert_eq!(of("Lili").as_deref(), Some("Лили"));
+        assert_eq!(of("Ljijana").as_deref(), Some("Лиляна"));
+        assert_eq!(of("Saint-Saens"), None);
+        assert_eq!(of("Stranger"), None);
+
+        let half = CharacterGlossaryEntry { translated_last_name: String::new(), ..entry.clone() };
+        assert_eq!(half.translation_of("Lilijana Ruznic"), None);
+    }
 
     #[test]
     fn test_damaged_glossary_is_reported_and_kept() {

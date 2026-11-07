@@ -1997,6 +1997,50 @@ async fn suggest_glossary_tokens(
     .await
 }
 
+/// Переводит подписи говорящих-строк по их репликам. В глоссарий их отбирает пользователь.
+#[tauri::command]
+async fn suggest_glossary_speakers(
+    game_dir: String,
+    target: llm::ChatTarget,
+    names: Vec<String>,
+    hints: llm::ModelHints,
+    on_batch: Channel<llm::BatchProgress<llm::SpeakerSuggestion>>,
+) -> Result<llm::AutofillResult<llm::SpeakerSuggestion>, String> {
+    let run = LlmRun::begin()?;
+    let base_path = effective_game_directory(Path::new(&game_dir));
+    let wanted = names.clone();
+    let samples = tauri::async_runtime::spawn_blocking(move || {
+        scenes::speaker_samples(&game_lines(&base_path), &wanted, llm::SPEAKER_SAMPLES)
+    })
+    .await
+    .map_err(|e| format!("Ошибка сбора реплик говорящих: {}", e))?;
+
+    llm::suggest_speakers(&target, &names, &samples, &hints, run.cancel(), |progress| {
+        send_progress(&on_batch, progress)
+    })
+    .await
+}
+
+/// Говорящие-строки игры для вкладки глоссария.
+#[tauri::command]
+async fn list_text_speakers(game_dir: String) -> Result<Vec<scenes::TextSpeaker>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scenes::text_speakers(&game_lines(&effective_game_directory(Path::new(&game_dir))))
+    })
+    .await
+    .map_err(|e| format!("Ошибка поиска говорящих: {}", e))
+}
+
+/// Сцены, где говорит говорящий-строка.
+#[tauri::command]
+async fn get_speaker_scenes(game_dir: String, name: String) -> Result<Vec<scenes::CharacterScene>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        scenes::speaker_scenes(&game_lines(&effective_game_directory(Path::new(&game_dir))), &name)
+    })
+    .await
+    .map_err(|e| format!("Ошибка поиска сцен говорящего: {}", e))
+}
+
 /// Токены из реплик игры для вкладки глоссария.
 #[tauri::command]
 async fn list_text_tokens(game_dir: String) -> Result<Vec<llm::TextToken>, String> {
@@ -2624,6 +2668,9 @@ pub fn run() {
             summarize_glossary_character,
             count_character_chunks,
             list_text_tokens,
+            list_text_speakers,
+            get_speaker_scenes,
+            suggest_glossary_speakers,
             list_character_parts,
             reset_character_notes,
             get_character_scenes,
@@ -3613,6 +3660,88 @@ mod tests {
             &out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpyc"),
         );
         assert!(!strings.contains("Taken"));
+
+        let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_glossary_names_become_string_translations() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("translator_name_strings_{}", uuid::Uuid::new_v4()));
+        let game_dir = temp_dir.join("game");
+        std::fs::create_dir_all(&game_dir).unwrap();
+        let story = game_dir.join("story.rpy");
+        std::fs::write(
+            &story,
+            concat!(
+                "define ce = Character('Celia')\n",
+                "define ka = Character(\"Katy\")\n",
+                "define pl = Character(\"[player]\")\n",
+                "define un = Character('Stranger')\n",
+                "label start:\n",
+                "    \"Radio Chatter\" \"News\"\n",
+                "    \"Celia & Radio Chatter\" \"Both\"\n",
+                "    \"[ce] and Guard\" \"Halt\"\n",
+                "    \"Guard & Stranger\" \"Who?\"\n",
+                "    \"[ce]\" \"Me\"\n",
+                "    ce \"Hi\"\n",
+            ),
+        )
+        .unwrap();
+        let entry = |alias: &str, first: &str, translated: &str| glossary::CharacterGlossaryEntry {
+            alias: alias.into(),
+            first_name: first.into(),
+            translated_first_name: translated.into(),
+            ..Default::default()
+        };
+        glossary::ProjectGlossary {
+            characters: vec![
+                entry("ce", "Celia", "Селия"),
+                entry("ka", "Katy", "Кэти"),
+                entry("~radio", "Radio Chatter", "Радио"),
+                entry("pl", "[player]", "[player]"),
+            ],
+            terms: vec![glossary::TermGlossaryEntry {
+                source_term: "Guard".into(),
+                translated_term: "Охранник".into(),
+                ..Default::default()
+            }],
+            speakers: vec![glossary::SpeakerGlossaryEntry {
+                name: "Stranger".into(),
+                translated: "Незнакомец".into(),
+                gender: "male".into(),
+            }],
+            ..Default::default()
+        }
+        .save_for_project(&game_dir)
+        .unwrap();
+        // Правка той же строки важнее глоссария
+        save_edits(&story, &[("Hi", "Привет")]);
+        let katy = translation::LineKey::Script { label: "start".into(), text: "Katy".into(), repeat: 0 };
+        translation::save(
+            &story,
+            &[translation::TranslationEdit { key: katy.encode().unwrap(), text: "Катя".into() }],
+        )
+        .unwrap();
+
+        let out_dir = temp_dir.join("out");
+        pack_and_unpack(&game_dir, &out_dir);
+        let strings = compiled_text(
+            &out_dir.join("tl").join(TL_LANG).join("translator_saved_strings.rpyc"),
+        );
+        for expected in [
+            "Селия",
+            "Радио",
+            "Катя",
+            "Привет",
+            "Селия & Радио",
+            "[ce] и Охранник",
+            "Охранник & Незнакомец",
+        ] {
+            assert!(strings.contains(expected), "{expected}: {strings}");
+        }
+        assert!(!strings.contains("Кэти"), "{strings}");
 
         let _ = std::fs::remove_dir_all(get_project_cache_dir(&game_dir));
         let _ = std::fs::remove_dir_all(&temp_dir);

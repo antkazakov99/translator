@@ -72,7 +72,20 @@
     note: string;
   }
 
-  type GlossaryTab = "characters" | "terms" | "tokens" | "scenes";
+  interface PanelSpeaker {
+    name: string;
+    lines: number;
+    translated: string;
+    gender: string;
+  }
+
+  interface SpeakerSuggestion {
+    name: string;
+    translated: string;
+    gender: string;
+  }
+
+  type GlossaryTab = "characters" | "terms" | "tokens" | "scenes" | "speakers";
 
   let {
     tab,
@@ -80,6 +93,7 @@
     characters,
     terms,
     tokens,
+    speakers,
     hints,
     settings,
     descriptionsOpen = $bindable(false),
@@ -88,13 +102,15 @@
     onnames,
     onorigins,
     onterms,
-    ontokens
+    ontokens,
+    onspeakers
   }: {
     tab: GlossaryTab;
     gameDir: string;
     characters: PanelCharacter[];
     terms: PanelTerm[];
     tokens: PanelToken[];
+    speakers: PanelSpeaker[];
     hints: object;
     settings: LlmSettings;
     descriptionsOpen?: boolean;
@@ -104,17 +120,19 @@
     onorigins: (rows: { alias: string; origin: CharacterNameOrigin }[], overwrite?: boolean) => void;
     onterms: (rows: { id: string; translated: string; category: string; notes: string }[]) => void;
     ontokens: (rows: { name: string; value: string; note: string }[]) => void;
+    onspeakers: (rows: { name: string; translated: string; gender: string }[]) => void;
   } = $props();
 
   const SECTIONS: Record<GlossaryTab, LlmAction[]> = {
     characters: ["descriptions", "names"],
     terms: ["terms", "descriptions"],
     tokens: ["tokens"],
-    scenes: ["descriptions"]
+    scenes: ["descriptions"],
+    speakers: ["speakers"]
   };
 
   let panelOpen = $state(false);
-  let sectionByTab = $state<Record<GlossaryTab, LlmAction>>({ characters: "descriptions", terms: "terms", tokens: "tokens", scenes: "descriptions" });
+  let sectionByTab = $state<Record<GlossaryTab, LlmAction>>({ characters: "descriptions", terms: "terms", tokens: "tokens", scenes: "descriptions", speakers: "speakers" });
   let openSection = $derived(sectionByTab[tab]);
   let openOutsideNote = $derived(outsideNote(settings, openSection));
 
@@ -618,6 +636,49 @@
     reviewTokens = [];
     tokensRun = false;
   }
+
+  // Подписи без реплик модели показать нечего. Без явного выбора в запуске подписи без перевода
+  let readableSpeakers = $derived(speakers.filter((s) => s.lines > 0));
+  let unselectedSpeakers = $state<string[] | null>(null);
+  let speakersDeselected = $derived(unselectedSpeakers ?? readableSpeakers.filter((s) => s.translated.trim()).map((s) => s.name));
+  let speakerTargets = $derived(readableSpeakers.filter((s) => !speakersDeselected.includes(s.name)));
+  let reviewSpeakers = $state<(SpeakerSuggestion & { current: string; selected: boolean })[]>([]);
+  let speakersRun = $state(false);
+  let chosenSpeakers = $derived(reviewSpeakers.filter((s) => s.selected && s.translated.trim()));
+
+  async function startSpeakers() {
+    const names = speakerTargets.map((s) => s.name);
+    if (!beginRun("Модель переводит подписи говорящих...")) return;
+    reviewSpeakers = [];
+    speakersRun = true;
+    try {
+      const result = await invoke<AutofillResult<SpeakerSuggestion>>("suggest_glossary_speakers", {
+        gameDir,
+        target: targetFor(settings, "speakers"),
+        names,
+        hints: $state.snapshot(hints),
+        onBatch: batchChannel<SpeakerSuggestion>((items) => {
+          reviewSpeakers.push(...items.map((item) => {
+            const current = speakers.find((s) => s.name === item.name)?.translated ?? "";
+            // Готовый перевод заменяется, только если его отметил пользователь
+            return { ...item, current, selected: !current.trim() };
+          }));
+        })
+      });
+      if (result.failed_batches > 0) errorMessage = failedBatchesMessage(result.failed_batches);
+    } catch (e) {
+      errorMessage = `Не удалось перевести подписи: ${String(e)}`;
+    } finally {
+      endRun();
+    }
+  }
+
+  function applySpeakers() {
+    onspeakers(chosenSpeakers.map(({ name, translated, gender }) => ({ name, translated: translated.trim(), gender })));
+    doneMessage = `Обновлено подписей: ${chosenSpeakers.length}`;
+    reviewSpeakers = [];
+    speakersRun = false;
+  }
 </script>
 
 {#snippet runButton(label: string, disabled: boolean, onclick: () => void)}
@@ -844,6 +905,43 @@
             <button class="btn-apply" onclick={applyTokens} disabled={chosenTokens.length === 0 || isProcessing}>
               <Check size={14} />
               <span>Записать выбранные ({chosenTokens.length})</span>
+            </button>
+          </div>
+        {/if}
+      {:else if openSection === "speakers"}
+        <p class="ai-note">Модель читает несколько реплик каждого говорящего и предлагает перевод подписи и род. Что записать в глоссарий, выберете вы.</p>
+        <EntryPicker
+          items={readableSpeakers.map((s) => ({ id: s.name, name: s.name }))}
+          unselected={speakersDeselected}
+          disabled={llmRun.active}
+          onchange={(next) => unselectedSpeakers = next}
+          onempty={() => unselectedSpeakers = null}
+        />
+        {@render runButton(`Перевести подписи (${speakerTargets.length})`, speakerTargets.length === 0, startSpeakers)}
+
+        {#if speakersRun && !isProcessing && reviewSpeakers.length === 0 && !errorMessage}
+          <p class="ai-note">Модель не смогла ничего предложить.</p>
+        {/if}
+        {#if reviewSpeakers.length > 0}
+          <div class="ai-review">
+            {#each reviewSpeakers as row (row.name)}
+              <div class="ai-row ai-row-select" class:off={!row.selected}>
+                <input type="checkbox" bind:checked={row.selected} aria-label={`Записать перевод ${row.name}`} />
+                <div class="ai-source">
+                  <span class="ai-term">{row.name}</span>
+                  <span class="ai-example">Сейчас: {row.current || "нет перевода"}</span>
+                </div>
+                <input type="text" class="input" bind:value={row.translated} placeholder="Перевод" aria-label={`Перевод подписи ${row.name}`} />
+                <select class="input" bind:value={row.gender} aria-label={`Род говорящего ${row.name}`}>
+                  <option value="male">Мужской</option>
+                  <option value="female">Женский</option>
+                  <option value="unknown">Не указан</option>
+                </select>
+              </div>
+            {/each}
+            <button class="btn-apply" onclick={applySpeakers} disabled={chosenSpeakers.length === 0 || isProcessing}>
+              <Check size={14} />
+              <span>Записать выбранные ({chosenSpeakers.length})</span>
             </button>
           </div>
         {/if}

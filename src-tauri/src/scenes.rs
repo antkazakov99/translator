@@ -56,12 +56,69 @@ pub struct ScriptLine {
     pub alias: Option<String>,
     pub speaker: Option<String>,
     pub text: String,
+    /// Говорящий задан строкой, а не персонажем: `"Radio Chatter" "..."`.
+    pub named: bool,
 }
 
 impl ScriptLine {
     pub fn key(&self) -> String {
         scene_key(&self.file, &self.scene)
     }
+
+    /// Подпись говорящего-строки так, как её покажет игра.
+    pub fn speaker_name(&self) -> Option<String> {
+        self.alias.as_deref().filter(|_| self.named).map(RenpyParser::unescape_renpy_string)
+    }
+}
+
+/// Говорящий, заданный строкой: роль вроде «Radio Chatter» или «Woman», а не персонаж.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TextSpeaker {
+    pub name: String,
+    /// Сколько у него реплик.
+    pub lines: usize,
+    pub example: String,
+}
+
+/// Переменные и союз в подписи: без них в подписи на двоих остаются только имена.
+static RE_NAME_FILLER: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\[[^\]]*\]|\band\b").unwrap());
+
+/// Есть ли в подписи что переводить: у `????` и `[mc] & [ne]` нет ни одного слова вне переменных.
+pub fn has_name_words(name: &str) -> bool {
+    RE_NAME_FILLER.replace_all(name, "").chars().any(char::is_alphabetic)
+}
+
+/// Говорящие-строки игры, начиная с самых частых.
+pub fn text_speakers(game: &GameLines) -> Vec<TextSpeaker> {
+    let mut found: HashMap<String, TextSpeaker> = HashMap::new();
+    for line in &game.lines {
+        let Some(name) = line.speaker_name().filter(|name| has_name_words(name)) else {
+            continue;
+        };
+        found
+            .entry(name.clone())
+            .or_insert_with(|| TextSpeaker { name, lines: 0, example: line.text.clone() })
+            .lines += 1;
+    }
+    let mut speakers: Vec<TextSpeaker> = found.into_values().collect();
+    speakers.sort_by(|a, b| b.lines.cmp(&a.lines).then_with(|| a.name.cmp(&b.name)));
+    speakers
+}
+
+/// Реплики говорящих-строк по подписи, не больше `limit` на каждого.
+pub fn speaker_samples(game: &GameLines, names: &[String], limit: usize) -> HashMap<String, Vec<String>> {
+    let wanted: HashSet<&str> = names.iter().map(String::as_str).collect();
+    let mut samples: HashMap<String, Vec<String>> = HashMap::new();
+    for line in &game.lines {
+        if let Some(name) = line.speaker_name().filter(|name| wanted.contains(name.as_str())) {
+            let own = samples.entry(name).or_default();
+            if own.len() < limit && !own.contains(&line.text) {
+                own.push(line.text.clone());
+            }
+        }
+    }
+    samples
 }
 
 /// Читает реплики всех скриптов. `file_name` даёт имя файла для показа и ключей сцен.
@@ -76,6 +133,7 @@ pub fn load_lines(scripts: &[PathBuf], file_name: impl Fn(&Path) -> String + Syn
                 return Vec::new();
             };
             let file = file_name(path);
+            let source: Vec<&str> = content.lines().collect();
             graph
                 .dialogues()
                 .map(|line| ScriptLine {
@@ -86,6 +144,11 @@ pub fn load_lines(scripts: &[PathBuf], file_name: impl Fn(&Path) -> String + Syn
                     alias: line.speaker_alias.clone(),
                     speaker: line.speaker.clone(),
                     text: line.original_text.clone(),
+                    named: line.speaker_alias.is_some()
+                        && source
+                            .get(line.line_number.wrapping_sub(1))
+                            .and_then(|text| RenpyParser::say_statement(text.trim()))
+                            .is_some_and(|say| say.speaker_is_string),
                 })
                 .collect()
         })
@@ -165,6 +228,11 @@ pub fn term_scenes(game: &GameLines, forms: &[String]) -> Vec<CharacterScene> {
         return Vec::new();
     }
     matching_scenes(game, &format!(r"(?i)(?:^|\W)(?:{})(?:$|\W)", forms.join("|")))
+}
+
+/// Сцены, где говорит говорящий-строка с этой подписью.
+pub fn speaker_scenes(game: &GameLines, name: &str) -> Vec<CharacterScene> {
+    scenes_with(game, |line| (line.speaker_name().as_deref() == Some(name)).then_some(true))
 }
 
 /// Все реплики сцены. Метка одна на игру, но локальная метка может повториться в другом файле.
@@ -265,6 +333,33 @@ mod tests {
         let game = GameLines::new(load_lines(&[path], |_| "story.rpy".to_string()), HashMap::new());
         let _ = fs::remove_dir_all(dir);
         game
+    }
+
+    #[test]
+    fn speakers_named_by_strings_are_listed_apart_from_characters() {
+        let game = game_of(concat!(
+            "define w = Character(\"Woman\")\n",
+            "label intro:\n",
+            "    \"Radio Chatter\" \"News one.\"\n",
+            "    w \"Character line.\"\n",
+            "    \"Radio Chatter\" \"News two.\"\n",
+            "    \"Radio Chatter\" \"News two.\"\n",
+            "    \"Woman\" \"Named by string.\"\n",
+            "    \"????\" \"Who?\"\n",
+            "    \"[mc] and [ne]\" \"Us!\"\n",
+            "    \"Celia & [mc]\" \"Hi.\"\n",
+            "    \"Plain narration.\"\n",
+        ));
+        let speakers = text_speakers(&game);
+        let found: Vec<(&str, usize)> = speakers.iter().map(|s| (s.name.as_str(), s.lines)).collect();
+        assert_eq!(found, [("Radio Chatter", 3), ("Celia & [mc]", 1), ("Woman", 1)]);
+
+        let samples = speaker_samples(&game, &["Radio Chatter".to_string()], 5);
+        assert_eq!(samples["Radio Chatter"], ["News one.", "News two."]);
+
+        let scenes = speaker_scenes(&game, "Woman");
+        assert_eq!(scenes.len(), 1);
+        assert_eq!(scenes[0].lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>(), ["Named by string."]);
     }
 
     #[test]

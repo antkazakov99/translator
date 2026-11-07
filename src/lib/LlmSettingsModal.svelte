@@ -38,6 +38,7 @@
       names: { connection: "", model: "" },
       terms: { connection: "", model: "" },
       tokens: { connection: "", model: "" },
+      speakers: { connection: "", model: "" },
       lines: { connection: "", model: "" },
       review: { connection: "", model: "" }
     }

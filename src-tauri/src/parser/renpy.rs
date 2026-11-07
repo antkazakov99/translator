@@ -118,6 +118,16 @@ static RE_DEFINITION_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
 /// Операторы экрана с текстом, который видит игрок.
 const SCREEN_TEXT_STATEMENTS: &[&str] = &["text", "textbutton", "tooltip"];
 
+/// Строка Python, которую игра покажет игроку: `textbutton _("Start")`, `renpy.input("Name?")`.
+/// Движок переводит любой показанный текст строковым переводом, поэтому они попадают в мод как `old`.
+static RE_CODE_STRING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r#"(?:\b_{1,2}|\brenpy\.input)\(\s*[uU]?"#,
+        r#"(?:"(?P<text>(?:[^"\\]|\\.)*)"|'(?P<text_sq>(?:[^'\\]|\\.)*)')"#,
+    ))
+    .unwrap()
+});
+
 static RE_REPEATED_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(" {2,}").unwrap());
 
 static RE_SOURCE_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
@@ -291,6 +301,58 @@ fn parse_say_line(line: &str) -> Option<SayLine<'_>> {
     })
 }
 
+/// Тексты строки оригинального скрипта, которые видит игрок: реплика или строки кода.
+/// `hidden` означает строку блока определений, где реплик нет, а строки кода бывают.
+/// Пустой текст не возвращается: строковый перевод `old ""` движок приклеил бы к каждому имени и реплике.
+fn script_texts(trimmed: &str, hidden: bool) -> Vec<(Option<&str>, String)> {
+    if !hidden && let Some(say) = parse_say_line(trimmed) {
+        if RenpyParser::is_blank_text(say.text) {
+            return Vec::new();
+        }
+        return vec![(say.speaker, RenpyParser::unescape_renpy_string(say.text))];
+    }
+    RE_CODE_STRING
+        .captures_iter(trimmed)
+        .filter_map(|caps| caps.name("text").or_else(|| caps.name("text_sq")))
+        .map(|text| unescape_python_string(text.as_str()))
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| (None, text))
+        .collect()
+}
+
+/// Значение строки Python. Пробелы, в отличие от строк сценария, не схлопываются.
+fn unescape_python_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            result.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => result.push('\n'),
+            Some('t') => result.push('\t'),
+            Some(quote @ ('"' | '\'' | '\\')) => result.push(quote),
+            Some('u') => {
+                let code: String = chars.clone().take(4).collect();
+                match u32::from_str_radix(&code, 16).ok().and_then(char::from_u32) {
+                    Some(decoded) if code.len() == 4 => {
+                        result.push(decoded);
+                        chars.nth(3);
+                    }
+                    _ => result.push_str("\\u"),
+                }
+            }
+            Some(other) => {
+                result.push('\\');
+                result.push(other);
+            }
+            None => result.push('\\'),
+        }
+    }
+    result
+}
+
 /// Реплика со всеми частями, нужными для её компиляции.
 pub struct SayParts {
     pub speaker: Option<String>,
@@ -439,6 +501,12 @@ impl RenpyParser {
         text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
     }
 
+    /// Пустая реплика вроде `mc ""`: переводить в ней нечего, поэтому репликой она не считается,
+    /// иначе навсегда осталась бы непереведённой. Текст передаётся с экранированием, как в файле.
+    pub fn is_blank_text(raw: &str) -> bool {
+        raw.trim().is_empty() || Self::unescape_renpy_string(raw).trim().is_empty()
+    }
+
     /// Разбирает реплику на части. Текст файла остаётся без снятия экранирования.
     pub fn say_statement(line: &str) -> Option<SayParts> {
         let say = parse_say_line(line)?;
@@ -454,6 +522,17 @@ impl RenpyParser {
             text: say.text.to_string(),
             rest: line[say.quoted.end..].to_string(),
         })
+    }
+
+    /// Говорящие, заданные строкой вместо персонажа: `"Radio Chatter" "..."`.
+    pub fn string_speakers(content: &str) -> std::collections::HashSet<String> {
+        content
+            .lines()
+            .filter_map(|line| Self::say_statement(line.trim()))
+            .filter(|say| say.speaker_is_string)
+            .filter_map(|say| say.speaker)
+            .map(|speaker| Self::unescape_renpy_string(&speaker))
+            .collect()
     }
 
     /// Текст строки `old` со снятым экранированием.
@@ -498,14 +577,9 @@ impl RenpyParser {
             let mut blocks = DefinitionBlocks::default();
             let total = content
                 .lines()
-                .filter(|line| {
-                    let trimmed = line.trim();
-                    !trimmed.is_empty()
-                        && !trimmed.starts_with('#')
-                        && !blocks.hides(line)
-                        && parse_say_line(trimmed).is_some()
-                })
-                .count();
+                .filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
+                .map(|line| script_texts(line.trim(), blocks.hides(line)).len())
+                .sum();
             return (total, 0);
         }
 
@@ -544,7 +618,8 @@ impl RenpyParser {
                         && let Some(e) = trimmed.rfind('"')
                         && e > s
                     {
-                        pending_old = Some(&trimmed[s + 1..e]);
+                        let old_str = &trimmed[s + 1..e];
+                        pending_old = (!Self::is_blank_text(old_str)).then_some(old_str);
                     }
                 } else if trimmed.starts_with("new ")
                     && let Some(old_str) = pending_old.take()
@@ -567,8 +642,9 @@ impl RenpyParser {
             if in_block {
                 if trimmed.starts_with('#') {
                     // Игнорируем комментарии путей вроде `# game/story.rpy:10`
-                    if parse_say_line(trimmed.trim_start_matches('#').trim()).is_some() {
-                        pending_dialogue = true;
+                    // Пустая реплика-источник снимает ожидание, чтобы её перевод не засчитался
+                    if let Some(say) = parse_say_line(trimmed.trim_start_matches('#').trim()) {
+                        pending_dialogue = !Self::is_blank_text(say.text);
                     }
                 } else if pending_dialogue && let Some(say) = parse_say_line(trimmed) {
                     total += 1;
@@ -843,13 +919,7 @@ impl RenpyParser {
                 last_node_idx = Some(label_node);
                 continue;
             }
-            if hidden {
-                continue;
-            }
-
-            if let Some(say) = parse_say_line(trimmed) {
-                let speaker_alias = say.speaker;
-                let text = Self::unescape_renpy_string(say.text);
+            for (speaker_alias, text) in script_texts(trimmed, hidden) {
                 let resolved_speaker = self.resolve_speaker(speaker_alias);
 
                 let mut dialogue =
@@ -946,7 +1016,7 @@ impl GameParser for RenpyParser {
                 if let Some(caps) = RE_OLD.captures(line) {
                     let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
                     let src_line = pending_comment_line.take().unwrap_or(line_num);
-                    pending_old = Some((text, src_line));
+                    pending_old = (!text.trim().is_empty()).then_some((text, src_line));
                 } else if let Some(caps) = RE_NEW.captures(line)
                     && let Some((old_text, old_line)) = pending_old.take()
                 {
@@ -998,7 +1068,8 @@ impl GameParser for RenpyParser {
                     if let Some(say) = parse_say_line(comment) {
                         let speaker = say.speaker.map(str::to_string);
                         let text = Self::unescape_renpy_string(say.text);
-                        pending_source = Some((speaker, text, line_num));
+                        pending_source =
+                            (!text.trim().is_empty()).then_some((speaker, text, line_num));
                     }
                 } else if let Some(say) = parse_say_line(trimmed) {
                     let speaker_alias = say.speaker;
@@ -1130,6 +1201,65 @@ mod tests {
             vec![(Some("e".to_string()), "Hello".to_string(), Some("Привет".to_string()))]
         );
         assert_eq!(RenpyParser::quick_translation_stats(rpy), (1, 1));
+    }
+
+    #[test]
+    fn test_blank_lines_are_not_dialogue() {
+        let script = "label start:\n    \"\"\n    mc \"\"\n    e \"  \"\n    \"...\"\n";
+        assert_eq!(dialogue_texts(script).len(), 1);
+        assert_eq!(RenpyParser::quick_translation_stats(script), (1, 0));
+
+        let tl = r#"translate russian start_abcd1234:
+
+    # mc ""
+    mc ""
+
+translate russian start_beef5678:
+
+    # e "Hello"
+    e "Привет"
+
+translate russian strings:
+
+    old ""
+    new ""
+
+    old "Menu"
+    new "Меню"
+"#;
+        assert_eq!(dialogue_texts(tl).len(), 2);
+        assert_eq!(RenpyParser::quick_translation_stats(tl), (2, 2));
+    }
+
+    #[test]
+    fn test_shown_code_strings_are_lines() {
+        let script = concat!(
+            "define config.name = _(\"Take Over\")\n",
+            "define gui.about = _p(\"\"\"About\"\"\")\n",
+            "screen navigation():\n",
+            "    vbox:\n",
+            "        textbutton _(\"Start\") action Start()\n",
+            "        textbutton __('Load') action ShowMenu(\"load\")\n",
+            "        text _(\"\")\n",
+            "        add my_(\"skip\")\n",
+            "label intro:\n",
+            "    $ mc = renpy.input(\"What is your name? \")\n",
+            "    $ renpy.notify(_(\"Tab\\there \\\"quoted\\\"  \\u00e9\"))\n",
+            "    \"Radio Chatter\" \"...and on this day\"\n",
+        );
+        let texts: Vec<String> = dialogue_texts(script).into_iter().map(|(_, text, _)| text).collect();
+        assert_eq!(
+            texts,
+            [
+                "Take Over",
+                "Start",
+                "Load",
+                "What is your name? ",
+                "Tab\there \"quoted\"  é",
+                "...and on this day",
+            ]
+        );
+        assert_eq!(RenpyParser::quick_translation_stats(script), (6, 0));
     }
 
     #[test]
