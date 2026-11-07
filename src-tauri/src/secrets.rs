@@ -50,7 +50,11 @@ impl SecretStore {
 
     /// Запуск приложения: удаляет ключи провайдеров, которых нет в базе (сбой между базой и хранилищем).
     pub fn delete_except(&self, providers: &[ProviderId]) {
-        todo!()
+        match self {
+            // Хранилище ОС не перечисляет записи: список ключей появится вместе с поддержкой keyring.
+            Self::System => todo!(),
+            Self::Memory(keys) => keys.lock().retain(|id, _| providers.contains(id)),
+        }
     }
 
     fn entry_name(provider: ProviderId) -> String {

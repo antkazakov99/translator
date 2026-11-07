@@ -8,8 +8,8 @@ use crate::common::{AppError, Timestamp};
 use crate::engines::{self, GameSource};
 use crate::files::FileStore;
 use crate::scan::ScanRepo;
-use crate::state::{AppState, OpenProject};
-use crate::storage::ProjectDb;
+use crate::state::{AppState, OpenProject, remove_dir};
+use crate::storage::{DbError, ProjectDb};
 
 /// Итог смены папки.
 #[derive(Debug)]
@@ -35,10 +35,10 @@ impl ProjectService<'_> {
         let dir = self.state.project_dir(project.id());
         let files = FileStore::create(&dir)?;
         // Долго и вне транзакции: файлы пишутся в files/ по мере чтения.
-        let snapshot = engine.read(&GameSource::Folder(root), &info, &files)?;
+        let snapshot = engine.read(&GameSource::Folder(root.clone()), &info, &files)?;
 
         let db = ProjectDb::create(&dir, &project)?;
-        db.write(|tx| ScanRepo { conn: tx }.save(&snapshot, None, engine.parser_version()).map(|_| ()))?;
+        db.write(|tx| ScanRepo { conn: tx }.save(&snapshot, Some(&root), engine.parser_version()).map(|_| ()))?;
 
         project.ready()?;
         self.state.app.write(|tx| ProjectRepo { conn: tx }.save(&project))?;
@@ -47,7 +47,7 @@ impl ProjectService<'_> {
 
     /// Сначала файлы, потом `opened_at`: с повреждённой project.db проект не поднимется наверх списка.
     pub fn open(&self, id: ProjectId) -> Result<Project, AppError> {
-        let mut project = self.state.app.read(|tx| ProjectRepo { conn: tx }.get(id))?;
+        let mut project = self.get(id)?;
         project.open(Timestamp::now())?;
 
         // Уже открытый проект второй раз не открывается.
@@ -64,16 +64,19 @@ impl ProjectService<'_> {
         self.state.open_projects.lock().remove(&id);
     }
 
-    pub fn archive(&self, id: ProjectId) -> Result<(), AppError> {
-        todo!()
+    pub fn archive(&self, id: ProjectId) -> Result<Project, AppError> {
+        self.update(id, |project| Ok(project.archive()?))
     }
 
-    pub fn unarchive(&self, id: ProjectId) -> Result<(), AppError> {
-        todo!()
+    pub fn unarchive(&self, id: ProjectId) -> Result<Project, AppError> {
+        self.update(id, |project| Ok(project.unarchive()?))
     }
 
-    pub fn rename(&self, id: ProjectId, title: Title) -> Result<(), AppError> {
-        todo!()
+    pub fn rename(&self, id: ProjectId, title: Title) -> Result<Project, AppError> {
+        self.update(id, |project| {
+            project.rename(title);
+            Ok(())
+        })
     }
 
     /// Привязывает другую папку: движок узнаёт игру, модель сверяет движок, игра считывается заново
@@ -82,16 +85,152 @@ impl ProjectService<'_> {
         todo!()
     }
 
-    pub fn unbind(&self, id: ProjectId) -> Result<(), AppError> {
-        todo!()
+    /// Отвязывает папку игры: проект работает дальше, недоступны установка мода и повторное считывание.
+    pub fn unbind(&self, id: ProjectId) -> Result<Project, AppError> {
+        self.update(id, |project| {
+            project.unbind();
+            Ok(())
+        })
     }
 
     /// `mark_deleting` и сохранение, закрытие, удаление папки, потом строки. Сбой посередине дочищает запуск.
     pub fn delete(&self, id: ProjectId) -> Result<(), AppError> {
-        todo!()
+        self.update(id, |project| {
+            project.mark_deleting();
+            Ok(())
+        })?;
+        self.close(id);
+        remove_dir(&self.state.project_dir(id))?;
+        self.state.app.write(|tx| ProjectRepo { conn: tx }.delete(id))?;
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<Project>, AppError> {
         Ok(self.state.app.read(|tx| ProjectRepo { conn: tx }.list())?)
+    }
+
+    /// Готовые проекты, привязанные к папке: при выборе папки окно предлагает открыть их.
+    pub fn find_by_root(&self, root: &GameRoot) -> Result<Vec<Project>, AppError> {
+        Ok(self.state.app.read(|tx| ProjectRepo { conn: tx }.find_by_root(root))?)
+    }
+
+    fn get(&self, id: ProjectId) -> Result<Project, AppError> {
+        self.state.app.read(|tx| ProjectRepo { conn: tx }.get(id)).map_err(not_found)
+    }
+
+    /// Чтение, правило модели и запись одной транзакцией.
+    fn update(&self, id: ProjectId, change: impl FnOnce(&mut Project) -> Result<(), AppError>) -> Result<Project, AppError> {
+        let mut result = Ok(());
+        let project = self
+            .state
+            .app
+            .write(|tx| {
+                let repo = ProjectRepo { conn: tx };
+                let mut project = repo.get(id)?;
+                result = change(&mut project);
+                if result.is_ok() {
+                    repo.save(&project)?;
+                }
+                Ok(project)
+            })
+            .map_err(not_found)?;
+        result.map(|()| project)
+    }
+}
+
+fn not_found(error: DbError) -> AppError {
+    match error {
+        DbError::NotFound => AppError::ProjectNotFound,
+        other => other.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use parking_lot::Mutex;
+
+    use super::*;
+    use crate::common::ValidationError;
+    use crate::secrets::SecretStore;
+    use crate::state::tests::ready_project;
+
+    fn state(dir: &std::path::Path) -> AppState {
+        AppState::start(dir.to_path_buf(), SecretStore::Memory(Mutex::new(HashMap::new()))).unwrap()
+    }
+
+    #[test]
+    fn open_once_and_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let service = ProjectService { state: &state };
+        let project = ready_project(&state, "game");
+
+        let opened = service.open(project.id()).unwrap();
+        assert!(opened.opened_at().is_some());
+        let first = state.open_project(project.id()).unwrap();
+        service.open(project.id()).unwrap();
+        assert!(Arc::ptr_eq(&first, &state.open_project(project.id()).unwrap()));
+
+        service.close(project.id());
+        assert!(matches!(state.open_project(project.id()), Err(AppError::ProjectNotOpen)));
+    }
+
+    #[test]
+    fn opening_returns_project_from_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let service = ProjectService { state: &state };
+        let project = ready_project(&state, "game");
+
+        assert!(service.archive(project.id()).unwrap().is_archived());
+        assert!(!service.open(project.id()).unwrap().is_archived());
+        assert!(!service.list().unwrap()[0].is_archived());
+    }
+
+    #[test]
+    fn rename_and_unbind_are_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let service = ProjectService { state: &state };
+        let project = ready_project(&state, "game");
+        let root = project.game_root().unwrap().clone();
+        assert_eq!(service.find_by_root(&root).unwrap().len(), 1);
+
+        service.rename(project.id(), Title::new("Новое имя").unwrap()).unwrap();
+        service.unbind(project.id()).unwrap();
+        let saved = &service.list().unwrap()[0];
+        assert_eq!(saved.title().as_str(), "Новое имя");
+        assert!(!saved.is_bound());
+        assert!(service.find_by_root(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_closes_and_removes_everything() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let service = ProjectService { state: &state };
+        let project = ready_project(&state, "game");
+        service.open(project.id()).unwrap();
+
+        service.delete(project.id()).unwrap();
+        assert!(!state.project_dir(project.id()).exists());
+        assert!(service.list().unwrap().is_empty());
+        assert!(matches!(service.open(project.id()), Err(AppError::ProjectNotFound)));
+    }
+
+    #[test]
+    fn unfinished_project_cannot_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let service = ProjectService { state: &state };
+        let mut project = ready_project(&state, "game");
+        project.mark_deleting();
+        state.app.write(|tx| ProjectRepo { conn: tx }.save(&project)).unwrap();
+
+        let result = service.open(project.id());
+        assert!(matches!(result, Err(AppError::Validation(ValidationError::WrongStatus("deleting")))));
+        assert!(state.open_project(project.id()).is_err());
     }
 }

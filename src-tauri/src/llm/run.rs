@@ -143,15 +143,54 @@ pub struct LlmRunRepo<'c> {
 impl LlmRunRepo<'_> {
     /// Имена провайдера и модели строкой: профиль могут удалить, а запись останется понятной.
     pub fn start(&self, action: Action, provider: &str, model: &str, now: Timestamp) -> Result<RunId, DbError> {
-        todo!()
+        self.conn.execute(
+            "INSERT INTO llm_runs (action_id, provider, model, status, started_at) VALUES (?1, ?2, ?3, 'running', ?4)",
+            rusqlite::params![action.id(), provider, model, now.secs()],
+        )?;
+        Ok(RunId::from_row(self.conn.last_insert_rowid()))
     }
 
     pub fn finish(&self, id: RunId, status: RunStatus, error: Option<&str>, now: Timestamp) -> Result<(), DbError> {
-        todo!()
+        self.conn.execute(
+            "UPDATE llm_runs SET status = ?2, error = ?3, finished_at = ?4 WHERE id = ?1",
+            rusqlite::params![id.get(), status.as_str(), error, now.secs()],
+        )?;
+        Ok(())
     }
 
     /// При открытии проекта: `running` после аварийного закрытия становится `failed`.
-    pub fn fail_stale(&self) -> Result<usize, DbError> {
-        todo!()
+    pub fn fail_stale(&self, now: Timestamp) -> Result<usize, DbError> {
+        Ok(self.conn.execute(
+            "UPDATE llm_runs SET status = 'failed', error = 'Приложение закрылось во время запуска', finished_at = ?1
+             WHERE status = 'running'",
+            [now.secs()],
+        )?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::Database;
+
+    #[test]
+    fn stale_runs_become_failed_and_new_can_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("runs.db")).unwrap();
+        db.write(|tx| Ok(tx.execute_batch(include_str!("../storage/schema/project/0001_init.sql"))?)).unwrap();
+
+        let first = db.write(|tx| LlmRunRepo { conn: tx }.start(Action::Lines, "LM Studio", "gemma", Timestamp::from_secs(1))).unwrap();
+        let second = db.write(|tx| LlmRunRepo { conn: tx }.start(Action::Lines, "LM Studio", "gemma", Timestamp::from_secs(2)));
+        assert!(second.is_err(), "два running в одной базе не пишутся");
+
+        assert_eq!(db.write(|tx| LlmRunRepo { conn: tx }.fail_stale(Timestamp::from_secs(3))).unwrap(), 1);
+        let status: String = db
+            .read(|tx| Ok(tx.query_row("SELECT status FROM llm_runs WHERE id = ?1", [first.get()], |row| row.get(0))?))
+            .unwrap();
+        assert_eq!(status, "failed");
+
+        let next = db.write(|tx| LlmRunRepo { conn: tx }.start(Action::Review, "Claude", "sonnet", Timestamp::from_secs(4))).unwrap();
+        db.write(|tx| LlmRunRepo { conn: tx }.finish(next, RunStatus::Done, None, Timestamp::from_secs(5))).unwrap();
+        assert_eq!(db.write(|tx| LlmRunRepo { conn: tx }.fail_stale(Timestamp::from_secs(6))).unwrap(), 0);
     }
 }
