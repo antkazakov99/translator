@@ -1,9 +1,27 @@
-//! Таблица `projects` в app.db.
+//! Таблица `projects` в app.db и строка `project` в project.db.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 use super::{GameRoot, Project, ProjectId};
+use crate::common::Timestamp;
+use crate::name_rules::LanguageTag;
 use crate::storage::DbError;
+
+/// Строка `project` в project.db: копия id и движка для восстановления списка без app.db, язык перевода.
+pub struct ProjectInfoRepo<'c> {
+    pub conn: &'c Connection,
+}
+
+impl ProjectInfoRepo<'_> {
+    /// Единственная строка, пишется при создании базы проекта.
+    pub fn insert(&self, project: &Project, target_language: &LanguageTag, now: Timestamp) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO project (id, engine, target_language, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![project.id().to_string(), project.engine().as_str(), target_language.as_str(), now.secs()],
+        )?;
+        Ok(())
+    }
+}
 
 /// Живёт одну операцию и хранит только ссылку на соединение или транзакцию сервиса.
 pub struct ProjectRepo<'c> {

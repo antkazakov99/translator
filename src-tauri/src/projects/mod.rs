@@ -5,5 +5,5 @@ pub mod repo;
 pub mod service;
 
 pub use model::{GameRoot, Project, ProjectId, ProjectRow, ProjectStatus, Title};
-pub use repo::ProjectRepo;
+pub use repo::{ProjectInfoRepo, ProjectRepo};
 pub use service::{ProjectService, RebindCheck};

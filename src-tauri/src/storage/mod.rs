@@ -2,6 +2,8 @@
 
 pub mod database;
 pub mod error;
+pub mod migrations;
 
 pub use database::{AppDb, CacheDb, Database, ProjectDb};
 pub use error::DbError;
+pub use migrations::Migration;

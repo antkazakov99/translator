@@ -47,7 +47,7 @@ cargo clippy --lib --tests
 - `glossary/`: говорящие и связи с персонажами, персонажи, термины, токены, описания сцен, заметки модели, `NameKey`.
 - `name_rules/`, `fonts/`, `export/`: правила имён, замены шрифтов, сборка и установка мода.
 - `engines/`: порт `GameEngine` и типы снимка. `engines/renpy/` это адаптер Ren'Py: `rpa` (архивы RPA-2.0 и 3.0), `rpyc` (декомпиляция), `rpyc_writer` (компиляция `.rpyc` без игры), `pickle`, `script` (разбор `.rpy`) и `graph`. Эти файлы перенесены из 1.0 как есть, `RenpyEngine` их пока не вызывает.
-- `storage/`: `Database` и обёртки `AppDb`, `ProjectDb`, `CacheDb`. `files.rs` это `FileStore`, `secrets.rs` это `SecretStore`, `state.rs` это `AppState` и `OpenProject`, `common.rs` это общие типы и ошибки.
+- `storage/`: `Database` и обёртки `AppDb`, `ProjectDb`, `CacheDb`. Миграции app.db и project.db (`migrations.rs`) это SQL-файлы `storage/schema/<база>/NNNN_<имя>.sql` в явном списке `APP` и `PROJECT`, история применённых шагов лежит в таблице `schema_migrations`. Новый шаг добавляется в конец, выпущенный шаг не меняется. cache.db без миграций: `schema/cache.sql` и `CACHE_VERSION`. `files.rs` это `FileStore`, `secrets.rs` это `SecretStore`, `state.rs` это `AppState` и `OpenProject`, `common.rs` это общие типы и ошибки.
 
 ### Правила слоёв
 
