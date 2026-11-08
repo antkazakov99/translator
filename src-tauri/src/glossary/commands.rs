@@ -13,6 +13,7 @@ use super::{
 };
 use crate::common::{AppError, Gender, Timestamp};
 use crate::engines::SpeakerKey;
+use crate::name_rules::{LanguageRules, LanguageTag, NameRuleService};
 use crate::llm::{ProfileId, RunProgress};
 use crate::projects::ProjectId;
 use crate::state::{AppState, blocking};
@@ -483,16 +484,40 @@ pub struct NameSuggestionDto {
     pub field: NameField,
     /// Написание в игре: у формы по нему находится сама форма.
     pub source: String,
-    pub origin: Option<String>,
+    /// Коды BCP 47 языков происхождения, вероятные первыми.
+    pub languages: Vec<String>,
     /// Что запишется: сначала выбор модели, окно меняет его вариантом или правкой.
     pub translation: String,
     pub variants: Vec<NameVariantDto>,
+    /// Замечания: неоднозначное происхождение, итог проверки.
+    pub issues: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct NameSuggestionsDto {
     pub items: Vec<NameSuggestionDto>,
+    pub error: Option<String>,
+    /// Языки имён без правил: перевод шёл без них.
+    pub missing_rules: Vec<String>,
+}
+
+/// Язык имён: сколько имён проекта на нём, общие правила и свои правила проекта.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LanguageRulesDto {
+    pub language: String,
+    #[specta(type = specta_typescript::Number)]
+    pub names: usize,
+    pub rules: Option<String>,
+    pub own: Option<String>,
+}
+
+/// Черновик правил. `error`: запуск оборвался.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RulesDraftDto {
+    pub text: Option<String>,
     pub error: Option<String>,
 }
 
@@ -536,23 +561,75 @@ pub async fn suggest_names(
     let found = NamesService { state: &state }.translate_names(self::project(&project)?, characters, self::profile(profile)?, progress).await?;
     Ok(NameSuggestionsDto {
         items: found
+            .suggestions
             .items
             .into_iter()
             .map(|item: NameSuggestion| NameSuggestionDto {
                 character: RowRef(item.character.get()),
                 field: item.field,
                 source: item.source,
-                origin: item.origin,
+                languages: item.languages.iter().map(ToString::to_string).collect(),
                 translation: item.variants.first().map(|variant| variant.translation.clone()).unwrap_or_default(),
                 variants: item
                     .variants
                     .into_iter()
                     .map(|variant: NameVariant| NameVariantDto { translation: variant.translation, description: variant.description })
                     .collect(),
+                issues: item.issues,
             })
             .collect(),
-        error: found.error,
+        error: found.suggestions.error,
+        missing_rules: found.missing_rules.iter().map(ToString::to_string).collect(),
     })
+}
+
+fn language(code: &str) -> Result<LanguageTag, AppError> {
+    Ok(LanguageTag::parse(code)?)
+}
+
+/// Языки имён проекта и библиотеки с правилами.
+#[tauri::command]
+#[specta::specta]
+pub async fn name_rules(app: AppHandle, project: String) -> Result<Vec<LanguageRulesDto>, String> {
+    blocking(app, move |state| {
+        let list = NameRuleService { state }.overview(self::project(&project)?)?;
+        Ok(list
+            .into_iter()
+            .map(|item: LanguageRules| LanguageRulesDto { language: item.language.to_string(), names: item.names, rules: item.rules, own: item.own })
+            .collect())
+    })
+    .await
+}
+
+/// Общие правила языка на язык перевода проекта. Пустой текст удаляет их.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_name_rule(app: AppHandle, project: String, language: String, rules: String) -> Result<(), String> {
+    blocking(app, move |state| NameRuleService { state }.save_shared(self::project(&project)?, &self::language(&language)?, &rules)).await
+}
+
+/// Свои правила языка в проекте: важнее общих. Пустой текст удаляет их.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_own_name_rule(app: AppHandle, project: String, language: String, rules: String) -> Result<(), String> {
+    blocking(app, move |state| NameRuleService { state }.save_own(self::project(&project)?, &self::language(&language)?, &rules)).await
+}
+
+/// Черновик правил моделью. Ничего не записывает: окно показывает его в поле общих правил.
+#[tauri::command]
+#[specta::specta]
+pub async fn draft_name_rule(
+    state: State<'_, AppState>,
+    project: String,
+    language: String,
+    existing: Option<String>,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<RulesDraftDto, String> {
+    let found = NamesService { state: &state }
+        .draft_rules(self::project(&project)?, self::language(&language)?, existing, self::profile(profile)?, progress)
+        .await?;
+    Ok(RulesDraftDto { text: found.items.into_iter().next(), error: found.error })
 }
 
 /// Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `save_term`.

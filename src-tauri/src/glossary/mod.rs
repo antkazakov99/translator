@@ -4,6 +4,7 @@ pub mod characters;
 pub mod commands;
 pub mod describe;
 pub mod key;
+pub mod names;
 pub mod notes;
 pub mod repo;
 pub mod scenes;
@@ -18,7 +19,8 @@ pub use describe::{DescribeService, DescribeTarget, NamesService, ReadingDepth, 
 pub use key::NameKey;
 pub use notes::{Note, NoteOwner};
 pub use repo::{CharacterRepo, LineSampleRepo, NoteRepo, SampleLine, SceneDescriptionRepo, SpeakerRepo, SpeakerUse, TermRepo, TokenRepo};
-pub use suggest::{NameSuggestion, NameVariant, SpeakerSuggestion, TermSuggestion, TokenSuggestion};
+pub use names::{NameSuggestion, NameVariant};
+pub use suggest::{SpeakerSuggestion, TermSuggestion, TokenSuggestion};
 pub use scenes::SceneDescription;
 pub use service::{ExcludeOwner, GlossaryData, GlossaryOverview, GlossaryService};
 pub use speakers::{Speaker, SpeakerEntry, SpeakerLink, speaker_gender};

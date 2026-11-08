@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Check, Languages, LoaderCircle, Plus, Trash2 } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Plus, Trash2, TriangleAlert } from "lucide-svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
   import { commands } from "./bindings";
@@ -7,6 +7,7 @@
     characterName,
     characterTranslation,
     genders,
+    languageList,
     matches,
     nameFieldLabels,
     runsBusy,
@@ -46,12 +47,18 @@
   function runTitle() {
     if (untranslated === 0) return "У всех имён, фамилий и форм есть перевод";
     if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
-    return "Модель предложит написание имён, фамилий и форм без перевода: сначала имён, потом форм от них";
+    return "Модель определит происхождение имён, напишет имена, фамилии и формы без перевода по правилам их языков и проверит написания";
   }
 
   function startRun() {
     const ids = data.characters.filter((character) => untranslatedNames(character) > 0).map((character) => character.id);
-    run.start((channel) => commands.suggestNames(projectId, ids, null, channel), onError);
+    run.start(async (channel) => {
+      const result = await commands.suggestNames(projectId, ids, null, channel);
+      if (result.missingRules.length > 0) {
+        run.warning = `Нет правил для языков: ${languageList(result.missingRules)}. Имена этих языков написаны без них: правила можно добавить в «Правилах имён» и перевести заново`;
+      }
+      return result;
+    }, onError);
   }
 
   /** Отмеченное ложится в пустые поля карточки и записывается персонажем целиком. */
@@ -170,6 +177,12 @@
 <SuggestStatus {run} {onError} />
 
 {#if run.review}
+  {#if run.warning}
+    <div class="banner warn page-error" role="status">
+      <TriangleAlert size={14} />
+      <span>{run.warning}</span>
+    </div>
+  {/if}
   <div class="list">
     <p class="pick-head">Написания от модели. Отмеченные запишутся в пустые поля персонажей, написание можно выбрать из вариантов или поправить</p>
     {#each run.review as item, index (index)}
@@ -178,7 +191,8 @@
         <input type="checkbox" bind:checked={item.selected} aria-label="Записать написание «{item.source}»" />
         <div class="name">
           <strong>{item.source}</strong>
-          <span>{nameFieldLabels[item.field]} · {owner(item.character)}{item.origin ? ` · ${item.origin}` : ""}</span>
+          <span>{nameFieldLabels[item.field]} · {owner(item.character)}{item.languages.length ? ` · ${languageList(item.languages)}` : ""}</span>
+          {#each item.issues as issue, issueIndex (issueIndex)}<span class="issue">{issue}</span>{/each}
         </div>
         <input class="input" bind:value={item.translation} aria-label="Написание «{item.source}»" />
         <div class="variants">
@@ -307,5 +321,10 @@
 
   .variants .segmented {
     flex-wrap: wrap;
+  }
+
+  .name .issue {
+    color: var(--warning);
+    white-space: normal;
   }
 </style>

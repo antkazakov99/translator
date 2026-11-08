@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { untranslatedNames, withSpelledNames } from "../src/lib/glossary.ts";
+import { languageList, untranslatedNames, withSpelledNames } from "../src/lib/glossary.ts";
+
+test("language codes read as Russian language names", () => {
+  assert.equal(languageList(["sr", "de", "zxx", "und"]), "сербский, немецкий, описание, неизвестно");
+  assert.equal(languageList(["qqq"]), "qqq", "неизвестный код остаётся кодом");
+});
 
 const anna = {
   id: 1,

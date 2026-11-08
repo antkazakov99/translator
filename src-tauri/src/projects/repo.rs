@@ -31,6 +31,12 @@ impl ProjectInfoRepo<'_> {
         Ok(())
     }
 
+    /// Язык перевода проекта.
+    pub fn target_language(&self) -> Result<LanguageTag, DbError> {
+        let text: String = self.conn.query_row("SELECT target_language FROM project", [], |row| row.get(0)).optional()?.ok_or(DbError::NotFound)?;
+        LanguageTag::parse(&text).map_err(|error| DbError::bad_value("project", "target_language", error))
+    }
+
     pub fn get(&self) -> Result<ProjectInfo, DbError> {
         let (id, engine, created_at): (String, String, i64) = self
             .conn

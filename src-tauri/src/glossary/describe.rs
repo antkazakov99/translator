@@ -6,11 +6,17 @@ use std::sync::Arc;
 use tauri::ipc::Channel;
 
 use super::repo::{LineSampleRepo, SampleLine};
-use super::suggest::{
-    NameSuggestion, NamesPrompt, SPEAKER_SAMPLES, SpeakerItem, SpeakerSuggestion, SpeakersPrompt, TOKEN_SAMPLES, TermItem, TermSuggestion,
-    TermsPrompt, TokenItem, TokenSuggestion, TokensPrompt, cast, form_items, name_items, sample_line, spread, token_line,
+use super::names::{
+    CheckPrompt, NameItem, NameSuggestion, NamesPrompt, ORIGIN_BATCH, OriginsPrompt, cast, form_items, missing_rules, name_items, with_origins,
 };
-use super::{Character, CharacterId, GlossaryData, SpeakerRepo, TermId};
+use super::suggest::{
+    SPEAKER_SAMPLES, SpeakerItem, SpeakerSuggestion, SpeakersPrompt, TOKEN_SAMPLES, TermItem, TermSuggestion, TermsPrompt, TokenItem,
+    TokenSuggestion, TokensPrompt, sample_line, spread, token_line,
+};
+use super::{Character, CharacterId, CharacterRepo, GlossaryData, NameOrigin, SpeakerRepo, TermId};
+use crate::common::ValidationError;
+use crate::name_rules::{LanguageTag, NameRule, NameRuleService, RulesDraftPrompt};
+use crate::translation::Hints;
 use crate::common::AppError;
 use crate::engines::{ContainerKey, SpeakerKey};
 use crate::llm::{Action, ChatRequest, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunProgress, RunStatus};
@@ -108,42 +114,112 @@ pub struct NamesService<'a> {
 }
 
 impl NamesService<'_> {
-    /// Имена без перевода всей группой в два шага одного запуска: имена и фамилии, потом формы от написанных имён.
-    /// Возвращает предложения для отбора.
+    /// Имена без перевода всей группой в одном запуске: разбор происхождения тех, у кого его нет, правила их
+    /// языков, перевод имён и фамилий, потом форм от написанных имён, и проверка каждого пакета перевода.
+    /// Происхождение записывается сразу, написания возвращаются для отбора.
     pub async fn translate_names(
         &self,
         project: ProjectId,
         characters: Vec<CharacterId>,
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
-    ) -> Result<Suggestions<NameSuggestion>, AppError> {
+    ) -> Result<NamesFound, AppError> {
         let open = self.state.open_project(project)?;
         let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Names, one_off)?;
-        let glossary = open.project.read(|tx| GlossaryData::load(tx))?;
+        let (glossary, stored) = open.project.read(|tx| Ok((GlossaryData::load(tx)?, CharacterRepo { conn: tx }.all_origins()?)))?;
+        let mut known: Vec<(CharacterId, NameOrigin)> =
+            stored.into_iter().flat_map(|(id, origins)| origins.into_iter().map(move |origin| (id, origin))).collect();
         let context = GlossaryContext::new(&glossary);
         let cast = cast(&glossary.characters);
         let chosen: Vec<&Character> =
             glossary.characters.iter().filter(|character| character.id().is_some_and(|id| characters.contains(&id))).collect();
-        let names = chunks(name_items(&chosen), &target);
-        let forms = form_items(&chosen, &[]).len().div_ceil(target.settings.batch_size.get());
-        if names.is_empty() && forms == 0 {
-            return Ok(Suggestions { items: Vec::new(), error: None });
+        let mut names = name_items(&chosen);
+        let mut forms = form_items(&chosen, &[]);
+        with_origins(&mut names, known.iter().map(|(id, origin)| (*id, origin)));
+        with_origins(&mut forms, known.iter().map(|(id, origin)| (*id, origin)));
+        if names.is_empty() && forms.is_empty() {
+            return Ok(NamesFound::default());
         }
-        let mut run = BatchRun::begin(self.state, &open, Action::Names, &target, progress, names.len() + forms)?;
-        let mut items = Vec::new();
-        for batch in &names {
-            let request = NamesPrompt::build(batch, &cast, &context.hints, &target);
-            if !run.ask(&request, &mut items, |text| NamesPrompt::accept(text, batch)).await {
-                return run.finish(items);
+        let unknown: Vec<NameItem> = names.iter().chain(&forms).filter(|item| item.languages.is_empty()).cloned().collect();
+        let origin_batches: Vec<&[NameItem]> = unknown.chunks(ORIGIN_BATCH).collect();
+        let size = target.settings.batch_size.get();
+        let total = origin_batches.len() + 2 * (names.len().div_ceil(size) + forms.len().div_ceil(size));
+        let mut run = BatchRun::begin(self.state, &open, Action::Names, &target, progress, total)?;
+        let mut items: Vec<NameSuggestion> = Vec::new();
+        let mut missing = Vec::new();
+
+        let mut going = true;
+        for batch in origin_batches {
+            match run.send(&OriginsPrompt::build(batch, &cast, &target)).await {
+                Sent::Text(text) => {
+                    let found = OriginsPrompt::accept(&text, batch);
+                    open.project.write(|tx| {
+                        let repo = CharacterRepo { conn: tx };
+                        for (id, origin) in &found {
+                            repo.save_origins(*id, std::slice::from_ref(origin))?;
+                        }
+                        Ok(())
+                    })?;
+                    known.extend(found);
+                }
+                Sent::Skipped => {}
+                Sent::Stop => {
+                    going = false;
+                    break;
+                }
             }
-        }
-        for batch in chunks(form_items(&chosen, &items), &target) {
-            let request = NamesPrompt::build(&batch, &cast, &context.hints, &target);
-            if !run.ask(&request, &mut items, |text| NamesPrompt::accept(text, &batch)).await {
+            if !run.step(0) {
+                going = false;
                 break;
             }
         }
-        run.finish(items)
+
+        if going {
+            with_origins(&mut names, known.iter().map(|(id, origin)| (*id, origin)));
+            with_origins(&mut forms, known.iter().map(|(id, origin)| (*id, origin)));
+            let languages: Vec<LanguageTag> = names.iter().chain(&forms).flat_map(|item| item.languages.iter().cloned()).collect();
+            let rules = NameRuleService { state: self.state }.effective(project, &languages)?;
+            missing = missing_rules(&names.iter().chain(&forms).cloned().collect::<Vec<_>>(), &rules);
+            let spell = Spell { cast: &cast, hints: &context.hints, rules: &rules, target: &target };
+            for batch in chunks(names, &target) {
+                going = spell.batch(&mut run, &batch, &mut items).await;
+                if !going {
+                    break;
+                }
+            }
+            if going {
+                let mut forms = form_items(&chosen, &items);
+                with_origins(&mut forms, known.iter().map(|(id, origin)| (*id, origin)));
+                for batch in chunks(forms, &target) {
+                    if !spell.batch(&mut run, &batch, &mut items).await {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(NamesFound { suggestions: run.finish(items)?, missing_rules: missing })
+    }
+
+    /// Черновик правил передачи имён с языка `from` на язык перевода проекта. `existing`: текст, который
+    /// черновик дополняет. В базу ничего не пишется.
+    pub async fn draft_rules(
+        &self,
+        project: ProjectId,
+        from: LanguageTag,
+        existing: Option<String>,
+        one_off: Option<ProfileId>,
+        progress: Channel<RunProgress>,
+    ) -> Result<Suggestions<String>, AppError> {
+        if !crate::name_rules::has_rules(&from) {
+            return Err(ValidationError::BadLanguage(from.to_string()).into());
+        }
+        let open = self.state.open_project(project)?;
+        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Names, one_off)?;
+        let request = RulesDraftPrompt::build(&from, existing.as_deref(), &target);
+        run_batches(self.state, &open, Action::Names, &target, progress, vec![request], |_, text| {
+            RulesDraftPrompt::accept(text).into_iter().collect()
+        })
+        .await
     }
 
     /// Перевод, категория и описание терминов. Модель видит своё описание термина и реплику с ним.
@@ -314,6 +390,60 @@ async fn run_batches<T>(
     run.finish(items)
 }
 
+/// Итог перевода имён: написания и языки имён, для которых не нашлось правил.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamesFound {
+    pub suggestions: Suggestions<NameSuggestion>,
+    pub missing_rules: Vec<LanguageTag>,
+}
+
+impl<T> Default for Suggestions<T> {
+    fn default() -> Self {
+        Self { items: Vec::new(), error: None }
+    }
+}
+
+/// Перевод одного пакета имён с проверкой.
+struct Spell<'a> {
+    cast: &'a [String],
+    hints: &'a Hints,
+    rules: &'a [NameRule],
+    target: &'a LlmTarget,
+}
+
+impl Spell<'_> {
+    /// Перевод и проверка: два шага прогресса. `false`: запуск остановлен или оборвался, написания пакета
+    /// остаются непроверенными.
+    async fn batch(&self, run: &mut BatchRun<'_>, batch: &[NameItem], items: &mut Vec<NameSuggestion>) -> bool {
+        let start = items.len();
+        let request = NamesPrompt::build(batch, self.cast, self.hints, self.rules, self.target);
+        if !run.ask(&request, items, |text| NamesPrompt::accept(text, batch)).await {
+            CheckPrompt::unchecked(&mut items[start..]);
+            return false;
+        }
+        if let Some(request) = CheckPrompt::build(batch, &items[start..], self.hints, self.rules, self.target) {
+            match run.send(&request).await {
+                Sent::Text(text) => CheckPrompt::apply(&text, batch, &mut items[start..]),
+                Sent::Skipped => CheckPrompt::unchecked(&mut items[start..]),
+                Sent::Stop => {
+                    CheckPrompt::unchecked(&mut items[start..]);
+                    return false;
+                }
+            }
+        }
+        run.step(items.len())
+    }
+}
+
+/// Ответ на запрос пакета.
+enum Sent {
+    Text(String),
+    /// Модель отказалась отвечать: пакет пропускается.
+    Skipped,
+    /// Запуск остановлен или оборвался.
+    Stop,
+}
+
 /// Ход запуска предложений по пакетам: место запуска, прогресс, ошибка, которая обрывает запуск.
 struct BatchRun<'a> {
     run: LlmRun,
@@ -340,25 +470,42 @@ impl<'a> BatchRun<'a> {
 
     /// Пакет: запрос, разбор в `items`, отчёт. `false`: запуск остановлен или оборвался, дальше не спрашивать.
     async fn ask<T>(&mut self, request: &ChatRequest, items: &mut Vec<T>, accept: impl FnOnce(&str) -> Vec<T>) -> bool {
-        if self.run.cancelled() || self.error.is_some() {
-            return false;
-        }
-        match ask(self.client, self.target, request, &self.run).await {
-            Ok(Some(text)) => {
+        match self.send(request).await {
+            Sent::Text(text) => {
                 let accepted = accept(&text);
                 if accepted.is_empty() {
                     tracing::warn!("Из ответа модели ничего не взято:\n{text}");
                 }
                 items.extend(accepted);
             }
-            Ok(None) => tracing::warn!("Модель отказалась отвечать на пакет, он пропущен"),
+            Sent::Skipped => {}
+            Sent::Stop => return false,
+        }
+        self.step(items.len())
+    }
+
+    /// Запрос без отчёта. Ошибка запоминается и обрывает запуск.
+    async fn send(&mut self, request: &ChatRequest) -> Sent {
+        if self.run.cancelled() || self.error.is_some() {
+            return Sent::Stop;
+        }
+        match ask(self.client, self.target, request, &self.run).await {
+            Ok(Some(text)) => Sent::Text(text),
+            Ok(None) => {
+                tracing::warn!("Модель отказалась отвечать на пакет, он пропущен");
+                Sent::Skipped
+            }
             Err(error) => {
                 self.error = Some(error.to_string());
-                return false;
+                Sent::Stop
             }
         }
+    }
+
+    /// Пакет готов: отчёт с числом предложений. `false`: запуск остановлен.
+    fn step(&mut self, written: usize) -> bool {
         self.report.done += 1;
-        self.report.written = items.len() as u32;
+        self.report.written = written as u32;
         self.run.report(self.report.clone());
         !self.run.cancelled()
     }
@@ -476,15 +623,24 @@ mod tests {
         assert!(!state.llm_run.is_active());
     }
 
+    fn system_text(body: &serde_json::Value) -> String {
+        body["messages"][0]["content"].as_str().unwrap_or_default().to_string()
+    }
+
     #[test]
-    fn names_go_first_and_forms_are_built_on_the_spelled_name() {
+    fn names_get_origins_rules_spelling_and_check_in_one_run() {
         let (url, seen) = fake_model(|body| {
-            let user = user_text(body);
-            let answer = if user.contains("form of") {
-                r#"[{"id": 1, "origin": "английский", "translated_name": "Мисс Ли", "variants": []}]"#
+            let (system, user) = (system_text(body), user_text(body));
+            let answer = if system.contains("linguistic origins") {
+                r#"[{"id": 1, "languages": ["ga", "en"], "reason": "Ирландское имя"}, {"id": 2, "languages": ["en"]}, {"id": 3, "languages": ["en"]}]"#
+            } else if system.contains("review proposed") && user.contains("Miss Lee") {
+                r#"[{"id": 1, "variants": [{"source": "Miss Lee", "translated": "Мисс Ли"}]}]"#
+            } else if system.contains("review proposed") {
+                r#"[{"id": 1, "variants": [{"source": "Eileen", "translated": "Айлин", "description": "Ирландское чтение"}, {"translated": "Эйлин"}], "issues": ["Чтение спорное"]}]"#
+            } else if user.contains("form of") {
+                r#"[{"id": 1, "translated_name": "Мисс Ли"}]"#
             } else {
-                r#"[{"id": 1, "origin": "Английский", "translated_name": "Эйлин", "variants": [{"source": "Eileen", "translated": "Айлин", "description": "Ирландское чтение"}]},
-                    {"id": 2, "translated_name": "Ли"}]"#
+                r#"[{"id": 1, "translated_name": "Эйлин"}, {"id": 2, "translated_name": "Ли"}]"#
             };
             completion(answer)
         });
@@ -505,30 +661,105 @@ mod tests {
             })
             .unwrap();
 
-        let found = tauri::async_runtime::block_on(NamesService { state: &state }.translate_names(id, vec![eileen], None, silent())).unwrap();
-        assert_eq!(found.error, None);
-        let spelled: Vec<(NameField, &str, Vec<&str>)> = found
+        let rules = NameRuleService { state: &state };
+        rules.save_shared(id, &LanguageTag::parse("en").unwrap(), "Ee это и").unwrap();
+
+        let service = NamesService { state: &state };
+        let found = tauri::async_runtime::block_on(service.translate_names(id, vec![eileen], None, silent())).unwrap();
+        assert_eq!(found.suggestions.error, None);
+        assert_eq!(found.missing_rules, [LanguageTag::parse("ga").unwrap()]);
+        let spelled: Vec<(NameField, &str, Vec<&str>, Vec<&str>)> = found
+            .suggestions
             .items
             .iter()
-            .map(|item| (item.field, item.source.as_str(), item.variants.iter().map(|variant| variant.translation.as_str()).collect()))
+            .map(|item| {
+                (
+                    item.field,
+                    item.source.as_str(),
+                    item.variants.iter().map(|variant| variant.translation.as_str()).collect(),
+                    item.issues.iter().map(String::as_str).collect(),
+                )
+            })
             .collect();
         assert_eq!(
             spelled,
             [
-                (NameField::First, "Eileen", vec!["Эйлин", "Айлин"]),
-                (NameField::Last, "Lee", vec!["Ли"]),
-                (NameField::Form, "Miss Lee", vec!["Мисс Ли"]),
-            ]
+                (NameField::First, "Eileen", vec!["Айлин", "Эйлин"], vec!["Происхождение неоднозначно: проверьте написание.", "Чтение спорное"]),
+                (NameField::Last, "Lee", vec!["Ли"], vec!["Проверка пропустила это имя."]),
+                (NameField::Form, "Miss Lee", vec!["Мисс Ли"], vec![]),
+            ],
+            "проверка заменила написание имени, пропущенная фамилия осталась с замечанием"
         );
-        let requests = seen.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let first = user_text(&requests[0]);
-        assert!(first.contains("All names in this game: Eileen Lee\n"), "{first}");
-        assert!(first.contains("- id: 1, name: \"Eileen\", given name of a woman\n- id: 2, name: \"Lee\", surname of a woman\n"), "{first}");
-        assert!(user_text(&requests[1]).contains("- id: 1, name: \"Miss Lee\", name of a woman, form of Эйлин Ли\n"));
-        let translated: Option<String> =
-            open.project.read(|tx| Ok(tx.query_row("SELECT translated_first_name FROM characters", [], |row| row.get(0))?)).unwrap();
-        assert_eq!(translated, None, "предложения в базу не пишутся");
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 5, "разбор, перевод и проверка имён, перевод и проверка формы");
+            let origins = user_text(&requests[0]);
+            assert!(origins.contains("- id: 3, name: \"Miss Lee\", another way to call the character, owner: \"Eileen Lee\"\n"), "{origins}");
+            let names = user_text(&requests[1]);
+            assert!(names.contains("All names in this game: Eileen Lee\n"), "{names}");
+            assert!(names.contains("- id: 1: ga, en (Ирландское имя)\n- id: 2: en\n"), "{names}");
+            assert!(names.contains("[en]\nEe это и\n"), "{names}");
+            assert!(user_text(&requests[3]).contains("- id: 1, name: \"Miss Lee\", name of a woman, form of Айлин Ли\n"), "форма от проверенного имени");
+        }
+        let open = state.open_project(id).unwrap();
+        let (translated, origins): (Option<String>, i64) = open
+            .project
+            .read(|tx| {
+                Ok((
+                    tx.query_row("SELECT translated_first_name FROM characters", [], |row| row.get(0))?,
+                    tx.query_row("SELECT count(*) FROM name_origins", [], |row| row.get(0))?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((translated, origins), (None, 3), "написания в базу не пишутся, происхождение записано");
+
+        tauri::async_runtime::block_on(service.translate_names(id, vec![eileen], None, silent())).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 9, "второй раз происхождение не спрашивается");
+    }
+
+    #[test]
+    fn own_rules_of_the_project_win_over_shared_ones() {
+        let (url, _) = fake_model(|_| completion("[]"));
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let rules = NameRuleService { state: &state };
+        let (sr, de) = (LanguageTag::parse("sr").unwrap(), LanguageTag::parse("de").unwrap());
+        rules.save_shared(id, &sr, "общее").unwrap();
+        rules.save_shared(id, &de, "немецкое").unwrap();
+        rules.save_own(id, &sr, "своё").unwrap();
+        let effective = rules.effective(id, &[sr.clone(), LanguageTag::undetermined(), sr.clone()]).unwrap();
+        assert_eq!(effective.iter().map(NameRule::rules).collect::<Vec<_>>(), ["своё"]);
+
+        let eileen = GlossaryService { state: &state }.create_character(id, "Eileen").unwrap();
+        let open = state.open_project(id).unwrap();
+        let origin = NameOrigin {
+            field: NameField::First,
+            source: "Eileen".to_string(),
+            context: "Eileen".to_string(),
+            languages: vec![LanguageTag::parse("ga").unwrap(), LanguageTag::undetermined()],
+            reason: None,
+        };
+        open.project.write(|tx| CharacterRepo { conn: tx }.save_origins(eileen, std::slice::from_ref(&origin))).unwrap();
+        assert_eq!(open.project.read(|tx| CharacterRepo { conn: tx }.origins(eileen)).unwrap(), [origin]);
+
+        let overview: Vec<(String, usize, Option<String>, Option<String>)> = rules
+            .overview(id)
+            .unwrap()
+            .into_iter()
+            .map(|item| (item.language.to_string(), item.names, item.rules, item.own))
+            .collect();
+        assert_eq!(
+            overview,
+            [
+                ("ga".to_string(), 1, None, None),
+                ("de".to_string(), 0, Some("немецкое".to_string()), None),
+                ("sr".to_string(), 0, Some("общее".to_string()), Some("своё".to_string())),
+            ],
+            "сначала языки имён проекта, und не язык правил"
+        );
+        rules.save_own(id, &sr, " ").unwrap();
+        rules.save_shared(id, &de, "").unwrap();
+        assert_eq!(rules.overview(id).unwrap().len(), 2);
     }
 
     #[test]

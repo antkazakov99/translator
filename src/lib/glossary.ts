@@ -61,6 +61,24 @@ export function untranslatedNames(character: Character) {
 
 export const nameFieldLabels: Record<NameField, string> = { first: "Имя", last: "Фамилия", form: "Форма" };
 
+let languageNames: Intl.DisplayNames | null = null;
+
+/** Название языка по коду BCP 47: «сербский». `zxx` это роли и описания, `und` неизвестное происхождение. */
+export function languageName(code: string) {
+  if (code === "zxx") return "описание";
+  if (code === "und") return "неизвестно";
+  try {
+    languageNames ??= new Intl.DisplayNames(["ru"], { type: "language", fallback: "code" });
+    const name = languageNames.of(code);
+    return name && name !== code ? name.toLowerCase() : code;
+  } catch {
+    return code;
+  }
+}
+
+/** Языки списком: «сербский, хорватский». */
+export const languageList = (codes: string[]) => codes.map(languageName).join(", ");
+
 /**
  * Персонаж с отмеченными написаниями. Пишется только пустое поле: перевод, который появился в карточке
  * за время запуска, не заменяется. Возвращает `null`, если писать нечего.

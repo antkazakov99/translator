@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Braces, BookText, LoaderCircle, MessagesSquare, TriangleAlert, Users, X } from "lucide-svelte";
+  import { Braces, BookText, LoaderCircle, MessagesSquare, SpellCheck, TriangleAlert, Users, X } from "lucide-svelte";
   import GlossaryCharacters from "./GlossaryCharacters.svelte";
+  import GlossaryNameRules from "./GlossaryNameRules.svelte";
   import GlossarySpeakers from "./GlossarySpeakers.svelte";
   import GlossaryTerms from "./GlossaryTerms.svelte";
   import GlossaryTokens from "./GlossaryTokens.svelte";
@@ -14,7 +15,7 @@
   /** Запуски модели и их отбор переживают переход между разделами. */
   const runs = glossaryRuns();
 
-  type Section = "speakers" | "characters" | "terms" | "tokens";
+  type Section = "speakers" | "characters" | "rules" | "terms" | "tokens";
   let data = $state<Glossary | null>(null);
   let error = $state("");
   let character = $state<number | null>(null);
@@ -26,7 +27,7 @@
   onMount(() => {
     try {
       const saved = sessionStorage.getItem(sectionKey);
-      if (saved === "speakers" || saved === "characters" || saved === "terms" || saved === "tokens") section = saved;
+      if (saved === "speakers" || saved === "characters" || saved === "rules" || saved === "terms" || saved === "tokens") section = saved;
     } catch {
       // Без хранилища раздел просто не запомнится.
     }
@@ -66,6 +67,7 @@
   const sections = $derived([
     { id: "speakers" as const, label: "Говорящие", icon: MessagesSquare, count: data?.speakers.filter((item) => item.state === "new").length ?? 0, hint: "новых" },
     { id: "characters" as const, label: "Персонажи", icon: Users, count: data?.characters.length ?? 0, hint: "" },
+    { id: "rules" as const, label: "Правила имён", icon: SpellCheck, count: null, hint: "" },
     { id: "terms" as const, label: "Термины", icon: BookText, count: data?.terms.length ?? 0, hint: "" },
     { id: "tokens" as const, label: "Токены", icon: Braces, count: data?.tokens.length ?? 0, hint: "" },
   ]);
@@ -77,7 +79,7 @@
       <button class="section" class:active={section === item.id} onclick={() => open(item.id)}>
         <item.icon size={14} />
         <span class="section-name">{item.label}</span>
-        {#if data}<span class="section-count">{item.hint ? `${item.hint}: ${item.count}` : item.count}</span>{/if}
+        {#if data && item.count !== null}<span class="section-count">{item.hint ? `${item.hint}: ${item.count}` : item.count}</span>{/if}
       </button>
     {/each}
   </nav>
@@ -115,6 +117,8 @@
         patch={patchCharacter}
         onError={(message) => (error = message)}
       />
+    {:else if section === "rules"}
+      <GlossaryNameRules {projectId} {runs} onError={(message) => (error = message)} />
     {:else if section === "terms"}
       <GlossaryTerms {projectId} {data} {runs} reload={load} patch={patchTerm} onError={(message) => (error = message)} />
     {:else}

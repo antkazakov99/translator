@@ -6,10 +6,11 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::terms::TermCandidate;
 use super::{
-    Character, CharacterId, DiscardReason, DiscardedTerm, Form, NameKey, NameOrigin, Note, NoteOwner, SceneDescription, Speaker,
+    Character, CharacterId, DiscardReason, DiscardedTerm, Form, NameField, NameKey, NameOrigin, Note, NoteOwner, SceneDescription, Speaker,
     SpeakerEntry, SpeakerLink, Term, TermCategory, TermId, Token,
 };
-use crate::common::{Gender, Timestamp};
+use crate::common::{Gender, Timestamp, ValidationError};
+use crate::name_rules::LanguageTag;
 use crate::engines::{ContainerKey, SpeakerKey};
 use crate::storage::DbError;
 
@@ -291,11 +292,58 @@ impl CharacterRepo<'_> {
     }
 
     pub fn origins(&self, id: CharacterId) -> Result<Vec<NameOrigin>, DbError> {
-        todo!()
+        Ok(self.origins_of(Some(id))?.remove(&id).unwrap_or_default())
     }
 
+    /// Происхождение имён всех персонажей.
+    pub fn all_origins(&self) -> Result<HashMap<CharacterId, Vec<NameOrigin>>, DbError> {
+        self.origins_of(None)
+    }
+
+    fn origins_of(&self, only: Option<CharacterId>) -> Result<HashMap<CharacterId, Vec<NameOrigin>>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT character_id, field, source, context, languages, reason FROM name_origins
+             WHERE ?1 IS NULL OR character_id = ?1 ORDER BY character_id, field, source",
+        )?;
+        let rows = statement
+            .query_map([only.map(CharacterId::get)], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut origins: HashMap<CharacterId, Vec<NameOrigin>> = HashMap::new();
+        for (id, field, source, context, languages, reason) in rows {
+            let field = NameField::parse(&field).map_err(|error| DbError::bad_value("name_origins", "field", error))?;
+            let codes: Vec<String> = serde_json::from_str(&languages)
+                .map_err(|_| DbError::bad_value("name_origins", "languages", ValidationError::BadLanguage(languages.clone())))?;
+            let languages = codes
+                .iter()
+                .map(|code| LanguageTag::parse(code).map_err(|error| DbError::bad_value("name_origins", "languages", error)))
+                .collect::<Result<Vec<_>, _>>()?;
+            origins.entry(CharacterId::from_row(id)).or_default().push(NameOrigin { field, source, context, languages, reason });
+        }
+        Ok(origins)
+    }
+
+    /// Вставляет происхождение или заменяет прежнее того же поля и написания.
     pub fn save_origins(&self, id: CharacterId, origins: &[NameOrigin]) -> Result<(), DbError> {
-        todo!()
+        for origin in origins {
+            let languages = serde_json::to_string(&origin.languages.iter().map(LanguageTag::as_str).collect::<Vec<_>>())
+                .map_err(|error| DbError::Corrupt(error.to_string()))?;
+            self.conn.execute(
+                "INSERT INTO name_origins (character_id, field, source, context, languages, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (character_id, field, source) DO UPDATE
+                 SET context = excluded.context, languages = excluded.languages, reason = excluded.reason",
+                params![id.get(), origin.field.as_str(), origin.source, origin.context, languages, origin.reason],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn excluded_containers(&self, id: CharacterId) -> Result<Vec<ContainerKey>, DbError> {

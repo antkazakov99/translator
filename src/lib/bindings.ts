@@ -67,6 +67,14 @@ export const commands = {
 	saveToken: (project: string, name: string, value: string, note: string) => __TAURI_INVOKE<null>("save_token", { project, name, value, note }),
 	/**  Перевод имён, фамилий и форм персонажей без перевода. Отмеченное окно записывает через `save_character`. */
 	suggestNames: (project: string, characters: RowRef[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<NameSuggestionsDto_Serialize>("suggest_names", { project, characters, profile, progress }),
+	/**  Языки имён проекта и библиотеки с правилами. */
+	nameRules: (project: string) => __TAURI_INVOKE<LanguageRulesDto_Serialize[]>("name_rules", { project }),
+	/**  Общие правила языка на язык перевода проекта. Пустой текст удаляет их. */
+	saveNameRule: (project: string, language: string, rules: string) => __TAURI_INVOKE<null>("save_name_rule", { project, language, rules }),
+	/**  Свои правила языка в проекте: важнее общих. Пустой текст удаляет их. */
+	saveOwnNameRule: (project: string, language: string, rules: string) => __TAURI_INVOKE<null>("save_own_name_rule", { project, language, rules }),
+	/**  Черновик правил моделью. Ничего не записывает: окно показывает его в поле общих правил. */
+	draftNameRule: (project: string, language: string, existing: string | null, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<RulesDraftDto_Serialize>("draft_name_rule", { project, language, existing, profile, progress }),
 	/**  Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `save_term`. */
 	suggestTerms: (project: string, terms: RowRef[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<TermSuggestionsDto_Serialize>("suggest_terms", { project, terms, profile, progress }),
 	/**  Перевод подписей и род говорящих моделью. Отмеченное окно записывает через `save_speaker_entry`. */
@@ -268,6 +276,25 @@ export type GraphSceneDto_Serialize = {
 	firstLine: string | null,
 };
 
+/**  Язык имён: сколько имён проекта на нём, общие правила и свои правила проекта. */
+export type LanguageRulesDto = LanguageRulesDto_Serialize | LanguageRulesDto_Deserialize;
+
+/**  Язык имён: сколько имён проекта на нём, общие правила и свои правила проекта. */
+export type LanguageRulesDto_Deserialize = {
+	language: string,
+	names: number,
+	rules?: string | null,
+	own?: string | null,
+};
+
+/**  Язык имён: сколько имён проекта на нём, общие правила и свои правила проекта. */
+export type LanguageRulesDto_Serialize = {
+	language: string,
+	names: number,
+	rules: string | null,
+	own: string | null,
+};
+
 /**  Реплика таблицы. */
 export type LineDto = LineDto_Serialize | LineDto_Deserialize;
 
@@ -349,10 +376,13 @@ export type NameSuggestionDto_Deserialize = {
 	field: NameField,
 	/**  Написание в игре: у формы по нему находится сама форма. */
 	source: string,
-	origin?: string | null,
+	/**  Коды BCP 47 языков происхождения, вероятные первыми. */
+	languages: string[],
 	/**  Что запишется: сначала выбор модели, окно меняет его вариантом или правкой. */
 	translation: string,
 	variants: NameVariantDto_Deserialize[],
+	/**  Замечания: неоднозначное происхождение, итог проверки. */
+	issues: string[],
 };
 
 /**  Написания одного поля персонажа. */
@@ -361,10 +391,13 @@ export type NameSuggestionDto_Serialize = {
 	field: NameField,
 	/**  Написание в игре: у формы по нему находится сама форма. */
 	source: string,
-	origin: string | null,
+	/**  Коды BCP 47 языков происхождения, вероятные первыми. */
+	languages: string[],
 	/**  Что запишется: сначала выбор модели, окно меняет его вариантом или правкой. */
 	translation: string,
 	variants: NameVariantDto_Serialize[],
+	/**  Замечания: неоднозначное происхождение, итог проверки. */
+	issues: string[],
 };
 
 export type NameSuggestionsDto = NameSuggestionsDto_Serialize | NameSuggestionsDto_Deserialize;
@@ -372,11 +405,15 @@ export type NameSuggestionsDto = NameSuggestionsDto_Serialize | NameSuggestionsD
 export type NameSuggestionsDto_Deserialize = {
 	items: NameSuggestionDto_Deserialize[],
 	error?: string | null,
+	/**  Языки имён без правил: перевод шёл без них. */
+	missingRules: string[],
 };
 
 export type NameSuggestionsDto_Serialize = {
 	items: NameSuggestionDto_Serialize[],
 	error: string | null,
+	/**  Языки имён без правил: перевод шёл без них. */
+	missingRules: string[],
 };
 
 export type NameVariantDto = NameVariantDto_Serialize | NameVariantDto_Deserialize;
@@ -531,6 +568,21 @@ export type ProviderKind =
 
 /**  Номер строки базы для окна. В JavaScript это `number`: точности до 2^53 номерам строк хватает. */
 export type RowRef = number;
+
+/**  Черновик правил. `error`: запуск оборвался. */
+export type RulesDraftDto = RulesDraftDto_Serialize | RulesDraftDto_Deserialize;
+
+/**  Черновик правил. `error`: запуск оборвался. */
+export type RulesDraftDto_Deserialize = {
+	text?: string | null,
+	error?: string | null,
+};
+
+/**  Черновик правил. `error`: запуск оборвался. */
+export type RulesDraftDto_Serialize = {
+	text: string | null,
+	error: string | null,
+};
 
 /**
  *  Прогресс запуска в окно: сколько пакетов готово из скольких и что сейчас идёт.

@@ -19,6 +19,8 @@ export class SuggestRun<T> {
   /** Отбор: `null`, пока предложений нет. */
   review = $state<Picked<T>[] | null>(null);
   notice = $state("");
+  /** Что стоит знать перед отбором, например языки имён без правил. Задаёт вызов запуска, живёт до конца отбора. */
+  warning = $state("");
 
   /** Как запуск называется в баннере хода: «Термины». */
   constructor(readonly label: string) {}
@@ -31,6 +33,7 @@ export class SuggestRun<T> {
   async start(call: (channel: Channel<RunProgress>) => Promise<{ items: T[]; error?: string | null }>, onError: (message: string) => void) {
     if (this.progress || this.review) return;
     this.notice = "";
+    this.warning = "";
     this.stopping = false;
     this.progress = { done: 0, total: 0, written: 0, message: null };
     const channel = new Channel<RunProgress>();
@@ -66,10 +69,12 @@ export class SuggestRun<T> {
   finish(notice: string) {
     this.review = null;
     this.notice = notice;
+    this.warning = "";
   }
 
   discard() {
     this.review = null;
+    this.warning = "";
   }
 
   get chosen() {
