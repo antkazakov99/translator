@@ -313,3 +313,17 @@ pub async fn llm_models(app: AppHandle, provider: ProviderInput) -> Result<Vec<S
     .await?;
     LlmClient::models(&target, key.as_ref()).await.map_err(|error| error.to_string())
 }
+
+/// Останавливает текущий запуск модели между запросами: готовое остаётся.
+#[tauri::command]
+#[specta::specta]
+pub fn cancel_llm_run(state: tauri::State<'_, crate::state::AppState>) {
+    state.llm_run.cancel();
+}
+
+/// Идёт ли запуск модели: окно, открытое заново, узнаёт, что место занято.
+#[tauri::command]
+#[specta::specta]
+pub fn llm_run_active(state: tauri::State<'_, crate::state::AppState>) -> bool {
+    state.llm_run.is_active()
+}

@@ -38,11 +38,15 @@ impl RunStatus {
     }
 }
 
-/// Прогресс запуска в окно. Итог пакета может прийти позже итога команды.
-#[derive(Debug, Clone, Serialize)]
+/// Прогресс запуска в окно: сколько пакетов готово из скольких и что сейчас идёт.
+/// Сообщение канала может прийти позже итога команды.
+#[derive(Debug, Clone, Default, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
 pub struct RunProgress {
-    pub done: usize,
-    pub total: usize,
+    pub done: u32,
+    pub total: u32,
+    /// Реплик записано за запуск.
+    pub written: u32,
     pub message: Option<String>,
 }
 
@@ -98,7 +102,23 @@ impl LlmRun {
         target: &LlmTarget,
         progress: Channel<RunProgress>,
     ) -> Result<LlmRun, AppError> {
-        todo!()
+        let cancel = state.llm_run.take()?;
+        let id = match &project {
+            Some(open) => {
+                let started = open.project.write(|tx| {
+                    LlmRunRepo { conn: tx }.start(action, target.provider.name(), target.profile.model(), Timestamp::now())
+                });
+                match started {
+                    Ok(id) => Some(id),
+                    Err(error) => {
+                        state.llm_run.release();
+                        return Err(error.into());
+                    }
+                }
+            }
+            None => None,
+        };
+        Ok(LlmRun { slot: state.llm_run.clone(), cancel, progress, project, id, finished: false })
     }
 
     pub fn id(&self) -> Option<RunId> {
@@ -121,7 +141,10 @@ impl LlmRun {
     }
 
     fn record(&self, status: RunStatus, error: Option<&str>) -> Result<(), AppError> {
-        todo!()
+        if let (Some(open), Some(id)) = (&self.project, self.id) {
+            open.project.write(|tx| LlmRunRepo { conn: tx }.finish(id, status, error, Timestamp::now()))?;
+        }
+        Ok(())
     }
 }
 

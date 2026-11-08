@@ -1,13 +1,16 @@
 //! Команды таблицы перевода.
 
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::ipc::Channel;
+use tauri::{AppHandle, State};
 
-use super::{FileProgress, LineState, Scene, SceneLine, TranslationService};
+use super::{FileProgress, LineState, Scene, SceneLine, TranslationScope, TranslationService};
 use crate::common::AppError;
+use crate::engines::ContainerKey;
+use crate::llm::{ProfileId, RunProgress};
 use crate::projects::ProjectId;
 use crate::scan::{FileId, SegmentId};
-use crate::state::blocking;
+use crate::state::{AppState, blocking};
 
 /// Номер строки базы для окна. В JavaScript это `number`: точности до 2^53 номерам строк хватает.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
@@ -87,8 +90,70 @@ impl From<Scene> for SceneDto {
     }
 }
 
+/// Что переводить или вычитывать.
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ScopeDto {
+    /// Сцены по ключам.
+    Scenes { keys: Vec<String> },
+    File { file: RowRef },
+    Line { line: RowRef },
+    /// Все файлы проекта.
+    Project,
+}
+
+impl TryFrom<ScopeDto> for TranslationScope {
+    type Error = AppError;
+
+    fn try_from(scope: ScopeDto) -> Result<Self, AppError> {
+        Ok(match scope {
+            ScopeDto::Scenes { keys } => {
+                Self::Scenes(keys.into_iter().map(ContainerKey::new).collect::<Result<Vec<_>, _>>()?)
+            }
+            ScopeDto::File { file } => Self::File(FileId::from_row(file.0)),
+            ScopeDto::Line { line } => Self::Line(SegmentId::from_row(line.0)),
+            ScopeDto::Project => Self::Project,
+        })
+    }
+}
+
 fn project(id: &str) -> Result<ProjectId, AppError> {
     Ok(ProjectId::parse(id)?)
+}
+
+fn profile(id: Option<String>) -> Result<Option<ProfileId>, AppError> {
+    Ok(id.as_deref().map(ProfileId::parse).transpose()?)
+}
+
+/// Переводит пустые реплики моделью: черновики пишутся по пакетам, прогресс идёт в `progress`.
+/// `profile` это разовый выбор модели. Возвращает число переведённых реплик.
+#[tauri::command]
+#[specta::specta]
+pub async fn translate_lines(
+    state: State<'_, AppState>,
+    project: String,
+    scope: ScopeDto,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<u32, String> {
+    let service = TranslationService { state: &state };
+    let count = service.translate(self::project(&project)?, scope.try_into()?, self::profile(profile)?, progress).await?;
+    Ok(count as u32)
+}
+
+/// Вычитывает готовые реплики моделью: исправления становятся черновиками. Возвращает число исправленных.
+#[tauri::command]
+#[specta::specta]
+pub async fn review_lines(
+    state: State<'_, AppState>,
+    project: String,
+    scope: ScopeDto,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<u32, String> {
+    let service = TranslationService { state: &state };
+    let count = service.review(self::project(&project)?, scope.try_into()?, self::profile(profile)?, progress).await?;
+    Ok(count as u32)
 }
 
 /// Файлы проекта с репликами и прогресс.

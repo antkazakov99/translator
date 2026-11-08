@@ -185,7 +185,7 @@ macro_rules! text_key {
 pub(crate) use text_key;
 
 /// Род: с ним согласуются глаголы в переводе. `None` в полях значит «неизвестен».
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum Gender {
     Male,

@@ -7,7 +7,7 @@ use crate::common::{Timestamp, ValidationError, non_empty, row_id};
 
 row_id!(TermId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, serde::Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum TermCategory {
     General,

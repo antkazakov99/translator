@@ -33,6 +33,7 @@ const BINDINGS: &str = "../src/lib/bindings.ts";
 
 /// Команды окна. Типы TypeScript к ним генерируются из этого же списка.
 fn commands() -> tauri_specta::Builder<tauri::Wry> {
+    use glossary::commands::*;
     use graph::commands::*;
     use llm::commands::*;
     use projects::commands::*;
@@ -49,11 +50,35 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             reorder_llm_profiles,
             save_llm_action,
             llm_models,
+            cancel_llm_run,
+            llm_run_active,
             scene_graph,
+            glossary,
+            speaker_to_character,
+            all_speakers_to_characters,
+            link_speaker,
+            unlink_speaker,
+            keep_as_speaker,
+            save_speaker_entry,
+            delete_speaker_entry,
+            discard_speaker,
+            restore_speaker,
+            create_character,
+            save_character,
+            delete_character,
+            take_term,
+            save_term,
+            delete_term,
+            give_term_to_character,
+            discard_term_name,
+            restore_term_name,
+            save_token,
             translation_files,
             file_lines,
             save_line,
             confirm_lines,
+            translate_lines,
+            review_lines,
             list_projects,
             find_projects,
             create_project,

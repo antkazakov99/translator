@@ -3,12 +3,14 @@
 pub mod answer;
 pub mod batcher;
 pub mod commands;
+pub mod hints;
 pub mod model;
 pub mod prompt;
 pub mod repo;
 pub mod service;
+pub mod text;
 
-pub use answer::LinesAnswer;
+pub use answer::{AnswerTerm, LinesAnswer};
 pub use batcher::{Batch, Batcher};
 pub use model::{Draft, FileProgress, Hints, LineState, RevisionKind, Scene, SceneLine, SentState, TranslationScope};
 pub use prompt::{LinesMode, LinesPrompt};

@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 use crate::common::{Gender, ValidationError};
-use crate::engines::ContainerKey;
+use crate::engines::{ContainerKey, SpeakerKey};
 use crate::scan::{FileId, SegmentId};
 
 /// Что переводить или вычитывать.
@@ -37,6 +37,8 @@ pub struct SceneLine {
     /// Подпись говорящего для модели: имя из глоссария, иначе подпись из игры.
     pub speaker: Option<String>,
     pub speaker_gender: Option<Gender>,
+    /// Ключ говорящего: по нему глоссарий даёт подпись и род.
+    pub speaker_key: Option<SpeakerKey>,
     pub source_text: String,
     pub source_hash: String,
     /// Действующий текст: `translations.text`, без строки `game_text`.

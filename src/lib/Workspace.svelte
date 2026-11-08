@@ -1,6 +1,21 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
-  import { ArrowLeft, Bot, Check, CheckCheck, FileText, LoaderCircle, TriangleAlert, Waypoints, X } from "lucide-svelte";
+  import { Channel } from "@tauri-apps/api/core";
+  import {
+    ArrowLeft,
+    Bot,
+    Check,
+    CheckCheck,
+    FileText,
+    Languages,
+    LoaderCircle,
+    SpellCheck,
+    Square,
+    TriangleAlert,
+    Waypoints,
+    X,
+  } from "lucide-svelte";
+  import Glossary from "./Glossary.svelte";
   import SceneGraph from "./SceneGraph.svelte";
   import type { GraphScene } from "$lib/scene-graph";
   import {
@@ -8,7 +23,9 @@
     type FileDto,
     type LineDto_Serialize as Line,
     type ProjectDto_Serialize as Project,
+    type RunProgress_Deserialize as RunProgress,
     type SceneDto_Serialize as Scene,
+    type ScopeDto,
   } from "$lib/bindings";
 
   let { project, onBack, onSettings }: { project: Project; onBack: () => void; onSettings: () => void } = $props();
@@ -23,11 +40,20 @@
   let filter = $state<Filter>("all");
   let editing = $state<{ id: number; text: string } | null>(null);
   let saving = $state(false);
-  let view = $state<"table" | "graph">("table");
+  let view = $state<"table" | "graph" | "glossary">("table");
   /** Сцена в центре графа: переживает переключение вида. */
   let graphFocus = $state<string | null>(null);
 
+  type RunMode = "translate" | "review";
+  /** Запуск модели из этого окна: перевод или редактура. */
+  let run = $state<{ mode: RunMode; progress: RunProgress; stopping: boolean } | null>(null);
+  /** Итог последнего запуска. */
+  let notice = $state("");
+
   const file = $derived(files.find((item) => item.id === fileId) ?? null);
+  const fileLines = $derived(scenes.flatMap((scene) => scene.lines));
+  const fileEmpty = $derived(fileLines.filter((line) => line.state === "empty").length);
+  const fileReady = $derived(fileLines.filter((line) => line.state !== "empty").length);
   const visible = (line: Line) =>
     filter === "all" || (filter === "empty" ? line.state === "empty" : line.state === "draft");
   const shown = $derived(
@@ -130,6 +156,88 @@
     }
   }
 
+  let refreshing = false;
+  let refreshAgain = false;
+
+  /** Перечитывает реплики файла и прогресс без крутилки: во время запуска черновики появляются по пакетам. */
+  async function refresh() {
+    if (refreshing) {
+      refreshAgain = true;
+      return;
+    }
+    refreshing = true;
+    try {
+      do {
+        refreshAgain = false;
+        if (fileId !== null) scenes = await commands.fileLines(project.id, fileId);
+        await loadFiles();
+      } while (refreshAgain);
+    } catch (e) {
+      error = String(e);
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  /** Запускает перевод или редактуру. Черновики пишутся по пакетам, итог показывается баннером. */
+  async function startRun(mode: RunMode, scope: ScopeDto) {
+    if (run) return;
+    if (editing) await save();
+    notice = "";
+    error = "";
+    run = { mode, progress: { done: 0, total: 0, written: 0, message: null }, stopping: false };
+    const channel = new Channel<RunProgress>();
+    let written = 0;
+    channel.onmessage = (progress) => {
+      if (!run) return;
+      run.progress = progress;
+      if (progress.written > written) {
+        written = progress.written;
+        refresh();
+      }
+    };
+    try {
+      const count =
+        mode === "translate"
+          ? await commands.translateLines(project.id, scope, null, channel)
+          : await commands.reviewLines(project.id, scope, null, channel);
+      notice = resultText(mode, count, run?.stopping ?? false);
+    } catch (e) {
+      error = String(e);
+    } finally {
+      run = null;
+      await refresh();
+    }
+  }
+
+  function resultText(mode: RunMode, count: number, stopped: boolean) {
+    const prefix = stopped ? "Остановлено. " : "";
+    if (mode === "translate") {
+      return count > 0 ? `${prefix}Переведено реплик: ${count}. Черновики ждут проверки` : `${prefix}Модель не перевела ни одной реплики`;
+    }
+    return count > 0 ? `${prefix}Исправлено реплик: ${count}. Исправления ждут проверки` : `${prefix}Модель не нашла ошибок`;
+  }
+
+  async function stopRun() {
+    if (!run) return;
+    run.stopping = true;
+    try {
+      await commands.cancelLlmRun();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function runText(current: NonNullable<typeof run>) {
+    const { done, total, written, message } = current.progress;
+    const action = current.mode === "translate" ? "Перевод" : "Редактура";
+    if (current.stopping) return `${action}: останавливается после текущего запроса`;
+    if (total === 0) return `${action}: подготовка`;
+    const parts = [`${action}: пакет ${Math.min(done + 1, total)} из ${total}`, `записано: ${written}`];
+    if (message) parts.push(message);
+    return parts.join(" · ");
+  }
+
   function onKey(event: KeyboardEvent) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -198,6 +306,7 @@
     <div class="segmented view-switch" role="tablist" aria-label="Вид">
       <button role="tab" aria-selected={view === "table"} class:on={view === "table"} onclick={() => (view = "table")}>Таблица</button>
       <button role="tab" aria-selected={view === "graph"} class:on={view === "graph"} onclick={() => (view = "graph")}>Граф</button>
+      <button role="tab" aria-selected={view === "glossary"} class:on={view === "glossary"} onclick={() => (view = "glossary")}>Глоссарий</button>
     </div>
     <button class="btn small" onclick={onSettings} title="Провайдеры, модели и настройки действий">
       <Bot size={15} />
@@ -208,6 +317,10 @@
   {#if view === "graph"}
     <div class="body">
       <SceneGraph projectId={project.id} focus={graphFocus} onFocus={(key) => (graphFocus = key)} onOpen={openScene} />
+    </div>
+  {:else if view === "glossary"}
+    <div class="body">
+      <Glossary projectId={project.id} />
     </div>
   {:else}
   <div class="body">
@@ -245,6 +358,41 @@
               <span>Подтвердить модель · {fileDrafts.length}</span>
             </button>
           {/if}
+          <button
+            class="btn small"
+            disabled={run !== null || fileReady === 0}
+            title={run ? "Модель уже работает" : fileReady === 0 ? "В файле нет переведённых реплик" : "Модель вычитает переведённые реплики файла"}
+            onclick={() => fileId !== null && startRun("review", { kind: "file", file: fileId })}
+          >
+            {#if run?.mode === "review"}<LoaderCircle size={14} class="spin" />{:else}<SpellCheck size={14} />{/if}
+            <span>Вычитать</span>
+          </button>
+          <button
+            class="btn small primary"
+            disabled={run !== null || fileEmpty === 0}
+            title={run ? "Модель уже работает" : fileEmpty === 0 ? "В файле нет пустых реплик" : "Модель переведёт пустые реплики файла"}
+            onclick={() => fileId !== null && startRun("translate", { kind: "file", file: fileId })}
+          >
+            {#if run?.mode === "translate"}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
+            <span>Перевести{fileEmpty ? ` · ${fileEmpty}` : ""}</span>
+          </button>
+        </div>
+      {/if}
+
+      {#if run}
+        <div class="banner progress page-error" role="status">
+          <LoaderCircle size={14} class="spin" />
+          <span>{runText(run)}</span>
+          <button class="btn small" disabled={run.stopping} onclick={stopRun}>
+            <Square size={13} />
+            <span>Остановить</span>
+          </button>
+        </div>
+      {:else if notice}
+        <div class="banner page-error" role="status">
+          <Check size={14} />
+          <span>{notice}</span>
+          <button class="icon-button" aria-label="Скрыть итог" title="Скрыть итог" onclick={() => (notice = "")}><X size={14} /></button>
         </div>
       {/if}
 
@@ -269,6 +417,16 @@
                 <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(scene.key)}>
                   <Waypoints size={13} />
                 </button>
+                {#if run === null && scenes.find((item) => item.key === scene.key)?.lines.some((line) => line.state === "empty")}
+                  <button
+                    class="icon-button"
+                    aria-label="Перевести пустые реплики сцены"
+                    title="Перевести пустые реплики сцены"
+                    onclick={() => scene.key && startRun("translate", { kind: "scenes", keys: [scene.key] })}
+                  >
+                    <Languages size={13} />
+                  </button>
+                {/if}
               {/if}
             </h3>
             {#each scene.lines as line (line.id)}
