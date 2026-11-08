@@ -93,11 +93,17 @@ export const commands = {
 	confirmLines: (project: string, lines: RowRef[]) => __TAURI_INVOKE<number>("confirm_lines", { project, lines }),
 	/**
 	 *  Переводит пустые реплики моделью: черновики пишутся по пакетам, прогресс идёт в `progress`.
-	 *  `profile` это разовый выбор модели. Возвращает число переведённых реплик.
+	 *  `profile` это разовый выбор модели. Возвращает запуск и число переведённых реплик.
 	 */
-	translateLines: (project: string, scope: ScopeDto, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<number>("translate_lines", { project, scope, profile, progress }),
-	/**  Вычитывает готовые реплики моделью: исправления становятся черновиками. Возвращает число исправленных. */
-	reviewLines: (project: string, scope: ScopeDto, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<number>("review_lines", { project, scope, profile, progress }),
+	translateLines: (project: string, scope: ScopeDto, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<LinesRunDto>("translate_lines", { project, scope, profile, progress }),
+	/**  Вычитывает готовые реплики моделью: исправления становятся черновиками. Возвращает запуск и число исправленных. */
+	reviewLines: (project: string, scope: ScopeDto, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<LinesRunDto>("review_lines", { project, scope, profile, progress }),
+	/**  Последние запуски перевода и редактуры, новые первыми. */
+	lineRuns: (project: string) => __TAURI_INVOKE<LineRunDto_Serialize[]>("line_runs", { project }),
+	/**  Откатывает запуск модели: реплики, которые после него не правили, возвращаются к прежнему тексту. */
+	rollbackRun: (project: string, run: RowRef) => __TAURI_INVOKE<RollbackDto>("rollback_run", { project, run }),
+	/**  Очищает перевод области, как ручная очистка каждой реплики. Возвращает число очищенных. */
+	resetLines: (project: string, scope: ScopeDto) => __TAURI_INVOKE<number>("reset_lines", { project, scope }),
 	/**  Готовые проекты: основной список, архивные в конце. */
 	listProjects: () => __TAURI_INVOKE<ProjectDto_Serialize[]>("list_projects"),
 	/**  Проекты, уже привязанные к папке: окно предлагает открыть их вместо нового. */
@@ -326,6 +332,37 @@ export type LineDto_Serialize = {
 	location: string | null,
 };
 
+/**  Запуск перевода или редактуры для меню «Запуски». */
+export type LineRunDto = LineRunDto_Serialize | LineRunDto_Deserialize;
+
+/**  Запуск перевода или редактуры для меню «Запуски». */
+export type LineRunDto_Deserialize = {
+	id: RowRef,
+	/**  `lines` или `review`. */
+	action: string,
+	model: string,
+	status: RunStatus,
+	error?: string | null,
+	/**  Unix-время начала, секунды. */
+	startedAt: number,
+	/**  Реплики, в которые запуск что-то записал. */
+	lines: number,
+};
+
+/**  Запуск перевода или редактуры для меню «Запуски». */
+export type LineRunDto_Serialize = {
+	id: RowRef,
+	/**  `lines` или `review`. */
+	action: string,
+	model: string,
+	status: RunStatus,
+	error: string | null,
+	/**  Unix-время начала, секунды. */
+	startedAt: number,
+	/**  Реплики, в которые запуск что-то записал. */
+	lines: number,
+};
+
 /**  Состояние реплики в таблице. */
 export type LineState = 
 /**  Нет перевода. */
@@ -336,6 +373,12 @@ export type LineState =
 "done" | 
 /**  Перевод, который уже есть в игре. */
 "game";
+
+/**  Итог запуска: по `run` его можно откатить. */
+export type LinesRunDto = {
+	run: RowRef,
+	written: number,
+};
 
 /**  Всё окно настроек LLM. */
 export type LlmSettingsDto = LlmSettingsDto_Serialize | LlmSettingsDto_Deserialize;
@@ -568,6 +611,13 @@ export type ProviderKind =
 /**  Другой OpenAI-совместимый сервер. */
 "compatible";
 
+/**  Итог отката. */
+export type RollbackDto = {
+	rolled: number,
+	/**  Реплики, которые правили после запуска: их откат не трогал. */
+	left: number,
+};
+
 /**  Номер строки базы для окна. В JavaScript это `number`: точности до 2^53 номерам строк хватает. */
 export type RowRef = number;
 
@@ -615,6 +665,8 @@ export type RunProgress_Serialize = {
 	written: number,
 	message: string | null,
 };
+
+export type RunStatus = "running" | "done" | "cancelled" | "failed";
 
 /**  Подряд идущие реплики одной сцены файла. */
 export type SceneDto = SceneDto_Serialize | SceneDto_Deserialize;

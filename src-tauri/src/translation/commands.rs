@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
-use super::{FileProgress, LineState, Scene, SceneLine, TranslationScope, TranslationService};
+use super::{FileProgress, LineRun, LineState, LinesRun, Scene, SceneLine, TranslationScope, TranslationService};
 use crate::common::AppError;
 use crate::engines::ContainerKey;
-use crate::llm::{ProfileId, RunProgress};
+use crate::llm::{ProfileId, RunId, RunProgress, RunStatus};
 use crate::projects::ProjectId;
 use crate::scan::{FileId, SegmentId};
 use crate::state::{AppState, blocking};
@@ -125,8 +125,48 @@ fn profile(id: Option<String>) -> Result<Option<ProfileId>, AppError> {
     Ok(id.as_deref().map(ProfileId::parse).transpose()?)
 }
 
+/// Итог запуска: по `run` его можно откатить.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LinesRunDto {
+    pub run: RowRef,
+    pub written: u32,
+}
+
+impl From<LinesRun> for LinesRunDto {
+    fn from(result: LinesRun) -> Self {
+        Self { run: RowRef(result.run.get()), written: u32::try_from(result.written).unwrap_or(u32::MAX) }
+    }
+}
+
+/// Запуск перевода или редактуры для меню «Запуски».
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct LineRunDto {
+    pub id: RowRef,
+    /// `lines` или `review`.
+    pub action: String,
+    pub model: String,
+    pub status: RunStatus,
+    pub error: Option<String>,
+    /// Unix-время начала, секунды.
+    #[specta(type = specta_typescript::Number)]
+    pub started_at: i64,
+    /// Реплики, в которые запуск что-то записал.
+    pub lines: u32,
+}
+
+/// Итог отката.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackDto {
+    pub rolled: u32,
+    /// Реплики, которые правили после запуска: их откат не трогал.
+    pub left: u32,
+}
+
 /// Переводит пустые реплики моделью: черновики пишутся по пакетам, прогресс идёт в `progress`.
-/// `profile` это разовый выбор модели. Возвращает число переведённых реплик.
+/// `profile` это разовый выбор модели. Возвращает запуск и число переведённых реплик.
 #[tauri::command]
 #[specta::specta]
 pub async fn translate_lines(
@@ -135,13 +175,12 @@ pub async fn translate_lines(
     scope: ScopeDto,
     profile: Option<String>,
     progress: Channel<RunProgress>,
-) -> Result<u32, String> {
+) -> Result<LinesRunDto, String> {
     let service = TranslationService { state: &state };
-    let count = service.translate(self::project(&project)?, scope.try_into()?, self::profile(profile)?, progress).await?;
-    Ok(count as u32)
+    Ok(service.translate(self::project(&project)?, scope.try_into()?, self::profile(profile)?, progress).await?.into())
 }
 
-/// Вычитывает готовые реплики моделью: исправления становятся черновиками. Возвращает число исправленных.
+/// Вычитывает готовые реплики моделью: исправления становятся черновиками. Возвращает запуск и число исправленных.
 #[tauri::command]
 #[specta::specta]
 pub async fn review_lines(
@@ -150,10 +189,53 @@ pub async fn review_lines(
     scope: ScopeDto,
     profile: Option<String>,
     progress: Channel<RunProgress>,
-) -> Result<u32, String> {
+) -> Result<LinesRunDto, String> {
     let service = TranslationService { state: &state };
-    let count = service.review(self::project(&project)?, scope.try_into()?, self::profile(profile)?, progress).await?;
-    Ok(count as u32)
+    Ok(service.review(self::project(&project)?, scope.try_into()?, self::profile(profile)?, progress).await?.into())
+}
+
+/// Последние запуски перевода и редактуры, новые первыми.
+#[tauri::command]
+#[specta::specta]
+pub async fn line_runs(app: AppHandle, project: String) -> Result<Vec<LineRunDto>, String> {
+    blocking(app, move |state| {
+        let runs = TranslationService { state }.line_runs(self::project(&project)?)?;
+        Ok(runs
+            .into_iter()
+            .map(|run: LineRun| LineRunDto {
+                id: RowRef(run.id.get()),
+                action: run.action.id().to_string(),
+                model: run.model,
+                status: run.status,
+                error: run.error,
+                started_at: run.started_at.secs(),
+                lines: u32::try_from(run.lines).unwrap_or(u32::MAX),
+            })
+            .collect())
+    })
+    .await
+}
+
+/// Откатывает запуск модели: реплики, которые после него не правили, возвращаются к прежнему тексту.
+#[tauri::command]
+#[specta::specta]
+pub async fn rollback_run(app: AppHandle, project: String, run: RowRef) -> Result<RollbackDto, String> {
+    blocking(app, move |state| {
+        let (rolled, left) = TranslationService { state }.rollback(self::project(&project)?, RunId::from_row(run.0))?;
+        Ok(RollbackDto { rolled: u32::try_from(rolled).unwrap_or(u32::MAX), left: u32::try_from(left).unwrap_or(u32::MAX) })
+    })
+    .await
+}
+
+/// Очищает перевод области, как ручная очистка каждой реплики. Возвращает число очищенных.
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_lines(app: AppHandle, project: String, scope: ScopeDto) -> Result<u32, String> {
+    blocking(app, move |state| {
+        let cleared = TranslationService { state }.reset(self::project(&project)?, scope.try_into()?)?;
+        Ok(u32::try_from(cleared).unwrap_or(u32::MAX))
+    })
+    .await
 }
 
 /// Файлы проекта с репликами и прогресс.

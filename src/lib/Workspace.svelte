@@ -6,12 +6,15 @@
     Bot,
     Check,
     CheckCheck,
+    Eraser,
     FileText,
+    History,
     Languages,
     LoaderCircle,
     SpellCheck,
     Square,
     TriangleAlert,
+    Undo2,
     Waypoints,
     X,
   } from "lucide-svelte";
@@ -22,6 +25,7 @@
     commands,
     type FileDto,
     type LineDto_Serialize as Line,
+    type LineRunDto_Serialize as LineRun,
     type ProjectDto_Serialize as Project,
     type RunProgress_Deserialize as RunProgress,
     type SceneDto_Serialize as Scene,
@@ -49,6 +53,13 @@
   let run = $state<{ mode: RunMode; progress: RunProgress; stopping: boolean } | null>(null);
   /** Итог последнего запуска. */
   let notice = $state("");
+  /** Запуск из итога: его можно откатить кнопкой в баннере. */
+  let lastRun = $state<number | null>(null);
+  /** Меню «Запуски»: `null`, пока закрыто. */
+  let runs = $state<LineRun[] | null>(null);
+  /** Что ждёт подтверждения: откат запуска, очистка файла или сцены. */
+  let confirming = $state<{ kind: "rollback"; run: number } | { kind: "file" } | { kind: "scene"; key: string } | null>(null);
+  let working = $state(false);
 
   const file = $derived(files.find((item) => item.id === fileId) ?? null);
   const fileLines = $derived(scenes.flatMap((scene) => scene.lines));
@@ -184,6 +195,8 @@
     if (run) return;
     if (editing) await save();
     notice = "";
+    lastRun = null;
+    confirming = null;
     error = "";
     run = { mode, progress: { done: 0, total: 0, written: 0, message: null }, stopping: false };
     const channel = new Channel<RunProgress>();
@@ -197,17 +210,78 @@
       }
     };
     try {
-      const count =
+      const result =
         mode === "translate"
           ? await commands.translateLines(project.id, scope, null, channel)
           : await commands.reviewLines(project.id, scope, null, channel);
-      notice = resultText(mode, count, run?.stopping ?? false);
+      notice = resultText(mode, result.written, run?.stopping ?? false);
+      lastRun = result.written > 0 ? result.run : null;
     } catch (e) {
       error = String(e);
     } finally {
       run = null;
       await refresh();
+      if (runs) await loadRuns();
     }
+  }
+
+  async function loadRuns() {
+    try {
+      runs = await commands.lineRuns(project.id);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function toggleRuns() {
+    if (runs) runs = null;
+    else loadRuns();
+  }
+
+  /** Откат запуска после подтверждения. */
+  async function rollback(id: number) {
+    working = true;
+    try {
+      const { rolled, left } = await commands.rollbackRun(project.id, id);
+      notice = left > 0 ? `Откачено реплик: ${rolled}. Не тронуто: ${left}, их правили после запуска` : `Откачено реплик: ${rolled}`;
+      if (lastRun === id) lastRun = null;
+      confirming = null;
+      await refresh();
+      if (runs) await loadRuns();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      working = false;
+    }
+  }
+
+  /** Очистка перевода файла или сцены после подтверждения. */
+  async function reset(scope: ScopeDto) {
+    if (editing) await save();
+    working = true;
+    try {
+      const cleared = await commands.resetLines(project.id, scope);
+      notice = `Очищено реплик: ${cleared}`;
+      lastRun = null;
+      confirming = null;
+      await refresh();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      working = false;
+    }
+  }
+
+  const runActions: Record<string, string> = { lines: "Перевод", review: "Редактура" };
+  const runStatuses: Record<LineRun["status"], string> = { running: "идёт", done: "готово", cancelled: "остановлен", failed: "ошибка" };
+
+  function runWhen(seconds: number) {
+    return new Date(seconds * 1000).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  }
+
+  /** Непустые реплики сцены: их очистит очистка сцены. */
+  function sceneReady(key: string) {
+    return scenes.find((item) => item.key === key)?.lines.filter((line) => line.state !== "empty").length ?? 0;
   }
 
   function resultText(mode: RunMode, count: number, stopped: boolean) {
@@ -358,6 +432,19 @@
               <span>Подтвердить модель · {fileDrafts.length}</span>
             </button>
           {/if}
+          <button class="btn small" title="Последние запуски перевода и редактуры: их можно откатить" onclick={toggleRuns}>
+            <History size={14} />
+            <span>Запуски</span>
+          </button>
+          <button
+            class="btn small"
+            disabled={run !== null || working || fileReady === 0}
+            title={fileReady === 0 ? "В файле нет переведённых реплик" : "Очистить перевод всех реплик файла: модель переведёт их заново"}
+            onclick={() => (confirming = { kind: "file" })}
+          >
+            <Eraser size={14} />
+            <span>Очистить</span>
+          </button>
           <button
             class="btn small"
             disabled={run !== null || fileReady === 0}
@@ -392,7 +479,71 @@
         <div class="banner page-error" role="status">
           <Check size={14} />
           <span>{notice}</span>
-          <button class="icon-button" aria-label="Скрыть итог" title="Скрыть итог" onclick={() => (notice = "")}><X size={14} /></button>
+          {#if lastRun !== null}
+            <button class="btn small" disabled={working} title="Вернуть реплики к виду до запуска" onclick={() => lastRun !== null && (confirming = { kind: "rollback", run: lastRun })}>
+              <Undo2 size={13} />
+              <span>Откатить</span>
+            </button>
+          {/if}
+          <button class="icon-button" aria-label="Скрыть итог" title="Скрыть итог" onclick={() => ((notice = ""), (lastRun = null))}><X size={14} /></button>
+        </div>
+      {/if}
+
+      {#if confirming}
+        <div class="banner warn choice page-error" role="alertdialog">
+          <TriangleAlert size={14} />
+          <span>
+            {#if confirming.kind === "rollback"}
+              Откатить запуск? Реплики, которые не правили после него, вернутся к виду до запуска
+            {:else if confirming.kind === "file"}
+              Очистить перевод файла? Реплик с переводом: {fileReady}. Модель переведёт их заново, история правок останется
+            {:else}
+              Очистить перевод сцены? Реплик с переводом: {sceneReady(confirming.key)}. Модель переведёт их заново, история правок останется
+            {/if}
+          </span>
+          <div class="choice-actions">
+            <button class="btn small" disabled={working} onclick={() => (confirming = null)}>Отмена</button>
+            <button
+              class="btn small danger"
+              disabled={working}
+              onclick={() => {
+                if (!confirming) return;
+                if (confirming.kind === "rollback") rollback(confirming.run);
+                else if (confirming.kind === "file") fileId !== null && reset({ kind: "file", file: fileId });
+                else reset({ kind: "scenes", keys: [confirming.key] });
+              }}
+            >
+              {#if working}<LoaderCircle size={13} class="spin" />{/if}
+              <span>{confirming.kind === "rollback" ? "Откатить" : "Очистить"}</span>
+            </button>
+          </div>
+        </div>
+      {/if}
+
+      {#if runs}
+        <div class="card runs page-error">
+          <div class="runs-head">
+            <strong>Запуски перевода и редактуры</strong>
+            <button class="icon-button" aria-label="Закрыть запуски" title="Закрыть" onclick={() => (runs = null)}><X size={14} /></button>
+          </div>
+          {#each runs as item (item.id)}
+            <div class="run-row">
+              <span class="run-when">{runWhen(item.startedAt)}</span>
+              <span class="run-what">{runActions[item.action] ?? item.action} · {item.model}</span>
+              <span class="run-state" class:failed={item.status === "failed"} title={item.error ?? ""}>{runStatuses[item.status]} · реплик: {item.lines}</span>
+              <button
+                class="btn small"
+                disabled={working || run !== null || item.status === "running" || item.lines === 0}
+                title={item.lines === 0 ? "Запуск ничего не записал" : "Вернуть реплики к виду до запуска"}
+                onclick={() => (confirming = { kind: "rollback", run: item.id })}
+              >
+                <Undo2 size={13} />
+                <span>Откатить</span>
+              </button>
+            </div>
+          {:else}
+            <p class="muted">Запусков ещё не было</p>
+          {/each}
         </div>
       {/if}
 
@@ -425,6 +576,16 @@
                     onclick={() => scene.key && startRun("translate", { kind: "scenes", keys: [scene.key] })}
                   >
                     <Languages size={13} />
+                  </button>
+                {/if}
+                {#if run === null && !working && sceneReady(scene.key) > 0}
+                  <button
+                    class="icon-button"
+                    aria-label="Очистить перевод сцены"
+                    title="Очистить перевод сцены: модель переведёт её заново"
+                    onclick={() => scene.key && (confirming = { kind: "scene", key: scene.key })}
+                  >
+                    <Eraser size={13} />
                   </button>
                 {/if}
               {/if}
@@ -782,5 +943,51 @@
 
   .confirm:hover {
     background: var(--warning-bg);
+  }
+
+  .choice-actions {
+    display: flex;
+    gap: 6px;
+  }
+
+  .runs {
+    gap: 4px;
+    max-height: 280px;
+    overflow: auto;
+  }
+
+  .runs-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 4px;
+    font-size: 12px;
+  }
+
+  .run-row {
+    display: grid;
+    grid-template-columns: 110px minmax(0, 1fr) auto auto;
+    gap: 12px;
+    align-items: center;
+    padding: 4px 0;
+    border-top: 1px solid var(--divider-row);
+    font-size: 12px;
+  }
+
+  .run-when,
+  .run-state {
+    color: var(--text-faint);
+    font-size: 11px;
+  }
+
+  .run-what {
+    overflow: hidden;
+    color: var(--text);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .run-state.failed {
+    color: var(--danger-banner);
   }
 </style>

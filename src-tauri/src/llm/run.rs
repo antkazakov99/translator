@@ -18,7 +18,7 @@ row_id!(
     RunId
 );
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
     Running,
@@ -35,6 +35,10 @@ impl RunStatus {
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
         }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        [Self::Running, Self::Done, Self::Cancelled, Self::Failed].into_iter().find(|status| status.as_str() == text)
     }
 }
 

@@ -12,7 +12,7 @@ pub mod text;
 
 pub use answer::{AnswerTerm, LinesAnswer};
 pub use batcher::{Batch, Batcher};
-pub use model::{Draft, FileProgress, Hints, LineState, RevisionKind, Scene, SceneLine, SentState, TranslationScope};
+pub use model::{Draft, FileProgress, Hints, LineRun, LineState, RevisionKind, Scene, SceneLine, SentState, TranslationScope};
 pub use prompt::{LinesMode, LinesPrompt};
 pub use repo::TranslationRepo;
-pub use service::TranslationService;
+pub use service::{LinesRun, TranslationService};

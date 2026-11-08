@@ -9,7 +9,7 @@ use super::batcher::LINE_CONTEXT;
 use super::hints::GlossaryContext;
 use super::text::is_wordless;
 use super::{
-    Batch, Batcher, Draft, FileProgress, Hints, LineState, LinesAnswer, LinesMode, LinesPrompt, Scene, SceneLine, SentState,
+    Batch, Batcher, Draft, FileProgress, Hints, LineRun, LineState, LinesAnswer, LinesMode, LinesPrompt, Scene, SceneLine, SentState,
     TranslationRepo, TranslationScope,
 };
 use crate::common::{AppError, Timestamp};
@@ -28,7 +28,7 @@ pub struct TranslationService<'a> {
 }
 
 impl TranslationService<'_> {
-    /// Заполняет пустые реплики. Возвращает число переведённых.
+    /// Заполняет пустые реплики. Возвращает запуск и число переведённых.
     /// Описание сцены пока берётся готовым: чтение сцены перед переводом придёт с описаниями сцен.
     pub async fn translate(
         &self,
@@ -36,18 +36,18 @@ impl TranslationService<'_> {
         scope: TranslationScope,
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
-    ) -> Result<usize, AppError> {
+    ) -> Result<LinesRun, AppError> {
         self.run(project, LinesMode::Translate, scope, one_off, progress).await
     }
 
-    /// Вычитывает готовые реплики, исправления становятся черновиками. Возвращает число исправленных.
+    /// Вычитывает готовые реплики, исправления становятся черновиками. Возвращает запуск и число исправленных.
     pub async fn review(
         &self,
         project: ProjectId,
         scope: TranslationScope,
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
-    ) -> Result<usize, AppError> {
+    ) -> Result<LinesRun, AppError> {
         self.run(project, LinesMode::Review, scope, one_off, progress).await
     }
 
@@ -59,7 +59,7 @@ impl TranslationService<'_> {
         scope: TranslationScope,
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
-    ) -> Result<usize, AppError> {
+    ) -> Result<LinesRun, AppError> {
         let open = self.state.open_project(project)?;
         let action = match mode {
             LinesMode::Translate => Action::Lines,
@@ -87,7 +87,7 @@ impl TranslationService<'_> {
         let result = match run.id() {
             Some(id) => {
                 let mut job = Job { open: &open, target: &target, run: &run, id, mode, hints: glossary.hints, sent, progress: RunProgress::default() };
-                job.lines(scenes, only).await
+                job.lines(scenes, only).await.map(|written| LinesRun { run: id, written })
             }
             None => Err(AppError::ProjectNotOpen),
         };
@@ -101,9 +101,34 @@ impl TranslationService<'_> {
         result
     }
 
-    /// Сброс перевода: пустые правки, как ручная очистка строки.
+    /// Очистка перевода области: пустые правки пользователя, как ручная очистка строки, одной транзакцией.
+    /// Уже пустые реплики не трогаются. Возвращает число очищенных.
     pub fn reset(&self, project: ProjectId, scope: TranslationScope) -> Result<usize, AppError> {
-        todo!()
+        let open = self.state.open_project(project)?;
+        let now = Timestamp::now();
+        Ok(open.project.write(|tx| {
+            let repo = TranslationRepo { conn: tx };
+            let lines: Vec<SegmentId> = load_scenes(&repo, &scope)?
+                .iter()
+                .flat_map(|scene| &scene.lines)
+                .filter(|line| !line.text.trim().is_empty())
+                .filter(|line| !matches!(scope, TranslationScope::Line(only) if only != line.id))
+                .map(|line| line.id)
+                .collect();
+            let mut cleared = 0;
+            for line in lines {
+                if repo.save_user_text(line, "", now)? {
+                    cleared += 1;
+                }
+            }
+            Ok(cleared)
+        })?)
+    }
+
+    /// Последние запуски перевода и редактуры для меню «Запуски».
+    pub fn line_runs(&self, project: ProjectId) -> Result<Vec<LineRun>, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| TranslationRepo { conn: tx }.line_runs(LINE_RUNS))?)
     }
 
     /// Файлы с репликами и прогресс по ним.
@@ -134,10 +159,27 @@ impl TranslationService<'_> {
         Ok(open.project.write(|tx| TranslationRepo { conn: tx }.confirm(lines, Timestamp::now()))?)
     }
 
-    /// Откат запуска модели. Возвращает число откаченных и оставленных реплик.
+    /// Откат запуска модели одной транзакцией. Идущий запуск не откатывается. Возвращает число откаченных
+    /// и оставленных реплик.
     pub fn rollback(&self, project: ProjectId, run: RunId) -> Result<(usize, usize), AppError> {
-        todo!()
+        let open = self.state.open_project(project)?;
+        match open.project.read(|tx| TranslationRepo { conn: tx }.run_status(run))? {
+            None => Err(crate::storage::DbError::NotFound.into()),
+            Some(RunStatus::Running) => Err(AppError::RunActive),
+            Some(_) => Ok(open.project.write(|tx| TranslationRepo { conn: tx }.rollback_run(run, Timestamp::now()))?),
+        }
     }
+}
+
+/// Сколько последних запусков показывает меню «Запуски».
+const LINE_RUNS: usize = 15;
+
+/// Итог запуска перевода или редактуры.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinesRun {
+    pub run: RunId,
+    /// Записанные реплики.
+    pub written: usize,
 }
 
 /// Сцены запуска. Проект берёт файлы по порядку.
@@ -480,7 +522,7 @@ mod tests {
         let service = TranslationService { state: &state };
         let file = service.files(id).unwrap()[0].clone();
 
-        let translated = tauri::async_runtime::block_on(service.translate(id, TranslationScope::File(file.id), None, silent())).unwrap();
+        let translated = tauri::async_runtime::block_on(service.translate(id, TranslationScope::File(file.id), None, silent())).unwrap().written;
         assert_eq!(translated, file.total);
         let all = lines(&service, id, file.id);
         assert!(all.iter().all(|line| line.state == LineState::Draft && line.text.starts_with("Перевод")), "{all:?}");
@@ -489,7 +531,7 @@ mod tests {
         assert!(!state.llm_run.is_active(), "место освобождено");
 
         let requests = seen.lock().unwrap().len();
-        assert_eq!(tauri::async_runtime::block_on(service.translate(id, TranslationScope::Project, None, silent())).unwrap(), 0);
+        assert_eq!(tauri::async_runtime::block_on(service.translate(id, TranslationScope::Project, None, silent())).unwrap().written, 0);
         assert_eq!(seen.lock().unwrap().len(), requests, "переводить нечего, запросов нет");
     }
 
@@ -542,7 +584,7 @@ mod tests {
         let first = lines(&service, id, file)[0].id;
         service.save_text(id, first, "Здравствуй.").unwrap();
 
-        let fixed = tauri::async_runtime::block_on(service.review(id, TranslationScope::Line(first), None, silent())).unwrap();
+        let fixed = tauri::async_runtime::block_on(service.review(id, TranslationScope::Line(first), None, silent())).unwrap().written;
         assert_eq!(fixed, 1);
         let line = &lines(&service, id, file)[0];
         assert_eq!((line.text.as_str(), line.state), ("Правка 1", LineState::Draft));
@@ -585,6 +627,40 @@ mod tests {
         assert!(matches!(result, Err(AppError::Llm(_))));
         assert_eq!(count(&state, id, "SELECT count(*) FROM llm_runs WHERE status = 'failed' AND error IS NOT NULL"), 1);
         assert!(!state.llm_run.is_active());
+    }
+
+    #[test]
+    fn rollback_returns_untouched_lines_to_their_state_before_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path());
+        let (url, _) = fake_model(answer_every_line);
+        add_model(&state, &url);
+        let service = TranslationService { state: &state };
+        let file = service.files(id).unwrap()[0].id;
+        let all = lines(&service, id, file);
+        let (first, second) = (all[0].id, all[1].id);
+        service.save_text(id, first, "Своё.").unwrap();
+        service.save_text(id, first, "").unwrap();
+
+        let run = tauri::async_runtime::block_on(service.translate(id, TranslationScope::File(file), None, silent())).unwrap();
+        assert_eq!(run.written, all.len());
+        service.save_text(id, second, "Поправлено.").unwrap();
+        let runs = service.line_runs(id).unwrap();
+        assert_eq!((runs[0].id, runs[0].action, runs[0].status, runs[0].lines), (run.run, Action::Lines, RunStatus::Done, all.len()));
+
+        assert_eq!(service.rollback(id, run.run).unwrap(), (all.len() - 1, 1), "поправленную после запуска не трогаем");
+        let after = lines(&service, id, file);
+        assert_eq!((after[0].text.as_str(), after[0].state), ("", LineState::Empty), "очищенная до запуска снова пуста");
+        assert_eq!(after[1].text, "Поправлено.");
+        assert!(after[2..].iter().all(|line| line.state == LineState::Empty), "{after:?}");
+        let others = format!("SELECT count(*) FROM translations WHERE segment_id NOT IN ({}, {})", first.get(), second.get());
+        assert_eq!(count(&state, id, &others), 0, "у реплик, которых не было в translations до запуска, строк нет");
+        assert_eq!(service.rollback(id, run.run).unwrap(), (0, all.len()), "второй откат ничего не меняет");
+
+        assert_eq!(service.reset(id, TranslationScope::File(file)).unwrap(), 1);
+        assert_eq!(service.reset(id, TranslationScope::File(file)).unwrap(), 0, "пустые не трогаются");
+        assert!(lines(&service, id, file).iter().all(|line| line.text.is_empty()));
+        assert!(matches!(service.rollback(id, RunId::from_row(999)), Err(AppError::Db(_))));
     }
 
     #[test]

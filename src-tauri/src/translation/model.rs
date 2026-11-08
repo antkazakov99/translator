@@ -2,8 +2,9 @@
 
 use serde::Serialize;
 
-use crate::common::{Gender, ValidationError};
+use crate::common::{Gender, Timestamp, ValidationError};
 use crate::engines::{ContainerKey, SpeakerKey};
+use crate::llm::{Action, RunId, RunStatus};
 use crate::scan::{FileId, SegmentId};
 
 /// Что переводить или вычитывать.
@@ -72,6 +73,19 @@ pub struct FileProgress {
     /// Реплики с действующим текстом: перевод, черновик или перевод из игры.
     pub translated: usize,
     pub drafts: usize,
+}
+
+/// Запуск перевода или редактуры реплик для меню «Запуски».
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineRun {
+    pub id: RunId,
+    pub action: Action,
+    pub model: String,
+    pub status: RunStatus,
+    pub error: Option<String>,
+    pub started_at: Timestamp,
+    /// Реплики, в которые запуск что-то записал.
+    pub lines: usize,
 }
 
 impl SceneLine {

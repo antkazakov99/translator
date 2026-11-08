@@ -2,10 +2,10 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::{Draft, FileProgress, LineState, RevisionKind, Scene, SceneLine};
-use crate::common::Timestamp;
+use super::{Draft, FileProgress, LineRun, LineState, RevisionKind, Scene, SceneLine};
+use crate::common::{Timestamp, ValidationError};
 use crate::engines::{ContainerKey, SpeakerKey};
-use crate::llm::RunId;
+use crate::llm::{Action, RunId, RunStatus};
 use crate::scan::{FileId, SegmentId};
 use crate::storage::DbError;
 
@@ -259,10 +259,112 @@ impl TranslationRepo<'_> {
         Ok(confirmed)
     }
 
-    /// Откат запуска: только реплики, где последняя правка без переносов принадлежит запуску.
+    /// Откат запуска: только реплики, где последняя правка без переносов принадлежит запуску. Реплика получает
+    /// состояние до первой записи запуска: без строки `translations` снова действует перевод из игры.
     /// Возвращает число откаченных и число оставленных.
     pub fn rollback_run(&self, run: RunId, now: Timestamp) -> Result<(usize, usize), DbError> {
-        todo!()
+        let lines: Vec<i64> = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT r.segment_id FROM revisions r JOIN segments s ON s.id = r.segment_id AND s.missing = 0
+                 WHERE r.run_id = ?1 AND r.kind = 'llm' ORDER BY r.segment_id",
+            )?
+            .query_map([run.get()], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let (mut rolled, mut left) = (0, 0);
+        for id in lines {
+            let line = SegmentId::from_row(id);
+            let last: Option<(String, Option<i64>)> = self
+                .conn
+                .query_row(
+                    "SELECT kind, run_id FROM revisions WHERE segment_id = ?1 AND kind <> 'transfer' ORDER BY id DESC LIMIT 1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if last != Some(("llm".to_string(), Some(run.get()))) {
+                left += 1;
+                continue;
+            }
+            let (had_row, text, draft, source_hash): (bool, Option<String>, Option<bool>, Option<String>) = self.conn.query_row(
+                "SELECT had_row, text_before, draft_before, source_hash_before FROM revisions
+                 WHERE segment_id = ?1 AND run_id = ?2 AND kind = 'llm' ORDER BY id LIMIT 1",
+                [id, run.get()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let before = self.translation(line)?;
+            let restored = match (had_row, text, source_hash) {
+                (true, Some(text), Some(source_hash)) => {
+                    self.conn.execute(
+                        "INSERT INTO translations (segment_id, text, draft, run_id, source_hash, updated_at)
+                         VALUES (?1, ?2, ?3, NULL, ?4, ?5)
+                         ON CONFLICT (segment_id) DO UPDATE SET
+                           text = excluded.text, draft = excluded.draft, run_id = NULL,
+                           source_hash = excluded.source_hash, updated_at = excluded.updated_at",
+                        params![id, text, draft.unwrap_or(false), source_hash, now.secs()],
+                    )?;
+                    Some(text)
+                }
+                _ => {
+                    self.conn.execute("DELETE FROM translations WHERE segment_id = ?1", [id])?;
+                    None
+                }
+            };
+            self.revision(line, RevisionKind::Rollback, before.as_ref(), restored.as_deref(), Some(run), now)?;
+            rolled += 1;
+        }
+        if rolled > 0 {
+            self.bump_search()?;
+        }
+        Ok((rolled, left))
+    }
+
+    /// Последние запуски перевода и редактуры, новые первыми, с числом реплик, в которые они писали.
+    pub fn line_runs(&self, limit: usize) -> Result<Vec<LineRun>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT r.id, r.action_id, r.model, r.status, r.error, r.started_at,
+                    (SELECT count(DISTINCT v.segment_id) FROM revisions v WHERE v.run_id = r.id AND v.kind = 'llm')
+             FROM llm_runs r WHERE r.action_id IN ('lines', 'review') ORDER BY r.id DESC LIMIT ?1",
+        )?;
+        let rows = statement
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, action, model, status, error, started, lines)| {
+                let bad = |column: &'static str, value: String| DbError::bad_value("llm_runs", column, ValidationError::UnknownValue { field: column, value });
+                Ok(LineRun {
+                    id: RunId::from_row(id),
+                    action: Action::parse(&action).ok_or_else(|| bad("action_id", action.clone()))?,
+                    model,
+                    status: RunStatus::parse(&status).ok_or_else(|| bad("status", status.clone()))?,
+                    error,
+                    started_at: Timestamp::from_secs(started),
+                    lines: usize::try_from(lines).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// Итог запуска. `None`: такого запуска нет.
+    pub fn run_status(&self, run: RunId) -> Result<Option<RunStatus>, DbError> {
+        let status: Option<String> =
+            self.conn.query_row("SELECT status FROM llm_runs WHERE id = ?1", [run.get()], |row| row.get(0)).optional()?;
+        status
+            .map(|status| {
+                RunStatus::parse(&status)
+                    .ok_or_else(|| DbError::bad_value("llm_runs", "status", ValidationError::UnknownValue { field: "status", value: status.clone() }))
+            })
+            .transpose()
     }
 
     fn translation(&self, line: SegmentId) -> Result<Option<Translation>, DbError> {
