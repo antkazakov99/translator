@@ -105,6 +105,12 @@ export const commands = {
 	excludeNote: (project: string, owner: OwnerDto, model: string, hash: string, excluded: boolean) => __TAURI_INVOKE<null>("exclude_note", { project, owner, model, hash, excluded }),
 	/**  Сцена не даётся модели при описании персонажа или термина, или возвращается. */
 	excludeScene: (project: string, owner: OwnerDto, key: string, excluded: boolean) => __TAURI_INVOKE<null>("exclude_scene", { project, owner, key, excluded }),
+	/**  Собирает `ru_lang.rpa` в папке проекта. Папка игры не нужна. */
+	buildMod: (project: string) => __TAURI_INVOKE<ModResultDto>("build_mod", { project }),
+	/**  Собирает мод заново и ставит в привязанную папку игры. */
+	installMod: (project: string) => __TAURI_INVOKE<ModResultDto>("install_mod", { project }),
+	/**  Убирает мод из папки игры. */
+	uninstallMod: (project: string) => __TAURI_INVOKE<null>("uninstall_mod", { project }),
 	/**  Файлы проекта с репликами и прогресс. */
 	translationFiles: (project: string) => __TAURI_INVOKE<FileDto[]>("translation_files", { project }),
 	/**  Реплики файла по сценам. */
@@ -507,6 +513,21 @@ export type LlmSettingsDto_Serialize = {
 	keysPersistent: boolean,
 	defaultReasoningTokens: number,
 	defaultTimeoutSecs: number,
+};
+
+/**  Итог сборки или установки мода. */
+export type ModResultDto = {
+	/**  Собранный архив в папке проекта. */
+	path: string,
+	files: number,
+	/**  Переводов реплик в моде. */
+	written: number,
+	/**  Переводов, которые в мод не вошли. */
+	skipped: number,
+	/**  В папке игры на диске есть свой перевод: он важнее архива. */
+	tlOnDisk: boolean,
+	/**  Файлы перевода игры, которые не удалось включить в мод. */
+	leftOut: string[],
 };
 
 /**  Поле имени, происхождение которого определила модель. */

@@ -73,16 +73,22 @@ fn format_error(path: impl Into<String>) -> impl FnOnce(String) -> EngineError {
 }
 
 /// Файлы игры в `FileStore` и сведения о них. Как в движке, файл на диске важнее архива,
-/// архивы перебираются с конца алфавита, а `.rpyc` рядом со своим `.rpy` не нужен.
+/// архивы перебираются с конца алфавита, а `.rpyc` рядом со своим `.rpy` не нужен. Исключение: актуальная
+/// компиляция файла перевода на диске остаётся готовой копией (`Asset`): если сборка мода не сможет
+/// скомпилировать нетронутый файл сама, в мод пойдёт эта копия.
 pub(crate) fn collect_folder(root: &GameRoot, store: &FileStore) -> Result<Vec<SnapshotFile>, EngineError> {
     let game = root.as_path().join(GAME_DIR);
     let mut chosen: BTreeMap<String, SnapshotFile> = BTreeMap::new();
     let mut disk_scripts = HashSet::new();
+    let mut modified: HashMap<String, std::time::SystemTime> = HashMap::new();
 
     for path in collect_game_files(&game) {
         let Ok(relative) = path.strip_prefix(&game) else { continue };
         let name = relative.to_string_lossy().replace('\\', "/");
         let Some(kind) = classify(&name) else { continue };
+        if let Ok(time) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+            modified.insert(name.clone(), time);
+        }
         let blob = store.put(File::open(&path)?)?;
         if is_script(&name) {
             disk_scripts.insert(script_base(&name).to_string());
@@ -113,7 +119,20 @@ pub(crate) fn collect_folder(root: &GameRoot, store: &FileStore) -> Result<Vec<S
 
     let sources: HashSet<String> =
         chosen.keys().filter_map(|name| name.strip_suffix(".rpy")).map(str::to_string).collect();
-    chosen.retain(|name, _| name.strip_suffix(".rpyc").is_none_or(|base| !sources.contains(base)));
+    let current = |base: &str| match (modified.get(&format!("{base}.rpyc")), modified.get(&format!("{base}.rpy"))) {
+        (Some(compiled), Some(source)) => compiled >= source,
+        _ => false,
+    };
+    for (name, file) in &mut chosen {
+        if file.kind == FileKind::Translation
+            && let Some(base) = name.strip_suffix(".rpyc")
+            && sources.contains(base)
+            && current(base)
+        {
+            file.kind = FileKind::Asset;
+        }
+    }
+    chosen.retain(|name, file| file.kind == FileKind::Asset || name.strip_suffix(".rpyc").is_none_or(|base| !sources.contains(base)));
     Ok(chosen.into_values().collect())
 }
 
@@ -238,7 +257,22 @@ pub(crate) fn read_edges(files: &[SnapshotFile], store: &FileStore) -> Result<Ve
     Ok(scene_edges(&structures))
 }
 
-pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameInfo) -> Result<GameSnapshot, EngineError> {
+/// Файлы перевода снимка в порядке имён и их текст: `.rpy` как есть, `.rpyc` декомпилирован по репликам
+/// оригинала. Номера строк реплик (`target_lines`) считаются по этому тексту, поэтому сборка мода берёт его отсюда же.
+pub(crate) fn translation_texts<'a>(
+    files: &'a [SnapshotFile],
+    store: &FileStore,
+) -> Result<Vec<(&'a SnapshotFile, String)>, EngineError> {
+    let (texts, _) = translations_and_scripts(files, store)?;
+    Ok(texts)
+}
+
+/// Файлы перевода с текстом и скрипты оригинала с текстом.
+#[allow(clippy::type_complexity)]
+fn translations_and_scripts<'a>(
+    files: &'a [SnapshotFile],
+    store: &FileStore,
+) -> Result<(Vec<(&'a SnapshotFile, String)>, Vec<ScriptText<'a>>), EngineError> {
     let mut translations: Vec<&SnapshotFile> =
         files.iter().filter(|f| f.kind == FileKind::Translation && is_script(&f.path)).collect();
     translations.sort_by_cached_key(|f| natural_key(&f.path));
@@ -246,7 +280,28 @@ pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameIn
     // Файл перевода в .rpyc восстанавливается по репликам оригинала, найденным по id.
     let needs_originals = translations.iter().any(|f| f.path.ends_with(".rpyc"));
     let mut originals = HashMap::new();
-    let texts = script_texts(&files, store, needs_originals.then_some(&mut originals))?;
+    let texts = script_texts(files, store, needs_originals.then_some(&mut originals))?;
+    let mut sources = Vec::new();
+    for file in translations {
+        let data = store.read(&file.hash)?;
+        let text = if file.path.ends_with(".rpyc") {
+            match RpycParser::decompile_translation(&data, &originals) {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::warn!(file = %file.path, %error, "Файл перевода не декомпилирован");
+                    continue;
+                }
+            }
+        } else {
+            decode_text(&data)
+        };
+        sources.push((file, text));
+    }
+    Ok((sources, texts))
+}
+
+pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameInfo) -> Result<GameSnapshot, EngineError> {
+    let (translated, texts) = translations_and_scripts(&files, store)?;
 
     let mut codes: HashMap<String, String> = HashMap::new();
     for script in &texts {
@@ -302,26 +357,11 @@ pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameIn
     let offers_language = texts.iter().any(|s| actions.iter().any(|action| s.text.contains(action)));
 
     // Есть перевод в игре: реплики берутся из него вместе с готовым текстом, иначе из скриптов.
-    let sources: Vec<ScriptText> = if translations.is_empty() {
-        texts
+    let has_translation = files.iter().any(|f| f.kind == FileKind::Translation && is_script(&f.path));
+    let sources: Vec<ScriptText> = if has_translation {
+        translated.into_iter().map(|(file, text)| ScriptText { file, text }).collect()
     } else {
-        let mut sources = Vec::new();
-        for file in &translations {
-            let data = store.read(&file.hash)?;
-            let text = if file.path.ends_with(".rpyc") {
-                match RpycParser::decompile_translation(&data, &originals) {
-                    Ok(text) => text,
-                    Err(error) => {
-                        tracing::warn!(file = %file.path, %error, "Файл перевода не декомпилирован");
-                        continue;
-                    }
-                }
-            } else {
-                decode_text(&data)
-            };
-            sources.push(ScriptText { file, text });
-        }
-        sources
+        texts
     };
 
     let parser = RenpyParser::new().with_speakers(codes.clone());

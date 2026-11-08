@@ -1,6 +1,7 @@
 //! Адаптер Ren'Py: архивы RPA, декомпиляция и компиляция `.rpyc`, разбор скриптов, считывание игры.
 
 pub mod graph;
+pub mod modpack;
 pub mod pickle;
 pub mod rpa;
 pub mod rpyc;
@@ -99,16 +100,16 @@ impl GameEngine for RenpyEngine {
 
     /// `ru_lang.rpa`: переводы `tl/<язык>`, строковые переводы, подписи говорящих, включение языка, шрифты.
     fn build_mod(&self, input: &ModInput, files: &FileStore, out_dir: &Path) -> Result<ModArchive, EngineError> {
-        todo!()
+        modpack::build(input, files, out_dir)
     }
 
     /// Атомарно заменяет `game/ru_lang.rpa`, не трогая `tl/` и оригиналы.
     fn install(&self, root: &GameRoot, archive: &ModArchive) -> Result<(), EngineError> {
-        todo!()
+        modpack::install(root, archive)
     }
 
     fn uninstall(&self, root: &GameRoot) -> Result<(), EngineError> {
-        todo!()
+        modpack::uninstall(root)
     }
 }
 

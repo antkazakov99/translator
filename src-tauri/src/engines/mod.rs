@@ -226,6 +226,14 @@ pub struct ModInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModArchive {
     pub path: PathBuf,
+    /// Файлов в архиве.
+    pub files: usize,
+    /// Переводов реплик, вошедших в мод.
+    pub written: usize,
+    /// Переводов, которые в мод не вошли: строку не нашли или оригинал повторился с другим переводом.
+    pub skipped: usize,
+    /// Файлы перевода игры, которые не удалось включить в мод.
+    pub left_out: Vec<String>,
 }
 
 /// Движок игры. Без состояния: все движки лежат в статическом `ENGINES`, поэтому трейт `Sync`.

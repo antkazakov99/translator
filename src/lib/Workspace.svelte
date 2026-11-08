@@ -11,6 +11,7 @@
     History,
     Languages,
     LoaderCircle,
+    Package,
     SpellCheck,
     Square,
     TriangleAlert,
@@ -19,6 +20,7 @@
     X,
   } from "lucide-svelte";
   import Glossary from "./Glossary.svelte";
+  import ModPanel from "./ModPanel.svelte";
   import SceneGraph from "./SceneGraph.svelte";
   import type { GraphScene } from "$lib/scene-graph";
   import {
@@ -45,6 +47,8 @@
   let editing = $state<{ id: number; text: string } | null>(null);
   let saving = $state(false);
   let view = $state<"table" | "graph" | "glossary">("table");
+  /** Карточка мода под шапкой. */
+  let modOpen = $state(false);
   /** Сцена в центре графа: переживает переключение вида. */
   let graphFocus = $state<string | null>(null);
 
@@ -382,11 +386,19 @@
       <button role="tab" aria-selected={view === "graph"} class:on={view === "graph"} onclick={() => (view = "graph")}>Граф</button>
       <button role="tab" aria-selected={view === "glossary"} class:on={view === "glossary"} onclick={() => (view = "glossary")}>Глоссарий</button>
     </div>
+    <button class="btn small" class:active={modOpen} onclick={() => (modOpen = !modOpen)} title="Собрать мод перевода и поставить его в игру">
+      <Package size={15} />
+      <span>Мод</span>
+    </button>
     <button class="btn small" onclick={onSettings} title="Провайдеры, модели и настройки действий">
       <Bot size={15} />
       <span>Модели</span>
     </button>
   </header>
+
+  {#if modOpen}
+    <ModPanel {project} onClose={() => (modOpen = false)} />
+  {/if}
 
   {#if view === "graph"}
     <div class="body">
