@@ -13,7 +13,8 @@ use super::{
     TranslationRepo, TranslationScope,
 };
 use crate::common::{AppError, Timestamp};
-use crate::glossary::{GlossaryData, Term, TermRepo};
+use crate::glossary::{CharacterRepo, GlossaryData, Term, TermRepo};
+use crate::name_rules::NameRuleService;
 use crate::llm::{Action, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunId, RunProgress, RunStatus};
 use crate::projects::ProjectId;
 use crate::scan::{FileId, SegmentId};
@@ -65,8 +66,10 @@ impl TranslationService<'_> {
             LinesMode::Review => Action::Review,
         };
         let target = LlmTargetService { state: self.state }.target(Some(&open), action, one_off)?;
-        let (mut scenes, glossary) =
-            open.project.read(|tx| Ok((load_scenes(&TranslationRepo { conn: tx }, &scope)?, GlossaryData::load(tx)?)))?;
+        let (mut scenes, glossary, origins) = open.project.read(|tx| {
+            Ok((load_scenes(&TranslationRepo { conn: tx }, &scope)?, GlossaryData::load(tx)?, CharacterRepo { conn: tx }.all_origins()?))
+        })?;
+        let rules = NameRuleService { state: self.state }.effective(project, &GlossaryContext::name_languages(&glossary, &origins))?;
         let only = match scope {
             TranslationScope::Line(line) => Some(line),
             _ => None,
@@ -74,7 +77,9 @@ impl TranslationService<'_> {
         // Что ушло бы модели без глоссария: по этому проверяется запись, ведь в базе токены не заменены.
         let sent: HashMap<SegmentId, SentState> =
             scenes.iter().flat_map(|scene| &scene.lines).map(|line| (line.id, line.sent())).collect();
-        let mut glossary = GlossaryContext::new(&glossary);
+        let mut context = GlossaryContext::new(&glossary);
+        context.with_name_rules(&glossary, &origins, &rules);
+        let mut glossary = context;
         for scene in &mut scenes {
             glossary.apply(scene);
         }

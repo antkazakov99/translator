@@ -6,7 +6,8 @@ use super::text::fill_tokens;
 use super::{Hints, Scene};
 use crate::common::Gender;
 use crate::engines::SpeakerKey;
-use crate::glossary::{GlossaryData, speaker_gender};
+use crate::glossary::{CharacterId, GlossaryData, NameField, NameOrigin, speaker_gender};
+use crate::name_rules::{LanguageTag, NameRule};
 
 /// Глоссарий, разобранный для запросов одного запуска.
 #[derive(Debug, Clone, Default)]
@@ -86,6 +87,48 @@ impl GlossaryContext {
             speaker.gender = speaker_gender(Some(entry), &[]).or(speaker.gender);
         }
         Self { hints, speakers, values }
+    }
+
+    /// Происхождение имён и правила их языков: правила идут в запрос, если имя упомянуто в репликах пакета.
+    /// Берётся только действующее происхождение, полное имя получает языки имени и фамилии.
+    pub fn with_name_rules(&mut self, data: &GlossaryData, origins: &HashMap<CharacterId, Vec<NameOrigin>>, rules: &[NameRule]) {
+        let ruled = |origin: &NameOrigin| -> Vec<String> {
+            origin.languages.iter().filter(|language| rules.iter().any(|rule| rule.from() == *language)).map(ToString::to_string).collect()
+        };
+        for character in &data.characters {
+            let Some(own) = character.id().and_then(|id| origins.get(&id)) else { continue };
+            let current: Vec<&NameOrigin> = own.iter().filter(|origin| origin.is_current(character)).collect();
+            let of = |field: NameField| current.iter().filter(|origin| origin.field == field).flat_map(|origin| ruled(origin)).collect::<Vec<_>>();
+            let (first, last) = (of(NameField::First), of(NameField::Last));
+            let mut add = |name: Option<&str>, codes: Vec<String>| {
+                if let Some(name) = name.filter(|_| !codes.is_empty()) {
+                    self.hints.name_origins.push((name.to_string(), codes));
+                }
+            };
+            let mut full = first.clone();
+            full.extend(last.iter().filter(|code| !first.contains(code)).cloned());
+            add(character.full_name().as_deref(), full);
+            add(character.first_name(), first);
+            add(character.last_name(), last);
+            for origin in current.iter().filter(|origin| origin.field == NameField::Form) {
+                add(Some(&origin.source), ruled(origin));
+            }
+        }
+        self.hints.name_rules = rules.iter().map(|rule| (rule.from().to_string(), rule.rules().to_string())).collect();
+    }
+
+    /// Языки имён, у которых есть действующее происхождение: по ним сервис берёт правила.
+    pub fn name_languages(data: &GlossaryData, origins: &HashMap<CharacterId, Vec<NameOrigin>>) -> Vec<LanguageTag> {
+        let mut languages: Vec<LanguageTag> = Vec::new();
+        for character in &data.characters {
+            let Some(own) = character.id().and_then(|id| origins.get(&id)) else { continue };
+            for language in own.iter().filter(|origin| origin.is_current(character)).flat_map(|origin| &origin.languages) {
+                if !languages.contains(language) {
+                    languages.push(language.clone());
+                }
+            }
+        }
+        languages
     }
 
     /// Подписи и род говорящих по глоссарию, значения токенов в оригинале и переводе. Перевод подписи из записи
@@ -170,5 +213,54 @@ mod tests {
         assert_eq!(scene.lines[0].source_text, "Hi, mother. I'm [mc].");
         assert_eq!(scene.lines[1].speaker_gender, Some(Gender::Male));
         assert!(context.hints.names.contains(&("Radio".to_string(), "Радио".to_string(), Some(Gender::Male))));
+    }
+
+    #[test]
+    fn name_rules_follow_current_origins_of_names_with_rules() {
+        let text = |value: &str| Some(value.to_string());
+        let anja = Character::restore(
+            CharacterId::from_row(1),
+            text("Anja"),
+            text("Karanovic"),
+            None,
+            None,
+            Some(Gender::Female),
+            None,
+            None,
+            vec![Form::new("Mrs. Karanovic", None).unwrap()],
+        );
+        let data = GlossaryData { characters: vec![anja], links: Vec::new(), entries: Vec::new(), terms: Vec::new(), tokens: Vec::new() };
+        let tag = |code: &str| LanguageTag::parse(code).unwrap();
+        let origin = |field: NameField, source: &str, context: &str, languages: &[&str]| NameOrigin {
+            field,
+            source: source.to_string(),
+            context: context.to_string(),
+            languages: languages.iter().map(|code| tag(code)).collect(),
+            reason: None,
+        };
+        let origins = HashMap::from([(
+            CharacterId::from_row(1),
+            vec![
+                origin(NameField::First, "Anja", "Anja Karanovic", &["sr"]),
+                origin(NameField::Last, "Karanovic", "Anja Karanovic", &["hr", "sr"]),
+                origin(NameField::Form, "Mrs. Karanovic", "Anja Karanovic", &["sr"]),
+                origin(NameField::Form, "Mrs. Karanovic", "Anja Petrovic", &["de"]),
+            ],
+        )]);
+        assert_eq!(GlossaryContext::name_languages(&data, &origins), [tag("sr"), tag("hr")], "устаревшее происхождение не в счёт");
+
+        let mut context = GlossaryContext::new(&data);
+        context.with_name_rules(&data, &origins, &[NameRule::new(tag("sr"), tag("ru"), "j это й").unwrap()]);
+        let sr = || vec!["sr".to_string()];
+        assert_eq!(
+            context.hints.name_origins,
+            [
+                ("Anja Karanovic".to_string(), sr()),
+                ("Anja".to_string(), sr()),
+                ("Karanovic".to_string(), sr()),
+                ("Mrs. Karanovic".to_string(), sr()),
+            ]
+        );
+        assert_eq!(context.hints.name_rules, [("sr".to_string(), "j это й".to_string())]);
     }
 }

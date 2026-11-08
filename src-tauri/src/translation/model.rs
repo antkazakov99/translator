@@ -118,7 +118,10 @@ pub struct Hints {
     pub terms: Vec<(String, String, bool)>,
     /// Токен без значения и его пояснение: модель видит токен в тексте.
     pub tokens: Vec<(String, String)>,
-    pub name_rules: Vec<String>,
+    /// Имя, фамилия, полное имя или форма персонажа и коды языков их происхождения, у которых есть правила.
+    pub name_origins: Vec<(String, Vec<String>)>,
+    /// Правила имён: код языка и текст.
+    pub name_rules: Vec<(String, String)>,
 }
 
 /// Вид строки истории.

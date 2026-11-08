@@ -15,6 +15,8 @@ pub const LINE_ANSWER_TOKENS: u32 = 4096;
 const MAX_TERM_HINT_CHARS: usize = 1500;
 /// Пометка термина, который предположила модель: она не должна считать его установленным.
 const UNCONFIRMED_MARK: &str = "(unconfirmed)";
+/// Сколько языков имён с правилами идёт в один запрос: правила длинные.
+const NAME_RULE_LANGUAGES: usize = 3;
 /// Подпись реплики без говорящего: повествование и мысли героя.
 const NARRATOR: &str = "Narrator";
 
@@ -123,9 +125,8 @@ impl LinesPrompt {
         context.extend(speakers_hint(&shown));
         let text: String = shown.iter().map(|line| format!("{}\n{}\n", line.speaker.as_deref().unwrap_or(NARRATOR), line.source_text)).collect();
         context.extend(glossary_hints(&text, hints));
-        if !hints.name_rules.is_empty() {
-            context.push(format!("Name rules:\n{}", hints.name_rules.join("\n")));
-        }
+        let lines: String = shown.iter().map(|line| format!("{}\n", line.source_text)).collect();
+        context.extend(name_rules_hint(&lines, hints));
         if !earlier.is_empty() {
             context.push(format!("Earlier lines:\n{}", json(&earlier)));
         }
@@ -153,6 +154,35 @@ fn json(items: &[Item]) -> String {
 /// и предложения модели в глоссарии.
 pub(crate) fn glossary_hints(text: &str, hints: &Hints) -> Vec<String> {
     token_hint(text, hints).into_iter().chain(name_hint(text, hints)).chain(term_hint(text, hints)).collect()
+}
+
+/// Правила языков имён, упомянутых в тексте реплик: как имя пишется и склоняется. Не больше
+/// `NAME_RULE_LANGUAGES` языков, первыми те, у кого больше упомянутых имён.
+fn name_rules_hint(text: &str, hints: &Hints) -> Option<String> {
+    let lower = text.to_lowercase();
+    let mut languages: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (name, codes) in &hints.name_origins {
+        if !mentions(&lower, &name.to_lowercase()) {
+            continue;
+        }
+        for code in codes.iter().filter(|code| hints.name_rules.iter().any(|(known, _)| known == *code)) {
+            match languages.iter_mut().find(|(known, _)| known == code) {
+                Some((_, names)) if !names.contains(&name.as_str()) => names.push(name),
+                Some(_) => {}
+                None => languages.push((code, vec![name])),
+            }
+        }
+    }
+    languages.sort_by_key(|(_, names)| std::cmp::Reverse(names.len()));
+    let blocks: Vec<String> = languages
+        .iter()
+        .take(NAME_RULE_LANGUAGES)
+        .filter_map(|(code, names)| {
+            let (_, rules) = hints.name_rules.iter().find(|(known, _)| known == code)?;
+            Some(format!("[{code}] {}\n{}", names.join(", "), rules.trim()))
+        })
+        .collect();
+    (!blocks.is_empty()).then(|| format!("Name rules (how names of each origin are spelled and declined in Russian):\n{}", blocks.join("\n\n")))
 }
 
 /// Род говорящих, если он известен.
@@ -267,6 +297,36 @@ pub(crate) mod tests {
         assert!(lines.contains("\"speaker\": \"Narrator\",\n    \"text\": \"...\"\n"), "готовая без перевода реплика идёт без полей");
         assert_eq!(request.max_tokens, LINE_ANSWER_TOKENS);
         assert_eq!(request.temperature, Action::Lines.default_temperature());
+    }
+
+    #[test]
+    fn name_rules_come_for_names_mentioned_in_the_lines_only() {
+        let mut lines = vec![line(1, "Mrs. Karanovic called Heike.", ""), line(2, "Tell Karanovic.", "")];
+        lines[0].speaker = Some("Yuki".to_string());
+        let scene = scene(lines);
+        let batch = Batch { lines: vec![SegmentId::from_row(1), SegmentId::from_row(2)], context: Vec::new() };
+        let codes = |codes: &[&str]| codes.iter().map(|code| code.to_string()).collect::<Vec<_>>();
+        let hints = Hints {
+            name_origins: vec![
+                ("Karanovic".to_string(), codes(&["sr", "hr"])),
+                ("Mrs. Karanovic".to_string(), codes(&["sr"])),
+                ("Heike".to_string(), codes(&["de"])),
+                ("Yuki".to_string(), codes(&["ja"])),
+            ],
+            name_rules: vec![
+                ("sr".to_string(), "j это й".to_string()),
+                ("de".to_string(), "ei это ай".to_string()),
+                ("ja".to_string(), "shi это си".to_string()),
+            ],
+            ..Default::default()
+        };
+        let user = LinesPrompt::build(LinesMode::Translate, &scene, &batch, &hints, &target()).user;
+        assert!(
+            user.contains("Name rules (how names of each origin are spelled and declined in Russian):\n[sr] Karanovic, Mrs. Karanovic\nj это й\n\n[de] Heike\nei это ай\n\n"),
+            "{user}"
+        );
+        assert!(!user.contains("shi это си"), "имя говорящего над репликой правил не просит");
+        assert!(!user.contains("[hr]"), "у hr правил нет");
     }
 
     #[test]
