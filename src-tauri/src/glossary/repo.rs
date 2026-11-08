@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+use super::parts::scene_hash;
+use super::scenes::SceneSource;
 use super::terms::TermCandidate;
 use super::{
     Character, CharacterId, DiscardReason, DiscardedTerm, Form, NameField, NameKey, NameOrigin, Note, NoteOwner, SceneDescription, Speaker,
@@ -666,6 +668,54 @@ impl SceneDescriptionRepo<'_> {
             .collect()
     }
 
+    /// Сцены текущего снимка с репликами в порядке сюжета. Отпечаток текста считается по отпечаткам оригиналов.
+    pub fn sources(&self) -> Result<Vec<SceneSource>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT c.key, f.path, s.source_hash
+             FROM containers c
+             JOIN segments s ON s.container_id = c.id AND s.missing = 0
+             LEFT JOIN files f ON f.id = s.file_id
+             WHERE c.kind = 'scene' AND c.last_seen_scan = (SELECT max(id) FROM scans)
+             ORDER BY c.story_order IS NULL, c.story_order, c.key, s.story_order, s.id",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut grouped: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
+        for (key, file, hash) in rows {
+            match grouped.last_mut() {
+                Some((last, _, hashes)) if *last == key => hashes.push(hash),
+                _ => grouped.push((key, file, vec![hash])),
+            }
+        }
+        grouped
+            .into_iter()
+            .map(|(key, file, hashes)| {
+                Ok(SceneSource {
+                    key: ContainerKey::new(key).map_err(|error| DbError::bad_value("containers", "key", error))?,
+                    file,
+                    lines: hashes.len(),
+                    text_hash: scene_hash(hashes.iter().map(String::as_str)),
+                })
+            })
+            .collect()
+    }
+
+    /// Первая сцена игры по сюжету: модель узнаёт, что это вступление.
+    pub fn first_scene(&self) -> Result<Option<ContainerKey>, DbError> {
+        let key: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT key FROM containers WHERE kind = 'scene' AND story_order IS NOT NULL
+                   AND last_seen_scan = (SELECT max(id) FROM scans)
+                 ORDER BY story_order LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        key.map(ContainerKey::new).transpose().map_err(|error| DbError::bad_value("containers", "key", error))
+    }
+
     /// Пустое описание удаляет строку.
     pub fn save(&self, scene: &SceneDescription) -> Result<(), DbError> {
         if scene.is_empty() {
@@ -688,16 +738,83 @@ pub struct NoteRepo<'c> {
 }
 
 impl NoteRepo<'_> {
+    /// Заметки владельца от одной модели.
     pub fn of(&self, owner: &NoteOwner, model: &str) -> Result<Vec<Note>, DbError> {
-        todo!()
+        self.query(
+            "SELECT model, part_hash, text, excluded, created_at FROM notes
+             WHERE owner_kind = ?1 AND owner_ref = ?2 AND model = ?3 ORDER BY created_at, part_hash",
+            owner,
+            Some(model),
+        )
     }
 
+    /// Заметки владельца от всех моделей, новые первыми.
+    pub fn all_of(&self, owner: &NoteOwner) -> Result<Vec<Note>, DbError> {
+        self.query(
+            "SELECT model, part_hash, text, excluded, created_at FROM notes
+             WHERE owner_kind = ?1 AND owner_ref = ?2 ORDER BY created_at DESC, model",
+            owner,
+            None,
+        )
+    }
+
+    fn query(&self, sql: &str, owner: &NoteOwner, model: Option<&str>) -> Result<Vec<Note>, DbError> {
+        let mut statement = self.conn.prepare(sql)?;
+        let reference = owner.reference();
+        let read = |row: &Row| {
+            Ok(Note {
+                owner: owner.clone(),
+                model: row.get(0)?,
+                part_hash: row.get(1)?,
+                text: row.get(2)?,
+                excluded: row.get::<_, i64>(3)? != 0,
+                created_at: Timestamp::from_secs(row.get(4)?),
+            })
+        };
+        let notes = match model {
+            Some(model) => statement.query_map(params![owner.kind(), reference, model], read)?.collect::<Result<Vec<_>, _>>()?,
+            None => statement.query_map(params![owner.kind(), reference], read)?.collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(notes)
+    }
+
+    /// Новая заметка той же части заменяет прежнюю.
     pub fn save(&self, note: &Note) -> Result<(), DbError> {
-        todo!()
+        self.conn.execute(
+            "INSERT INTO notes (owner_kind, owner_ref, model, part_hash, text, excluded, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (owner_kind, owner_ref, model, part_hash) DO UPDATE SET text = excluded.text,
+               excluded = excluded.excluded, created_at = excluded.created_at",
+            params![
+                note.owner.kind(),
+                note.owner.reference(),
+                note.model,
+                note.part_hash,
+                note.text,
+                i64::from(note.excluded),
+                note.created_at.secs()
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn set_excluded(&self, owner: &NoteOwner, model: &str, part_hash: &str, excluded: bool) -> Result<(), DbError> {
-        todo!()
+        self.conn.execute(
+            "UPDATE notes SET excluded = ?5 WHERE owner_kind = ?1 AND owner_ref = ?2 AND model = ?3 AND part_hash = ?4",
+            params![owner.kind(), owner.reference(), model, part_hash, i64::from(excluded)],
+        )?;
+        Ok(())
+    }
+
+    /// Число заметок по владельцам одного вида: окно показывает, у кого они есть.
+    pub fn counts(&self, kind: &str) -> Result<HashMap<String, usize>, DbError> {
+        let mut statement = self.conn.prepare("SELECT owner_ref, count(*) FROM notes WHERE owner_kind = ?1 GROUP BY owner_ref")?;
+        let rows = statement.query_map([kind], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut counts = HashMap::new();
+        for row in rows {
+            let (owner, count) = row?;
+            counts.insert(owner, usize::try_from(count).unwrap_or(0));
+        }
+        Ok(counts)
     }
 
     /// Явный сброс или удаление владельца. Пока заметки пишет только описание модели, удалять нечего,
@@ -708,7 +825,18 @@ impl NoteRepo<'_> {
 
     /// После повторного считывания: удаляет заметки, чьих частей нет среди всех частей владельца.
     pub fn retain_parts(&self, owner: &NoteOwner, part_hashes: &[String]) -> Result<usize, DbError> {
-        todo!()
+        let mut statement = self.conn.prepare("SELECT DISTINCT part_hash FROM notes WHERE owner_kind = ?1 AND owner_ref = ?2")?;
+        let stored = statement
+            .query_map(params![owner.kind(), owner.reference()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut removed = 0;
+        for hash in stored.iter().filter(|hash| !part_hashes.contains(hash)) {
+            removed += self.conn.execute(
+                "DELETE FROM notes WHERE owner_kind = ?1 AND owner_ref = ?2 AND part_hash = ?3",
+                params![owner.kind(), owner.reference(), hash],
+            )?;
+        }
+        Ok(removed)
     }
 }
 

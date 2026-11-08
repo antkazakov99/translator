@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
+use super::describe::PartNote;
 use super::{
-    Character, CharacterId, Form, GlossaryOverview, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
+    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, GlossaryOverview, ReadingDepth, SceneEntry, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
     SpeakerSuggestion, Term,
     TermCandidate, TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
 };
 use crate::common::{AppError, Gender, Timestamp};
-use crate::engines::SpeakerKey;
+use crate::engines::{ContainerKey, SpeakerKey};
 use crate::name_rules::{LanguageRules, LanguageTag, NameRuleService};
 use crate::llm::{ProfileId, RunProgress};
 use crate::projects::ProjectId;
@@ -729,4 +730,136 @@ pub async fn suggest_tokens(
             .collect(),
         error: found.error,
     })
+}
+
+/// Сцена раздела «Сцены».
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneEntryDto {
+    pub key: String,
+    pub file: Option<String>,
+    pub lines: u32,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    /// Игра изменила текст сцены после того, как модель его прочитала.
+    pub stale: bool,
+    /// Заметки модели по частям сцены.
+    pub notes: u32,
+}
+
+/// Часть сцены с заметкой модели.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct PartNoteDto {
+    /// Первая строка части.
+    pub start: String,
+    pub note: Option<String>,
+    pub model: Option<String>,
+    /// Заметка идёт в описание: не пустая и не отказ модели.
+    pub useful: bool,
+}
+
+/// Итог запуска описаний: описанные сцены и ошибка, которая оборвала запуск.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribedDto {
+    pub scenes: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl From<Described> for DescribedDto {
+    fn from(described: Described) -> Self {
+        Self { scenes: described.scenes.into_iter().map(|key| key.to_string()).collect(), error: described.error }
+    }
+}
+
+fn scene_key(key: String) -> Result<ContainerKey, AppError> {
+    Ok(ContainerKey::new(key)?)
+}
+
+/// Сцены текущего снимка по сюжету с описаниями.
+#[tauri::command]
+#[specta::specta]
+pub async fn scene_descriptions(app: AppHandle, project: String) -> Result<Vec<SceneEntryDto>, String> {
+    blocking(app, move |state| {
+        let scenes = GlossaryService { state }.scenes(self::project(&project)?)?;
+        Ok(scenes
+            .into_iter()
+            .map(|entry: SceneEntry| SceneEntryDto {
+                key: entry.source.key.to_string(),
+                file: entry.source.file,
+                lines: u32::try_from(entry.source.lines).unwrap_or(u32::MAX),
+                title: entry.description.as_ref().and_then(|scene| scene.title().map(str::to_string)),
+                description: entry.description.as_ref().and_then(|scene| scene.description().map(str::to_string)),
+                stale: entry.description.as_ref().is_some_and(|scene| scene.is_stale(&entry.source.text_hash)),
+                notes: u32::try_from(entry.notes).unwrap_or(u32::MAX),
+            })
+            .collect())
+    })
+    .await
+}
+
+/// Правка названия и описания сцены. Пустые поля удаляют запись.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_scene_description(app: AppHandle, project: String, key: String, title: String, description: String) -> Result<(), String> {
+    blocking(app, move |state| GlossaryService { state }.edit_scene(self::project(&project)?, &scene_key(key)?, &title, &description)).await
+}
+
+/// Части сцены с заметками модели.
+#[tauri::command]
+#[specta::specta]
+pub async fn scene_notes(app: AppHandle, project: String, key: String) -> Result<Vec<PartNoteDto>, String> {
+    blocking(app, move |state| {
+        let parts = DescribeService { state }.scene_parts(self::project(&project)?, &scene_key(key)?)?;
+        Ok(parts
+            .into_iter()
+            .map(|part: PartNote| PartNoteDto { start: part.start, note: part.note, model: part.model, useful: part.useful })
+            .collect())
+    })
+    .await
+}
+
+/// Сбрасывает заметки сцены: следующий запуск прочитает её заново. Возвращает число удалённых.
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_scene_notes(app: AppHandle, project: String, key: String) -> Result<u32, String> {
+    blocking(app, move |state| {
+        let removed = DescribeService { state }.reset_notes(self::project(&project)?, &DescribeTarget::Scene(scene_key(key)?))?;
+        Ok(u32::try_from(removed).unwrap_or(u32::MAX))
+    })
+    .await
+}
+
+/// Описывает одну сцену целиком: заменяет описание, название пишет только в пустое поле.
+#[tauri::command]
+#[specta::specta]
+pub async fn describe_scene(
+    state: State<'_, AppState>,
+    project: String,
+    key: String,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<DescribedDto, String> {
+    let target = DescribeTarget::Scene(scene_key(key)?);
+    let described =
+        DescribeService { state: &state }.describe(self::project(&project)?, target, usize::MAX, self::profile(profile)?, progress).await?;
+    Ok(described.into())
+}
+
+/// Описывает сцены по очереди с глубиной чтения по умолчанию. Описанные сцены без новых частей пропускаются.
+#[tauri::command]
+#[specta::specta]
+pub async fn describe_scenes(
+    state: State<'_, AppState>,
+    project: String,
+    keys: Vec<String>,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<DescribedDto, String> {
+    let targets = keys.into_iter().map(|key| Ok(DescribeTarget::Scene(scene_key(key)?))).collect::<Result<Vec<_>, AppError>>()?;
+    let described = DescribeService { state: &state }
+        .describe_many(self::project(&project)?, targets, ReadingDepth::default(), self::profile(profile)?, progress)
+        .await?;
+    Ok(described.into())
 }

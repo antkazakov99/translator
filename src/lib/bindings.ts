@@ -83,6 +83,18 @@ export const commands = {
 	suggestSpeakers: (project: string, speakers: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<SpeakerSuggestionsDto_Serialize>("suggest_speakers", { project, speakers, profile, progress }),
 	/**  Значения и пояснения токенов моделью. Отмеченное окно записывает через `save_token`. */
 	suggestTokens: (project: string, tokens: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<TokenSuggestionsDto_Serialize>("suggest_tokens", { project, tokens, profile, progress }),
+	/**  Сцены текущего снимка по сюжету с описаниями. */
+	sceneDescriptions: (project: string) => __TAURI_INVOKE<SceneEntryDto_Serialize[]>("scene_descriptions", { project }),
+	/**  Правка названия и описания сцены. Пустые поля удаляют запись. */
+	saveSceneDescription: (project: string, key: string, title: string, description: string) => __TAURI_INVOKE<null>("save_scene_description", { project, key, title, description }),
+	/**  Части сцены с заметками модели. */
+	sceneNotes: (project: string, key: string) => __TAURI_INVOKE<PartNoteDto_Serialize[]>("scene_notes", { project, key }),
+	/**  Сбрасывает заметки сцены: следующий запуск прочитает её заново. Возвращает число удалённых. */
+	resetSceneNotes: (project: string, key: string) => __TAURI_INVOKE<number>("reset_scene_notes", { project, key }),
+	/**  Описывает одну сцену целиком: заменяет описание, название пишет только в пустое поле. */
+	describeScene: (project: string, key: string, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scene", { project, key, profile, progress }),
+	/**  Описывает сцены по очереди с глубиной чтения по умолчанию. Описанные сцены без новых частей пропускаются. */
+	describeScenes: (project: string, keys: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scenes", { project, keys, profile, progress }),
 	/**  Файлы проекта с репликами и прогресс. */
 	translationFiles: (project: string) => __TAURI_INVOKE<FileDto[]>("translation_files", { project }),
 	/**  Реплики файла по сценам. */
@@ -193,6 +205,21 @@ export type CharacterDto_Serialize = {
 	speech: string | null,
 	description: string | null,
 	forms: FormDto_Serialize[],
+};
+
+/**  Итог запуска описаний: описанные сцены и ошибка, которая оборвала запуск. */
+export type DescribedDto = DescribedDto_Serialize | DescribedDto_Deserialize;
+
+/**  Итог запуска описаний: описанные сцены и ошибка, которая оборвала запуск. */
+export type DescribedDto_Deserialize = {
+	scenes: string[],
+	error?: string | null,
+};
+
+/**  Итог запуска описаний: описанные сцены и ошибка, которая оборвала запуск. */
+export type DescribedDto_Serialize = {
+	scenes: string[],
+	error: string | null,
 };
 
 /**  Название в корзине. */
@@ -473,6 +500,29 @@ export type NameVariantDto_Serialize = {
 	description: string | null,
 };
 
+/**  Часть сцены с заметкой модели. */
+export type PartNoteDto = PartNoteDto_Serialize | PartNoteDto_Deserialize;
+
+/**  Часть сцены с заметкой модели. */
+export type PartNoteDto_Deserialize = {
+	/**  Первая строка части. */
+	start: string,
+	note?: string | null,
+	model?: string | null,
+	/**  Заметка идёт в описание: не пустая и не отказ модели. */
+	useful: boolean,
+};
+
+/**  Часть сцены с заметкой модели. */
+export type PartNoteDto_Serialize = {
+	/**  Первая строка части. */
+	start: string,
+	note: string | null,
+	model: string | null,
+	/**  Заметка идёт в описание: не пустая и не отказ модели. */
+	useful: boolean,
+};
+
 /**  Профиль. Пустое поле значит значение из кода. */
 export type ProfileDto = ProfileDto_Serialize | ProfileDto_Deserialize;
 
@@ -685,6 +735,35 @@ export type SceneDto_Serialize = {
 	key: string | null,
 	title: string | null,
 	lines: LineDto_Serialize[],
+};
+
+/**  Сцена раздела «Сцены». */
+export type SceneEntryDto = SceneEntryDto_Serialize | SceneEntryDto_Deserialize;
+
+/**  Сцена раздела «Сцены». */
+export type SceneEntryDto_Deserialize = {
+	key: string,
+	file?: string | null,
+	lines: number,
+	title?: string | null,
+	description?: string | null,
+	/**  Игра изменила текст сцены после того, как модель его прочитала. */
+	stale: boolean,
+	/**  Заметки модели по частям сцены. */
+	notes: number,
+};
+
+/**  Сцена раздела «Сцены». */
+export type SceneEntryDto_Serialize = {
+	key: string,
+	file: string | null,
+	lines: number,
+	title: string | null,
+	description: string | null,
+	/**  Игра изменила текст сцены после того, как модель его прочитала. */
+	stale: boolean,
+	/**  Заметки модели по частям сцены. */
+	notes: number,
 };
 
 export type SceneGraphDto = SceneGraphDto_Serialize | SceneGraphDto_Deserialize;

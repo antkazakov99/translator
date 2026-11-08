@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use super::candidates::{TERM_CANDIDATES_VERSION, find_candidates, name_words, without_names};
 use super::{
     Character, CharacterId, CharacterRepo, DiscardReason, DiscardedTerm, Form, LineSampleRepo, NameKey, NoteOwner, NoteRepo,
-    SceneDescription, SceneDescriptionRepo, Speaker, SpeakerEntry, SpeakerLink, SpeakerRepo, SpeakerUse, Term, TermCandidate,
+    SceneDescription, SceneDescriptionRepo, SceneSource, Speaker, SpeakerEntry, SpeakerLink, SpeakerRepo, SpeakerUse, Term, TermCandidate,
     TermCategory, TermId, TermRepo, Token, TokenRepo,
 };
 use crate::common::{AppError, Timestamp, ValidationError};
@@ -39,6 +39,14 @@ impl GlossaryData {
             tokens: TokenRepo { conn }.list()?,
         })
     }
+}
+
+/// Сцена раздела «Сцены»: текст в снимке, описание, если есть, и число заметок модели по частям.
+#[derive(Debug, Clone)]
+pub struct SceneEntry {
+    pub source: SceneSource,
+    pub description: Option<SceneDescription>,
+    pub notes: usize,
 }
 
 /// Раздел «Говорящие» окна: говорящие снимка, корзина и корзина названий.
@@ -261,6 +269,36 @@ impl GlossaryService<'_> {
     /// Пустое описание удаляет строку.
     pub fn save_scene(&self, project: ProjectId, scene: &SceneDescription) -> Result<(), AppError> {
         self.write(project, |tx| SceneDescriptionRepo { conn: tx }.save(scene))
+    }
+
+    /// Правка названия и описания сцены пользователем. Пустые поля удаляют строку.
+    pub fn edit_scene(&self, project: ProjectId, key: &ContainerKey, title: &str, description: &str) -> Result<(), AppError> {
+        self.write(project, |tx| {
+            let repo = SceneDescriptionRepo { conn: tx };
+            let mut scene = repo.get(key)?.unwrap_or_else(|| SceneDescription::new(key.clone(), Timestamp::now()));
+            scene.edit(title, description, Timestamp::now());
+            repo.save(&scene)
+        })
+    }
+
+    /// Раздел «Сцены»: сцены текущего снимка по сюжету с описаниями и числом заметок модели.
+    pub fn scenes(&self, project: ProjectId) -> Result<Vec<SceneEntry>, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| {
+            let repo = SceneDescriptionRepo { conn: tx };
+            let mut described: BTreeMap<ContainerKey, SceneDescription> =
+                repo.list()?.into_iter().map(|scene| (scene.key().clone(), scene)).collect();
+            let notes = NoteRepo { conn: tx }.counts("container")?;
+            Ok(repo
+                .sources()?
+                .into_iter()
+                .map(|source| SceneEntry {
+                    description: described.remove(&source.key),
+                    notes: notes.get(source.key.as_str()).copied().unwrap_or(0),
+                    source,
+                })
+                .collect())
+        })?)
     }
 
     /// Сцена не передаётся модели при описании персонажа или термина.

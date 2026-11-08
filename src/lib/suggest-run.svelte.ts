@@ -3,7 +3,13 @@ import { commands, type RunProgress_Deserialize as RunProgress } from "./binding
 import type { GlossaryRuns } from "./glossary";
 
 export function glossaryRuns(): GlossaryRuns {
-  return { names: new SuggestRun("Имена"), terms: new SuggestRun("Термины"), speakers: new SuggestRun("Подписи"), tokens: new SuggestRun("Токены") };
+  return {
+    names: new SuggestRun("Имена"),
+    terms: new SuggestRun("Термины"),
+    speakers: new SuggestRun("Подписи"),
+    tokens: new SuggestRun("Токены"),
+    scenes: new WriteRun("Описания"),
+  };
 }
 
 /** Предложение в отборе: отмеченные записываются в глоссарий. */
@@ -27,6 +33,11 @@ export class SuggestRun<T> {
 
   get active() {
     return this.progress !== null;
+  }
+
+  /** Отбор открыт: другие запуски ждут, пока его запишут или отбросят. */
+  get waiting() {
+    return this.review !== null;
   }
 
   /** Запускает и открывает отбор. Ошибка запуска не теряет готовых предложений: они тоже идут в отбор. */
@@ -88,5 +99,68 @@ export class SuggestRun<T> {
     const { done, total, written } = this.progress;
     if (total === 0) return `${this.label}: подготовка`;
     return `${this.label}: пакет ${Math.min(done + 1, total)} из ${total} · предложений: ${written}`;
+  }
+}
+
+/**
+ * Запуск, который пишет сам, без отбора: описания сцен. Итог это число записанных и ошибка, которая
+ * оборвала запуск.
+ */
+export class WriteRun {
+  progress = $state<RunProgress | null>(null);
+  stopping = $state(false);
+  notice = $state("");
+  readonly waiting = false;
+
+  constructor(readonly label: string) {}
+
+  get active() {
+    return this.progress !== null;
+  }
+
+  /** `notice` получает число записанных и признак остановки. Возвращает записанное. */
+  async start(
+    call: (channel: Channel<RunProgress>) => Promise<{ scenes: string[]; error?: string | null }>,
+    onError: (message: string) => void,
+    notice: (written: number, stopped: boolean) => string,
+  ): Promise<string[]> {
+    if (this.progress) return [];
+    this.notice = "";
+    this.stopping = false;
+    this.progress = { done: 0, total: 0, written: 0, message: null };
+    const channel = new Channel<RunProgress>();
+    channel.onmessage = (progress) => {
+      if (this.progress) this.progress = progress;
+    };
+    try {
+      const result = await call(channel);
+      if (result.error) onError(result.error);
+      this.notice = notice(result.scenes.length, this.stopping);
+      return result.scenes;
+    } catch (e) {
+      onError(String(e));
+      return [];
+    } finally {
+      this.progress = null;
+    }
+  }
+
+  async stop(onError: (message: string) => void) {
+    if (!this.progress) return;
+    this.stopping = true;
+    try {
+      await commands.cancelLlmRun();
+    } catch (e) {
+      onError(String(e));
+    }
+  }
+
+  /** «Описания: запрос 2 из 7 · записано: 1». */
+  get text() {
+    if (!this.progress) return "";
+    if (this.stopping) return `${this.label}: останавливается после текущего запроса`;
+    const { done, total, written } = this.progress;
+    if (total === 0) return `${this.label}: подготовка`;
+    return `${this.label}: запрос ${Math.min(done + 1, total)} из ${total} · записано: ${written}`;
   }
 }

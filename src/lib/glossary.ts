@@ -13,7 +13,7 @@ import type {
   TokenDto_Serialize,
   TokenSuggestionDto_Serialize,
 } from "./bindings";
-import type { SuggestRun } from "./suggest-run.svelte";
+import type { SuggestRun, WriteRun } from "./suggest-run.svelte";
 
 export type Glossary = GlossaryDto_Serialize;
 export type Character = CharacterDto_Serialize;
@@ -32,11 +32,12 @@ export type GlossaryRuns = {
   terms: SuggestRun<TermSuggestion>;
   speakers: SuggestRun<SpeakerSuggestion>;
   tokens: SuggestRun<TokenSuggestion>;
+  scenes: WriteRun;
 };
 
 /** Идёт ли запуск или открыт отбор: новый запуск тогда недоступен. */
 export function runsBusy(runs: GlossaryRuns) {
-  return Object.values(runs).some((run) => run.active || run.review !== null);
+  return Object.values(runs).some((run) => run.active || run.waiting);
 }
 
 /** Имя и фамилия через пробел, как подпись карточки. */

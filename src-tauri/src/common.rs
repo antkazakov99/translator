@@ -92,6 +92,8 @@ pub enum AppError {
     Cancelled,
     #[error("Ошибка запроса к модели: {0}")]
     Llm(String),
+    #[error("{0} пока не сделаны")]
+    NotReady(&'static str),
 }
 
 impl From<AppError> for String {

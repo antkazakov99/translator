@@ -1,8 +1,8 @@
 <script lang="ts" generics="T">
   import { Check, LoaderCircle, Square, X } from "lucide-svelte";
-  import type { SuggestRun } from "./suggest-run.svelte";
+  import type { SuggestRun, WriteRun } from "./suggest-run.svelte";
 
-  let { run, onError }: { run: SuggestRun<T>; onError: (message: string) => void } = $props();
+  let { run, onError }: { run: SuggestRun<T> | WriteRun; onError: (message: string) => void } = $props();
 </script>
 
 {#if run.active}

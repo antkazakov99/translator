@@ -5,7 +5,13 @@ use std::sync::Arc;
 
 use tauri::ipc::Channel;
 
-use super::repo::{LineSampleRepo, SampleLine};
+use super::describe_prompt::{CondensePrompt, PartPrompt, ScenePrompt, TitlePrompt, clean_note, is_useful};
+use super::parts::{MAX_PART_TEXT, Part, pick_parts, scene_hash, script_line, split_lines};
+use super::repo::{LineSampleRepo, NoteRepo, SampleLine, SceneDescriptionRepo};
+use super::{Note, NoteOwner, SceneDescription};
+use crate::common::Timestamp;
+use crate::storage::DbError;
+use crate::translation::TranslationRepo;
 use super::names::{
     CheckPrompt, NameItem, NameSuggestion, NamesPrompt, ORIGIN_BATCH, OriginsPrompt, cast, form_items, missing_rules, name_items, with_origins,
 };
@@ -72,13 +78,52 @@ impl ReadingDepth {
     }
 }
 
-/// Описания персонажей, терминов и сцен.
+/// Сколько раз сжимаются заметки, которые не помещаются в запрос сборки.
+const CONDENSE_ROUNDS: usize = 3;
+
+/// Итог запуска описаний: описанные записи и ошибка, которая оборвала запуск.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Described {
+    pub scenes: Vec<ContainerKey>,
+    pub error: Option<String>,
+}
+
+/// Сколько частей читать.
+#[derive(Debug, Clone, Copy)]
+enum Choice {
+    Count(usize),
+    Depth(ReadingDepth),
+}
+
+/// Сцена, готовая к запуску: выбранные части, прочитанные заметки этой модели и что писать.
+struct ScenePlan {
+    key: ContainerKey,
+    parts: Vec<Part>,
+    /// Заметки этой модели по отпечатку части.
+    stored: HashMap<String, Note>,
+    /// Текст выбранных частей: по нему берутся подсказки сборки.
+    text: String,
+    text_hash: String,
+    need_title: bool,
+    opening: bool,
+}
+
+impl ScenePlan {
+    /// Запросы плана без сжатия: непрочитанные части, сборка нескольких заметок, название.
+    fn requests(&self) -> usize {
+        let unread = self.parts.iter().filter(|part| !self.stored.contains_key(&part.hash)).count();
+        unread + usize::from(self.parts.len() > 1) + usize::from(self.need_title)
+    }
+}
+
+/// Описания персонажей, терминов и сцен. Сейчас описываются сцены: персонажи и термины пойдут тем же путём.
 pub struct DescribeService<'a> {
     pub state: &'a AppState,
 }
 
 impl DescribeService<'_> {
-    /// Читает `parts` частей и собирает описание. Описание по готовым заметкам собирается и после остановки.
+    /// Читает `parts` частей (не меньше прочитанных) и собирает описание. Остановленный запуск продолжается
+    /// со следующей непрочитанной части: заметки пишутся сразу.
     pub async fn describe(
         &self,
         project: ProjectId,
@@ -86,8 +131,8 @@ impl DescribeService<'_> {
         parts: usize,
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
-    ) -> Result<(), AppError> {
-        todo!()
+    ) -> Result<Described, AppError> {
+        self.run(project, vec![target], Choice::Count(parts), false, one_off, progress).await
     }
 
     /// Группа по очереди с глубиной чтения. Заполненная запись без новых частей в запуск не входит.
@@ -98,13 +143,302 @@ impl DescribeService<'_> {
         depth: ReadingDepth,
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
-    ) -> Result<(), AppError> {
-        todo!()
+    ) -> Result<Described, AppError> {
+        self.run(project, targets, Choice::Depth(depth), true, one_off, progress).await
     }
 
-    /// Сбрасывает заметки владельца.
+    /// Сбрасывает заметки владельца всех моделей: следующий запуск прочитает части заново.
     pub fn reset_notes(&self, project: ProjectId, target: &DescribeTarget) -> Result<usize, AppError> {
-        todo!()
+        let open = self.state.open_project(project)?;
+        let owner = owner_of(target);
+        Ok(open.project.write(|tx| NoteRepo { conn: tx }.delete_owner(&owner))?)
+    }
+
+    /// Части сцены с заметками всех моделей для окна: начало части и заметка, новая первой.
+    pub fn scene_parts(&self, project: ProjectId, key: &ContainerKey) -> Result<Vec<PartNote>, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| {
+            let glossary = GlossaryData::load(tx)?;
+            let mut context = GlossaryContext::new(&glossary);
+            let parts = scene_text(tx, &mut context, key)?.map(|(parts, _)| parts).unwrap_or_default();
+            let notes = NoteRepo { conn: tx }.all_of(&NoteOwner::Container(key.clone()))?;
+            Ok(parts
+                .into_iter()
+                .map(|part| {
+                    let note = notes.iter().find(|note| note.part_hash == part.hash);
+                    PartNote {
+                        start: part.start(),
+                        note: note.map(|note| note.text.clone()),
+                        model: note.map(|note| note.model.clone()),
+                        useful: note.is_some_and(|note| is_useful(&note.text)),
+                    }
+                })
+                .collect())
+        })?)
+    }
+
+    async fn run(
+        &self,
+        project: ProjectId,
+        targets: Vec<DescribeTarget>,
+        choice: Choice,
+        skip_filled: bool,
+        one_off: Option<ProfileId>,
+        progress: Channel<RunProgress>,
+    ) -> Result<Described, AppError> {
+        let keys = targets
+            .into_iter()
+            .map(|target| match target {
+                DescribeTarget::Scene(key) => Ok(key),
+                DescribeTarget::Character(_) | DescribeTarget::Term(_) => Err(AppError::NotReady("Описания персонажей и терминов")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let open = self.state.open_project(project)?;
+        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Descriptions, one_off)?;
+        let model = target.profile.model().to_string();
+        let (plans, hints) = open.project.read(|tx| {
+            let glossary = GlossaryData::load(tx)?;
+            let mut context = GlossaryContext::new(&glossary);
+            let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
+            let mut plans = Vec::new();
+            for key in keys {
+                if let Some(plan) = plan_scene(tx, &mut context, key, &model, choice, skip_filled, first.as_ref())? {
+                    plans.push(plan);
+                }
+            }
+            Ok((plans, context.hints))
+        })?;
+        let mut described = Described::default();
+        if plans.is_empty() {
+            return Ok(described);
+        }
+        let total = plans.iter().map(ScenePlan::requests).sum();
+        let mut run = BatchRun::begin(self.state, &open, Action::Descriptions, &target, progress, total)?;
+        let writer = SceneWriter { open: &open, hints: &hints, target: &target, model: &model };
+        for plan in plans {
+            match writer.scene(&mut run, &plan, described.scenes.len()).await {
+                Ok(outcome) => {
+                    if outcome.written {
+                        described.scenes.push(plan.key);
+                    }
+                    if !outcome.going {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    run.error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        let result = run.finish(described.scenes)?;
+        Ok(Described { scenes: result.items, error: result.error })
+    }
+}
+
+/// Часть сцены для окна.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartNote {
+    pub start: String,
+    pub note: Option<String>,
+    pub model: Option<String>,
+    /// Заметка пойдёт в описание: не пустая и не отказ.
+    pub useful: bool,
+}
+
+fn owner_of(target: &DescribeTarget) -> NoteOwner {
+    match target {
+        DescribeTarget::Character(id) => NoteOwner::Character(*id),
+        DescribeTarget::Term(id) => NoteOwner::Term(*id),
+        DescribeTarget::Scene(key) => NoteOwner::Container(key.clone()),
+    }
+}
+
+/// Реплики сцены строками «Говорящий: текст» с подписями из глоссария и значениями токенов, разрезанные на части,
+/// и отпечаток текста сцены. `None`: сцены нет в текущем снимке.
+fn scene_text(tx: &rusqlite::Connection, context: &mut GlossaryContext, key: &ContainerKey) -> Result<Option<(Vec<Part>, String)>, DbError> {
+    let found = TranslationRepo { conn: tx }.scene(key);
+    let mut scene = match found {
+        Ok(scene) => scene,
+        Err(DbError::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let text_hash = scene_hash(scene.lines.iter().map(|line| line.source_hash.as_str()));
+    context.apply(&mut scene);
+    let lines: Vec<String> = scene.lines.iter().map(|line| script_line(line.speaker.as_deref(), &line.source_text)).collect();
+    Ok(Some((split_lines(&lines), text_hash)))
+}
+
+/// План сцены. `None`: сцену пропускаем, у неё нет реплик или она заполнена и новых частей нет.
+fn plan_scene(
+    tx: &rusqlite::Connection,
+    context: &mut GlossaryContext,
+    key: ContainerKey,
+    model: &str,
+    choice: Choice,
+    skip_filled: bool,
+    first: Option<&ContainerKey>,
+) -> Result<Option<ScenePlan>, DbError> {
+    let Some((all, text_hash)) = scene_text(tx, context, &key)? else { return Ok(None) };
+    if all.is_empty() {
+        return Ok(None);
+    }
+    let stored: HashMap<String, Note> = NoteRepo { conn: tx }
+        .of(&NoteOwner::Container(key.clone()), model)?
+        .into_iter()
+        .map(|note| (note.part_hash.clone(), note))
+        .collect();
+    let ready: Vec<bool> = all.iter().map(|part| stored.contains_key(&part.hash)).collect();
+    let count = match choice {
+        Choice::Count(count) => count,
+        Choice::Depth(depth) => depth.parts_for(all.len()),
+    };
+    let parts: Vec<Part> = pick_parts(&ready, count).into_iter().map(|index| all[index].clone()).collect();
+    let description = SceneDescriptionRepo { conn: tx }.get(&key)?;
+    let filled = description.as_ref().is_some_and(|scene| scene.description().is_some() && !scene.is_stale(&text_hash));
+    if skip_filled && filled && parts.iter().all(|part| stored.contains_key(&part.hash)) {
+        return Ok(None);
+    }
+    let text = parts.iter().map(|part| part.text.as_str()).collect();
+    let need_title = description.as_ref().is_none_or(|scene| scene.title().is_none());
+    let opening = first == Some(&key);
+    Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening }))
+}
+
+/// Итог сцены: записано ли описание и идёт ли запуск дальше.
+#[derive(Debug, Clone, Copy)]
+struct Outcome {
+    written: bool,
+    going: bool,
+}
+
+impl Outcome {
+    const STOPPED: Self = Self { written: false, going: false };
+    const NOTHING: Self = Self { written: false, going: true };
+}
+
+/// Чтение частей, сборка и запись описания одной сцены.
+struct SceneWriter<'a> {
+    open: &'a Arc<OpenProject>,
+    hints: &'a Hints,
+    target: &'a LlmTarget,
+    model: &'a str,
+}
+
+impl SceneWriter<'_> {
+    /// Возвращает, записано ли описание и идёт ли запуск дальше.
+    async fn scene(&self, run: &mut BatchRun<'_>, plan: &ScenePlan, written: usize) -> Result<Outcome, AppError> {
+        let owner = NoteOwner::Container(plan.key.clone());
+        let mut notes = Vec::new();
+        for part in &plan.parts {
+            let note = match plan.stored.get(&part.hash) {
+                Some(note) if note.excluded => continue,
+                Some(note) => note.text.clone(),
+                None => {
+                    let note = match run.send(&PartPrompt::build(&part.text, self.hints, self.target)).await {
+                        Sent::Text(text) => clean_note(&text),
+                        Sent::Skipped => String::new(),
+                        Sent::Stop => return Ok(Outcome::STOPPED),
+                    };
+                    if !note.is_empty() {
+                        let saved = Note {
+                            owner: owner.clone(),
+                            model: self.model.to_string(),
+                            part_hash: part.hash.clone(),
+                            text: note.clone(),
+                            excluded: false,
+                            created_at: Timestamp::now(),
+                        };
+                        self.open.project.write(|tx| NoteRepo { conn: tx }.save(&saved))?;
+                    }
+                    if !run.step(written) {
+                        return Ok(Outcome::STOPPED);
+                    }
+                    note
+                }
+            };
+            if is_useful(&note) {
+                notes.push(note);
+            }
+        }
+        if notes.is_empty() {
+            return Ok(Outcome::NOTHING);
+        }
+
+        let mut going = true;
+        let description = if let ([_], [note]) = (plan.parts.as_slice(), notes.as_slice()) {
+            note.clone()
+        } else {
+            let Some(notes) = self.condense(run, notes, written).await else { return Ok(Outcome::STOPPED) };
+            let description = match run.send(&ScenePrompt::build(&notes, &plan.text, self.hints, self.target)).await {
+                Sent::Text(text) => clean_note(&text),
+                Sent::Skipped => String::new(),
+                Sent::Stop => return Ok(Outcome::STOPPED),
+            };
+            going = run.step(written);
+            description
+        };
+        if description.is_empty() {
+            return Ok(Outcome { written: false, going });
+        }
+        self.open.project.write(|tx| {
+            let repo = SceneDescriptionRepo { conn: tx };
+            let mut scene = repo.get(&plan.key)?.unwrap_or_else(|| SceneDescription::new(plan.key.clone(), Timestamp::now()));
+            scene.replace_description(&description, &plan.text_hash, Timestamp::now());
+            repo.save(&scene)
+        })?;
+        if !going || !plan.need_title {
+            return Ok(Outcome { written: true, going });
+        }
+
+        let title = match run.send(&TitlePrompt::build(&description, plan.opening, self.target)).await {
+            Sent::Text(text) => TitlePrompt::accept(&text),
+            Sent::Skipped => None,
+            Sent::Stop => return Ok(Outcome { written: true, going: false }),
+        };
+        if let Some(title) = title {
+            self.open.project.write(|tx| {
+                let repo = SceneDescriptionRepo { conn: tx };
+                let Some(mut scene) = repo.get(&plan.key)? else { return Ok(()) };
+                if scene.fill_title(&title, Timestamp::now()) {
+                    repo.save(&scene)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(Outcome { written: true, going: run.step(written + 1) })
+    }
+
+    /// Сжимает заметки группами, пока они не поместятся в запрос сборки. `None`: запуск остановлен.
+    async fn condense(&self, run: &mut BatchRun<'_>, mut notes: Vec<String>, written: usize) -> Option<Vec<String>> {
+        for _ in 0..CONDENSE_ROUNDS {
+            if CondensePrompt::fits(&notes) {
+                break;
+            }
+            let groups = CondensePrompt::groups(notes);
+            run.grow(groups.len());
+            let mut condensed = Vec::new();
+            for group in groups {
+                match run.send(&CondensePrompt::build(&group, self.target)).await {
+                    Sent::Text(text) => {
+                        let text = clean_note(&text);
+                        if text.is_empty() { condensed.extend(group) } else { condensed.push(text) }
+                    }
+                    Sent::Skipped => condensed.extend(group),
+                    Sent::Stop => return None,
+                }
+                if !run.step(written) {
+                    return None;
+                }
+            }
+            notes = condensed;
+        }
+        if !CondensePrompt::fits(&notes) {
+            let size: usize = notes.iter().map(|note| note.chars().count()).sum();
+            let keep = (notes.len() * MAX_PART_TEXT / size.max(1)).max(1);
+            notes = spread(&notes, keep);
+        }
+        Some(notes)
     }
 }
 
@@ -502,6 +836,12 @@ impl<'a> BatchRun<'a> {
         }
     }
 
+    /// Запуск узнал о запросах, которых не было в плане, например о сжатии заметок.
+    fn grow(&mut self, more: usize) {
+        self.report.total += more as u32;
+        self.run.report(self.report.clone());
+    }
+
     /// Пакет готов: отчёт с числом предложений. `false`: запуск остановлен.
     fn step(&mut self, written: usize) -> bool {
         self.report.done += 1;
@@ -804,6 +1144,68 @@ mod tests {
         assert_eq!(failed, 1);
     }
 
+
+    #[test]
+    fn scenes_are_described_from_part_notes_and_named_once() {
+        let (url, seen) = fake_model(|body| {
+            let system = system_text(body);
+            let answer = if system.contains("name a scene") { "«Знакомство с Эйлин»." } else { "**Эйлин** здоровается с героем." };
+            completion(answer)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let service = DescribeService { state: &state };
+        let start = ContainerKey::new("label:start").unwrap();
+        let left = ContainerKey::new("label:left").unwrap();
+
+        let described =
+            tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(start.clone()), usize::MAX, None, silent())).unwrap();
+        assert_eq!(described, Described { scenes: vec![start.clone()], error: None });
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 2, "одна часть сразу становится описанием, потом название");
+            let part = user_text(&requests[0]);
+            assert!(part.contains("Script:\n\nEileen: Hello.\nNarration.\nRadio Chatter: Static.\n"), "{part}");
+            assert!(system_text(&requests[1]).ends_with("This is the first scene of the game."));
+        }
+        let open = state.open_project(id).unwrap();
+        let (scene, sources) = open
+            .project
+            .read(|tx| {
+                let repo = SceneDescriptionRepo { conn: tx };
+                Ok((repo.get(&start)?.unwrap(), repo.sources()?))
+            })
+            .unwrap();
+        assert_eq!(scene.description(), Some("Эйлин здоровается с героем."));
+        assert_eq!(scene.title(), Some("Знакомство с Эйлин"));
+        let source = sources.iter().find(|source| source.key == start).unwrap();
+        assert!(!scene.is_stale(&source.text_hash), "описание помнит текст, который прочитала модель");
+
+        let described = tauri::async_runtime::block_on(service.describe_many(
+            id,
+            vec![DescribeTarget::Scene(start.clone()), DescribeTarget::Scene(left.clone())],
+            ReadingDepth::default(),
+            None,
+            silent(),
+        ))
+        .unwrap();
+        assert_eq!(described.scenes, std::slice::from_ref(&left), "заполненная сцена без новых частей пропущена");
+        assert_eq!(seen.lock().unwrap().len(), 4);
+
+        tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(start.clone()), usize::MAX, None, silent())).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 4, "заметка готова, название есть: запросов нет");
+
+        let parts = service.scene_parts(id, &start).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].note.as_deref(), Some("Эйлин здоровается с героем."));
+        assert!(parts[0].useful);
+        assert_eq!(service.reset_notes(id, &DescribeTarget::Scene(start.clone())).unwrap(), 1);
+        assert_eq!(service.scene_parts(id, &start).unwrap()[0].note, None);
+        assert!(matches!(
+            tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Term(TermId::from_row(1)), 1, None, silent())),
+            Err(AppError::NotReady(_))
+        ));
+    }
 
     #[test]
     fn depth_rounds_up_and_clamps() {

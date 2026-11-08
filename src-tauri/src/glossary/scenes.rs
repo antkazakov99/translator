@@ -50,6 +50,15 @@ impl SceneDescription {
         true
     }
 
+    /// Описание от запуска, о котором попросил пользователь: заменяет прежнее.
+    pub fn replace_description(&mut self, text: &str, text_hash: &str, now: Timestamp) -> bool {
+        let Some(text) = non_empty(text) else { return false };
+        self.description = Some(text);
+        self.text_hash = Some(text_hash.to_string());
+        self.updated_at = now;
+        true
+    }
+
     /// Название от модели: тоже только в пустое поле, заполненное мог задать пользователь.
     pub fn fill_title(&mut self, text: &str, now: Timestamp) -> bool {
         if self.title.is_some() {
@@ -89,4 +98,14 @@ impl SceneDescription {
     pub fn updated_at(&self) -> Timestamp {
         self.updated_at
     }
+}
+
+/// Сцена текущего снимка для раздела «Сцены»: файл первой реплики, число реплик, отпечаток текста.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneSource {
+    pub key: ContainerKey,
+    pub file: Option<String>,
+    pub lines: usize,
+    /// Отпечаток оригиналов реплик (`parts::scene_hash`).
+    pub text_hash: String,
 }
