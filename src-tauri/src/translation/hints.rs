@@ -131,6 +131,16 @@ impl GlossaryContext {
         languages
     }
 
+    /// Имя единственного персонажа, связанного с говорящим.
+    pub fn speaker_name(&self, key: &SpeakerKey) -> Option<&str> {
+        self.speakers.get(key)?.name.as_deref()
+    }
+
+    /// Текст со значениями токенов: так его видит модель.
+    pub fn fill(&self, text: &str) -> String {
+        if self.values.is_empty() { text.to_string() } else { fill_tokens(text, &self.values) }
+    }
+
     /// Подписи и род говорящих по глоссарию, значения токенов в оригинале и переводе. Перевод подписи из записи
     /// говорящего идёт в подсказку имён: модель увидит его рядом с подписью.
     pub fn apply(&mut self, scene: &mut Scene) {

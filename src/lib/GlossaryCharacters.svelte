@@ -1,5 +1,6 @@
 <script lang="ts">
   import { Check, Languages, LoaderCircle, Plus, Trash2, TriangleAlert } from "lucide-svelte";
+  import DescribeParts from "./DescribeParts.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
   import { commands } from "./bindings";
@@ -112,6 +113,16 @@
     fieldError = "";
     confirmDelete = false;
   });
+
+  /** Модель записала описание и манеру речи: они ложатся в открытую карточку. */
+  async function described() {
+    await reload();
+    const found = data.characters.find((character) => character.id === draft?.id);
+    if (draft && found) {
+      draft.description = found.description;
+      draft.speech = found.speech;
+    }
+  }
 
   async function save() {
     if (!draft) return;
@@ -287,6 +298,7 @@
 
       <label class="field">Манера речи<input class="input" bind:value={draft.speech} onchange={save} placeholder="Например: грубит, говорит коротко" /></label>
       <label class="field">Описание<textarea class="input" rows="4" bind:value={draft.description} onchange={save}></textarea></label>
+      <DescribeParts {projectId} owner={{ kind: "character", id: draft.id }} {runs} onDescribed={described} {onError} />
 
       <div class="field">
         <span>Говорящие</span>

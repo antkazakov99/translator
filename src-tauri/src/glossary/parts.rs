@@ -2,6 +2,8 @@
 
 use sha2::{Digest, Sha256};
 
+use crate::engines::ContainerKey;
+
 /// Сколько символов текста уходит модели в одном запросе части.
 pub const MAX_PART_TEXT: usize = 12_000;
 /// Меньше этого в конце длинной сцены модели не хватает контекста: хвост начинается с конца предыдущей части.
@@ -73,6 +75,55 @@ pub fn split_lines(lines: &[String]) -> Vec<Part> {
         .collect()
 }
 
+/// Строка между сценами внутри части: они могут быть далеко друг от друга в игре.
+const SCENE_BREAK: &str = "---\n";
+/// Сколько следующих кусков просматривается, чтобы заполнить часть до конца.
+const SCENE_WINDOW: usize = 8;
+
+/// Часть персонажа или термина и сцены, из которых она собрана.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScenesPart {
+    pub part: Part,
+    pub scenes: Vec<ContainerKey>,
+}
+
+/// Раскладывает сцены по частям: целые сцены по сюжету через `---`, часть дополняется подходящими по размеру
+/// кусками из следующих `SCENE_WINDOW`. По репликам режется только сцена, которая сама не помещается.
+/// Так частей меньше, а порядок сюжета нарушается только в пределах окна.
+pub fn pack_scenes(scenes: &[(ContainerKey, Vec<String>)]) -> Vec<ScenesPart> {
+    let pieces: Vec<(String, &ContainerKey)> =
+        scenes.iter().flat_map(|(key, lines)| split_lines(lines).into_iter().map(move |part| (part.text, key))).collect();
+    let sizes: Vec<usize> = pieces.iter().map(|(text, _)| text.chars().count()).collect();
+    let gap = SCENE_BREAK.chars().count();
+    let mut pending: Vec<usize> = (0..pieces.len()).collect();
+    let mut parts = Vec::new();
+    while !pending.is_empty() {
+        let first = pending.remove(0);
+        let mut chosen = vec![first];
+        let mut size = sizes[first];
+        let mut position = 0;
+        for _ in 0..SCENE_WINDOW {
+            let Some(&next) = pending.get(position) else { break };
+            if size + gap + sizes[next] <= MAX_PART_TEXT {
+                size += gap + sizes[next];
+                chosen.push(pending.remove(position));
+            } else {
+                position += 1;
+            }
+        }
+        chosen.sort_unstable();
+        let text = chosen.iter().map(|&index| pieces[index].0.as_str()).collect::<Vec<_>>().join(SCENE_BREAK);
+        let mut keys: Vec<ContainerKey> = Vec::new();
+        for &index in &chosen {
+            if !keys.contains(pieces[index].1) {
+                keys.push(pieces[index].1.clone());
+            }
+        }
+        parts.push(ScenesPart { part: Part::new(text), scenes: keys });
+    }
+    parts
+}
+
 /// Отпечаток текста сцены по отпечаткам оригиналов её реплик: другой текст игры даёт другой отпечаток.
 pub fn scene_hash<'a>(source_hashes: impl IntoIterator<Item = &'a str>) -> String {
     let mut hasher = Sha256::new();
@@ -130,6 +181,21 @@ mod tests {
         assert!(parts[1].text.starts_with("0012"));
         assert!(parts[2].text.starts_with("0022"), "хвост начинается с конца второй части: {}", &parts[2].text[..4]);
         assert!(parts[2].text.contains("0024"));
+    }
+
+    #[test]
+    fn small_scenes_share_a_part_and_big_ones_fill_it_from_the_window() {
+        let key = |name: &str| ContainerKey::new(format!("label:{name}")).unwrap();
+        let scenes = vec![
+            (key("a"), lines(6, 999)),
+            (key("b"), lines(7, 999)),
+            (key("c"), lines(3, 999)),
+        ];
+        let parts = pack_scenes(&scenes);
+        assert_eq!(parts.len(), 2, "b не помещается к a, зато c помещается");
+        assert_eq!(parts[0].scenes, [key("a"), key("c")]);
+        assert!(parts[0].part.text.contains("\n---\n"));
+        assert_eq!(parts[1].scenes, [key("b")]);
     }
 
     #[test]

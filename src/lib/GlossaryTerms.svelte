@@ -1,4 +1,5 @@
 <script lang="ts">
+  import DescribeParts from "./DescribeParts.svelte";
   import { onMount } from "svelte";
   import { Check, Languages, LoaderCircle, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
@@ -134,6 +135,13 @@
     confirmDelete = false;
     giving = false;
   });
+
+  /** Модель записала описание: оно ложится в открытую карточку. */
+  async function described() {
+    await reload();
+    const found = data.terms.find((term) => term.id === draft?.id);
+    if (draft && found) draft.description = found.description;
+  }
 
   async function save(next?: Partial<Term>) {
     if (!draft) return;
@@ -369,6 +377,7 @@
 
         <GlossaryForms forms={draft.forms} hint="Сокращения и короткие формы" onchange={(forms: NameForm[]) => save({ forms })} />
         <label class="field">Описание<textarea class="input" rows="4" bind:value={draft.description} onchange={() => save()}></textarea></label>
+        <DescribeParts {projectId} owner={{ kind: "term", id: draft.id }} {runs} onDescribed={described} {onError} />
 
         <div class="card-actions">
           {#if giving}

@@ -142,6 +142,132 @@ impl TitlePrompt {
     }
 }
 
+const CHARACTER_PART_SYSTEM: &str = "You read a part of a visual novel script and take notes about the character {name}. \
+The text has the form \"Speaker: text\", and \"you\" usually means the protagonist. \
+A line \"---\" separates scenes that may be far apart in the story. \
+Write in Russian, 2 to 5 short sentences, only what this text shows: what the character does, \
+occupation, relations with others, and how they speak (tone, slang, \"ты\" or \"вы\"). \
+If the character is neither named nor speaks anywhere in the text, answer only with: Нет сведений о персонаже. \
+Otherwise always write notes, even if the character appears only briefly. \
+Text in [square brackets] is an in-game variable: never infer anything from its name. \
+A line starting with \"Tokens:\" explains such variables: rely on it, but never copy it word for word. \
+A line starting with \"Russian names:\" gives the exact spelling of names: always use it, declining the name as Russian grammar requires. \
+A line starting with \"Gender:\" tells who is male or female. \
+A line starting with \"Known terms:\" gives established translations: use them. \
+Never copy these glossary hint lines into your answer. Write only the note text, without headings, labels or Markdown.";
+
+const TERM_PART_SYSTEM: &str = "You read a part of a visual novel script and take notes about the term {name}. \
+It may be a place, an organization, an item, a skill, a title, an event or another concept of the game. \
+The text has the form \"Speaker: text\", and \"you\" usually means the protagonist. \
+A line \"---\" separates scenes that may be far apart in the story. \
+Write in Russian, 1 to 3 short sentences, only what this text shows: what it is, \
+who or what it is connected with, and what happens with it. \
+If the text says nothing about it, answer only with: Нет сведений о термине. \
+Text in [square brackets] is an in-game variable: never infer anything from its name. \
+A line starting with \"Tokens:\" explains such variables: rely on it, but never copy it word for word. \
+A line starting with \"Russian names:\" gives the exact spelling of names: always use it, declining the name as Russian grammar requires. \
+A line starting with \"Gender:\" tells who is male or female. \
+A line starting with \"Known terms:\" gives established translations: use them. \
+Never copy these glossary hint lines into your answer. Write only the note text, without headings, labels or Markdown.";
+
+const CHARACTER_SYSTEM: &str = "You write a glossary entry about one character of a visual novel for its translator into Russian. \
+You receive notes about the character collected from the game. Answer with a JSON object with two string fields. \
+\"description\": 2 to 5 sentences in Russian: who the character is, occupation, relations with others, place in the story. \
+\"speech\": one short sentence in Russian on how the character speaks: tone, slang, \"ты\" or \"вы\" and to whom; \
+an empty string if the notes say nothing about it. \
+Use only the notes and do not invent facts. \
+A line starting with \"Russian names:\" gives the exact spelling of names: always use it, declining the name as Russian grammar requires. \
+A line starting with \"Gender:\" tells who is male or female. \
+A line starting with \"Known terms:\" gives established translations: use them. \
+Never copy these glossary hint lines into your answer. Respond with the JSON object only.";
+
+const TERM_SYSTEM: &str = "You write a glossary entry for a translator of a visual novel into Russian. \
+You receive notes about one term collected from the game. Write in Russian, 2 to 4 sentences, plain text only: \
+what it is, who or what it is connected with, and its place in the story. \
+Use only the notes, do not invent facts, and do not translate the term itself in a new way. \
+A line starting with \"Russian names:\" gives the exact spelling of names: always use it, declining the name as Russian grammar requires. \
+A line starting with \"Gender:\" tells who is male or female. \
+A line starting with \"Known terms:\" gives established translations: use them. \
+Never copy these glossary hint lines into your answer. Write only the description, without headings, labels or Markdown.";
+
+/// Чья запись описывается: от этого зависят запросы части и сборки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Character,
+    Term,
+}
+
+/// Заметка о персонаже или термине по одной части его сцен.
+pub struct EntryPartPrompt;
+
+impl EntryPartPrompt {
+    pub fn build(kind: EntryKind, name: &str, part: &str, hints: &Hints, target: &LlmTarget) -> ChatRequest {
+        let system = match kind {
+            EntryKind::Character => CHARACTER_PART_SYSTEM,
+            EntryKind::Term => TERM_PART_SYSTEM,
+        };
+        ChatRequest {
+            system: system.replace("{name}", name),
+            user: format!("{}Script:\n\n{part}\nNotes about {name}:", hints_block(&format!("{name}\n{part}"), hints)),
+            temperature: target.settings.temperature,
+            max_tokens: NOTE_ANSWER_TOKENS,
+        }
+    }
+}
+
+/// Описание и манера речи персонажа по заметкам.
+pub struct CharacterPrompt;
+
+/// Ответ сборки персонажа.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CharacterAnswer {
+    pub description: String,
+    pub speech: Option<String>,
+}
+
+impl CharacterPrompt {
+    pub fn build(name: &str, notes: &[String], text: &str, hints: &Hints, target: &LlmTarget) -> ChatRequest {
+        ChatRequest {
+            system: CHARACTER_SYSTEM.to_string(),
+            user: format!("{}Notes about {name}:\n\n{}\n\nProvide JSON object now:", hints_block(&format!("{name}\n{text}"), hints), notes.join("\n\n")),
+            temperature: target.settings.temperature,
+            max_tokens: NOTE_ANSWER_TOKENS,
+        }
+    }
+
+    /// Объект из ответа, даже обёрнутый в Markdown. `None`: описания нет.
+    pub fn accept(answer: &str) -> Option<CharacterAnswer> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            description: Option<String>,
+            speech: Option<String>,
+        }
+        let start = answer.find('{')?;
+        let end = answer.rfind('}')?;
+        let raw: Raw = serde_json::from_str(answer.get(start..=end)?).ok()?;
+        let description = clean_note(raw.description.as_deref().unwrap_or_default());
+        if description.is_empty() {
+            return None;
+        }
+        let speech = raw.speech.map(|speech| clean_note(&speech)).filter(|speech| !speech.is_empty());
+        Some(CharacterAnswer { description, speech })
+    }
+}
+
+/// Статья термина по заметкам.
+pub struct TermPrompt;
+
+impl TermPrompt {
+    pub fn build(name: &str, notes: &[String], text: &str, hints: &Hints, target: &LlmTarget) -> ChatRequest {
+        ChatRequest {
+            system: TERM_SYSTEM.to_string(),
+            user: format!("{}Notes about {name}:\n\n{}", hints_block(&format!("{name}\n{text}"), hints), notes.join("\n\n")),
+            temperature: target.settings.temperature,
+            max_tokens: NOTE_ANSWER_TOKENS,
+        }
+    }
+}
+
 /// Текст ответа без Markdown, заголовков и строк подсказок глоссария, которые модель иногда переписывает.
 pub fn clean_note(text: &str) -> String {
     static EMPHASIS: LazyLock<Regex> =
@@ -208,6 +334,17 @@ mod tests {
         assert_eq!(TitlePrompt::accept("\n«Знакомство с Анной».\nЛишнее").as_deref(), Some("Знакомство с Анной"));
         assert_eq!(TitlePrompt::accept("  \n"), None);
         assert!(TitlePrompt::build("Описание", true, &target()).system.ends_with("This is the first scene of the game."));
+    }
+
+    #[test]
+    fn character_answer_is_read_from_json_even_in_markdown() {
+        let answer = CharacterPrompt::accept("Вот:\n```json\n{\"description\": \"**Анна** учится.\", \"speech\": \" \"}\n```");
+        assert_eq!(answer, Some(CharacterAnswer { description: "Анна учится.".to_string(), speech: None }));
+        assert_eq!(CharacterPrompt::accept("{\"description\": \"\"}"), None);
+        assert_eq!(CharacterPrompt::accept("Не JSON"), None);
+        let request = EntryPartPrompt::build(EntryKind::Term, "Old Key", "Anna: The old key.\n", &Hints::default(), &target());
+        assert!(request.system.contains("notes about the term Old Key"));
+        assert!(request.user.ends_with("Notes about Old Key:"));
     }
 
     #[test]

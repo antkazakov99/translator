@@ -95,6 +95,16 @@ export const commands = {
 	describeScene: (project: string, key: string, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scene", { project, key, profile, progress }),
 	/**  Описывает сцены по очереди с глубиной чтения по умолчанию. Описанные сцены без новых частей пропускаются. */
 	describeScenes: (project: string, keys: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scenes", { project, keys, profile, progress }),
+	/**  Части сцен персонажа или термина с заметками модели. */
+	entryParts: (project: string, owner: OwnerDto) => __TAURI_INVOKE<EntryPartsDto_Serialize>("entry_parts", { project, owner }),
+	/**  Описывает персонажа или термин по частям сцен с глубиной чтения по умолчанию и заменяет описание. */
+	describeEntry: (project: string, owner: OwnerDto, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_entry", { project, owner, profile, progress }),
+	/**  Сбрасывает заметки персонажа или термина. Возвращает число удалённых. */
+	resetEntryNotes: (project: string, owner: OwnerDto) => __TAURI_INVOKE<number>("reset_entry_notes", { project, owner }),
+	/**  Заметка не идёт в описание или возвращается в него. */
+	excludeNote: (project: string, owner: OwnerDto, model: string, hash: string, excluded: boolean) => __TAURI_INVOKE<null>("exclude_note", { project, owner, model, hash, excluded }),
+	/**  Сцена не даётся модели при описании персонажа или термина, или возвращается. */
+	excludeScene: (project: string, owner: OwnerDto, key: string, excluded: boolean) => __TAURI_INVOKE<null>("exclude_scene", { project, owner, key, excluded }),
 	/**  Файлы проекта с репликами и прогресс. */
 	translationFiles: (project: string) => __TAURI_INVOKE<FileDto[]>("translation_files", { project }),
 	/**  Реплики файла по сценам. */
@@ -207,18 +217,27 @@ export type CharacterDto_Serialize = {
 	forms: FormDto_Serialize[],
 };
 
-/**  Итог запуска описаний: описанные сцены и ошибка, которая оборвала запуск. */
+/**
+ *  Итог запуска описаний: описанные записи и ошибка, которая оборвала запуск. Сцена записана ключом,
+ *  персонаж и термин видом и номером: `character:12`.
+ */
 export type DescribedDto = DescribedDto_Serialize | DescribedDto_Deserialize;
 
-/**  Итог запуска описаний: описанные сцены и ошибка, которая оборвала запуск. */
+/**
+ *  Итог запуска описаний: описанные записи и ошибка, которая оборвала запуск. Сцена записана ключом,
+ *  персонаж и термин видом и номером: `character:12`.
+ */
 export type DescribedDto_Deserialize = {
-	scenes: string[],
+	written: string[],
 	error?: string | null,
 };
 
-/**  Итог запуска описаний: описанные сцены и ошибка, которая оборвала запуск. */
+/**
+ *  Итог запуска описаний: описанные записи и ошибка, которая оборвала запуск. Сцена записана ключом,
+ *  персонаж и термин видом и номером: `character:12`.
+ */
 export type DescribedDto_Serialize = {
-	scenes: string[],
+	written: string[],
 	error: string | null,
 };
 
@@ -228,6 +247,60 @@ export type DiscardedTermDto = {
 	text: string,
 	/**  Передано персонажу, а не мусор. */
 	givenToCharacter: boolean,
+};
+
+/**  Часть сцен персонажа или термина. */
+export type EntryPartDto = EntryPartDto_Serialize | EntryPartDto_Deserialize;
+
+/**  Часть сцен персонажа или термина. */
+export type EntryPartDto_Deserialize = {
+	hash: string,
+	/**  Первая строка части. */
+	start: string,
+	scenes: string[],
+	note?: string | null,
+	/**  Модель заметки: по ней заметку исключают. */
+	model?: string | null,
+	/**  Заметка идёт в описание: не пустая и не отказ модели. */
+	useful: boolean,
+	/**  Пользователь исключил заметку. */
+	excluded: boolean,
+	/**  Часть войдёт в следующий запуск. */
+	picked: boolean,
+};
+
+/**  Часть сцен персонажа или термина. */
+export type EntryPartDto_Serialize = {
+	hash: string,
+	/**  Первая строка части. */
+	start: string,
+	scenes: string[],
+	note: string | null,
+	/**  Модель заметки: по ней заметку исключают. */
+	model: string | null,
+	/**  Заметка идёт в описание: не пустая и не отказ модели. */
+	useful: boolean,
+	/**  Пользователь исключил заметку. */
+	excluded: boolean,
+	/**  Часть войдёт в следующий запуск. */
+	picked: boolean,
+};
+
+/**  Части записи, сколько из них прочитает запуск, и исключённые сцены. */
+export type EntryPartsDto = EntryPartsDto_Serialize | EntryPartsDto_Deserialize;
+
+/**  Части записи, сколько из них прочитает запуск, и исключённые сцены. */
+export type EntryPartsDto_Deserialize = {
+	parts: EntryPartDto_Deserialize[],
+	picked: number,
+	excluded: string[],
+};
+
+/**  Части записи, сколько из них прочитает запуск, и исключённые сцены. */
+export type EntryPartsDto_Serialize = {
+	parts: EntryPartDto_Serialize[],
+	picked: number,
+	excluded: string[],
 };
 
 /**  Файл с репликами и прогресс по нему. */
@@ -499,6 +572,9 @@ export type NameVariantDto_Serialize = {
 	translation: string,
 	description: string | null,
 };
+
+/**  Персонаж или термин, которого описывает модель. */
+export type OwnerDto = { kind: "character"; id: RowRef } | { kind: "term"; id: RowRef };
 
 /**  Часть сцены с заметкой модели. */
 export type PartNoteDto = PartNoteDto_Serialize | PartNoteDto_Deserialize;

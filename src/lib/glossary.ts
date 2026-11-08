@@ -33,6 +33,7 @@ export type GlossaryRuns = {
   speakers: SuggestRun<SpeakerSuggestion>;
   tokens: SuggestRun<TokenSuggestion>;
   scenes: WriteRun;
+  entries: WriteRun;
 };
 
 /** Идёт ли запуск или открыт отбор: новый запуск тогда недоступен. */

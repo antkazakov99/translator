@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
-use super::describe::PartNote;
+use super::describe::{EntryPart, PartNote};
 use super::{
-    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, GlossaryOverview, ReadingDepth, SceneEntry, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
+    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, SceneEntry, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
     SpeakerSuggestion, Term,
     TermCandidate, TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
 };
@@ -759,18 +759,80 @@ pub struct PartNoteDto {
     pub useful: bool,
 }
 
-/// Итог запуска описаний: описанные сцены и ошибка, которая оборвала запуск.
+/// Итог запуска описаний: описанные записи и ошибка, которая оборвала запуск. Сцена записана ключом,
+/// персонаж и термин видом и номером: `character:12`.
 #[derive(Debug, Clone, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct DescribedDto {
-    pub scenes: Vec<String>,
+    pub written: Vec<String>,
     pub error: Option<String>,
 }
 
 impl From<Described> for DescribedDto {
     fn from(described: Described) -> Self {
-        Self { scenes: described.scenes.into_iter().map(|key| key.to_string()).collect(), error: described.error }
+        let written = described
+            .written
+            .into_iter()
+            .map(|target| match target {
+                DescribeTarget::Scene(key) => key.to_string(),
+                DescribeTarget::Character(id) => format!("character:{}", id.get()),
+                DescribeTarget::Term(id) => format!("term:{}", id.get()),
+            })
+            .collect();
+        Self { written, error: described.error }
     }
+}
+
+/// Персонаж или термин, которого описывает модель.
+#[derive(Debug, Clone, Copy, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum OwnerDto {
+    Character { id: RowRef },
+    Term { id: RowRef },
+}
+
+impl OwnerDto {
+    fn target(self) -> DescribeTarget {
+        match self {
+            Self::Character { id } => DescribeTarget::Character(CharacterId::from_row(id.0)),
+            Self::Term { id } => DescribeTarget::Term(TermId::from_row(id.0)),
+        }
+    }
+
+    fn exclude(self) -> ExcludeOwner {
+        match self {
+            Self::Character { id } => ExcludeOwner::Character(CharacterId::from_row(id.0)),
+            Self::Term { id } => ExcludeOwner::Term(TermId::from_row(id.0)),
+        }
+    }
+}
+
+/// Часть сцен персонажа или термина.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryPartDto {
+    pub hash: String,
+    /// Первая строка части.
+    pub start: String,
+    pub scenes: Vec<String>,
+    pub note: Option<String>,
+    /// Модель заметки: по ней заметку исключают.
+    pub model: Option<String>,
+    /// Заметка идёт в описание: не пустая и не отказ модели.
+    pub useful: bool,
+    /// Пользователь исключил заметку.
+    pub excluded: bool,
+    /// Часть войдёт в следующий запуск.
+    pub picked: bool,
+}
+
+/// Части записи, сколько из них прочитает запуск, и исключённые сцены.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryPartsDto {
+    pub parts: Vec<EntryPartDto>,
+    pub picked: u32,
+    pub excluded: Vec<String>,
 }
 
 fn scene_key(key: String) -> Result<ContainerKey, AppError> {
@@ -845,6 +907,78 @@ pub async fn describe_scene(
     let described =
         DescribeService { state: &state }.describe(self::project(&project)?, target, usize::MAX, self::profile(profile)?, progress).await?;
     Ok(described.into())
+}
+
+/// Части сцен персонажа или термина с заметками модели.
+#[tauri::command]
+#[specta::specta]
+pub async fn entry_parts(app: AppHandle, project: String, owner: OwnerDto) -> Result<EntryPartsDto, String> {
+    blocking(app, move |state| {
+        let found = DescribeService { state }.entry_parts(self::project(&project)?, &owner.target())?;
+        Ok(EntryPartsDto {
+            parts: found
+                .parts
+                .into_iter()
+                .map(|part: EntryPart| EntryPartDto {
+                    hash: part.hash,
+                    start: part.start,
+                    scenes: part.scenes.into_iter().map(|key| key.to_string()).collect(),
+                    useful: part.useful,
+                    excluded: part.note.as_ref().is_some_and(|note| note.excluded),
+                    model: part.note.as_ref().map(|note| note.model.clone()),
+                    note: part.note.map(|note| note.text),
+                    picked: part.picked,
+                })
+                .collect(),
+            picked: u32::try_from(found.picked).unwrap_or(u32::MAX),
+            excluded: found.excluded.into_iter().map(|key| key.to_string()).collect(),
+        })
+    })
+    .await
+}
+
+/// Описывает персонажа или термин по частям сцен с глубиной чтения по умолчанию и заменяет описание.
+#[tauri::command]
+#[specta::specta]
+pub async fn describe_entry(
+    state: State<'_, AppState>,
+    project: String,
+    owner: OwnerDto,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<DescribedDto, String> {
+    let described = DescribeService { state: &state }
+        .describe_many(self::project(&project)?, vec![owner.target()], ReadingDepth::default(), self::profile(profile)?, progress)
+        .await?;
+    Ok(described.into())
+}
+
+/// Сбрасывает заметки персонажа или термина. Возвращает число удалённых.
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_entry_notes(app: AppHandle, project: String, owner: OwnerDto) -> Result<u32, String> {
+    blocking(app, move |state| {
+        let removed = DescribeService { state }.reset_notes(self::project(&project)?, &owner.target())?;
+        Ok(u32::try_from(removed).unwrap_or(u32::MAX))
+    })
+    .await
+}
+
+/// Заметка не идёт в описание или возвращается в него.
+#[tauri::command]
+#[specta::specta]
+pub async fn exclude_note(app: AppHandle, project: String, owner: OwnerDto, model: String, hash: String, excluded: bool) -> Result<(), String> {
+    blocking(app, move |state| DescribeService { state }.exclude_note(self::project(&project)?, &owner.target(), &model, &hash, excluded)).await
+}
+
+/// Сцена не даётся модели при описании персонажа или термина, или возвращается.
+#[tauri::command]
+#[specta::specta]
+pub async fn exclude_scene(app: AppHandle, project: String, owner: OwnerDto, key: String, excluded: bool) -> Result<(), String> {
+    blocking(app, move |state| {
+        GlossaryService { state }.set_excluded_scene(self::project(&project)?, owner.exclude(), &scene_key(key)?, excluded)
+    })
+    .await
 }
 
 /// Описывает сцены по очереди с глубиной чтения по умолчанию. Описанные сцены без новых частей пропускаются.

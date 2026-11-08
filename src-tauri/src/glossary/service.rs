@@ -303,7 +303,10 @@ impl GlossaryService<'_> {
 
     /// Сцена не передаётся модели при описании персонажа или термина.
     pub fn set_excluded_scene(&self, project: ProjectId, owner: ExcludeOwner, container: &ContainerKey, excluded: bool) -> Result<(), AppError> {
-        todo!()
+        self.write(project, |tx| match owner {
+            ExcludeOwner::Character(id) => CharacterRepo { conn: tx }.set_excluded(id, container, excluded),
+            ExcludeOwner::Term(id) => TermRepo { conn: tx }.set_excluded(id, container, excluded),
+        })
     }
 
     fn write<T>(&self, project: ProjectId, work: impl FnOnce(&rusqlite::Transaction) -> Result<T, DbError>) -> Result<T, AppError> {

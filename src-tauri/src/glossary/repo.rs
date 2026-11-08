@@ -350,11 +350,18 @@ impl CharacterRepo<'_> {
     }
 
     pub fn excluded_containers(&self, id: CharacterId) -> Result<Vec<ContainerKey>, DbError> {
-        todo!()
+        let mut statement = self.conn.prepare("SELECT container_key FROM character_excluded_containers WHERE character_id = ?1 ORDER BY container_key")?;
+        let keys = statement.query_map([id.get()], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        keys.into_iter().map(|key| ContainerKey::new(key).map_err(|error| DbError::bad_value("character_excluded_containers", "container_key", error))).collect()
     }
 
     pub fn set_excluded(&self, id: CharacterId, container: &ContainerKey, excluded: bool) -> Result<(), DbError> {
-        todo!()
+        if excluded {
+            self.conn.execute("INSERT OR IGNORE INTO character_excluded_containers (character_id, container_key) VALUES (?1, ?2)", params![id.get(), container.as_str()])?;
+        } else {
+            self.conn.execute("DELETE FROM character_excluded_containers WHERE character_id = ?1 AND container_key = ?2", params![id.get(), container.as_str()])?;
+        }
+        Ok(())
     }
 }
 
@@ -593,11 +600,18 @@ impl TermRepo<'_> {
     }
 
     pub fn excluded_containers(&self, id: TermId) -> Result<Vec<ContainerKey>, DbError> {
-        todo!()
+        let mut statement = self.conn.prepare("SELECT container_key FROM term_excluded_containers WHERE term_id = ?1 ORDER BY container_key")?;
+        let keys = statement.query_map([id.get()], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        keys.into_iter().map(|key| ContainerKey::new(key).map_err(|error| DbError::bad_value("term_excluded_containers", "container_key", error))).collect()
     }
 
     pub fn set_excluded(&self, id: TermId, container: &ContainerKey, excluded: bool) -> Result<(), DbError> {
-        todo!()
+        if excluded {
+            self.conn.execute("INSERT OR IGNORE INTO term_excluded_containers (term_id, container_key) VALUES (?1, ?2)", params![id.get(), container.as_str()])?;
+        } else {
+            self.conn.execute("DELETE FROM term_excluded_containers WHERE term_id = ?1 AND container_key = ?2", params![id.get(), container.as_str()])?;
+        }
+        Ok(())
     }
 }
 
@@ -848,6 +862,16 @@ pub struct SampleLine {
     pub text: String,
 }
 
+/// Реплика сцены текущего снимка для описаний персонажей и терминов.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoryLine {
+    pub scene: ContainerKey,
+    pub speaker_key: Option<SpeakerKey>,
+    /// Подпись говорящего из игры.
+    pub label: Option<String>,
+    pub text: String,
+}
+
 /// Реплики текущего снимка в порядке сюжета: образцы для предложений модели.
 pub struct LineSampleRepo<'c> {
     pub conn: &'c Connection,
@@ -860,6 +884,33 @@ impl LineSampleRepo<'_> {
          LEFT JOIN speakers sp ON sp.key = s.speaker_key
          WHERE s.missing = 0";
     const ORDER: &'static str = "ORDER BY c.story_order IS NULL, c.story_order, s.story_order IS NULL, s.story_order, s.id";
+
+    /// Реплики всех сцен текущего снимка по сюжету: из них выбираются сцены персонажа и термина.
+    pub fn story_lines(&self) -> Result<Vec<StoryLine>, DbError> {
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT c.key, s.speaker_key, sp.label, s.source_text
+             FROM segments s
+             JOIN containers c ON c.id = s.container_id AND c.kind = 'scene'
+             LEFT JOIN speakers sp ON sp.key = s.speaker_key
+             WHERE s.missing = 0 {}",
+            Self::ORDER
+        ))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(scene, speaker, label, text)| {
+                Ok(StoryLine {
+                    scene: ContainerKey::new(scene).map_err(|error| DbError::bad_value("containers", "key", error))?,
+                    speaker_key: speaker.map(|key| speaker_key("segments", key)).transpose()?,
+                    label,
+                    text,
+                })
+            })
+            .collect()
+    }
 
     /// Тексты всех реплик текущего снимка: по ним ищутся кандидаты в термины.
     pub fn all_texts(&self) -> Result<Vec<String>, DbError> {

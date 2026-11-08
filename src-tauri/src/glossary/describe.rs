@@ -5,9 +5,13 @@ use std::sync::Arc;
 
 use tauri::ipc::Channel;
 
-use super::describe_prompt::{CondensePrompt, PartPrompt, ScenePrompt, TitlePrompt, clean_note, is_useful};
-use super::parts::{MAX_PART_TEXT, Part, pick_parts, scene_hash, script_line, split_lines};
-use super::repo::{LineSampleRepo, NoteRepo, SampleLine, SceneDescriptionRepo};
+use super::describe_prompt::{
+    CharacterAnswer, CharacterPrompt, CondensePrompt, EntryKind, EntryPartPrompt, PartPrompt, ScenePrompt, TermPrompt, TitlePrompt, clean_note,
+    is_useful,
+};
+use super::entries::{character_names, character_scenes, entry_parts, term_names, term_scenes};
+use super::parts::{MAX_PART_TEXT, Part, ScenesPart, pick_parts, scene_hash, script_line, split_lines};
+use super::repo::{LineSampleRepo, NoteRepo, SampleLine, SceneDescriptionRepo, StoryLine, TermRepo};
 use super::{Note, NoteOwner, SceneDescription};
 use crate::common::Timestamp;
 use crate::storage::DbError;
@@ -84,7 +88,7 @@ const CONDENSE_ROUNDS: usize = 3;
 /// Итог запуска описаний: описанные записи и ошибка, которая оборвала запуск.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Described {
-    pub scenes: Vec<ContainerKey>,
+    pub written: Vec<DescribeTarget>,
     pub error: Option<String>,
 }
 
@@ -128,7 +132,73 @@ impl ScenePlan {
     }
 }
 
-/// Описания персонажей, терминов и сцен. Сейчас описываются сцены: персонажи и термины пойдут тем же путём.
+/// Персонаж или термин, готовый к запуску: выбранные части его сцен и прочитанные заметки этой модели.
+struct EntryPlan {
+    target: DescribeTarget,
+    kind: EntryKind,
+    name: String,
+    parts: Vec<Part>,
+    stored: HashMap<String, Note>,
+    /// Текст выбранных частей: по нему берутся подсказки сборки.
+    text: String,
+}
+
+impl EntryPlan {
+    /// Непрочитанные части и сборка. У персонажа сборка всегда: из неё берётся манера речи.
+    fn requests(&self) -> usize {
+        let unread = self.parts.iter().filter(|part| !self.stored.contains_key(&part.hash)).count();
+        let assembly = match self.kind {
+            EntryKind::Character => true,
+            EntryKind::Term => self.parts.len() > 1,
+        };
+        unread + usize::from(assembly)
+    }
+}
+
+/// Запись запуска описаний.
+enum Plan {
+    Scene(ScenePlan),
+    Entry(EntryPlan),
+}
+
+impl Plan {
+    fn requests(&self) -> usize {
+        match self {
+            Self::Scene(plan) => plan.requests(),
+            Self::Entry(plan) => plan.requests(),
+        }
+    }
+
+    fn target(&self) -> DescribeTarget {
+        match self {
+            Self::Scene(plan) => DescribeTarget::Scene(plan.key.clone()),
+            Self::Entry(plan) => plan.target.clone(),
+        }
+    }
+}
+
+/// Часть сцен персонажа или термина для окна.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryPart {
+    pub hash: String,
+    pub start: String,
+    pub scenes: Vec<ContainerKey>,
+    /// Заметка модели действия `descriptions`, иначе самая новая.
+    pub note: Option<Note>,
+    pub useful: bool,
+    /// Входит в выборку следующего запуска.
+    pub picked: bool,
+}
+
+/// Части записи, сколько из них прочитает запуск, и исключённые сцены.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EntryParts {
+    pub parts: Vec<EntryPart>,
+    pub picked: usize,
+    pub excluded: Vec<ContainerKey>,
+}
+
+/// Описания персонажей, терминов и сцен.
 pub struct DescribeService<'a> {
     pub state: &'a AppState,
 }
@@ -166,6 +236,52 @@ impl DescribeService<'_> {
         Ok(open.project.write(|tx| NoteRepo { conn: tx }.delete_owner(&owner))?)
     }
 
+    /// Части сцен персонажа или термина для окна: сцены части, заметка, войдёт ли часть в следующий запуск.
+    pub fn entry_parts(&self, project: ProjectId, target: &DescribeTarget) -> Result<EntryParts, AppError> {
+        let open = self.state.open_project(project)?;
+        // Без моделей окно всё равно показывает части: выборка считается по заметкам любой модели.
+        let model = LlmTargetService { state: self.state }
+            .target(Some(&open), Action::Descriptions, None)
+            .ok()
+            .map(|target| target.profile.model().to_string());
+        Ok(open.project.read(|tx| {
+            let glossary = GlossaryData::load(tx)?;
+            let context = GlossaryContext::new(&glossary);
+            let lines = LineSampleRepo { conn: tx }.story_lines()?;
+            let Some(selection) = select_entry(tx, &context, &glossary, &lines, target)? else { return Ok(EntryParts::default()) };
+            let notes = NoteRepo { conn: tx }.all_of(&owner_of(target))?;
+            let note_of = |hash: &str| {
+                let own = notes.iter().find(|note| note.part_hash == hash && Some(&note.model) == model.as_ref());
+                own.or_else(|| notes.iter().find(|note| note.part_hash == hash && model.is_none()))
+            };
+            let ready: Vec<bool> = selection.parts.iter().map(|part| note_of(&part.part.hash).is_some()).collect();
+            let picked = pick_parts(&ready, ReadingDepth::default().parts_for(selection.parts.len()));
+            let parts = selection
+                .parts
+                .iter()
+                .enumerate()
+                .map(|(index, part)| {
+                    let note = note_of(&part.part.hash).or_else(|| notes.iter().find(|note| note.part_hash == part.part.hash)).cloned();
+                    EntryPart {
+                        hash: part.part.hash.clone(),
+                        start: part.part.start(),
+                        scenes: part.scenes.clone(),
+                        useful: note.as_ref().is_some_and(|note| is_useful(&note.text)),
+                        note,
+                        picked: picked.contains(&index),
+                    }
+                })
+                .collect();
+            Ok(EntryParts { parts, picked: picked.len(), excluded: selection.excluded })
+        })?)
+    }
+
+    /// Заметка не идёт в описание или возвращается в него.
+    pub fn exclude_note(&self, project: ProjectId, target: &DescribeTarget, model: &str, part_hash: &str, excluded: bool) -> Result<(), AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.write(|tx| NoteRepo { conn: tx }.set_excluded(&owner_of(target), model, part_hash, excluded))?)
+    }
+
     /// Части сцены с заметками всех моделей для окна: начало части и заметка, новая первой.
     pub fn scene_parts(&self, project: ProjectId, key: &ContainerKey) -> Result<Vec<PartNote>, AppError> {
         let open = self.state.open_project(project)?;
@@ -198,13 +314,6 @@ impl DescribeService<'_> {
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
     ) -> Result<Described, AppError> {
-        let keys = targets
-            .into_iter()
-            .map(|target| match target {
-                DescribeTarget::Scene(key) => Ok(key),
-                DescribeTarget::Character(_) | DescribeTarget::Term(_) => Err(AppError::NotReady("Описания персонажей и терминов")),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let open = self.state.open_project(project)?;
         let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Descriptions, one_off)?;
         let model = target.profile.model().to_string();
@@ -212,11 +321,15 @@ impl DescribeService<'_> {
             let glossary = GlossaryData::load(tx)?;
             let mut context = GlossaryContext::new(&glossary);
             let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
+            let entries = targets.iter().any(|target| !matches!(target, DescribeTarget::Scene(_)));
+            let lines = if entries { LineSampleRepo { conn: tx }.story_lines()? } else { Vec::new() };
             let mut plans = Vec::new();
-            for key in keys {
-                if let Some(plan) = plan_scene(tx, &mut context, key, &model, choice, fill, first.as_ref())? {
-                    plans.push(plan);
-                }
+            for target in targets {
+                let plan = match target {
+                    DescribeTarget::Scene(key) => plan_scene(tx, &mut context, key, &model, choice, fill, first.as_ref())?.map(Plan::Scene),
+                    other => plan_entry(tx, &context, &glossary, &lines, other, &model, choice, fill)?.map(Plan::Entry),
+                };
+                plans.extend(plan);
             }
             Ok((plans, context.hints))
         })?;
@@ -224,14 +337,19 @@ impl DescribeService<'_> {
         if plans.is_empty() {
             return Ok(described);
         }
-        let total = plans.iter().map(ScenePlan::requests).sum();
+        let total = plans.iter().map(Plan::requests).sum();
         let mut run = BatchRun::begin(self.state, &open, Action::Descriptions, &target, progress, total)?;
         let writer = SceneWriter { open: &open, hints: &hints, target: &target, model: &model };
         for plan in plans {
-            match writer.scene(&mut run, &plan, described.scenes.len()).await {
+            let done = described.written.len();
+            let outcome = match &plan {
+                Plan::Scene(scene) => writer.scene(&mut run, scene, done).await,
+                Plan::Entry(entry) => writer.entry(&mut run, entry, done).await,
+            };
+            match outcome {
                 Ok(outcome) => {
                     if outcome.description.is_some() {
-                        described.scenes.push(plan.key);
+                        described.written.push(plan.target());
                     }
                     if !outcome.going {
                         break;
@@ -243,8 +361,8 @@ impl DescribeService<'_> {
                 }
             }
         }
-        let result = run.finish(described.scenes)?;
-        Ok(Described { scenes: result.items, error: result.error })
+        let result = run.finish(described.written)?;
+        Ok(Described { written: result.items, error: result.error })
     }
 }
 
@@ -380,6 +498,81 @@ fn plan_scene(
     Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening, fill }))
 }
 
+/// Сцены записи без исключённых и части из них.
+struct Selection {
+    kind: EntryKind,
+    name: String,
+    parts: Vec<ScenesPart>,
+    excluded: Vec<ContainerKey>,
+    /// Описание, которое уже есть.
+    described: bool,
+}
+
+/// `None`: записи нет или у персонажа нет имени, по которому его искать.
+fn select_entry(
+    tx: &rusqlite::Connection,
+    context: &GlossaryContext,
+    glossary: &GlossaryData,
+    lines: &[StoryLine],
+    target: &DescribeTarget,
+) -> Result<Option<Selection>, DbError> {
+    Ok(match target {
+        DescribeTarget::Character(id) => {
+            let Some(character) = glossary.characters.iter().find(|character| character.id() == Some(*id)) else { return Ok(None) };
+            let Some(name) = character.full_name() else { return Ok(None) };
+            let excluded = CharacterRepo { conn: tx }.excluded_containers(*id)?;
+            let speakers = glossary.links.iter().filter(|link| link.character == *id).map(|link| link.speaker.clone()).collect();
+            let scenes = character_scenes(lines, &speakers, &character_names(character), &excluded);
+            let parts = entry_parts(lines, &scenes, context);
+            Some(Selection { kind: EntryKind::Character, name, parts, excluded, described: character.description().is_some() })
+        }
+        DescribeTarget::Term(id) => {
+            let Some(term) = glossary.terms.iter().find(|term| term.id() == Some(*id)) else { return Ok(None) };
+            let excluded = TermRepo { conn: tx }.excluded_containers(*id)?;
+            let scenes = term_scenes(lines, &term_names(term), &excluded);
+            let parts = entry_parts(lines, &scenes, context);
+            Some(Selection { kind: EntryKind::Term, name: term.name().to_string(), parts, excluded, described: term.description().is_some() })
+        }
+        DescribeTarget::Scene(_) => None,
+    })
+}
+
+/// План персонажа или термина. `None`: читать нечего или запись заполнена и новых частей нет.
+#[allow(clippy::too_many_arguments)]
+fn plan_entry(
+    tx: &rusqlite::Connection,
+    context: &GlossaryContext,
+    glossary: &GlossaryData,
+    lines: &[StoryLine],
+    target: DescribeTarget,
+    model: &str,
+    choice: Choice,
+    fill: Fill,
+) -> Result<Option<EntryPlan>, DbError> {
+    let Some(selection) = select_entry(tx, context, glossary, lines, &target)? else { return Ok(None) };
+    if selection.parts.is_empty() {
+        return Ok(None);
+    }
+    let stored: HashMap<String, Note> =
+        NoteRepo { conn: tx }.of(&owner_of(&target), model)?.into_iter().map(|note| (note.part_hash.clone(), note)).collect();
+    let ready: Vec<bool> = selection.parts.iter().map(|part| stored.contains_key(&part.part.hash)).collect();
+    let count = match choice {
+        Choice::Count(count) => count,
+        Choice::Depth(depth) => depth.parts_for(selection.parts.len()),
+    };
+    let parts: Vec<Part> = pick_parts(&ready, count).into_iter().map(|index| selection.parts[index].part.clone()).collect();
+    let skip = match fill {
+        Fill::Replace => false,
+        Fill::ReplaceUnlessRead => selection.described && parts.iter().all(|part| stored.contains_key(&part.hash)),
+        Fill::Empty => selection.described,
+    };
+    if skip {
+        return Ok(None);
+    }
+    let text = parts.iter().map(|part| part.text.as_str()).collect();
+    Ok(Some(EntryPlan { target, kind: selection.kind, name: selection.name, parts, stored, text }))
+}
+
 /// Итог сцены: записанное описание и идёт ли запуск дальше.
 #[derive(Debug, Clone)]
 struct Outcome {
@@ -401,19 +594,27 @@ struct SceneWriter<'a> {
 }
 
 impl SceneWriter<'_> {
-    /// Возвращает, записано ли описание и идёт ли запуск дальше.
-    async fn scene(&self, run: &mut impl Ask, plan: &ScenePlan, written: usize) -> Result<Outcome, AppError> {
-        let owner = NoteOwner::Container(plan.key.clone());
+    /// Заметки выбранных частей: готовые из базы, новые спрашиваются и пишутся сразу. Исключённые, пустые
+    /// и отказы в итог не входят. `None`: запуск остановлен.
+    async fn notes(
+        &self,
+        run: &mut impl Ask,
+        owner: &NoteOwner,
+        parts: &[Part],
+        stored: &HashMap<String, Note>,
+        written: usize,
+        request: impl Fn(&Part) -> ChatRequest,
+    ) -> Result<Option<Vec<String>>, AppError> {
         let mut notes = Vec::new();
-        for part in &plan.parts {
-            let note = match plan.stored.get(&part.hash) {
+        for part in parts {
+            let note = match stored.get(&part.hash) {
                 Some(note) if note.excluded => continue,
                 Some(note) => note.text.clone(),
                 None => {
-                    let note = match run.send(&PartPrompt::build(&part.text, self.hints, self.target)).await {
+                    let note = match run.send(&request(part)).await {
                         Sent::Text(text) => clean_note(&text),
                         Sent::Skipped => String::new(),
-                        Sent::Stop => return Ok(Outcome::STOPPED),
+                        Sent::Stop => return Ok(None),
                     };
                     if !note.is_empty() {
                         let saved = Note {
@@ -427,7 +628,7 @@ impl SceneWriter<'_> {
                         self.open.project.write(|tx| NoteRepo { conn: tx }.save(&saved))?;
                     }
                     if !run.step(written) {
-                        return Ok(Outcome::STOPPED);
+                        return Ok(None);
                     }
                     note
                 }
@@ -436,6 +637,64 @@ impl SceneWriter<'_> {
                 notes.push(note);
             }
         }
+        Ok(Some(notes))
+    }
+
+    /// Описание персонажа или термина по заметкам частей. Запуск заменяет описание, у персонажа и манеру речи.
+    async fn entry(&self, run: &mut impl Ask, plan: &EntryPlan, written: usize) -> Result<Outcome, AppError> {
+        let owner = owner_of(&plan.target);
+        let request = |part: &Part| EntryPartPrompt::build(plan.kind, &plan.name, &part.text, self.hints, self.target);
+        let Some(notes) = self.notes(run, &owner, &plan.parts, &plan.stored, written, request).await? else { return Ok(Outcome::STOPPED) };
+        if notes.is_empty() {
+            return Ok(Outcome::NOTHING);
+        }
+        let mut going = true;
+        let answer = if let (EntryKind::Term, [_], [note]) = (plan.kind, plan.parts.as_slice(), notes.as_slice()) {
+            Some(CharacterAnswer { description: note.clone(), speech: None })
+        } else {
+            let Some(notes) = self.condense(run, notes, written).await else { return Ok(Outcome::STOPPED) };
+            let request = match plan.kind {
+                EntryKind::Character => CharacterPrompt::build(&plan.name, &notes, &plan.text, self.hints, self.target),
+                EntryKind::Term => TermPrompt::build(&plan.name, &notes, &plan.text, self.hints, self.target),
+            };
+            let text = match run.send(&request).await {
+                Sent::Text(text) => text,
+                Sent::Skipped => String::new(),
+                Sent::Stop => return Ok(Outcome::STOPPED),
+            };
+            going = run.step(written);
+            match plan.kind {
+                EntryKind::Character => CharacterPrompt::accept(&text),
+                EntryKind::Term => Some(clean_note(&text)).filter(|text| !text.is_empty()).map(|description| CharacterAnswer { description, speech: None }),
+            }
+        };
+        let Some(answer) = answer else { return Ok(Outcome { description: None, going }) };
+        self.open.project.write(|tx| match &plan.target {
+            DescribeTarget::Character(id) => {
+                let repo = CharacterRepo { conn: tx };
+                let mut character = repo.get(*id)?;
+                character.set_description(&answer.description);
+                if let Some(speech) = &answer.speech {
+                    character.set_speech(speech);
+                }
+                repo.save(&character).map(|_| ())
+            }
+            DescribeTarget::Term(id) => {
+                let repo = TermRepo { conn: tx };
+                let mut term = repo.get(*id)?;
+                term.set_description(&answer.description);
+                repo.save(&term).map(|_| ())
+            }
+            DescribeTarget::Scene(_) => Ok(()),
+        })?;
+        Ok(Outcome { description: Some(answer.description), going })
+    }
+
+    /// Возвращает записанное описание и идёт ли запуск дальше.
+    async fn scene(&self, run: &mut impl Ask, plan: &ScenePlan, written: usize) -> Result<Outcome, AppError> {
+        let owner = NoteOwner::Container(plan.key.clone());
+        let request = |part: &Part| PartPrompt::build(&part.text, self.hints, self.target);
+        let Some(notes) = self.notes(run, &owner, &plan.parts, &plan.stored, written, request).await? else { return Ok(Outcome::STOPPED) };
         if notes.is_empty() {
             return Ok(Outcome::NOTHING);
         }
@@ -1026,6 +1285,7 @@ async fn ask(client: LlmClient, target: &LlmTarget, request: &ChatRequest, run: 
 mod tests {
     use super::*;
     use crate::glossary::{GlossaryService, NameField, TermCategory};
+
     use crate::llm::client::tests::{completion, fake_model};
     use crate::llm::{LlmSettingsService, Profile, Provider, ProviderKind};
     use crate::projects::ProjectService;
@@ -1304,7 +1564,7 @@ mod tests {
 
         let described =
             tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(start.clone()), usize::MAX, None, silent())).unwrap();
-        assert_eq!(described, Described { scenes: vec![start.clone()], error: None });
+        assert_eq!(described, Described { written: vec![DescribeTarget::Scene(start.clone())], error: None });
         {
             let requests = seen.lock().unwrap();
             assert_eq!(requests.len(), 2, "одна часть сразу становится описанием, потом название");
@@ -1333,7 +1593,7 @@ mod tests {
             silent(),
         ))
         .unwrap();
-        assert_eq!(described.scenes, std::slice::from_ref(&left), "заполненная сцена без новых частей пропущена");
+        assert_eq!(described.written, [DescribeTarget::Scene(left.clone())], "заполненная сцена без новых частей пропущена");
         assert_eq!(seen.lock().unwrap().len(), 4);
 
         tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(start.clone()), usize::MAX, None, silent())).unwrap();
@@ -1345,10 +1605,67 @@ mod tests {
         assert!(parts[0].useful);
         assert_eq!(service.reset_notes(id, &DescribeTarget::Scene(start.clone())).unwrap(), 1);
         assert_eq!(service.scene_parts(id, &start).unwrap()[0].note, None);
-        assert!(matches!(
-            tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Term(TermId::from_row(1)), 1, None, silent())),
-            Err(AppError::NotReady(_))
-        ));
+    }
+
+    #[test]
+    fn characters_and_terms_are_described_from_their_scenes() {
+        let (url, seen) = fake_model(|body| {
+            let system = system_text(body);
+            // Сборка тоже говорит о заметках, поэтому проверяется первой.
+            let answer = if system.contains("about one character") {
+                "```json\n{\"description\": \"Эйлин встречает героя.\", \"speech\": \"Говорит на «ты».\"}\n```"
+            } else if system.contains("notes about the character") {
+                "Эйлин здоровается и показывает дорогу."
+            } else if system.contains("notes about the term") {
+                "Сторона, куда ведёт дорога."
+            } else {
+                "Лишняя сборка."
+            };
+            completion(answer)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let glossary = GlossaryService { state: &state };
+        let eileen = glossary.speaker_to_character(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
+        let side = glossary.take_term(id, "side", TermCategory::General).unwrap();
+        let service = DescribeService { state: &state };
+        let character = DescribeTarget::Character(eileen);
+        let term = DescribeTarget::Term(side);
+
+        let parts = service.entry_parts(id, &character).unwrap();
+        assert_eq!(parts.parts.len(), 1, "две маленькие сцены в одной части");
+        let scenes: Vec<&str> = parts.parts[0].scenes.iter().map(ContainerKey::as_str).collect();
+        assert_eq!(scenes, ["label:start", "label:left"]);
+        assert_eq!((parts.picked, parts.parts[0].note.is_none()), (1, true));
+
+        let described =
+            tauri::async_runtime::block_on(service.describe_many(id, vec![character.clone(), term.clone()], ReadingDepth::default(), None, silent()))
+                .unwrap();
+        assert_eq!(described, Described { written: vec![character.clone(), term.clone()], error: None });
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 3, "часть и сборка персонажа, единственная часть термина");
+            let part = user_text(&requests[0]);
+            assert!(part.contains("Eileen: Hello.\n") && part.contains("---\nEileen: Left side.\n"), "{part}");
+            assert!(part.ends_with("Notes about Eileen:"), "{part}");
+        }
+        let open = state.open_project(id).unwrap();
+        let (person, item) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.get(eileen)?, TermRepo { conn: tx }.get(side)?))).unwrap();
+        assert_eq!((person.description(), person.speech()), (Some("Эйлин встречает героя."), Some("Говорит на «ты».")));
+        assert_eq!(item.description(), Some("Сторона, куда ведёт дорога."), "заметка единственной части сразу описание");
+
+        let parts = service.entry_parts(id, &character).unwrap();
+        let note = parts.parts[0].note.clone().unwrap();
+        service.exclude_note(id, &character, &note.model, &note.part_hash, true).unwrap();
+        assert!(service.entry_parts(id, &character).unwrap().parts[0].note.as_ref().unwrap().excluded);
+
+        let left = ContainerKey::new("label:left").unwrap();
+        glossary.set_excluded_scene(id, crate::glossary::ExcludeOwner::Character(eileen), &left, true).unwrap();
+        let parts = service.entry_parts(id, &character).unwrap();
+        assert_eq!(parts.excluded, std::slice::from_ref(&left));
+        let scenes: Vec<&str> = parts.parts[0].scenes.iter().map(ContainerKey::as_str).collect();
+        assert_eq!(scenes, ["label:start"], "исключённая сцена модели не даётся");
+        assert!(parts.parts[0].note.is_none(), "у новой части заметки нет");
     }
 
     #[test]

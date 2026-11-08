@@ -9,6 +9,7 @@ export function glossaryRuns(): GlossaryRuns {
     speakers: new SuggestRun("Подписи"),
     tokens: new SuggestRun("Токены"),
     scenes: new WriteRun("Описания"),
+    entries: new WriteRun("Описание"),
   };
 }
 
@@ -120,7 +121,7 @@ export class WriteRun {
 
   /** `notice` получает число записанных и признак остановки. Возвращает записанное. */
   async start(
-    call: (channel: Channel<RunProgress>) => Promise<{ scenes: string[]; error?: string | null }>,
+    call: (channel: Channel<RunProgress>) => Promise<{ written: string[]; error?: string | null }>,
     onError: (message: string) => void,
     notice: (written: number, stopped: boolean) => string,
   ): Promise<string[]> {
@@ -135,8 +136,8 @@ export class WriteRun {
     try {
       const result = await call(channel);
       if (result.error) onError(result.error);
-      this.notice = notice(result.scenes.length, this.stopping);
-      return result.scenes;
+      this.notice = notice(result.written.length, this.stopping);
+      return result.written;
     } catch (e) {
       onError(String(e));
       return [];
