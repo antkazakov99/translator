@@ -1,9 +1,10 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { Check, Languages, LoaderCircle, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
-  import { commands, type TermCategory } from "./bindings";
+  import { commands, type TermCandidateDto as TermCandidate, type TermCategory } from "./bindings";
   import {
     categories,
     categoryLabel,
@@ -72,8 +73,39 @@
     }
   }
 
-  type Filter = "all" | "guess" | "trash";
+  type Filter = "all" | "fresh" | "guess" | "trash";
   let filter = $state<Filter>("all");
+
+  /** Сколько «Новых» показывать сразу: в большой игре их тысячи, остальное находит поиск. */
+  const FRESH_SHOWN = 300;
+  /** «Новые термины» из текста игры. `null`: ещё не загружены. */
+  let fresh = $state<TermCandidate[] | null>(null);
+  let freshBusy = $state<string | null>(null);
+  const freshShown = $derived((fresh ?? []).filter((item) => matches(query, item.text, item.example)));
+
+  onMount(loadFresh);
+
+  async function loadFresh() {
+    try {
+      fresh = await commands.newTerms(projectId);
+    } catch (e) {
+      onError(String(e));
+    }
+  }
+
+  /** «Термин» или «Не термин»: название уходит из «Новых». */
+  async function settle(text: string, work: () => Promise<unknown>) {
+    freshBusy = text;
+    try {
+      await work();
+      await reload();
+      await loadFresh();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      freshBusy = null;
+    }
+  }
   let query = $state("");
   let selected = $state<number | null>(null);
   let newName = $state("");
@@ -124,6 +156,7 @@
       await work();
       after?.();
       await reload();
+      await loadFresh();
     } catch (e) {
       onError(String(e));
     }
@@ -164,6 +197,13 @@
   </div>
   <div class="segmented" role="tablist" aria-label="Какие термины">
     <button role="tab" aria-selected={filter === "all"} class:on={filter === "all"} onclick={() => (filter = "all")}>Все · {data.terms.length}</button>
+    <button
+      role="tab"
+      aria-selected={filter === "fresh"}
+      class:on={filter === "fresh"}
+      title="Названия из текста игры, которых нет в глоссарии"
+      onclick={() => (filter = "fresh")}>Новые · {fresh?.length ?? "…"}</button
+    >
     <button role="tab" aria-selected={filter === "guess"} class:on={filter === "guess"} onclick={() => (filter = "guess")}>Модель · {guesses}</button>
     <button role="tab" aria-selected={filter === "trash"} class:on={filter === "trash"} onclick={() => (filter = "trash")}>
       Корзина · {data.discardedTerms.length}
@@ -211,6 +251,43 @@
       {#if writing}<LoaderCircle size={13} class="spin" />{:else}<Check size={13} />{/if}
       <span>Записать выбранные · {run.chosen.length}</span>
     </button>
+  </div>
+{:else if filter === "fresh"}
+  <div class="list">
+    <div class="fresh-head">
+      <input class="input" placeholder="Поиск по названию и реплике" bind:value={query} aria-label="Поиск новых терминов" />
+      <span class="faint">Названия с заглавной буквы и сокращения из реплик игры. Среди них бывает мусор: его отправляют в корзину</span>
+    </div>
+    {#if fresh === null}
+      <div class="empty"><LoaderCircle size={20} class="spin" /><span>Поиск названий в тексте игры</span></div>
+    {:else}
+      {#each freshShown.slice(0, FRESH_SHOWN) as item (item.text)}
+        <div class="row fresh" class:busy={freshBusy === item.text}>
+          <div class="name">
+            <strong>{item.text}</strong>
+            <span title={item.example}>реплик: {item.occurrences} · {item.example}</span>
+          </div>
+          <div class="fresh-actions">
+            <button class="btn small" disabled={freshBusy !== null} title="Взять в глоссарий: перевод и категорию можно задать потом" onclick={() => settle(item.text, () => commands.takeTerm(projectId, item.text, "general"))}>
+              <Plus size={13} />
+              <span>Термин</span>
+            </button>
+            <button class="btn small" disabled={freshBusy !== null} title="Не термин: убрать в корзину и не предлагать снова" onclick={() => settle(item.text, () => commands.discardTermName(projectId, item.text))}>
+              <Trash2 size={13} />
+              <span>Не термин</span>
+            </button>
+          </div>
+        </div>
+      {:else}
+        <div class="empty">
+          <strong>{fresh.length ? "Ничего не нашлось" : "Новых названий нет"}</strong>
+          <span>{fresh.length ? "Уточните поиск" : "Все названия из текста игры уже в глоссарии или в корзине"}</span>
+        </div>
+      {/each}
+      {#if freshShown.length > FRESH_SHOWN}
+        <p class="faint more">Показаны {FRESH_SHOWN} самых частых из {freshShown.length}: остальные находит поиск</p>
+      {/if}
+    {/if}
   </div>
 {:else if filter === "trash"}
   <div class="list">
@@ -341,3 +418,52 @@
     {/if}
   </div>
 {/if}
+
+<style>
+  .fresh-head {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 4px 4px 8px;
+  }
+
+  .fresh-head .input {
+    max-width: 360px;
+  }
+
+  .row.fresh.busy {
+    opacity: 0.55;
+  }
+
+  .row.fresh .name {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .row.fresh .name strong {
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .row.fresh .name span {
+    overflow: hidden;
+    color: var(--text-faint);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .fresh-actions {
+    display: flex;
+    flex-shrink: 0;
+    gap: 6px;
+  }
+
+  .more {
+    margin: 10px 4px 0;
+  }
+</style>

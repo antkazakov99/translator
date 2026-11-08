@@ -9,7 +9,7 @@ use tauri::{AppHandle, State};
 use super::{
     Character, CharacterId, Form, GlossaryOverview, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
     SpeakerSuggestion, Term,
-    TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
+    TermCandidate, TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
 };
 use crate::common::{AppError, Gender, Timestamp};
 use crate::engines::SpeakerKey;
@@ -426,6 +426,31 @@ pub async fn discard_term_name(app: AppHandle, project: String, name: String) ->
 #[specta::specta]
 pub async fn restore_term_name(app: AppHandle, project: String, key: String) -> Result<(), String> {
     blocking(app, move |state| GlossaryService { state }.restore_term_name(self::project(&project)?, &NameKey::from_stored(key))).await
+}
+
+/// Кандидат в термины из текста игры.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TermCandidateDto {
+    pub text: String,
+    /// В скольких разных репликах встретилось.
+    pub occurrences: u32,
+    /// Кусок реплики вокруг названия.
+    pub example: String,
+}
+
+/// «Новые термины»: названия из текста игры, которых нет в глоссарии. Первый вызов после считывания их собирает.
+#[tauri::command]
+#[specta::specta]
+pub async fn new_terms(app: AppHandle, project: String) -> Result<Vec<TermCandidateDto>, String> {
+    blocking(app, move |state| {
+        let found = GlossaryService { state }.new_terms(self::project(&project)?)?;
+        Ok(found
+            .into_iter()
+            .map(|item: TermCandidate| TermCandidateDto { text: item.text, occurrences: item.occurrences, example: item.example })
+            .collect())
+    })
+    .await
 }
 
 /// Значение или пояснение токена. Пустые оба удаляют запись.

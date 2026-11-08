@@ -72,6 +72,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             give_term_to_character,
             discard_term_name,
             restore_term_name,
+            new_terms,
             save_token,
             suggest_names,
             name_rules,

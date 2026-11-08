@@ -12,6 +12,7 @@ use super::{
 use crate::common::{Gender, Timestamp, ValidationError};
 use crate::name_rules::LanguageTag;
 use crate::engines::{ContainerKey, SpeakerKey};
+use crate::scan::ScanId;
 use crate::storage::DbError;
 
 fn speaker_key(table: &'static str, key: String) -> Result<SpeakerKey, DbError> {
@@ -402,6 +403,8 @@ pub struct TermRepo<'c> {
 }
 
 const TERM_SELECT: &str = "SELECT id, name, translation, category, guess, description FROM terms";
+/// Имя таблицы кандидатов в `derived`.
+const TERM_CANDIDATES: &str = "term_candidates";
 
 type TermRow = (i64, String, Option<String>, String, bool, Option<String>);
 
@@ -498,13 +501,49 @@ impl TermRepo<'_> {
     }
 
     /// «Новые термины»: кандидаты без терминов, имён персонажей, подписей разобранных говорящих и корзины.
+    /// Частые первыми.
     pub fn new_candidates(&self) -> Result<Vec<TermCandidate>, DbError> {
-        todo!()
+        let mut statement = self.conn.prepare(
+            "SELECT c.text, c.occurrences, c.example FROM term_candidates c
+             WHERE c.text_key NOT IN (SELECT name_key FROM terms)
+               AND c.text_key NOT IN (SELECT text_key FROM term_forms)
+               AND c.text_key NOT IN (SELECT text_key FROM glossary_name_keys WHERE text_key IS NOT NULL)
+               AND c.text_key NOT IN (SELECT text_key FROM discarded_terms)
+             ORDER BY c.occurrences DESC, c.text_key",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok(TermCandidate { text: row.get(0)?, occurrences: row.get(1)?, example: row.get(2)? }))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
-    /// Пересобирает `term_candidates` и строку `derived` одной транзакцией.
-    pub fn replace_candidates(&self, candidates: &[TermCandidate], version: u32) -> Result<(), DbError> {
-        todo!()
+    /// Версия сборки и считывание, по которому собраны кандидаты. `None`: ещё не собирались.
+    pub fn candidates_state(&self) -> Result<Option<(u32, ScanId)>, DbError> {
+        Ok(self
+            .conn
+            .query_row("SELECT version, scan_id FROM derived WHERE name = ?1", [TERM_CANDIDATES], |row| {
+                Ok((row.get::<_, u32>(0)?, ScanId::from_row(row.get(1)?)))
+            })
+            .optional()?)
+    }
+
+    /// Заменяет `term_candidates` целиком и отмечает версию и считывание в `derived`. Транзакцию открывает сервис.
+    /// Написания с одним ключом сливаются: побеждает первое, то есть более частое.
+    pub fn replace_candidates(&self, candidates: &[TermCandidate], version: u32, scan: ScanId) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM term_candidates", [])?;
+        let mut insert = self.conn.prepare(
+            "INSERT INTO term_candidates (text_key, text, occurrences, example) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+        )?;
+        for candidate in candidates {
+            let Some(key) = NameKey::new(&candidate.text) else { continue };
+            insert.execute(params![key.as_str(), candidate.text, candidate.occurrences, candidate.example])?;
+        }
+        self.conn.execute(
+            "INSERT INTO derived (name, version, scan_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT (name) DO UPDATE SET version = excluded.version, scan_id = excluded.scan_id",
+            params![TERM_CANDIDATES, version, scan.get()],
+        )?;
+        Ok(())
     }
 
     /// Есть ли название среди терминов, их форм, имён глоссария и корзины: так проверяются предположения модели.
@@ -693,6 +732,22 @@ impl LineSampleRepo<'_> {
          LEFT JOIN speakers sp ON sp.key = s.speaker_key
          WHERE s.missing = 0";
     const ORDER: &'static str = "ORDER BY c.story_order IS NULL, c.story_order, s.story_order IS NULL, s.story_order, s.id";
+
+    /// Тексты всех реплик текущего снимка: по ним ищутся кандидаты в термины.
+    pub fn all_texts(&self) -> Result<Vec<String>, DbError> {
+        let mut statement = self.conn.prepare("SELECT source_text FROM segments WHERE missing = 0 ORDER BY id")?;
+        let texts = statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+        Ok(texts)
+    }
+
+    /// Подписи говорящих текущего снимка: их слова тоже имена.
+    pub fn speaker_labels(&self) -> Result<Vec<String>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT label FROM speakers WHERE label IS NOT NULL AND last_seen_scan = (SELECT max(id) FROM scans)",
+        )?;
+        let labels = statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
+        Ok(labels)
+    }
 
     /// Все реплики говорящего.
     pub fn of_speaker(&self, key: &SpeakerKey) -> Result<Vec<SampleLine>, DbError> {

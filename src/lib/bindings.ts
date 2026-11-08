@@ -63,6 +63,8 @@ export const commands = {
 	/**  Название в корзину: модель не предложит его снова. */
 	discardTermName: (project: string, name: string) => __TAURI_INVOKE<null>("discard_term_name", { project, name }),
 	restoreTermName: (project: string, key: string) => __TAURI_INVOKE<null>("restore_term_name", { project, key }),
+	/**  «Новые термины»: названия из текста игры, которых нет в глоссарии. Первый вызов после считывания их собирает. */
+	newTerms: (project: string) => __TAURI_INVOKE<TermCandidateDto[]>("new_terms", { project }),
 	/**  Значение или пояснение токена. Пустые оба удаляют запись. */
 	saveToken: (project: string, name: string, value: string, note: string) => __TAURI_INVOKE<null>("save_token", { project, name, value, note }),
 	/**  Перевод имён, фамилий и форм персонажей без перевода. Отмеченное окно записывает через `save_character`. */
@@ -718,6 +720,15 @@ export type SpeakerSuggestionsDto_Deserialize = {
 export type SpeakerSuggestionsDto_Serialize = {
 	items: SpeakerSuggestionDto_Serialize[],
 	error: string | null,
+};
+
+/**  Кандидат в термины из текста игры. */
+export type TermCandidateDto = {
+	text: string,
+	/**  В скольких разных репликах встретилось. */
+	occurrences: number,
+	/**  Кусок реплики вокруг названия. */
+	example: string,
 };
 
 export type TermCategory = "general" | "location" | "organization" | "title" | "item" | "event";

@@ -1,5 +1,6 @@
 //! Глоссарий: говорящие и их связи с персонажами, персонажи, термины, токены, описания сцен, заметки модели.
 
+pub mod candidates;
 pub mod characters;
 pub mod commands;
 pub mod describe;
