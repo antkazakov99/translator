@@ -88,6 +88,17 @@ pub struct Described {
     pub error: Option<String>,
 }
 
+/// Как писать описание.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// Карточка сцены: описание заменяется.
+    Replace,
+    /// Группа: заменяется, но описанная сцена без новых частей пропускается.
+    ReplaceUnlessRead,
+    /// Перевод: только сцена без описания, описание пишется в пустое поле.
+    Empty,
+}
+
 /// Сколько частей читать.
 #[derive(Debug, Clone, Copy)]
 enum Choice {
@@ -106,6 +117,7 @@ struct ScenePlan {
     text_hash: String,
     need_title: bool,
     opening: bool,
+    fill: Fill,
 }
 
 impl ScenePlan {
@@ -132,7 +144,7 @@ impl DescribeService<'_> {
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
     ) -> Result<Described, AppError> {
-        self.run(project, vec![target], Choice::Count(parts), false, one_off, progress).await
+        self.run(project, vec![target], Choice::Count(parts), Fill::Replace, one_off, progress).await
     }
 
     /// Группа по очереди с глубиной чтения. Заполненная запись без новых частей в запуск не входит.
@@ -144,7 +156,7 @@ impl DescribeService<'_> {
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
     ) -> Result<Described, AppError> {
-        self.run(project, targets, Choice::Depth(depth), true, one_off, progress).await
+        self.run(project, targets, Choice::Depth(depth), Fill::ReplaceUnlessRead, one_off, progress).await
     }
 
     /// Сбрасывает заметки владельца всех моделей: следующий запуск прочитает части заново.
@@ -182,7 +194,7 @@ impl DescribeService<'_> {
         project: ProjectId,
         targets: Vec<DescribeTarget>,
         choice: Choice,
-        skip_filled: bool,
+        fill: Fill,
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
     ) -> Result<Described, AppError> {
@@ -202,7 +214,7 @@ impl DescribeService<'_> {
             let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
             let mut plans = Vec::new();
             for key in keys {
-                if let Some(plan) = plan_scene(tx, &mut context, key, &model, choice, skip_filled, first.as_ref())? {
+                if let Some(plan) = plan_scene(tx, &mut context, key, &model, choice, fill, first.as_ref())? {
                     plans.push(plan);
                 }
             }
@@ -218,7 +230,7 @@ impl DescribeService<'_> {
         for plan in plans {
             match writer.scene(&mut run, &plan, described.scenes.len()).await {
                 Ok(outcome) => {
-                    if outcome.written {
+                    if outcome.description.is_some() {
                         described.scenes.push(plan.key);
                     }
                     if !outcome.going {
@@ -233,6 +245,61 @@ impl DescribeService<'_> {
         }
         let result = run.finish(described.scenes)?;
         Ok(Described { scenes: result.items, error: result.error })
+    }
+}
+
+/// Чтение сцен перед переводом: сцены без описания читаются с глубиной по умолчанию моделью действия
+/// `descriptions`, описание пишется только в пустое поле.
+pub(crate) struct SceneReader {
+    plans: Vec<ScenePlan>,
+    pub target: LlmTarget,
+    model: String,
+}
+
+impl SceneReader {
+    /// Планы для сцен `keys`. Сцена с описанием в план не входит.
+    pub fn prepare(
+        state: &AppState,
+        open: &Arc<OpenProject>,
+        keys: Vec<ContainerKey>,
+        context: &mut GlossaryContext,
+        one_off: Option<ProfileId>,
+    ) -> Result<Self, AppError> {
+        let target = LlmTargetService { state }.target(Some(open), Action::Descriptions, one_off)?;
+        let model = target.profile.model().to_string();
+        let plans = open.project.read(|tx| {
+            let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
+            let mut plans = Vec::new();
+            for key in keys {
+                let choice = Choice::Depth(ReadingDepth::default());
+                if let Some(plan) = plan_scene(tx, context, key, &model, choice, Fill::Empty, first.as_ref())? {
+                    plans.push(plan);
+                }
+            }
+            Ok(plans)
+        })?;
+        Ok(Self { plans, target, model })
+    }
+
+    /// Запросы всех планов без сжатия: для прогресса запуска.
+    pub fn requests(&self) -> usize {
+        self.plans.iter().map(ScenePlan::requests).sum()
+    }
+
+    pub fn wants(&self, key: &ContainerKey) -> bool {
+        self.plans.iter().any(|plan| &plan.key == key)
+    }
+
+    /// Читает сцену и возвращает записанное описание. `None`: модель ничего не дала, описание уже кто-то
+    /// написал или запуск остановлен. Ошибка запроса обрывает запуск.
+    pub async fn read(&self, open: &Arc<OpenProject>, key: &ContainerKey, hints: &Hints, asker: &mut RunAsk<'_>) -> Result<Option<String>, AppError> {
+        let Some(plan) = self.plans.iter().find(|plan| &plan.key == key) else { return Ok(None) };
+        let writer = SceneWriter { open, hints, target: &self.target, model: &self.model };
+        let outcome = writer.scene(asker, plan, 0).await?;
+        if let Some(error) = asker.error.take() {
+            return Err(error.into());
+        }
+        Ok(outcome.description)
     }
 }
 
@@ -276,7 +343,7 @@ fn plan_scene(
     key: ContainerKey,
     model: &str,
     choice: Choice,
-    skip_filled: bool,
+    fill: Fill,
     first: Option<&ContainerKey>,
 ) -> Result<Option<ScenePlan>, DbError> {
     let Some((all, text_hash)) = scene_text(tx, context, &key)? else { return Ok(None) };
@@ -295,26 +362,34 @@ fn plan_scene(
     };
     let parts: Vec<Part> = pick_parts(&ready, count).into_iter().map(|index| all[index].clone()).collect();
     let description = SceneDescriptionRepo { conn: tx }.get(&key)?;
-    let filled = description.as_ref().is_some_and(|scene| scene.description().is_some() && !scene.is_stale(&text_hash));
-    if skip_filled && filled && parts.iter().all(|part| stored.contains_key(&part.hash)) {
+    let described = description.as_ref().is_some_and(|scene| scene.description().is_some());
+    let skip = match fill {
+        Fill::Replace => false,
+        Fill::ReplaceUnlessRead => {
+            let current = described && description.as_ref().is_some_and(|scene| !scene.is_stale(&text_hash));
+            current && parts.iter().all(|part| stored.contains_key(&part.hash))
+        }
+        Fill::Empty => described,
+    };
+    if skip {
         return Ok(None);
     }
     let text = parts.iter().map(|part| part.text.as_str()).collect();
     let need_title = description.as_ref().is_none_or(|scene| scene.title().is_none());
     let opening = first == Some(&key);
-    Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening }))
+    Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening, fill }))
 }
 
-/// Итог сцены: записано ли описание и идёт ли запуск дальше.
-#[derive(Debug, Clone, Copy)]
+/// Итог сцены: записанное описание и идёт ли запуск дальше.
+#[derive(Debug, Clone)]
 struct Outcome {
-    written: bool,
+    description: Option<String>,
     going: bool,
 }
 
 impl Outcome {
-    const STOPPED: Self = Self { written: false, going: false };
-    const NOTHING: Self = Self { written: false, going: true };
+    const STOPPED: Self = Self { description: None, going: false };
+    const NOTHING: Self = Self { description: None, going: true };
 }
 
 /// Чтение частей, сборка и запись описания одной сцены.
@@ -327,7 +402,7 @@ struct SceneWriter<'a> {
 
 impl SceneWriter<'_> {
     /// Возвращает, записано ли описание и идёт ли запуск дальше.
-    async fn scene(&self, run: &mut BatchRun<'_>, plan: &ScenePlan, written: usize) -> Result<Outcome, AppError> {
+    async fn scene(&self, run: &mut impl Ask, plan: &ScenePlan, written: usize) -> Result<Outcome, AppError> {
         let owner = NoteOwner::Container(plan.key.clone());
         let mut notes = Vec::new();
         for part in &plan.parts {
@@ -379,22 +454,31 @@ impl SceneWriter<'_> {
             description
         };
         if description.is_empty() {
-            return Ok(Outcome { written: false, going });
+            return Ok(Outcome { description: None, going });
         }
-        self.open.project.write(|tx| {
+        let changed = self.open.project.write(|tx| {
             let repo = SceneDescriptionRepo { conn: tx };
             let mut scene = repo.get(&plan.key)?.unwrap_or_else(|| SceneDescription::new(plan.key.clone(), Timestamp::now()));
-            scene.replace_description(&description, &plan.text_hash, Timestamp::now());
-            repo.save(&scene)
+            let changed = match plan.fill {
+                Fill::Empty => scene.fill_description(&description, &plan.text_hash, Timestamp::now()),
+                Fill::Replace | Fill::ReplaceUnlessRead => scene.replace_description(&description, &plan.text_hash, Timestamp::now()),
+            };
+            if changed {
+                repo.save(&scene)?;
+            }
+            Ok(changed)
         })?;
+        if !changed {
+            return Ok(Outcome { description: None, going });
+        }
         if !going || !plan.need_title {
-            return Ok(Outcome { written: true, going });
+            return Ok(Outcome { description: Some(description), going });
         }
 
         let title = match run.send(&TitlePrompt::build(&description, plan.opening, self.target)).await {
             Sent::Text(text) => TitlePrompt::accept(&text),
             Sent::Skipped => None,
-            Sent::Stop => return Ok(Outcome { written: true, going: false }),
+            Sent::Stop => return Ok(Outcome { description: Some(description), going: false }),
         };
         if let Some(title) = title {
             self.open.project.write(|tx| {
@@ -406,11 +490,12 @@ impl SceneWriter<'_> {
                 Ok(())
             })?;
         }
-        Ok(Outcome { written: true, going: run.step(written + 1) })
+        let going = run.step(written + 1);
+        Ok(Outcome { description: Some(description), going })
     }
 
     /// Сжимает заметки группами, пока они не поместятся в запрос сборки. `None`: запуск остановлен.
-    async fn condense(&self, run: &mut BatchRun<'_>, mut notes: Vec<String>, written: usize) -> Option<Vec<String>> {
+    async fn condense(&self, run: &mut impl Ask, mut notes: Vec<String>, written: usize) -> Option<Vec<String>> {
         for _ in 0..CONDENSE_ROUNDS {
             if CondensePrompt::fits(&notes) {
                 break;
@@ -770,7 +855,7 @@ impl Spell<'_> {
 }
 
 /// Ответ на запрос пакета.
-enum Sent {
+pub(crate) enum Sent {
     Text(String),
     /// Модель отказалась отвечать: пакет пропускается.
     Skipped,
@@ -859,6 +944,65 @@ impl<'a> BatchRun<'a> {
         };
         self.run.finish(status, self.error.as_deref())?;
         Ok(Suggestions { items, error: self.error })
+    }
+}
+
+/// Запросы запуска, в котором читаются сцены: свой запуск описаний или чужой запуск, например перевода.
+pub(crate) trait Ask {
+    /// Запрос без отчёта. Ошибка запоминается и обрывает запуск.
+    async fn send(&mut self, request: &ChatRequest) -> Sent;
+    /// Запрос готов. `false`: запуск остановлен.
+    fn step(&mut self, written: usize) -> bool;
+    /// Запросов больше, чем было в плане.
+    fn grow(&mut self, more: usize);
+}
+
+impl Ask for BatchRun<'_> {
+    async fn send(&mut self, request: &ChatRequest) -> Sent {
+        BatchRun::send(self, request).await
+    }
+
+    fn step(&mut self, written: usize) -> bool {
+        BatchRun::step(self, written)
+    }
+
+    fn grow(&mut self, more: usize) {
+        BatchRun::grow(self, more);
+    }
+}
+
+/// Запросы чтения сцены внутри запуска перевода: прогресс общий, ошибка запоминается для запуска.
+pub(crate) struct RunAsk<'a> {
+    pub run: &'a LlmRun,
+    pub target: &'a LlmTarget,
+    pub progress: &'a mut RunProgress,
+    pub error: Option<LlmError>,
+}
+
+impl Ask for RunAsk<'_> {
+    async fn send(&mut self, request: &ChatRequest) -> Sent {
+        if self.run.cancelled() || self.error.is_some() {
+            return Sent::Stop;
+        }
+        match ask(LlmClient::for_kind(self.target.provider.kind()), self.target, request, self.run).await {
+            Ok(Some(text)) => Sent::Text(text),
+            Ok(None) => Sent::Skipped,
+            Err(error) => {
+                self.error = Some(error);
+                Sent::Stop
+            }
+        }
+    }
+
+    fn step(&mut self, _written: usize) -> bool {
+        self.progress.done += 1;
+        self.run.report(self.progress.clone());
+        !self.run.cancelled()
+    }
+
+    fn grow(&mut self, more: usize) {
+        self.progress.total += more as u32;
+        self.run.report(self.progress.clone());
     }
 }
 

@@ -13,6 +13,7 @@ use super::{
     TranslationRepo, TranslationScope,
 };
 use crate::common::{AppError, Timestamp};
+use crate::glossary::describe::{RunAsk, SceneReader};
 use crate::glossary::{CharacterRepo, GlossaryData, Term, TermRepo};
 use crate::name_rules::NameRuleService;
 use crate::llm::{Action, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunId, RunProgress, RunStatus};
@@ -83,10 +84,21 @@ impl TranslationService<'_> {
         for scene in &mut scenes {
             glossary.apply(scene);
         }
+        // Перевод сцены без описания начинается с её чтения. Перевод одной реплики это быстрая правка, он сцену не читает.
+        let unread: Vec<_> = scenes
+            .iter()
+            .filter(|scene| scene.description.is_none() && scene.lines.iter().any(|line| mode.wants(line)))
+            .filter_map(|scene| scene.key.clone())
+            .collect();
+        let reader = match (mode, only) {
+            (LinesMode::Translate, None) if !unread.is_empty() => Some(SceneReader::prepare(self.state, &open, unread, &mut glossary, one_off)?),
+            _ => None,
+        };
         let run = LlmRun::begin(self.state, Some(open.clone()), action, &target, progress)?;
         let result = match run.id() {
             Some(id) => {
-                let mut job = Job { open: &open, target: &target, run: &run, id, mode, hints: glossary.hints, sent, progress: RunProgress::default() };
+                let mut job =
+                    Job { open: &open, target: &target, run: &run, id, mode, hints: glossary.hints, sent, progress: RunProgress::default(), reader };
                 job.lines(scenes, only).await.map(|written| LinesRun { run: id, written })
             }
             None => Err(AppError::ProjectNotOpen),
@@ -209,6 +221,8 @@ struct Job<'r> {
     /// Текст реплики в базе, без значений токенов: с ним сверяется запись черновика.
     sent: HashMap<SegmentId, SentState>,
     progress: RunProgress,
+    /// Чтение сцен без описания перед их переводом.
+    reader: Option<SceneReader>,
 }
 
 impl Job<'_> {
@@ -224,11 +238,15 @@ impl Job<'_> {
                 None => Batcher::split(scene, self.mode, self.target.settings.batch_size),
             })
             .collect();
-        self.progress.total = plans.iter().map(Vec::len).sum::<usize>() as u32;
+        let reading = self.reader.as_ref().map_or(0, SceneReader::requests);
+        self.progress.total = (plans.iter().map(Vec::len).sum::<usize>() + reading) as u32;
         self.report(None);
 
         for (scene, batches) in scenes.iter_mut().zip(plans) {
             let name = scene.title.clone().or_else(|| scene.key.as_ref().map(|key| key.to_string()));
+            if !batches.is_empty() {
+                self.read(scene, name.as_deref()).await?;
+            }
             for batch in batches {
                 if self.run.cancelled() {
                     return Ok(self.progress.written as usize);
@@ -243,6 +261,22 @@ impl Job<'_> {
             }
         }
         Ok(self.progress.written as usize)
+    }
+
+    /// Читает сцену без описания, если она в плане чтения: описание пишется в пустое поле и сразу идёт
+    /// в запросы её перевода.
+    async fn read(&mut self, scene: &mut Scene, name: Option<&str>) -> Result<(), AppError> {
+        let (Some(reader), Some(key)) = (&self.reader, &scene.key) else { return Ok(()) };
+        if !reader.wants(key) || self.run.cancelled() {
+            return Ok(());
+        }
+        self.progress.message = Some(format!("Чтение сцены: {}", name.unwrap_or(key.as_str())));
+        self.run.report(self.progress.clone());
+        let mut asker = RunAsk { run: self.run, target: &reader.target, progress: &mut self.progress, error: None };
+        if let Some(description) = reader.read(self.open, key, &self.hints, &mut asker).await? {
+            scene.description = Some(description);
+        }
+        Ok(())
     }
 
     /// Слабая модель бросает конец длинного пакета, а ответ может не разобраться. Повтор спрашивает
@@ -564,13 +598,66 @@ mod tests {
         tauri::async_runtime::block_on(service.translate(id, TranslationScope::Project, None, silent())).unwrap();
 
         let requests = seen.lock().unwrap();
-        let first = requests[0]["messages"][1]["content"].as_str().unwrap();
+        let first = requests
+            .iter()
+            .filter_map(|request| request["messages"][1]["content"].as_str())
+            .find(|user| user.contains("Lines:"))
+            .unwrap();
         assert!(first.contains("Speakers:\nEileen: female"), "{first}");
         assert!(first.contains("Russian names: Eileen = Эйлин"), "{first}");
 
         let terms = glossary.overview(id).unwrap().data.terms;
         assert_eq!(terms.len(), 1, "выдуманный термин без упоминания не сохраняется");
         assert_eq!((terms[0].name(), terms[0].translation(), terms[0].is_guess()), ("Left Side", Some("Левая сторона"), true));
+    }
+
+    #[test]
+    fn scene_without_description_is_read_before_its_translation() {
+        use crate::engines::ContainerKey;
+        use crate::glossary::GlossaryService;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path());
+        let (url, seen) = fake_model(|body| {
+            let system = body["messages"][0]["content"].as_str().unwrap_or_default();
+            if system.contains("read a part") {
+                completion("Эйлин здоровается с героем.")
+            } else if system.contains("name a scene") {
+                completion("Приветствие")
+            } else {
+                answer_every_line(body)
+            }
+        });
+        add_model(&state, &url);
+        let service = TranslationService { state: &state };
+        let glossary = GlossaryService { state: &state };
+        let left = ContainerKey::new("label:left").unwrap();
+        glossary.edit_scene(id, &left, "", "Своё описание.").unwrap();
+
+        tauri::async_runtime::block_on(service.translate(id, TranslationScope::Project, None, silent())).unwrap();
+        let users: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request["messages"][1]["content"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let translations: Vec<&String> = users.iter().filter(|user| user.contains("Lines:")).collect();
+        assert_eq!(users.len(), translations.len() + 2, "одна сцена прочитана: часть и название");
+        assert!(translations[0].contains("Scene: Эйлин здоровается с героем."), "{}", translations[0]);
+        assert!(translations.iter().any(|user| user.contains("Scene: Своё описание.")), "своё описание не трогается");
+        let scenes = glossary.scenes(id).unwrap();
+        let start = scenes.iter().find(|entry| entry.source.key.as_str() == "label:start").unwrap();
+        let description = start.description.as_ref().unwrap();
+        assert_eq!((description.description(), description.title()), (Some("Эйлин здоровается с героем."), Some("Приветствие")));
+        assert_eq!(count(&state, id, "SELECT count(*) FROM llm_runs"), 1, "чтение идёт в запуске перевода");
+
+        glossary.edit_scene(id, &start.source.key, "", "").unwrap();
+        let file = service.files(id).unwrap()[0].id;
+        let line = lines(&service, id, file)[0].id;
+        service.save_text(id, line, "").unwrap();
+        let before = seen.lock().unwrap().len();
+        tauri::async_runtime::block_on(service.translate(id, TranslationScope::Line(line), None, silent())).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), before + 1, "перевод одной реплики сцену не читает");
     }
 
     #[test]

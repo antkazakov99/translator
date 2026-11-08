@@ -307,7 +307,7 @@
     const action = current.mode === "translate" ? "Перевод" : "Редактура";
     if (current.stopping) return `${action}: останавливается после текущего запроса`;
     if (total === 0) return `${action}: подготовка`;
-    const parts = [`${action}: пакет ${Math.min(done + 1, total)} из ${total}`, `записано: ${written}`];
+    const parts = [`${action}: запрос ${Math.min(done + 1, total)} из ${total}`, `записано: ${written}`];
     if (message) parts.push(message);
     return parts.join(" · ");
   }
