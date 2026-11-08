@@ -65,6 +65,8 @@ export const commands = {
 	restoreTermName: (project: string, key: string) => __TAURI_INVOKE<null>("restore_term_name", { project, key }),
 	/**  Значение или пояснение токена. Пустые оба удаляют запись. */
 	saveToken: (project: string, name: string, value: string, note: string) => __TAURI_INVOKE<null>("save_token", { project, name, value, note }),
+	/**  Перевод имён, фамилий и форм персонажей без перевода. Отмеченное окно записывает через `save_character`. */
+	suggestNames: (project: string, characters: RowRef[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<NameSuggestionsDto_Serialize>("suggest_names", { project, characters, profile, progress }),
 	/**  Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `save_term`. */
 	suggestTerms: (project: string, terms: RowRef[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<TermSuggestionsDto_Serialize>("suggest_terms", { project, terms, profile, progress }),
 	/**  Перевод подписей и род говорящих моделью. Отмеченное окно записывает через `save_speaker_entry`. */
@@ -333,6 +335,60 @@ export type LlmSettingsDto_Serialize = {
 	keysPersistent: boolean,
 	defaultReasoningTokens: number,
 	defaultTimeoutSecs: number,
+};
+
+/**  Поле имени, происхождение которого определила модель. */
+export type NameField = "first" | "last" | "form";
+
+/**  Написания одного поля персонажа. */
+export type NameSuggestionDto = NameSuggestionDto_Serialize | NameSuggestionDto_Deserialize;
+
+/**  Написания одного поля персонажа. */
+export type NameSuggestionDto_Deserialize = {
+	character: RowRef,
+	field: NameField,
+	/**  Написание в игре: у формы по нему находится сама форма. */
+	source: string,
+	origin?: string | null,
+	/**  Что запишется: сначала выбор модели, окно меняет его вариантом или правкой. */
+	translation: string,
+	variants: NameVariantDto_Deserialize[],
+};
+
+/**  Написания одного поля персонажа. */
+export type NameSuggestionDto_Serialize = {
+	character: RowRef,
+	field: NameField,
+	/**  Написание в игре: у формы по нему находится сама форма. */
+	source: string,
+	origin: string | null,
+	/**  Что запишется: сначала выбор модели, окно меняет его вариантом или правкой. */
+	translation: string,
+	variants: NameVariantDto_Serialize[],
+};
+
+export type NameSuggestionsDto = NameSuggestionsDto_Serialize | NameSuggestionsDto_Deserialize;
+
+export type NameSuggestionsDto_Deserialize = {
+	items: NameSuggestionDto_Deserialize[],
+	error?: string | null,
+};
+
+export type NameSuggestionsDto_Serialize = {
+	items: NameSuggestionDto_Serialize[],
+	error: string | null,
+};
+
+export type NameVariantDto = NameVariantDto_Serialize | NameVariantDto_Deserialize;
+
+export type NameVariantDto_Deserialize = {
+	translation: string,
+	description?: string | null,
+};
+
+export type NameVariantDto_Serialize = {
+	translation: string,
+	description: string | null,
 };
 
 /**  Профиль. Пустое поле значит значение из кода. */

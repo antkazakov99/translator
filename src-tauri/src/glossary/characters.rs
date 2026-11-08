@@ -243,7 +243,7 @@ impl Character {
 }
 
 /// Поле имени, происхождение которого определила модель.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum NameField {
     First,

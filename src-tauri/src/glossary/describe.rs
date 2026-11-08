@@ -7,10 +7,10 @@ use tauri::ipc::Channel;
 
 use super::repo::{LineSampleRepo, SampleLine};
 use super::suggest::{
-    SPEAKER_SAMPLES, SpeakerItem, SpeakerSuggestion, SpeakersPrompt, TOKEN_SAMPLES, TermItem, TermSuggestion, TermsPrompt, TokenItem,
-    TokenSuggestion, TokensPrompt, sample_line, spread, token_line,
+    NameSuggestion, NamesPrompt, SPEAKER_SAMPLES, SpeakerItem, SpeakerSuggestion, SpeakersPrompt, TOKEN_SAMPLES, TermItem, TermSuggestion,
+    TermsPrompt, TokenItem, TokenSuggestion, TokensPrompt, cast, form_items, name_items, sample_line, spread, token_line,
 };
-use super::{CharacterId, GlossaryData, SpeakerRepo, TermId};
+use super::{Character, CharacterId, GlossaryData, SpeakerRepo, TermId};
 use crate::common::AppError;
 use crate::engines::{ContainerKey, SpeakerKey};
 use crate::llm::{Action, ChatRequest, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunProgress, RunStatus};
@@ -108,15 +108,42 @@ pub struct NamesService<'a> {
 }
 
 impl NamesService<'_> {
-    /// Имена всей группой в два шага: имена и фамилии, потом остальные формы. Возвращает предложения для отбора.
+    /// Имена без перевода всей группой в два шага одного запуска: имена и фамилии, потом формы от написанных имён.
+    /// Возвращает предложения для отбора.
     pub async fn translate_names(
         &self,
         project: ProjectId,
         characters: Vec<CharacterId>,
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
-    ) -> Result<serde_json::Value, AppError> {
-        todo!()
+    ) -> Result<Suggestions<NameSuggestion>, AppError> {
+        let open = self.state.open_project(project)?;
+        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Names, one_off)?;
+        let glossary = open.project.read(|tx| GlossaryData::load(tx))?;
+        let context = GlossaryContext::new(&glossary);
+        let cast = cast(&glossary.characters);
+        let chosen: Vec<&Character> =
+            glossary.characters.iter().filter(|character| character.id().is_some_and(|id| characters.contains(&id))).collect();
+        let names = chunks(name_items(&chosen), &target);
+        let forms = form_items(&chosen, &[]).len().div_ceil(target.settings.batch_size.get());
+        if names.is_empty() && forms == 0 {
+            return Ok(Suggestions { items: Vec::new(), error: None });
+        }
+        let mut run = BatchRun::begin(self.state, &open, Action::Names, &target, progress, names.len() + forms)?;
+        let mut items = Vec::new();
+        for batch in &names {
+            let request = NamesPrompt::build(batch, &cast, &context.hints, &target);
+            if !run.ask(&request, &mut items, |text| NamesPrompt::accept(text, batch)).await {
+                return run.finish(items);
+            }
+        }
+        for batch in chunks(form_items(&chosen, &items), &target) {
+            let request = NamesPrompt::build(&batch, &cast, &context.hints, &target);
+            if !run.ask(&request, &mut items, |text| NamesPrompt::accept(text, &batch)).await {
+                break;
+            }
+        }
+        run.finish(items)
     }
 
     /// Перевод, категория и описание терминов. Модель видит своё описание термина и реплику с ним.
@@ -277,40 +304,75 @@ async fn run_batches<T>(
     if requests.is_empty() {
         return Ok(Suggestions { items: Vec::new(), error: None });
     }
-    let run = LlmRun::begin(state, Some(open.clone()), action, target, progress)?;
-    let client = LlmClient::for_kind(target.provider.kind());
-    let mut result = Suggestions { items: Vec::new(), error: None };
-    let mut report = RunProgress { total: requests.len() as u32, ..RunProgress::default() };
-    run.report(report.clone());
+    let mut run = BatchRun::begin(state, open, action, target, progress, requests.len())?;
+    let mut items = Vec::new();
     for (index, request) in requests.iter().enumerate() {
-        if run.cancelled() {
+        if !run.ask(request, &mut items, |text| accept(index, text)).await {
             break;
         }
-        match ask(client, target, request, &run).await {
+    }
+    run.finish(items)
+}
+
+/// Ход запуска предложений по пакетам: место запуска, прогресс, ошибка, которая обрывает запуск.
+struct BatchRun<'a> {
+    run: LlmRun,
+    client: LlmClient,
+    target: &'a LlmTarget,
+    report: RunProgress,
+    error: Option<String>,
+}
+
+impl<'a> BatchRun<'a> {
+    fn begin(
+        state: &AppState,
+        open: &Arc<OpenProject>,
+        action: Action,
+        target: &'a LlmTarget,
+        progress: Channel<RunProgress>,
+        total: usize,
+    ) -> Result<Self, AppError> {
+        let run = LlmRun::begin(state, Some(open.clone()), action, target, progress)?;
+        let report = RunProgress { total: total as u32, ..RunProgress::default() };
+        run.report(report.clone());
+        Ok(Self { run, client: LlmClient::for_kind(target.provider.kind()), target, report, error: None })
+    }
+
+    /// Пакет: запрос, разбор в `items`, отчёт. `false`: запуск остановлен или оборвался, дальше не спрашивать.
+    async fn ask<T>(&mut self, request: &ChatRequest, items: &mut Vec<T>, accept: impl FnOnce(&str) -> Vec<T>) -> bool {
+        if self.run.cancelled() || self.error.is_some() {
+            return false;
+        }
+        match ask(self.client, self.target, request, &self.run).await {
             Ok(Some(text)) => {
-                let accepted = accept(index, &text);
+                let accepted = accept(&text);
                 if accepted.is_empty() {
                     tracing::warn!("Из ответа модели ничего не взято:\n{text}");
                 }
-                result.items.extend(accepted);
+                items.extend(accepted);
             }
             Ok(None) => tracing::warn!("Модель отказалась отвечать на пакет, он пропущен"),
             Err(error) => {
-                result.error = Some(error.to_string());
-                break;
+                self.error = Some(error.to_string());
+                return false;
             }
         }
-        report.done += 1;
-        report.written = result.items.len() as u32;
-        run.report(report.clone());
+        self.report.done += 1;
+        self.report.written = items.len() as u32;
+        self.run.report(self.report.clone());
+        !self.run.cancelled()
     }
-    let status = match &result.error {
-        Some(_) => RunStatus::Failed,
-        None if run.cancelled() => RunStatus::Cancelled,
-        None => RunStatus::Done,
-    };
-    run.finish(status, result.error.as_deref())?;
-    Ok(result)
+
+    /// Итог в `llm_runs`. Готовое не теряется и при ошибке.
+    fn finish<T>(self, items: Vec<T>) -> Result<Suggestions<T>, AppError> {
+        let status = match &self.error {
+            Some(_) => RunStatus::Failed,
+            None if self.run.cancelled() => RunStatus::Cancelled,
+            None => RunStatus::Done,
+        };
+        self.run.finish(status, self.error.as_deref())?;
+        Ok(Suggestions { items, error: self.error })
+    }
 }
 
 /// Один запрос с повтором при сбое сети. `None`: модель отказалась отвечать.
@@ -332,7 +394,7 @@ async fn ask(client: LlmClient, target: &LlmTarget, request: &ChatRequest, run: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glossary::{GlossaryService, TermCategory};
+    use crate::glossary::{GlossaryService, NameField, TermCategory};
     use crate::llm::client::tests::{completion, fake_model};
     use crate::llm::{LlmSettingsService, Profile, Provider, ProviderKind};
     use crate::projects::ProjectService;
@@ -412,6 +474,61 @@ mod tests {
             .unwrap();
         assert_eq!((translation, runs), (None, 2), "предложения в базу не пишутся, запуски записаны");
         assert!(!state.llm_run.is_active());
+    }
+
+    #[test]
+    fn names_go_first_and_forms_are_built_on_the_spelled_name() {
+        let (url, seen) = fake_model(|body| {
+            let user = user_text(body);
+            let answer = if user.contains("form of") {
+                r#"[{"id": 1, "origin": "английский", "translated_name": "Мисс Ли", "variants": []}]"#
+            } else {
+                r#"[{"id": 1, "origin": "Английский", "translated_name": "Эйлин", "variants": [{"source": "Eileen", "translated": "Айлин", "description": "Ирландское чтение"}]},
+                    {"id": 2, "translated_name": "Ли"}]"#
+            };
+            completion(answer)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let glossary = GlossaryService { state: &state };
+        let eileen = glossary.create_character(id, "Eileen").unwrap();
+        let open = state.open_project(id).unwrap();
+        let mut character = open.project.read(|tx| GlossaryData::load(tx)).unwrap().characters.remove(0);
+        character.set_last_name("Lee");
+        character.set_gender(Some(crate::common::Gender::Female));
+        character.add_form(crate::glossary::Form::new("Miss Lee", None).unwrap()).unwrap();
+        glossary.save_character(id, &character).unwrap();
+        open.project
+            .write(|tx| {
+                tx.execute("INSERT INTO llm_action_settings (action_id, batch_size) VALUES ('names', 5)", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        let found = tauri::async_runtime::block_on(NamesService { state: &state }.translate_names(id, vec![eileen], None, silent())).unwrap();
+        assert_eq!(found.error, None);
+        let spelled: Vec<(NameField, &str, Vec<&str>)> = found
+            .items
+            .iter()
+            .map(|item| (item.field, item.source.as_str(), item.variants.iter().map(|variant| variant.translation.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            spelled,
+            [
+                (NameField::First, "Eileen", vec!["Эйлин", "Айлин"]),
+                (NameField::Last, "Lee", vec!["Ли"]),
+                (NameField::Form, "Miss Lee", vec!["Мисс Ли"]),
+            ]
+        );
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first = user_text(&requests[0]);
+        assert!(first.contains("All names in this game: Eileen Lee\n"), "{first}");
+        assert!(first.contains("- id: 1, name: \"Eileen\", given name of a woman\n- id: 2, name: \"Lee\", surname of a woman\n"), "{first}");
+        assert!(user_text(&requests[1]).contains("- id: 1, name: \"Miss Lee\", name of a woman, form of Эйлин Ли\n"));
+        let translated: Option<String> =
+            open.project.read(|tx| Ok(tx.query_row("SELECT translated_first_name FROM characters", [], |row| row.get(0))?)).unwrap();
+        assert_eq!(translated, None, "предложения в базу не пишутся");
     }
 
     #[test]

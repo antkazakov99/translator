@@ -7,7 +7,8 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
 use super::{
-    Character, CharacterId, Form, GlossaryOverview, GlossaryService, NameKey, NamesService, SpeakerEntry, SpeakerSuggestion, Term,
+    Character, CharacterId, Form, GlossaryOverview, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
+    SpeakerSuggestion, Term,
     TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
 };
 use crate::common::{AppError, Gender, Timestamp};
@@ -467,6 +468,34 @@ pub struct TokenSuggestionDto {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NameVariantDto {
+    pub translation: String,
+    pub description: Option<String>,
+}
+
+/// Написания одного поля персонажа.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NameSuggestionDto {
+    pub character: RowRef,
+    pub field: NameField,
+    /// Написание в игре: у формы по нему находится сама форма.
+    pub source: String,
+    pub origin: Option<String>,
+    /// Что запишется: сначала выбор модели, окно меняет его вариантом или правкой.
+    pub translation: String,
+    pub variants: Vec<NameVariantDto>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct NameSuggestionsDto {
+    pub items: Vec<NameSuggestionDto>,
+    pub error: Option<String>,
+}
+
 /// Предложения запуска. `error`: запуск оборвался, готовые предложения всё равно пришли.
 #[derive(Debug, Clone, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -491,6 +520,39 @@ pub struct TokenSuggestionsDto {
 
 fn profile(id: Option<String>) -> Result<Option<ProfileId>, AppError> {
     Ok(id.as_deref().map(ProfileId::parse).transpose()?)
+}
+
+/// Перевод имён, фамилий и форм персонажей без перевода. Отмеченное окно записывает через `save_character`.
+#[tauri::command]
+#[specta::specta]
+pub async fn suggest_names(
+    state: State<'_, AppState>,
+    project: String,
+    characters: Vec<RowRef>,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<NameSuggestionsDto, String> {
+    let characters = characters.iter().map(|id| CharacterId::from_row(id.0)).collect();
+    let found = NamesService { state: &state }.translate_names(self::project(&project)?, characters, self::profile(profile)?, progress).await?;
+    Ok(NameSuggestionsDto {
+        items: found
+            .items
+            .into_iter()
+            .map(|item: NameSuggestion| NameSuggestionDto {
+                character: RowRef(item.character.get()),
+                field: item.field,
+                source: item.source,
+                origin: item.origin,
+                translation: item.variants.first().map(|variant| variant.translation.clone()).unwrap_or_default(),
+                variants: item
+                    .variants
+                    .into_iter()
+                    .map(|variant: NameVariant| NameVariantDto { translation: variant.translation, description: variant.description })
+                    .collect(),
+            })
+            .collect(),
+        error: found.error,
+    })
 }
 
 /// Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `save_term`.

@@ -1,12 +1,28 @@
 <script lang="ts">
-  import { LoaderCircle, Plus, Trash2 } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Plus, Trash2 } from "lucide-svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
+  import SuggestStatus from "./SuggestStatus.svelte";
   import { commands } from "./bindings";
-  import { characterName, characterTranslation, genders, matches, speakerName, type Character, type Glossary, type NameForm } from "./glossary";
+  import {
+    characterName,
+    characterTranslation,
+    genders,
+    matches,
+    nameFieldLabels,
+    runsBusy,
+    speakerName,
+    untranslatedNames,
+    withSpelledNames,
+    type Character,
+    type Glossary,
+    type GlossaryRuns,
+    type NameForm,
+  } from "./glossary";
 
   let {
     projectId,
     data,
+    runs,
     selected = $bindable(null),
     reload,
     patch,
@@ -14,12 +30,56 @@
   }: {
     projectId: string;
     data: Glossary;
+    runs: GlossaryRuns;
     selected: number | null;
     reload: () => Promise<void>;
     /** Сохранённый персонаж без перечитывания глоссария: правка в соседнем поле не теряется. */
     patch: (character: Character) => void;
     onError: (message: string) => void;
   } = $props();
+
+  const run = $derived(runs.names);
+  /** Имена, фамилии и формы без перевода у всех персонажей. */
+  const untranslated = $derived(data.characters.reduce((sum, character) => sum + untranslatedNames(character), 0));
+  let writing = $state(false);
+
+  function runTitle() {
+    if (untranslated === 0) return "У всех имён, фамилий и форм есть перевод";
+    if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
+    return "Модель предложит написание имён, фамилий и форм без перевода: сначала имён, потом форм от них";
+  }
+
+  function startRun() {
+    const ids = data.characters.filter((character) => untranslatedNames(character) > 0).map((character) => character.id);
+    run.start((channel) => commands.suggestNames(projectId, ids, null, channel), onError);
+  }
+
+  /** Отмеченное ложится в пустые поля карточки и записывается персонажем целиком. */
+  async function writeChosen() {
+    const chosen = run.chosen.filter((item) => item.translation.trim());
+    writing = true;
+    try {
+      let written = 0;
+      for (const id of new Set(chosen.map((item) => item.character))) {
+        const character = data.characters.find((known) => known.id === id);
+        const next = character && withSpelledNames($state.snapshot(character), chosen.filter((item) => item.character === id));
+        if (!next) continue;
+        await commands.saveCharacter(projectId, next);
+        written += 1;
+      }
+      run.finish(`Записано персонажей: ${written}`);
+      await reload();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      writing = false;
+    }
+  }
+
+  function owner(id: number) {
+    const character = data.characters.find((known) => known.id === id);
+    return character ? characterName(character) : "Удалённый персонаж";
+  }
 
   let query = $state("");
   let newName = $state("");
@@ -96,6 +156,58 @@
   }
 </script>
 
+<div class="toolbar">
+  <div class="toolbar-title">
+    <strong>Персонажи</strong>
+    <span>Имена с переводом и родом: модель видит их в каждой реплике, где они встречаются</span>
+  </div>
+  <button class="btn small primary" disabled={untranslated === 0 || runsBusy(runs)} title={runTitle()} onclick={startRun}>
+    {#if run.active}<LoaderCircle size={13} class="spin" />{:else}<Languages size={13} />{/if}
+    <span>Перевести имена · {untranslated}</span>
+  </button>
+</div>
+
+<SuggestStatus {run} {onError} />
+
+{#if run.review}
+  <div class="list">
+    <p class="pick-head">Написания от модели. Отмеченные запишутся в пустые поля персонажей, написание можно выбрать из вариантов или поправить</p>
+    {#each run.review as item, index (index)}
+      {@const variant = item.variants.find((variant) => variant.translation === item.translation.trim())}
+      <div class="pick-row names" class:off={!item.selected}>
+        <input type="checkbox" bind:checked={item.selected} aria-label="Записать написание «{item.source}»" />
+        <div class="name">
+          <strong>{item.source}</strong>
+          <span>{nameFieldLabels[item.field]} · {owner(item.character)}{item.origin ? ` · ${item.origin}` : ""}</span>
+        </div>
+        <input class="input" bind:value={item.translation} aria-label="Написание «{item.source}»" />
+        <div class="variants">
+          {#if item.variants.length > 1}
+            <div class="segmented" role="radiogroup" aria-label="Варианты написания «{item.source}»">
+              {#each item.variants as variant (variant.translation)}
+                <button
+                  role="radio"
+                  aria-checked={item.translation.trim() === variant.translation}
+                  class:on={item.translation.trim() === variant.translation}
+                  title={variant.description ?? ""}
+                  onclick={() => (item.translation = variant.translation)}>{variant.translation}</button
+                >
+              {/each}
+            </div>
+          {/if}
+          <span class="faint">{variant ? (variant.description ?? "") : item.translation.trim() ? "Своё написание" : ""}</span>
+        </div>
+      </div>
+    {/each}
+  </div>
+  <div class="pick-actions">
+    <button class="btn small" disabled={writing} onclick={() => run.discard()}>Отбросить</button>
+    <button class="btn small primary" disabled={writing || run.chosen.length === 0} onclick={writeChosen}>
+      {#if writing}<LoaderCircle size={13} class="spin" />{:else}<Check size={13} />{/if}
+      <span>Записать выбранные · {run.chosen.length}</span>
+    </button>
+  </div>
+{:else}
 <div class="master">
   <div class="list-side">
     <input class="input" placeholder="Поиск по имени и формам" bind:value={query} aria-label="Поиск персонажей" />
@@ -182,3 +294,18 @@
     </div>
   {/if}
 </div>
+{/if}
+
+<style>
+  .variants {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: flex-start;
+    min-width: 0;
+  }
+
+  .variants .segmented {
+    flex-wrap: wrap;
+  }
+</style>

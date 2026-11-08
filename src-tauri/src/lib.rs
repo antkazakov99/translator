@@ -73,6 +73,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             discard_term_name,
             restore_term_name,
             save_token,
+            suggest_names,
             suggest_terms,
             suggest_speakers,
             suggest_tokens,

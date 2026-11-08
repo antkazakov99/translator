@@ -3,6 +3,8 @@ import type {
   FormDto_Serialize,
   Gender,
   GlossaryDto_Serialize,
+  NameField,
+  NameSuggestionDto_Serialize,
   SpeakerDto_Serialize,
   SpeakerSuggestionDto_Serialize,
   TermCategory,
@@ -19,12 +21,14 @@ export type Speaker = SpeakerDto_Serialize;
 export type Term = TermDto_Serialize;
 export type Token = TokenDto_Serialize;
 export type NameForm = FormDto_Serialize;
+export type NameSuggestion = NameSuggestionDto_Serialize;
 export type TermSuggestion = TermSuggestionDto_Serialize;
 export type SpeakerSuggestion = SpeakerSuggestionDto_Serialize;
 export type TokenSuggestion = TokenSuggestionDto_Serialize;
 
 /** Запуски предложений модели по разделам глоссария. */
 export type GlossaryRuns = {
+  names: SuggestRun<NameSuggestion>;
   terms: SuggestRun<TermSuggestion>;
   speakers: SuggestRun<SpeakerSuggestion>;
   tokens: SuggestRun<TokenSuggestion>;
@@ -43,6 +47,46 @@ export function characterName(character: Pick<Character, "firstName" | "lastName
 /** Перевод имени и фамилии, если он есть. */
 export function characterTranslation(character: Pick<Character, "translatedFirstName" | "translatedLastName">) {
   return [character.translatedFirstName, character.translatedLastName].filter((part) => part?.trim()).join(" ");
+}
+
+/** Сколько у персонажа имён, фамилий и форм без перевода: их спросит перевод имён моделью. */
+export function untranslatedNames(character: Character) {
+  const filled = (text: string | null) => Boolean(text?.trim());
+  return (
+    Number(filled(character.firstName) && !filled(character.translatedFirstName)) +
+    Number(filled(character.lastName) && !filled(character.translatedLastName)) +
+    character.forms.filter((form) => !filled(form.translation)).length
+  );
+}
+
+export const nameFieldLabels: Record<NameField, string> = { first: "Имя", last: "Фамилия", form: "Форма" };
+
+/**
+ * Персонаж с отмеченными написаниями. Пишется только пустое поле: перевод, который появился в карточке
+ * за время запуска, не заменяется. Возвращает `null`, если писать нечего.
+ */
+export function withSpelledNames(character: Character, chosen: Pick<NameSuggestion, "field" | "source" | "translation">[]): Character | null {
+  const next: Character = { ...character, forms: character.forms.map((form) => ({ ...form })) };
+  const sameName = (one: string, other: string) => one.trim().toLowerCase() === other.trim().toLowerCase();
+  let changed = false;
+  for (const item of chosen) {
+    const translation = item.translation.trim();
+    if (!translation) continue;
+    if (item.field === "first" && !next.translatedFirstName?.trim()) {
+      next.translatedFirstName = translation;
+      changed = true;
+    } else if (item.field === "last" && !next.translatedLastName?.trim()) {
+      next.translatedLastName = translation;
+      changed = true;
+    } else if (item.field === "form") {
+      const form = next.forms.find((own) => sameName(own.text, item.source) && !own.translation?.trim());
+      if (form) {
+        form.translation = translation;
+        changed = true;
+      }
+    }
+  }
+  return changed ? next : null;
 }
 
 /** Подпись говорящего: подпись из игры, иначе ключ без вида. */

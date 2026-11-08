@@ -106,13 +106,15 @@
         }}
       />
     {:else if section === "characters"}
-      <div class="toolbar">
-        <div class="toolbar-title">
-          <strong>Персонажи</strong>
-          <span>Имена с переводом и родом: модель видит их в каждой реплике, где они встречаются</span>
-        </div>
-      </div>
-      <GlossaryCharacters {projectId} {data} bind:selected={character} reload={load} patch={patchCharacter} onError={(message) => (error = message)} />
+      <GlossaryCharacters
+        {projectId}
+        {data}
+        {runs}
+        bind:selected={character}
+        reload={load}
+        patch={patchCharacter}
+        onError={(message) => (error = message)}
+      />
     {:else if section === "terms"}
       <GlossaryTerms {projectId} {data} {runs} reload={load} patch={patchTerm} onError={(message) => (error = message)} />
     {:else}
@@ -399,6 +401,10 @@
     align-items: center;
     padding: 8px 4px;
     border-bottom: 1px solid var(--divider-row);
+  }
+
+  .glossary :global(.pick-row.names) {
+    grid-template-columns: auto minmax(160px, 1fr) minmax(140px, 1fr) 1.6fr;
   }
 
   .glossary :global(.pick-row.terms) {

@@ -3,7 +3,7 @@ import { commands, type RunProgress_Deserialize as RunProgress } from "./binding
 import type { GlossaryRuns } from "./glossary";
 
 export function glossaryRuns(): GlossaryRuns {
-  return { terms: new SuggestRun("Термины"), speakers: new SuggestRun("Подписи"), tokens: new SuggestRun("Токены") };
+  return { names: new SuggestRun("Имена"), terms: new SuggestRun("Термины"), speakers: new SuggestRun("Подписи"), tokens: new SuggestRun("Токены") };
 }
 
 /** Предложение в отборе: отмеченные записываются в глоссарий. */

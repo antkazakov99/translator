@@ -34,10 +34,15 @@ pub fn fill_tokens(text: &str, values: &std::collections::HashMap<String, String
         .into_owned()
 }
 
+/// Текст без токенов и тегов.
+pub fn outside_markers(text: &str) -> String {
+    let text = TAG.replace_all(text, "");
+    TOKEN.replace_all(&text, "").into_owned()
+}
+
 /// Буквы вне токенов и тегов.
 fn letters_outside_markers(text: &str) -> usize {
-    let text = TAG.replace_all(text, "");
-    TOKEN.replace_all(&text, "").chars().filter(|c| c.is_alphabetic()).count()
+    outside_markers(text).chars().filter(|c| c.is_alphabetic()).count()
 }
 
 /// Реплика, где кроме токенов и тегов нет букв, вроде «...» или «[mc]!»: её перевод совпадает с оригиналом.
