@@ -624,3 +624,50 @@ impl NoteRepo<'_> {
         todo!()
     }
 }
+
+/// Реплика текущего снимка для образца в запросе модели.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleLine {
+    /// Подпись говорящего, у говорящего без подписи хвост ключа.
+    pub speaker: Option<String>,
+    pub text: String,
+}
+
+/// Реплики текущего снимка в порядке сюжета: образцы для предложений модели.
+pub struct LineSampleRepo<'c> {
+    pub conn: &'c Connection,
+}
+
+impl LineSampleRepo<'_> {
+    const SELECT: &'static str = "SELECT sp.label, s.speaker_key, s.source_text
+         FROM segments s
+         LEFT JOIN containers c ON c.id = s.container_id
+         LEFT JOIN speakers sp ON sp.key = s.speaker_key
+         WHERE s.missing = 0";
+    const ORDER: &'static str = "ORDER BY c.story_order IS NULL, c.story_order, s.story_order IS NULL, s.story_order, s.id";
+
+    /// Все реплики говорящего.
+    pub fn of_speaker(&self, key: &SpeakerKey) -> Result<Vec<SampleLine>, DbError> {
+        self.query(&format!("{} AND s.speaker_key = ?1 {}", Self::SELECT, Self::ORDER), key.as_str())
+    }
+
+    /// Реплики, где есть `text`, без учёта регистра латиницы. Границы слов проверяет сервис. `None`: все.
+    pub fn containing(&self, text: &str, limit: Option<usize>) -> Result<Vec<SampleLine>, DbError> {
+        let limit = limit.map(|limit| format!(" LIMIT {limit}")).unwrap_or_default();
+        self.query(&format!("{} AND instr(lower(s.source_text), lower(?1)) > 0 {}{limit}", Self::SELECT, Self::ORDER), text)
+    }
+
+    fn query(&self, sql: &str, value: &str) -> Result<Vec<SampleLine>, DbError> {
+        let mut statement = self.conn.prepare(sql)?;
+        let rows = statement
+            .query_map([value], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(label, key, text)| SampleLine {
+                speaker: label.or_else(|| key.map(|key| key.split_once(':').map_or(key.as_str(), |(_, tail)| tail).to_string())),
+                text,
+            })
+            .collect())
+    }
+}

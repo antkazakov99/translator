@@ -3,13 +3,18 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::ipc::Channel;
+use tauri::{AppHandle, State};
 
-use super::{Character, CharacterId, Form, GlossaryOverview, GlossaryService, NameKey, SpeakerEntry, Term, TermCategory, TermId, Token};
+use super::{
+    Character, CharacterId, Form, GlossaryOverview, GlossaryService, NameKey, NamesService, SpeakerEntry, SpeakerSuggestion, Term,
+    TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
+};
 use crate::common::{AppError, Gender, Timestamp};
 use crate::engines::SpeakerKey;
+use crate::llm::{ProfileId, RunProgress};
 use crate::projects::ProjectId;
-use crate::state::blocking;
+use crate::state::{AppState, blocking};
 use crate::translation::commands::RowRef;
 
 /// Как разобран говорящий.
@@ -432,4 +437,132 @@ pub async fn save_token(app: AppHandle, project: String, name: String, value: St
         GlossaryService { state }.save_token(self::project(&project)?, &token)
     })
     .await
+}
+
+/// Предложение перевода термина.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TermSuggestionDto {
+    pub id: RowRef,
+    pub translation: String,
+    /// `None`: категория остаётся прежней.
+    pub category: Option<TermCategory>,
+    /// Только у термина без своего описания.
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerSuggestionDto {
+    pub key: String,
+    pub translation: String,
+    pub gender: Option<Gender>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenSuggestionDto {
+    pub name: String,
+    pub value: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Предложения запуска. `error`: запуск оборвался, готовые предложения всё равно пришли.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TermSuggestionsDto {
+    pub items: Vec<TermSuggestionDto>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerSuggestionsDto {
+    pub items: Vec<SpeakerSuggestionDto>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenSuggestionsDto {
+    pub items: Vec<TokenSuggestionDto>,
+    pub error: Option<String>,
+}
+
+fn profile(id: Option<String>) -> Result<Option<ProfileId>, AppError> {
+    Ok(id.as_deref().map(ProfileId::parse).transpose()?)
+}
+
+/// Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `save_term`.
+#[tauri::command]
+#[specta::specta]
+pub async fn suggest_terms(
+    state: State<'_, AppState>,
+    project: String,
+    terms: Vec<RowRef>,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<TermSuggestionsDto, String> {
+    let terms = terms.iter().map(|id| TermId::from_row(id.0)).collect();
+    let found = NamesService { state: &state }.translate_terms(self::project(&project)?, terms, self::profile(profile)?, progress).await?;
+    Ok(TermSuggestionsDto {
+        items: found
+            .items
+            .into_iter()
+            .map(|item: TermSuggestion| TermSuggestionDto {
+                id: RowRef(item.id.get()),
+                translation: item.translation,
+                category: item.category,
+                description: item.description,
+            })
+            .collect(),
+        error: found.error,
+    })
+}
+
+/// Перевод подписей и род говорящих моделью. Отмеченное окно записывает через `save_speaker_entry`.
+#[tauri::command]
+#[specta::specta]
+pub async fn suggest_speakers(
+    state: State<'_, AppState>,
+    project: String,
+    speakers: Vec<String>,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<SpeakerSuggestionsDto, String> {
+    let speakers = speakers.iter().map(|key| speaker(key)).collect::<Result<Vec<_>, _>>()?;
+    let found = NamesService { state: &state }.suggest_speakers(self::project(&project)?, speakers, self::profile(profile)?, progress).await?;
+    Ok(SpeakerSuggestionsDto {
+        items: found
+            .items
+            .into_iter()
+            .map(|item: SpeakerSuggestion| SpeakerSuggestionDto {
+                key: item.key.as_str().to_string(),
+                translation: item.translation,
+                gender: item.gender,
+            })
+            .collect(),
+        error: found.error,
+    })
+}
+
+/// Значения и пояснения токенов моделью. Отмеченное окно записывает через `save_token`.
+#[tauri::command]
+#[specta::specta]
+pub async fn suggest_tokens(
+    state: State<'_, AppState>,
+    project: String,
+    tokens: Vec<String>,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<TokenSuggestionsDto, String> {
+    let found = NamesService { state: &state }.suggest_tokens(self::project(&project)?, tokens, self::profile(profile)?, progress).await?;
+    Ok(TokenSuggestionsDto {
+        items: found
+            .items
+            .into_iter()
+            .map(|item: TokenSuggestion| TokenSuggestionDto { name: item.name, value: item.value, note: item.note })
+            .collect(),
+        error: found.error,
+    })
 }

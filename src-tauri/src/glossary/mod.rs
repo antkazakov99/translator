@@ -9,14 +9,16 @@ pub mod repo;
 pub mod scenes;
 pub mod service;
 pub mod speakers;
+pub mod suggest;
 pub mod terms;
 pub mod tokens;
 
 pub use characters::{Character, CharacterId, Form, NameField, NameOrigin};
-pub use describe::{DescribeService, DescribeTarget, NamesService, ReadingDepth};
+pub use describe::{DescribeService, DescribeTarget, NamesService, ReadingDepth, Suggestions};
 pub use key::NameKey;
 pub use notes::{Note, NoteOwner};
-pub use repo::{CharacterRepo, NoteRepo, SceneDescriptionRepo, SpeakerRepo, SpeakerUse, TermRepo, TokenRepo};
+pub use repo::{CharacterRepo, LineSampleRepo, NoteRepo, SampleLine, SceneDescriptionRepo, SpeakerRepo, SpeakerUse, TermRepo, TokenRepo};
+pub use suggest::{SpeakerSuggestion, TermSuggestion, TokenSuggestion};
 pub use scenes::SceneDescription;
 pub use service::{ExcludeOwner, GlossaryData, GlossaryOverview, GlossaryService};
 pub use speakers::{Speaker, SpeakerEntry, SpeakerLink, speaker_gender};

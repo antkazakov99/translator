@@ -1,13 +1,54 @@
 <script lang="ts">
+  import { Check, LoaderCircle, Sparkles } from "lucide-svelte";
+  import SuggestStatus from "./SuggestStatus.svelte";
   import { commands } from "./bindings";
-  import { matches, type Glossary, type Token } from "./glossary";
+  import { matches, runsBusy, type Glossary, type GlossaryRuns, type Token } from "./glossary";
 
   let {
     projectId,
     data,
+    runs,
+    reload,
     patch,
     onError,
-  }: { projectId: string; data: Glossary; patch: (token: Token) => void; onError: (message: string) => void } = $props();
+  }: {
+    projectId: string;
+    data: Glossary;
+    runs: GlossaryRuns;
+    reload: () => Promise<void>;
+    patch: (token: Token) => void;
+    onError: (message: string) => void;
+  } = $props();
+
+  const run = $derived(runs.tokens);
+  /** Токены из текста игры без значения и пояснения: модели есть что читать, а глоссарию нечего показать. */
+  const empty = $derived(data.tokens.filter((token) => token.lines > 0 && !token.value?.trim() && !token.note?.trim()));
+  let writing = $state(false);
+
+  function runTitle() {
+    if (empty.length === 0) return "У всех токенов из текста игры есть значение или пояснение";
+    if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
+    return "Модель прочитает реплики с токеном, не видя его имени, и предложит значение и пояснение";
+  }
+
+  function startRun() {
+    const names = empty.map((token) => token.name);
+    run.start((channel) => commands.suggestTokens(projectId, names, null, channel), onError);
+  }
+
+  async function writeChosen() {
+    const chosen = run.chosen.filter((item) => item.value?.trim() || item.note?.trim());
+    writing = true;
+    try {
+      for (const item of chosen) await commands.saveToken(projectId, item.name, item.value?.trim() ?? "", item.note?.trim() ?? "");
+      run.finish(`Записано токенов: ${chosen.length}`);
+      await reload();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      writing = false;
+    }
+  }
 
   let query = $state("");
   let busy = $state<string | null>(null);
@@ -32,8 +73,38 @@
     <span>Переменные в тексте игры. Значение подставляется в реплику перед переводом, токен без значения остаётся в тексте, а модель видит пояснение</span>
   </div>
   <input class="input search" placeholder="Поиск" bind:value={query} aria-label="Поиск токенов" />
+  <button class="btn small primary" disabled={empty.length === 0 || runsBusy(runs)} title={runTitle()} onclick={startRun}>
+    {#if run.active}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
+    <span>Предложить · {empty.length}</span>
+  </button>
 </div>
 
+<SuggestStatus {run} {onError} />
+
+{#if run.review}
+  <div class="list">
+    <p class="pick-head">Предложения модели. Отмеченные запишутся в токены, значение и пояснение можно поправить</p>
+    {#each run.review as item (item.name)}
+      {@const token = data.tokens.find((known) => known.name === item.name)}
+      <div class="pick-row tokens" class:off={!item.selected}>
+        <input type="checkbox" bind:checked={item.selected} aria-label="Записать токен {item.name}" />
+        <div class="name">
+          <strong><code>[{item.name}]</code></strong>
+          <span>реплик: {token?.lines ?? 0}</span>
+        </div>
+        <input class="input" bind:value={item.value} placeholder="Значение" aria-label="Значение токена {item.name}" />
+        <input class="input" bind:value={item.note} placeholder="Пояснение" aria-label="Пояснение токена {item.name}" />
+      </div>
+    {/each}
+  </div>
+  <div class="pick-actions">
+    <button class="btn small" disabled={writing} onclick={() => run.discard()}>Отбросить</button>
+    <button class="btn small primary" disabled={writing || run.chosen.length === 0} onclick={writeChosen}>
+      {#if writing}<LoaderCircle size={13} class="spin" />{:else}<Check size={13} />{/if}
+      <span>Записать выбранные · {run.chosen.length}</span>
+    </button>
+  </div>
+{:else}
 <div class="list">
   {#if shown.length > 0}
     <div class="token-row head">
@@ -71,6 +142,7 @@
     </div>
   {/each}
 </div>
+{/if}
 
 <style>
   .token-row {

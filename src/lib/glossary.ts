@@ -4,10 +4,14 @@ import type {
   Gender,
   GlossaryDto_Serialize,
   SpeakerDto_Serialize,
+  SpeakerSuggestionDto_Serialize,
   TermCategory,
   TermDto_Serialize,
+  TermSuggestionDto_Serialize,
   TokenDto_Serialize,
+  TokenSuggestionDto_Serialize,
 } from "./bindings";
+import type { SuggestRun } from "./suggest-run.svelte";
 
 export type Glossary = GlossaryDto_Serialize;
 export type Character = CharacterDto_Serialize;
@@ -15,6 +19,21 @@ export type Speaker = SpeakerDto_Serialize;
 export type Term = TermDto_Serialize;
 export type Token = TokenDto_Serialize;
 export type NameForm = FormDto_Serialize;
+export type TermSuggestion = TermSuggestionDto_Serialize;
+export type SpeakerSuggestion = SpeakerSuggestionDto_Serialize;
+export type TokenSuggestion = TokenSuggestionDto_Serialize;
+
+/** Запуски предложений модели по разделам глоссария. */
+export type GlossaryRuns = {
+  terms: SuggestRun<TermSuggestion>;
+  speakers: SuggestRun<SpeakerSuggestion>;
+  tokens: SuggestRun<TokenSuggestion>;
+};
+
+/** Идёт ли запуск или открыт отбор: новый запуск тогда недоступен. */
+export function runsBusy(runs: GlossaryRuns) {
+  return Object.values(runs).some((run) => run.active || run.review !== null);
+}
 
 /** Имя и фамилия через пробел, как подпись карточки. */
 export function characterName(character: Pick<Character, "firstName" | "lastName">) {

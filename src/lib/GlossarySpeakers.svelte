@@ -1,22 +1,65 @@
 <script lang="ts">
-  import { Link, LoaderCircle, MessageSquare, Undo2, UserPlus, Users, X, Trash2 } from "lucide-svelte";
+  import { Check, Languages, Link, LoaderCircle, MessageSquare, Undo2, UserPlus, Users, X, Trash2 } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
+  import SuggestStatus from "./SuggestStatus.svelte";
   import { commands, type Gender } from "./bindings";
-  import { characterName, genders, matches, speakerCode, speakerName, type Glossary, type Speaker } from "./glossary";
+  import {
+    characterName,
+    genders,
+    matches,
+    runsBusy,
+    speakerCode,
+    speakerName,
+    type Glossary,
+    type GlossaryRuns,
+    type Speaker,
+  } from "./glossary";
 
   let {
     projectId,
     data,
+    runs,
     reload,
     onError,
     onOpenCharacter,
   }: {
     projectId: string;
     data: Glossary;
+    runs: GlossaryRuns;
     reload: () => Promise<void>;
     onError: (message: string) => void;
     onOpenCharacter: (id: number) => void;
   } = $props();
+
+  const run = $derived(runs.speakers);
+  /** Модель переводит только разобранные подписи: у говорящего есть своя запись, а перевода в ней нет. */
+  const untranslated = $derived(data.speakers.filter((speaker) => speaker.hasEntry && speaker.state !== "discarded" && !speaker.translation?.trim()));
+  let writing = $state(false);
+
+  function runTitle() {
+    if (untranslated.length === 0) return "Нет подписей без перевода: сначала «Подпись» у говорящего";
+    if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
+    return "Модель предложит перевод подписи и род по нескольким репликам говорящего";
+  }
+
+  function startRun() {
+    const keys = untranslated.map((speaker) => speaker.key);
+    run.start((channel) => commands.suggestSpeakers(projectId, keys, null, channel), onError);
+  }
+
+  async function writeChosen() {
+    const chosen = run.chosen.filter((item) => item.translation.trim());
+    writing = true;
+    try {
+      for (const item of chosen) await commands.saveSpeakerEntry(projectId, item.key, item.translation.trim(), item.gender);
+      run.finish(`Записано подписей: ${chosen.length}`);
+      await reload();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      writing = false;
+    }
+  }
 
   type Filter = Speaker["state"];
   const filters: { value: Filter; label: string }[] = [
@@ -80,8 +123,45 @@
       <span>Все в персонажи · {count("new")}</span>
     </button>
   {/if}
+  <button class="btn small" disabled={untranslated.length === 0 || runsBusy(runs)} title={runTitle()} onclick={startRun}>
+    {#if run.active}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
+    <span>Перевести подписи · {untranslated.length}</span>
+  </button>
 </div>
 
+<SuggestStatus {run} {onError} />
+
+{#if run.review}
+  <div class="list">
+    <p class="pick-head">Предложения модели. Отмеченные запишутся в подписи говорящих, перевод и род можно поправить</p>
+    {#each run.review as item (item.key)}
+      {@const speaker = data.speakers.find((known) => known.key === item.key)}
+      {@const name = speaker ? speakerName(speaker) : item.key}
+      <div class="pick-row speakers" class:off={!item.selected}>
+        <input type="checkbox" bind:checked={item.selected} aria-label="Записать перевод «{name}»" />
+        <div class="name">
+          <strong title={item.key}>{name}</strong>
+          <span>Сейчас: {speaker?.translation ?? "нет перевода"}</span>
+        </div>
+        <input class="input" bind:value={item.translation} placeholder="Перевод подписи" aria-label="Перевод подписи «{name}»" />
+        <div class="segmented" role="radiogroup" aria-label="Род «{name}»">
+          {#each genders as gender (gender.label)}
+            <button role="radio" aria-checked={item.gender === gender.value} class:on={item.gender === gender.value} onclick={() => (item.gender = gender.value)}>
+              {gender.label}
+            </button>
+          {/each}
+        </div>
+      </div>
+    {/each}
+  </div>
+  <div class="pick-actions">
+    <button class="btn small" disabled={writing} onclick={() => run.discard()}>Отбросить</button>
+    <button class="btn small primary" disabled={writing || run.chosen.length === 0} onclick={writeChosen}>
+      {#if writing}<LoaderCircle size={13} class="spin" />{:else}<Check size={13} />{/if}
+      <span>Записать выбранные · {run.chosen.length}</span>
+    </button>
+  </div>
+{:else}
 <div class="filters">
   <div class="segmented" role="tablist" aria-label="Какие говорящие">
     {#each filters as item (item.value)}
@@ -201,6 +281,7 @@
     </div>
   {/each}
 </div>
+{/if}
 
 <style>
   .filters {

@@ -65,6 +65,12 @@ export const commands = {
 	restoreTermName: (project: string, key: string) => __TAURI_INVOKE<null>("restore_term_name", { project, key }),
 	/**  Значение или пояснение токена. Пустые оба удаляют запись. */
 	saveToken: (project: string, name: string, value: string, note: string) => __TAURI_INVOKE<null>("save_token", { project, name, value, note }),
+	/**  Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `save_term`. */
+	suggestTerms: (project: string, terms: RowRef[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<TermSuggestionsDto_Serialize>("suggest_terms", { project, terms, profile, progress }),
+	/**  Перевод подписей и род говорящих моделью. Отмеченное окно записывает через `save_speaker_entry`. */
+	suggestSpeakers: (project: string, speakers: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<SpeakerSuggestionsDto_Serialize>("suggest_speakers", { project, speakers, profile, progress }),
+	/**  Значения и пояснения токенов моделью. Отмеченное окно записывает через `save_token`. */
+	suggestTokens: (project: string, tokens: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<TokenSuggestionsDto_Serialize>("suggest_tokens", { project, tokens, profile, progress }),
 	/**  Файлы проекта с репликами и прогресс. */
 	translationFiles: (project: string) => __TAURI_INVOKE<FileDto[]>("translation_files", { project }),
 	/**  Реплики файла по сценам. */
@@ -580,6 +586,32 @@ export type SpeakerState =
 /**  Запись говорящего без персонажей. */
 "speaker" | "discarded";
 
+export type SpeakerSuggestionDto = SpeakerSuggestionDto_Serialize | SpeakerSuggestionDto_Deserialize;
+
+export type SpeakerSuggestionDto_Deserialize = {
+	key: string,
+	translation: string,
+	gender?: Gender | null,
+};
+
+export type SpeakerSuggestionDto_Serialize = {
+	key: string,
+	translation: string,
+	gender: Gender | null,
+};
+
+export type SpeakerSuggestionsDto = SpeakerSuggestionsDto_Serialize | SpeakerSuggestionsDto_Deserialize;
+
+export type SpeakerSuggestionsDto_Deserialize = {
+	items: SpeakerSuggestionDto_Deserialize[],
+	error?: string | null,
+};
+
+export type SpeakerSuggestionsDto_Serialize = {
+	items: SpeakerSuggestionDto_Serialize[],
+	error: string | null,
+};
+
 export type TermCategory = "general" | "location" | "organization" | "title" | "item" | "event";
 
 export type TermDto = TermDto_Serialize | TermDto_Deserialize;
@@ -606,6 +638,44 @@ export type TermDto_Serialize = {
 	forms: FormDto_Serialize[],
 };
 
+/**  Предложение перевода термина. */
+export type TermSuggestionDto = TermSuggestionDto_Serialize | TermSuggestionDto_Deserialize;
+
+/**  Предложение перевода термина. */
+export type TermSuggestionDto_Deserialize = {
+	id: RowRef,
+	translation: string,
+	/**  `None`: категория остаётся прежней. */
+	category?: TermCategory | null,
+	/**  Только у термина без своего описания. */
+	description?: string | null,
+};
+
+/**  Предложение перевода термина. */
+export type TermSuggestionDto_Serialize = {
+	id: RowRef,
+	translation: string,
+	/**  `None`: категория остаётся прежней. */
+	category: TermCategory | null,
+	/**  Только у термина без своего описания. */
+	description: string | null,
+};
+
+/**  Предложения запуска. `error`: запуск оборвался, готовые предложения всё равно пришли. */
+export type TermSuggestionsDto = TermSuggestionsDto_Serialize | TermSuggestionsDto_Deserialize;
+
+/**  Предложения запуска. `error`: запуск оборвался, готовые предложения всё равно пришли. */
+export type TermSuggestionsDto_Deserialize = {
+	items: TermSuggestionDto_Deserialize[],
+	error?: string | null,
+};
+
+/**  Предложения запуска. `error`: запуск оборвался, готовые предложения всё равно пришли. */
+export type TermSuggestionsDto_Serialize = {
+	items: TermSuggestionDto_Serialize[],
+	error: string | null,
+};
+
 /**  Токен из текста игры или глоссария. */
 export type TokenDto = TokenDto_Serialize | TokenDto_Deserialize;
 
@@ -627,5 +697,31 @@ export type TokenDto_Serialize = {
 	note: string | null,
 	/**  Реплик текущего снимка с этим токеном. */
 	lines: number,
+};
+
+export type TokenSuggestionDto = TokenSuggestionDto_Serialize | TokenSuggestionDto_Deserialize;
+
+export type TokenSuggestionDto_Deserialize = {
+	name: string,
+	value?: string | null,
+	note?: string | null,
+};
+
+export type TokenSuggestionDto_Serialize = {
+	name: string,
+	value: string | null,
+	note: string | null,
+};
+
+export type TokenSuggestionsDto = TokenSuggestionsDto_Serialize | TokenSuggestionsDto_Deserialize;
+
+export type TokenSuggestionsDto_Deserialize = {
+	items: TokenSuggestionDto_Deserialize[],
+	error?: string | null,
+};
+
+export type TokenSuggestionsDto_Serialize = {
+	items: TokenSuggestionDto_Serialize[],
+	error: string | null,
 };
 

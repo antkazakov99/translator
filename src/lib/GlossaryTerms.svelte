@@ -1,23 +1,76 @@
 <script lang="ts">
-  import { Check, LoaderCircle, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
+  import SuggestStatus from "./SuggestStatus.svelte";
   import { commands, type TermCategory } from "./bindings";
-  import { categories, categoryLabel, characterName, matches, type Glossary, type NameForm, type Term } from "./glossary";
+  import {
+    categories,
+    categoryLabel,
+    characterName,
+    matches,
+    runsBusy,
+    type Glossary,
+    type GlossaryRuns,
+    type NameForm,
+    type Term,
+  } from "./glossary";
 
   let {
     projectId,
     data,
+    runs,
     reload,
     patch,
     onError,
   }: {
     projectId: string;
     data: Glossary;
+    runs: GlossaryRuns;
     reload: () => Promise<void>;
     patch: (term: Term) => void;
     onError: (message: string) => void;
   } = $props();
+
+  const run = $derived(runs.terms);
+  const untranslated = $derived(data.terms.filter((term) => !term.translation?.trim()));
+  let writing = $state(false);
+
+  function runTitle() {
+    if (untranslated.length === 0) return "У всех терминов есть перевод";
+    if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
+    return "Модель предложит перевод, категорию и описание терминам без перевода";
+  }
+
+  function startRun() {
+    const ids = untranslated.map((term) => term.id);
+    run.start((channel) => commands.suggestTerms(projectId, ids, null, channel), onError);
+  }
+
+  /** Отмеченное записывается целиком через `save_term`: термин подтверждается, своё описание остаётся. */
+  async function writeChosen() {
+    const chosen = run.chosen.filter((item) => item.translation.trim());
+    writing = true;
+    try {
+      for (const item of chosen) {
+        const term = data.terms.find((known) => known.id === item.id);
+        if (!term) continue;
+        await commands.saveTerm(projectId, {
+          ...$state.snapshot(term),
+          translation: item.translation.trim(),
+          category: item.category ?? term.category,
+          description: term.description ?? (item.description?.trim() || null),
+          guess: false,
+        });
+      }
+      run.finish(`Записано терминов: ${chosen.length}`);
+      await reload();
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      writing = false;
+    }
+  }
 
   type Filter = "all" | "guess" | "trash";
   let filter = $state<Filter>("all");
@@ -116,9 +169,50 @@
       Корзина · {data.discardedTerms.length}
     </button>
   </div>
+  <button class="btn small primary" disabled={untranslated.length === 0 || runsBusy(runs)} title={runTitle()} onclick={startRun}>
+    {#if run.active}<LoaderCircle size={13} class="spin" />{:else}<Languages size={13} />{/if}
+    <span>Перевести · {untranslated.length}</span>
+  </button>
 </div>
 
-{#if filter === "trash"}
+<SuggestStatus {run} {onError} />
+
+{#if run.review}
+  <div class="list">
+    <p class="pick-head">Предложения модели. Отмеченные запишутся в глоссарий, перевод и описание можно поправить</p>
+    {#each run.review as item (item.id)}
+      {@const term = data.terms.find((known) => known.id === item.id)}
+      <div class="pick-row terms" class:off={!item.selected}>
+        <input type="checkbox" bind:checked={item.selected} aria-label="Записать перевод «{term?.name}»" />
+        <div class="name">
+          <strong>{term?.name ?? item.id}</strong>
+          <span>Сейчас: {term?.translation ?? "нет перевода"}</span>
+        </div>
+        <input class="input" bind:value={item.translation} placeholder="Перевод" aria-label="Перевод «{term?.name}»" />
+        <select
+          class="input"
+          value={item.category ?? term?.category}
+          onchange={(event) => (item.category = event.currentTarget.value as TermCategory)}
+          aria-label="Категория «{term?.name}»"
+        >
+          {#each categories as category (category.value)}<option value={category.value}>{category.label}</option>{/each}
+        </select>
+        {#if term?.description}
+          <span class="faint" title={term.description}>Своё описание остаётся</span>
+        {:else}
+          <input class="input" bind:value={item.description} placeholder="Описание" aria-label="Описание «{term?.name}»" />
+        {/if}
+      </div>
+    {/each}
+  </div>
+  <div class="pick-actions">
+    <button class="btn small" disabled={writing} onclick={() => run.discard()}>Отбросить</button>
+    <button class="btn small primary" disabled={writing || run.chosen.length === 0} onclick={writeChosen}>
+      {#if writing}<LoaderCircle size={13} class="spin" />{:else}<Check size={13} />{/if}
+      <span>Записать выбранные · {run.chosen.length}</span>
+    </button>
+  </div>
+{:else if filter === "trash"}
   <div class="list">
     {#each data.discardedTerms as item (item.key)}
       <div class="row">

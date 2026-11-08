@@ -7,8 +7,12 @@
   import GlossaryTokens from "./GlossaryTokens.svelte";
   import { commands } from "./bindings";
   import type { Character, Glossary, Term, Token } from "./glossary";
+  import { glossaryRuns } from "./suggest-run.svelte";
 
   let { projectId }: { projectId: string } = $props();
+
+  /** Запуски модели и их отбор переживают переход между разделами. */
+  const runs = glossaryRuns();
 
   type Section = "speakers" | "characters" | "terms" | "tokens";
   let data = $state<Glossary | null>(null);
@@ -93,6 +97,7 @@
       <GlossarySpeakers
         {projectId}
         {data}
+        {runs}
         reload={load}
         onError={(message) => (error = message)}
         onOpenCharacter={(id) => {
@@ -109,9 +114,9 @@
       </div>
       <GlossaryCharacters {projectId} {data} bind:selected={character} reload={load} patch={patchCharacter} onError={(message) => (error = message)} />
     {:else if section === "terms"}
-      <GlossaryTerms {projectId} {data} reload={load} patch={patchTerm} onError={(message) => (error = message)} />
+      <GlossaryTerms {projectId} {data} {runs} reload={load} patch={patchTerm} onError={(message) => (error = message)} />
     {:else}
-      <GlossaryTokens {projectId} {data} patch={patchToken} onError={(message) => (error = message)} />
+      <GlossaryTokens {projectId} {data} {runs} reload={load} patch={patchToken} onError={(message) => (error = message)} />
     {/if}
   </section>
 </div>
@@ -378,5 +383,69 @@
 
   .glossary :global(.field textarea) {
     resize: vertical;
+  }
+
+  /* Отбор предложений модели. */
+
+  .glossary :global(.pick-head) {
+    margin: 4px 4px 8px;
+    color: var(--text-faint);
+    font-size: 11px;
+  }
+
+  .glossary :global(.pick-row) {
+    display: grid;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--divider-row);
+  }
+
+  .glossary :global(.pick-row.terms) {
+    grid-template-columns: auto minmax(140px, 1fr) 1.2fr 140px 1.2fr;
+  }
+
+  .glossary :global(.pick-row.speakers) {
+    grid-template-columns: auto minmax(140px, 1fr) 1.2fr auto;
+  }
+
+  .glossary :global(.pick-row.tokens) {
+    grid-template-columns: auto minmax(120px, 0.8fr) 1fr 1.4fr;
+  }
+
+  .glossary :global(.pick-row.off) {
+    opacity: 0.55;
+  }
+
+  .glossary :global(.pick-row .name) {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .glossary :global(.pick-row .name strong) {
+    overflow: hidden;
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .glossary :global(.pick-row .name span) {
+    overflow: hidden;
+    color: var(--text-muted);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .glossary :global(.pick-actions) {
+    display: flex;
+    gap: 6px;
+    justify-content: flex-end;
+    padding: 10px 16px;
+    border-top: 1px solid var(--divider);
   }
 </style>

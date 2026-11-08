@@ -122,9 +122,7 @@ impl LinesPrompt {
         }
         context.extend(speakers_hint(&shown));
         let text: String = shown.iter().map(|line| format!("{}\n{}\n", line.speaker.as_deref().unwrap_or(NARRATOR), line.source_text)).collect();
-        context.extend(token_hint(&text, hints));
-        context.extend(name_hint(&text, hints));
-        context.extend(term_hint(&text, hints));
+        context.extend(glossary_hints(&text, hints));
         if !hints.name_rules.is_empty() {
             context.push(format!("Name rules:\n{}", hints.name_rules.join("\n")));
         }
@@ -149,6 +147,12 @@ impl LinesPrompt {
 /// Список реплик в запрос. Сериализация строк и чисел не падает.
 fn json(items: &[Item]) -> String {
     serde_json::to_string_pretty(items).unwrap_or_default()
+}
+
+/// Подсказки глоссария по тексту запроса: пояснения токенов, имена с родом, термины. Ими пользуются
+/// и предложения модели в глоссарии.
+pub(crate) fn glossary_hints(text: &str, hints: &Hints) -> Vec<String> {
+    token_hint(text, hints).into_iter().chain(name_hint(text, hints)).chain(term_hint(text, hints)).collect()
 }
 
 /// Род говорящих, если он известен.

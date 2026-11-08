@@ -68,7 +68,7 @@ impl Item {
 }
 
 /// Первый массив объектов в тексте: модели окружают JSON пояснениями и блоком кода.
-fn json_array(raw: &str) -> &str {
+pub(crate) fn json_array(raw: &str) -> &str {
     let trimmed = raw.trim();
     for (start, _) in trimmed.match_indices('[') {
         let mut values = serde_json::Deserializer::from_str(&trimmed[start..]).into_iter::<serde_json::Value>();
