@@ -27,7 +27,7 @@ pub use repo::{CharacterRepo, LineSampleRepo, NoteRepo, ReadingDepthRepo, Sample
 pub use names::{NameSuggestion, NameVariant};
 pub use suggest::{SpeakerSuggestion, TermSuggestion, TokenSuggestion};
 pub use scenes::{SceneDescription, SceneSource};
-pub use service::{ExcludeOwner, GlossaryData, GlossaryOverview, GlossaryService, SceneEntry};
+pub use service::{ExcludeOwner, GlossaryData, GlossaryOverview, GlossaryService};
 pub use speakers::{Speaker, SpeakerEntry, SpeakerLink, speaker_gender};
 pub use terms::{DiscardReason, DiscardedTerm, Term, TermCandidate, TermCategory, TermId};
 pub use tokens::Token;

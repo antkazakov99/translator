@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
-use super::{FileProgress, LineRun, LineState, LinesRun, Scene, SceneLine, TranslationScope, TranslationService};
+use super::{FileProgress, FileScenes, LineRun, LineState, LinesRun, Scene, SceneLine, SceneProgress, SceneRef, TranslationScope, TranslationService};
 use crate::common::AppError;
 use crate::engines::ContainerKey;
 use crate::llm::{ProfileId, RunId, RunProgress, RunStatus};
@@ -77,6 +77,7 @@ pub struct SceneDto {
     /// Ключ сцены от движка. `None`: реплики вне сцен.
     pub key: Option<String>,
     pub title: Option<String>,
+    pub description: Option<String>,
     pub lines: Vec<LineDto>,
 }
 
@@ -85,8 +86,72 @@ impl From<Scene> for SceneDto {
         Self {
             key: scene.key.map(|key| key.to_string()),
             title: scene.title,
+            description: scene.description,
             lines: scene.lines.into_iter().map(LineDto::from).collect(),
         }
+    }
+}
+
+/// Сцена в списке таблицы. `key = None`: реплики файла вне сцен («Без сцены»).
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneItemDto {
+    pub key: Option<String>,
+    pub title: Option<String>,
+    /// У сцены есть описание.
+    pub described: bool,
+    /// Игра изменила текст сцены после того, как модель его прочитала.
+    pub stale: bool,
+    pub total: u32,
+    pub translated: u32,
+    pub drafts: u32,
+}
+
+impl From<SceneProgress> for SceneItemDto {
+    fn from(scene: SceneProgress) -> Self {
+        Self {
+            key: scene.key.map(|key| key.to_string()),
+            title: scene.title,
+            described: scene.described,
+            stale: scene.stale,
+            total: u32::try_from(scene.total).unwrap_or(u32::MAX),
+            translated: u32::try_from(scene.translated).unwrap_or(u32::MAX),
+            drafts: u32::try_from(scene.drafts).unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// Файл с прогрессом и его сцены по сюжету, «Без сцены» последней.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FileScenesDto {
+    pub file: FileDto,
+    pub scenes: Vec<SceneItemDto>,
+}
+
+impl From<FileScenes> for FileScenesDto {
+    fn from(group: FileScenes) -> Self {
+        Self { file: group.file.into(), scenes: group.scenes.into_iter().map(SceneItemDto::from).collect() }
+    }
+}
+
+/// Какую сцену открыть в таблице.
+#[derive(Debug, Clone, Deserialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum SceneRefDto {
+    Scene { key: String },
+    /// Реплики файла вне сцен.
+    Loose { file: RowRef },
+}
+
+impl TryFrom<SceneRefDto> for SceneRef {
+    type Error = AppError;
+
+    fn try_from(scene: SceneRefDto) -> Result<Self, AppError> {
+        Ok(match scene {
+            SceneRefDto::Scene { key } => Self::Scene(ContainerKey::new(key)?),
+            SceneRefDto::Loose { file } => Self::Loose(FileId::from_row(file.0)),
+        })
     }
 }
 
@@ -98,6 +163,8 @@ pub enum ScopeDto {
     Scenes { keys: Vec<String> },
     File { file: RowRef },
     Line { line: RowRef },
+    /// Реплики файла вне сцен.
+    Loose { file: RowRef },
     /// Все файлы проекта.
     Project,
 }
@@ -112,6 +179,7 @@ impl TryFrom<ScopeDto> for TranslationScope {
             }
             ScopeDto::File { file } => Self::File(FileId::from_row(file.0)),
             ScopeDto::Line { line } => Self::Line(SegmentId::from_row(line.0)),
+            ScopeDto::Loose { file } => Self::Loose(FileId::from_row(file.0)),
             ScopeDto::Project => Self::Project,
         })
     }
@@ -248,7 +316,28 @@ pub async fn translation_files(app: AppHandle, project: String) -> Result<Vec<Fi
     .await
 }
 
-/// Реплики файла по сценам.
+/// Файлы с прогрессом и их сцены для списка таблицы.
+#[tauri::command]
+#[specta::specta]
+pub async fn translation_scenes(app: AppHandle, project: String) -> Result<Vec<FileScenesDto>, String> {
+    blocking(app, move |state| {
+        Ok(TranslationService { state }.scene_tree(self::project(&project)?)?.into_iter().map(FileScenesDto::from).collect())
+    })
+    .await
+}
+
+/// Реплики одной сцены или реплики файла вне сцен.
+#[tauri::command]
+#[specta::specta]
+pub async fn scene_lines(app: AppHandle, project: String, scene: SceneRefDto) -> Result<Vec<SceneDto>, String> {
+    blocking(app, move |state| {
+        let scenes = TranslationService { state }.scene_lines(self::project(&project)?, scene.try_into()?)?;
+        Ok(scenes.into_iter().map(SceneDto::from).collect())
+    })
+    .await
+}
+
+/// Реплики файла по сценам: «Пропавшие» выбирают из них реплику для привязки.
 #[tauri::command]
 #[specta::specta]
 pub async fn file_lines(app: AppHandle, project: String, file: RowRef) -> Result<Vec<SceneDto>, String> {

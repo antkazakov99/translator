@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::{Draft, FileProgress, LineRun, LineState, PlacedLine, RevisionKind, Scene, SceneLine};
+use super::{Draft, FileProgress, LineRun, LineState, PlacedLine, RevisionKind, Scene, SceneLine, SceneProgress};
 use crate::common::{Timestamp, ValidationError};
 use crate::engines::{ContainerKey, SpeakerKey};
 use crate::llm::{Action, RunId, RunStatus};
@@ -84,6 +84,11 @@ fn group_scenes(rows: Vec<LineRow>) -> Result<Vec<Scene>, DbError> {
     Ok(scenes)
 }
 
+/// Число строк из `count` и `sum`: отрицательного SQLite не даёт, но из базы панику не берём.
+fn count(value: i64) -> usize {
+    usize::try_from(value).unwrap_or_default()
+}
+
 pub struct TranslationRepo<'c> {
     pub conn: &'c Connection,
 }
@@ -128,6 +133,85 @@ impl TranslationRepo<'_> {
         let sql = format!("{LINE_SELECT} AND s.file_id = ?1 ORDER BY s.id");
         let rows = self.conn.prepare(&sql)?.query_map([file.get()], read_line)?.collect::<Result<Vec<_>, _>>()?;
         group_scenes(rows)
+    }
+
+    /// Реплики файла вне сцен в порядке файла, по контейнерам: экраны, строки интерфейса, код вне меток.
+    pub fn loose_scenes(&self, file: FileId) -> Result<Vec<Scene>, DbError> {
+        let sql = format!("{LINE_SELECT} AND s.file_id = ?1 AND (c.id IS NULL OR c.kind <> 'scene') ORDER BY s.id");
+        let rows = self.conn.prepare(&sql)?.query_map([file.get()], read_line)?.collect::<Result<Vec<_>, _>>()?;
+        group_scenes(rows)
+    }
+
+    /// Сцены с репликами по сюжету, за ними остаток вне сцен каждого файла. Сцена стоит в файле своей
+    /// первой реплики. Прогресс считается так же, как у файлов. `stale` здесь всегда `false`: его ставит сервис.
+    pub fn scene_progress(&self) -> Result<Vec<SceneProgress>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT c.key, min(s.file_id), d.title, coalesce(trim(d.description) <> '', 0), count(*),
+                    sum(trim(coalesce(t.text, s.game_text, '')) <> ''),
+                    sum(coalesce(t.draft, 0) = 1 AND trim(t.text) <> '')
+             FROM segments s
+             JOIN containers c ON c.id = s.container_id AND c.kind = 'scene'
+             LEFT JOIN scene_descriptions d ON d.container_key = c.key
+             LEFT JOIN translations t ON t.segment_id = s.id
+             WHERE s.missing = 0
+             GROUP BY c.id
+             ORDER BY c.story_order IS NULL, c.story_order, c.key",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut scenes = rows
+            .into_iter()
+            .map(|(key, file, title, described, total, translated, drafts)| {
+                Ok(SceneProgress {
+                    key: Some(ContainerKey::new(key).map_err(|error| DbError::bad_value("containers", "key", error))?),
+                    file: FileId::from_row(file),
+                    title,
+                    described,
+                    stale: false,
+                    total: count(total),
+                    translated: count(translated),
+                    drafts: count(drafts),
+                })
+            })
+            .collect::<Result<Vec<_>, DbError>>()?;
+        let mut statement = self.conn.prepare(
+            "SELECT s.file_id, count(*),
+                    sum(trim(coalesce(t.text, s.game_text, '')) <> ''),
+                    sum(coalesce(t.draft, 0) = 1 AND trim(t.text) <> '')
+             FROM segments s
+             LEFT JOIN containers c ON c.id = s.container_id
+             LEFT JOIN translations t ON t.segment_id = s.id
+             WHERE s.missing = 0 AND (c.id IS NULL OR c.kind <> 'scene')
+             GROUP BY s.file_id
+             ORDER BY s.file_id",
+        )?;
+        let loose = statement
+            .query_map([], |row| {
+                Ok(SceneProgress {
+                    key: None,
+                    file: FileId::from_row(row.get(0)?),
+                    title: None,
+                    described: false,
+                    stale: false,
+                    total: count(row.get(1)?),
+                    translated: count(row.get(2)?),
+                    drafts: count(row.get(3)?),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        scenes.extend(loose);
+        Ok(scenes)
     }
 
     /// Все реплики текущего снимка по сюжету: сцены в порядке сюжета, реплики вне сцен в конце.

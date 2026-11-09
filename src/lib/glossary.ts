@@ -32,7 +32,6 @@ export type GlossaryRuns = {
   terms: SuggestRun<TermSuggestion>;
   speakers: SuggestRun<SpeakerSuggestion>;
   tokens: SuggestRun<TokenSuggestion>;
-  scenes: WriteRun;
   entries: WriteRun;
 };
 

@@ -8,7 +8,7 @@ use super::candidates::{TERM_CANDIDATES_VERSION, find_candidates, name_words, wi
 use super::entries::{EntryLine, character_lines, character_names, term_lines, term_names};
 use super::{
     Character, CharacterId, CharacterRepo, DiscardReason, DiscardedTerm, Form, LineSampleRepo, NameKey, NoteOwner, NoteRepo,
-    SceneDescription, SceneDescriptionRepo, SceneSource, Speaker, SpeakerEntry, SpeakerLink, SpeakerRepo, SpeakerUse, Term, TermCandidate,
+    SceneDescription, SceneDescriptionRepo, Speaker, SpeakerEntry, SpeakerLink, SpeakerRepo, SpeakerUse, Term, TermCandidate,
     TermCategory, TermId, TermRepo, Token, TokenRepo,
 };
 use crate::common::{AppError, Timestamp, ValidationError};
@@ -41,14 +41,6 @@ impl GlossaryData {
             tokens: TokenRepo { conn }.list()?,
         })
     }
-}
-
-/// Сцена раздела «Сцены»: текст в снимке, описание, если есть, и число заметок модели по частям.
-#[derive(Debug, Clone)]
-pub struct SceneEntry {
-    pub source: SceneSource,
-    pub description: Option<SceneDescription>,
-    pub notes: usize,
 }
 
 /// Раздел «Говорящие» окна: говорящие снимка, корзина и корзина названий.
@@ -281,26 +273,6 @@ impl GlossaryService<'_> {
             scene.edit(title, description, Timestamp::now());
             repo.save(&scene)
         })
-    }
-
-    /// Раздел «Сцены»: сцены текущего снимка по сюжету с описаниями и числом заметок модели.
-    pub fn scenes(&self, project: ProjectId) -> Result<Vec<SceneEntry>, AppError> {
-        let open = self.state.open_project(project)?;
-        Ok(open.project.read(|tx| {
-            let repo = SceneDescriptionRepo { conn: tx };
-            let mut described: BTreeMap<ContainerKey, SceneDescription> =
-                repo.list()?.into_iter().map(|scene| (scene.key().clone(), scene)).collect();
-            let notes = NoteRepo { conn: tx }.counts("container")?;
-            Ok(repo
-                .sources()?
-                .into_iter()
-                .map(|source| SceneEntry {
-                    description: described.remove(&source.key),
-                    notes: notes.get(source.key.as_str()).copied().unwrap_or(0),
-                    source,
-                })
-                .collect())
-        })?)
     }
 
     /// Реплики персонажа или термина по сюжету с переводом и местом в игре. Исключённые из описания

@@ -9,12 +9,12 @@ use super::batcher::LINE_CONTEXT;
 use super::hints::GlossaryContext;
 use super::text::is_wordless;
 use super::{
-    Batch, Batcher, Draft, FileProgress, Hints, LineRun, LineState, LinesAnswer, LinesMode, LinesPrompt, Scene, SceneLine, SentState,
+    Batch, Batcher, Draft, FileProgress, FileScenes, Hints, LineRun, LineState, LinesAnswer, LinesMode, LinesPrompt, Scene, SceneLine, SceneProgress, SceneRef, SentState,
     TranslationRepo, TranslationScope,
 };
 use crate::common::{AppError, Timestamp};
 use crate::glossary::describe::{RunAsk, SceneReader};
-use crate::glossary::{CharacterRepo, GlossaryData, Term, TermRepo};
+use crate::glossary::{CharacterRepo, GlossaryData, SceneDescriptionRepo, Term, TermRepo};
 use crate::name_rules::NameRuleService;
 use crate::llm::{Action, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunId, RunProgress, RunStatus};
 use crate::projects::ProjectId;
@@ -155,6 +155,43 @@ impl TranslationService<'_> {
         Ok(open.project.read(|tx| TranslationRepo { conn: tx }.file_scenes(file))?)
     }
 
+    /// Файлы с прогрессом и их сцены для таблицы одним чтением. «Устарело» сверяет отпечаток описания
+    /// с текстом сцены в снимке.
+    pub fn scene_tree(&self, project: ProjectId) -> Result<Vec<FileScenes>, AppError> {
+        let open = self.state.open_project(project)?;
+        let (files, mut scenes, sources, described) = open.project.read(|tx| {
+            let repo = TranslationRepo { conn: tx };
+            let descriptions = SceneDescriptionRepo { conn: tx };
+            Ok((repo.files()?, repo.scene_progress()?, descriptions.sources()?, descriptions.list()?))
+        })?;
+        let hashes: HashMap<_, _> = sources.into_iter().map(|source| (source.key, source.text_hash)).collect();
+        let described: HashMap<_, _> = described.into_iter().map(|scene| (scene.key().clone(), scene)).collect();
+        for scene in &mut scenes {
+            let Some(key) = &scene.key else { continue };
+            scene.stale = match (described.get(key), hashes.get(key)) {
+                (Some(description), Some(hash)) => description.is_stale(hash),
+                _ => false,
+            };
+        }
+        let mut by_file: HashMap<FileId, Vec<SceneProgress>> = HashMap::new();
+        for scene in scenes {
+            by_file.entry(scene.file).or_default().push(scene);
+        }
+        Ok(files.into_iter().map(|file| FileScenes { scenes: by_file.remove(&file.id).unwrap_or_default(), file }).collect())
+    }
+
+    /// Реплики одной сцены по сюжету или реплики файла вне сцен по контейнерам.
+    pub fn scene_lines(&self, project: ProjectId, scene: SceneRef) -> Result<Vec<Scene>, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| {
+            let repo = TranslationRepo { conn: tx };
+            match scene {
+                SceneRef::Scene(key) => Ok(vec![repo.scene(&key)?]),
+                SceneRef::Loose(file) => repo.loose_scenes(file),
+            }
+        })?)
+    }
+
     /// Правка пользователя одной транзакцией с историей. Возвращает реплику после правки.
     pub fn save_text(&self, project: ProjectId, line: SegmentId, text: &str) -> Result<SceneLine, AppError> {
         let open = self.state.open_project(project)?;
@@ -200,6 +237,7 @@ fn load_scenes(repo: &TranslationRepo, scope: &TranslationScope) -> Result<Vec<S
         TranslationScope::Scenes(keys) => keys.iter().map(|key| repo.scene(key)).collect(),
         TranslationScope::File(file) => repo.file_scenes(*file),
         TranslationScope::Line(line) => Ok(vec![repo.scene_of(*line)?]),
+        TranslationScope::Loose(file) => repo.loose_scenes(*file),
         TranslationScope::Project => {
             let mut scenes = Vec::new();
             for file in repo.files()? {
@@ -421,6 +459,8 @@ mod tests {
     use super::*;
     use crate::projects::ProjectService;
     use crate::state::tests::memory_secrets;
+    use crate::engines::ContainerKey;
+    use crate::glossary::GlossaryService;
     use crate::translation::LineState;
 
     /// Открытый проект по синтетической игре.
@@ -457,6 +497,55 @@ mod tests {
         assert_eq!(first.speaker.as_deref(), Some("Eileen"));
         assert_eq!(first.state, LineState::Empty);
         assert!(first.location.is_some());
+    }
+
+    #[test]
+    fn scene_tree_groups_scenes_by_file_with_loose_lines_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path());
+        let service = TranslationService { state: &state };
+        // Реплики вне сцен: одна без контейнера, одна на экране.
+        let open = state.open_project(id).unwrap();
+        open.project
+            .write(|tx| {
+                Ok(tx.execute_batch(
+                    "INSERT INTO containers (key, kind, file_id, last_seen_scan)
+                       SELECT 'screen:hud', 'screen', file_id, last_seen_scan FROM containers WHERE key = 'label:left';
+                     UPDATE segments SET container_id = NULL WHERE source_text = 'Static.';
+                     UPDATE segments SET container_id = (SELECT id FROM containers WHERE key = 'screen:hud') WHERE source_text = 'Who?';",
+                )?)
+            })
+            .unwrap();
+        let start = ContainerKey::new("label:start").unwrap();
+        let glossary = GlossaryService { state: &state };
+        glossary.edit_scene(id, &start, "Начало", "Эйлин здоровается.").unwrap();
+        // Модель читала другой текст сцены.
+        open.project.write(|tx| Ok(tx.execute("UPDATE scene_descriptions SET text_hash = 'old'", [])?)).unwrap();
+        let loose_line = lines(&service, id, service.files(id).unwrap()[0].id).into_iter().find(|line| line.source_text == "Static.").unwrap();
+        service.save_text(id, loose_line.id, "Помехи.").unwrap();
+
+        let tree = service.scene_tree(id).unwrap();
+        assert_eq!(tree.len(), 1);
+        let group = &tree[0];
+        let keys: Vec<_> = group.scenes.iter().map(|scene| scene.key.as_ref().map(|key| key.as_str())).collect();
+        assert_eq!(keys, [Some("label:start"), Some("label:left"), None]);
+        assert_eq!(group.scenes.iter().map(|scene| scene.total).sum::<usize>(), group.file.total, "каждая реплика файла в одной сцене");
+        let (first, left, loose) = (&group.scenes[0], &group.scenes[1], &group.scenes[2]);
+        assert_eq!((first.title.as_deref(), first.described, first.stale), (Some("Начало"), true, true));
+        assert_eq!((left.described, left.stale), (false, false));
+        assert_eq!((loose.total, loose.translated), (2, 1));
+
+        let read = service.scene_lines(id, SceneRef::Scene(start.clone())).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].description.as_deref(), Some("Эйлин здоровается."));
+        assert!(read[0].lines.iter().all(|line| line.source_text != "Static." && line.source_text != "Who?"));
+        let outside = service.scene_lines(id, SceneRef::Loose(group.file.id)).unwrap();
+        let outside: Vec<_> =
+            outside.iter().map(|scene| (scene.key.as_ref().map(|key| key.as_str()), scene.lines.len())).collect();
+        assert_eq!(outside, [(None, 1), (Some("screen:hud"), 1)], "в порядке файла по контейнерам");
+
+        assert_eq!(service.reset(id, TranslationScope::Loose(group.file.id)).unwrap(), 1);
+        assert_eq!(service.scene_tree(id).unwrap()[0].scenes[2].translated, 0);
     }
 
     #[test]
@@ -613,8 +702,6 @@ mod tests {
 
     #[test]
     fn scene_without_description_is_read_before_its_translation() {
-        use crate::engines::ContainerKey;
-        use crate::glossary::GlossaryService;
 
         let dir = tempfile::tempdir().unwrap();
         let (state, id) = project(dir.path());
@@ -645,13 +732,12 @@ mod tests {
         assert_eq!(users.len(), translations.len() + 2, "одна сцена прочитана: часть и название");
         assert!(translations[0].contains("Scene: Эйлин здоровается с героем."), "{}", translations[0]);
         assert!(translations.iter().any(|user| user.contains("Scene: Своё описание.")), "своё описание не трогается");
-        let scenes = glossary.scenes(id).unwrap();
-        let start = scenes.iter().find(|entry| entry.source.key.as_str() == "label:start").unwrap();
-        let description = start.description.as_ref().unwrap();
-        assert_eq!((description.description(), description.title()), (Some("Эйлин здоровается с героем."), Some("Приветствие")));
+        let start = ContainerKey::new("label:start").unwrap();
+        let read = service.scene_lines(id, SceneRef::Scene(start.clone())).unwrap();
+        assert_eq!((read[0].description.as_deref(), read[0].title.as_deref()), (Some("Эйлин здоровается с героем."), Some("Приветствие")));
         assert_eq!(count(&state, id, "SELECT count(*) FROM llm_runs"), 1, "чтение идёт в запуске перевода");
 
-        glossary.edit_scene(id, &start.source.key, "", "").unwrap();
+        glossary.edit_scene(id, &start, "", "").unwrap();
         let file = service.files(id).unwrap()[0].id;
         let line = lines(&service, id, file)[0].id;
         service.save_text(id, line, "").unwrap();

@@ -1,9 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Braces, BookText, Clapperboard, LoaderCircle, MessagesSquare, SpellCheck, TriangleAlert, Users, X } from "lucide-svelte";
+  import { Braces, BookText, LoaderCircle, MessagesSquare, SpellCheck, TriangleAlert, Users, X } from "lucide-svelte";
   import GlossaryCharacters from "./GlossaryCharacters.svelte";
   import GlossaryNameRules from "./GlossaryNameRules.svelte";
-  import GlossaryScenes from "./GlossaryScenes.svelte";
   import GlossarySpeakers from "./GlossarySpeakers.svelte";
   import GlossaryTerms from "./GlossaryTerms.svelte";
   import GlossaryTokens from "./GlossaryTokens.svelte";
@@ -23,7 +22,7 @@
   /** Запуски модели и их отбор переживают переход между разделами. */
   const runs = glossaryRuns();
 
-  type Section = "speakers" | "characters" | "rules" | "terms" | "tokens" | "scenes";
+  type Section = "speakers" | "characters" | "rules" | "terms" | "tokens";
   let data = $state<Glossary | null>(null);
   let error = $state("");
   let character = $state<number | null>(null);
@@ -38,7 +37,7 @@
   onMount(() => {
     try {
       const saved = sessionStorage.getItem(sectionKey);
-      if (saved === "speakers" || saved === "characters" || saved === "rules" || saved === "terms" || saved === "tokens" || saved === "scenes") section = saved;
+      if (saved === "speakers" || saved === "characters" || saved === "rules" || saved === "terms" || saved === "tokens") section = saved;
       const picked = JSON.parse(sessionStorage.getItem(pickedKey) ?? "{}");
       if (typeof picked.character === "number") character = picked.character;
       if (typeof picked.term === "number") term = picked.term;
@@ -93,7 +92,6 @@
     { id: "rules" as const, label: "Правила имён", icon: SpellCheck, count: null, hint: "" },
     { id: "terms" as const, label: "Термины", icon: BookText, count: data?.terms.length ?? 0, hint: "" },
     { id: "tokens" as const, label: "Токены", icon: Braces, count: data?.tokens.length ?? 0, hint: "" },
-    { id: "scenes" as const, label: "Сцены", icon: Clapperboard, count: null, hint: "" },
   ]);
 </script>
 
@@ -155,8 +153,6 @@
         {onOpenLine}
         onError={(message) => (error = message)}
       />
-    {:else if section === "scenes"}
-      <GlossaryScenes {projectId} {runs} onError={(message) => (error = message)} />
     {:else}
       <GlossaryTokens {projectId} {data} {runs} reload={load} patch={patchToken} onError={(message) => (error = message)} />
     {/if}

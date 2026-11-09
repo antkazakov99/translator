@@ -9,7 +9,7 @@ use tauri::{AppHandle, State};
 use super::describe::{EntryPart, PartNote};
 use super::entries::EntryLine;
 use super::{
-    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, SceneEntry, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
+    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
     SpeakerSuggestion, Term,
     TermCandidate, TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
 };
@@ -766,21 +766,6 @@ pub async fn suggest_tokens(
     })
 }
 
-/// Сцена раздела «Сцены».
-#[derive(Debug, Clone, Serialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct SceneEntryDto {
-    pub key: String,
-    pub file: Option<String>,
-    pub lines: u32,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    /// Игра изменила текст сцены после того, как модель его прочитала.
-    pub stale: bool,
-    /// Заметки модели по частям сцены.
-    pub notes: u32,
-}
-
 /// Часть сцены с заметкой модели.
 #[derive(Debug, Clone, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
@@ -871,28 +856,6 @@ pub struct EntryPartsDto {
 
 fn scene_key(key: String) -> Result<ContainerKey, AppError> {
     Ok(ContainerKey::new(key)?)
-}
-
-/// Сцены текущего снимка по сюжету с описаниями.
-#[tauri::command]
-#[specta::specta]
-pub async fn scene_descriptions(app: AppHandle, project: String) -> Result<Vec<SceneEntryDto>, String> {
-    blocking(app, move |state| {
-        let scenes = GlossaryService { state }.scenes(self::project(&project)?)?;
-        Ok(scenes
-            .into_iter()
-            .map(|entry: SceneEntry| SceneEntryDto {
-                key: entry.source.key.to_string(),
-                file: entry.source.file,
-                lines: u32::try_from(entry.source.lines).unwrap_or(u32::MAX),
-                title: entry.description.as_ref().and_then(|scene| scene.title().map(str::to_string)),
-                description: entry.description.as_ref().and_then(|scene| scene.description().map(str::to_string)),
-                stale: entry.description.as_ref().is_some_and(|scene| scene.is_stale(&entry.source.text_hash)),
-                notes: u32::try_from(entry.notes).unwrap_or(u32::MAX),
-            })
-            .collect())
-    })
-    .await
 }
 
 /// Правка названия и описания сцены. Пустые поля удаляют запись.

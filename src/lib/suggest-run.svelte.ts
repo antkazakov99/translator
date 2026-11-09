@@ -8,7 +8,6 @@ export function glossaryRuns(): GlossaryRuns {
     terms: new SuggestRun("Термины"),
     speakers: new SuggestRun("Подписи"),
     tokens: new SuggestRun("Токены"),
-    scenes: new WriteRun("Описания"),
     entries: new WriteRun("Описание"),
   };
 }

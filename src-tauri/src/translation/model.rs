@@ -13,6 +13,8 @@ pub enum TranslationScope {
     Scenes(Vec<ContainerKey>),
     File(FileId),
     Line(SegmentId),
+    /// Реплики файла вне сцен: контейнера нет или он не сцена.
+    Loose(FileId),
     /// Все файлы с пустыми репликами по очереди.
     Project,
 }
@@ -82,6 +84,36 @@ pub struct FileProgress {
     /// Реплики с действующим текстом: перевод, черновик или перевод из игры.
     pub translated: usize,
     pub drafts: usize,
+}
+
+/// Сцена в списке таблицы с прогрессом и описанием. `key = None`: реплики файла вне сцен.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SceneProgress {
+    pub key: Option<ContainerKey>,
+    /// Файл, в группе которого сцена стоит в списке: файл её первой реплики.
+    pub file: FileId,
+    pub title: Option<String>,
+    /// У сцены есть непустое описание.
+    pub described: bool,
+    /// Игра изменила текст сцены после того, как модель его прочитала.
+    pub stale: bool,
+    pub total: usize,
+    pub translated: usize,
+    pub drafts: usize,
+}
+
+/// Сцена таблицы: сцена по ключу или реплики файла вне сцен.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SceneRef {
+    Scene(ContainerKey),
+    Loose(FileId),
+}
+
+/// Файл с прогрессом и его сцены: по сюжету, реплики вне сцен последними.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileScenes {
+    pub file: FileProgress,
+    pub scenes: Vec<SceneProgress>,
 }
 
 /// Запуск перевода или редактуры реплик для меню «Запуски».
