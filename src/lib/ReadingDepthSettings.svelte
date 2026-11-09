@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from "svelte";
   import { LoaderCircle, RotateCcw, X } from "lucide-svelte";
   import { commands } from "./bindings";
-  import { DEFAULT_READING_DEPTH, normalizeReadingDepth, type ReadingDepth } from "./character-parts";
+  import { DEFAULT_READING_DEPTH, normalizeReadingDepth, type ReadingDepth } from "./reading-depth";
   import { depthChanges } from "./reading-depth.svelte";
   import RequestSlider from "./RequestSlider.svelte";
 

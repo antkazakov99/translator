@@ -8,8 +8,6 @@
     status,
     max,
     value,
-    floor = 1,
-    ready = 0,
     disabled = false,
     onchange,
     ends
@@ -20,10 +18,6 @@
     /** Шкала делится на `max` частей, и значение равно числу закрашенных. */
     max: number;
     value: number;
-    /** Ниже этого значения бегунок не опускается. */
-    floor?: number;
-    /** Части, которые уже готовы: они выделены своим цветом. */
-    ready?: number;
     disabled?: boolean;
     onchange: (value: number) => void;
     ends: Snippet;
@@ -38,8 +32,9 @@
     return parts >= max ? "100%" : `calc(7px + (100% - 14px) * ${parts / max})`;
   }
 
+  // Шкала начинается с нуля, но меньше одной части значение не бывает.
   function oninput(event: Event & { currentTarget: HTMLInputElement }) {
-    const wanted = Math.min(max, Math.max(event.currentTarget.valueAsNumber, floor));
+    const wanted = Math.min(max, Math.max(event.currentTarget.valueAsNumber, 1));
     event.currentTarget.value = String(wanted);
     onchange(wanted);
   }
@@ -55,7 +50,7 @@
     type="range"
     min="0"
     use:syncRange={{ max, value }}
-    style={`--ready-stop: ${stop(ready)}; --parts-stop: ${stop(value)}; --segment: calc((100% + 2px) / ${max})`}
+    style={`--parts-stop: ${stop(value)}; --segment: calc((100% + 2px) / ${max})`}
     class:segmented={max <= MAX_SEGMENTS_WITH_GAPS}
     {disabled}
     {oninput}
@@ -88,8 +83,7 @@
   .slider input {
     --fill: linear-gradient(
       to right,
-      var(--accent-icon) var(--ready-stop),
-      var(--accent) var(--ready-stop) var(--parts-stop),
+      var(--accent) var(--parts-stop),
       var(--track) var(--parts-stop)
     );
     appearance: none;
