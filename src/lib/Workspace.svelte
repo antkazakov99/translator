@@ -12,6 +12,7 @@
     Languages,
     LoaderCircle,
     Package,
+    RefreshCw,
     SpellCheck,
     Square,
     TriangleAlert,
@@ -21,6 +22,7 @@
   } from "lucide-svelte";
   import Glossary from "./Glossary.svelte";
   import ModPanel from "./ModPanel.svelte";
+  import ScanPanel from "./ScanPanel.svelte";
   import SceneGraph from "./SceneGraph.svelte";
   import type { GraphScene } from "$lib/scene-graph";
   import {
@@ -34,7 +36,12 @@
     type ScopeDto,
   } from "$lib/bindings";
 
-  let { project, onBack, onSettings }: { project: Project; onBack: () => void; onSettings: () => void } = $props();
+  let {
+    project,
+    onBack,
+    onSettings,
+    onProject,
+  }: { project: Project; onBack: () => void; onSettings: () => void; onProject: (next: Project) => void } = $props();
 
   type Filter = "all" | "empty" | "draft";
 
@@ -49,6 +56,8 @@
   let view = $state<"table" | "graph" | "glossary">("table");
   /** Карточка мода под шапкой. */
   let modOpen = $state(false);
+  /** Карточка версии игры: считывание, смена папки, «Пропавшие». */
+  let scanOpen = $state(false);
   /** Сцена в центре графа: переживает переключение вида. */
   let graphFocus = $state<string | null>(null);
 
@@ -97,6 +106,20 @@
       files = await commands.translationFiles(project.id);
     } catch (e) {
       error = String(e);
+    }
+  }
+
+  /** После считывания: файлы и реплики могли смениться, открытый файл мог исчезнуть. */
+  async function reloadSnapshot() {
+    editing = null;
+    // Изменённый файл получает новую строку: его находят по пути.
+    const path = file?.path;
+    await loadFiles();
+    const next = files.find((item) => item.id === fileId) ?? files.find((item) => item.path === path) ?? files[0];
+    if (next) await selectFile(next.id);
+    else {
+      fileId = null;
+      scenes = [];
     }
   }
 
@@ -386,6 +409,10 @@
       <button role="tab" aria-selected={view === "graph"} class:on={view === "graph"} onclick={() => (view = "graph")}>Граф</button>
       <button role="tab" aria-selected={view === "glossary"} class:on={view === "glossary"} onclick={() => (view = "glossary")}>Глоссарий</button>
     </div>
+    <button class="btn small" class:active={scanOpen} onclick={() => (scanOpen = !scanOpen)} title="Считать новую версию игры, сменить папку, пропавшие реплики">
+      <RefreshCw size={15} />
+      <span>Версия игры</span>
+    </button>
     <button class="btn small" class:active={modOpen} onclick={() => (modOpen = !modOpen)} title="Собрать мод перевода и поставить его в игру">
       <Package size={15} />
       <span>Мод</span>
@@ -396,6 +423,9 @@
     </button>
   </header>
 
+  {#if scanOpen}
+    <ScanPanel {project} {onProject} onClose={() => (scanOpen = false)} onChanged={reloadSnapshot} />
+  {/if}
   {#if modOpen}
     <ModPanel {project} onClose={() => (modOpen = false)} />
   {/if}
@@ -770,15 +800,16 @@
 
   .toolbar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 14px;
+    gap: 8px 14px;
     padding: 10px 16px;
     border-bottom: 1px solid var(--divider);
   }
 
   .toolbar-title {
     display: flex;
-    flex: 1;
+    flex: 1 1 160px;
     flex-direction: column;
     gap: 2px;
     min-width: 0;
@@ -790,6 +821,10 @@
     font-size: 13px;
     font-weight: 600;
     text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .toolbar-title span {
     white-space: nowrap;
   }
 

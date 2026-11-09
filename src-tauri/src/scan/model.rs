@@ -40,3 +40,19 @@ pub struct MissingSegment {
     pub file: String,
     pub location: Option<String>,
 }
+
+/// Итог считывания для окна.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanReport {
+    pub scan: ScanId,
+    /// Реплик в новом снимке.
+    pub lines: usize,
+    /// Новых реплик без пары в прошлом снимке.
+    pub new_lines: usize,
+    /// Переводов, перенесённых на другую строку.
+    pub transferred: usize,
+    /// Переводов, которые считывание сделало черновиками: текст изменился или пара сомнительная.
+    pub drafts: usize,
+    /// Реплик в «Пропавших» после считывания.
+    pub missing: usize,
+}

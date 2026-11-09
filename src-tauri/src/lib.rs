@@ -38,6 +38,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
     use graph::commands::*;
     use llm::commands::*;
     use projects::commands::*;
+    use scan::commands::*;
     use translation::commands::*;
     tauri_specta::Builder::<tauri::Wry>::new()
         .error_handling(ErrorHandlingMode::Throw)
@@ -115,6 +116,10 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             unarchive_project,
             rename_project,
             unbind_project,
+            rebind_project,
+            rescan_game,
+            missing_lines,
+            attach_missing_line,
             delete_project,
         ])
 }

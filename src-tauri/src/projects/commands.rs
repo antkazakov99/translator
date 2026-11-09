@@ -5,8 +5,10 @@ use std::path::Path;
 use serde::Serialize;
 use tauri::AppHandle;
 
-use super::{GameRoot, Project, ProjectId, ProjectService, Title};
+use super::{GameRoot, Project, ProjectId, ProjectService, RebindCheck, Title};
 use crate::common::AppError;
+use crate::scan::ScanService;
+use crate::scan::commands::ScanReportDto;
 use crate::state::blocking;
 
 /// Проект для окна.
@@ -77,10 +79,19 @@ pub async fn create_project(app: AppHandle, root: String) -> Result<ProjectDto, 
     .await
 }
 
+/// Открывает проект. Снимок, разобранный прошлой версией движка, пересобирается из файлов проекта:
+/// без папки игры, с переносом перевода. Сбой пересборки не мешает открыть проект со старым снимком.
 #[tauri::command]
 #[specta::specta]
 pub async fn open_project(app: AppHandle, id: String) -> Result<ProjectDto, String> {
-    blocking(app, move |state| Ok(ProjectDto::of(&ProjectService { state }.open(self::id(&id)?)?))).await
+    blocking(app, move |state| {
+        let project = ProjectService { state }.open(self::id(&id)?)?;
+        if let Err(error) = (ScanService { state }).rebuild_if_stale(project.id()) {
+            tracing::warn!("снимок проекта {} не пересобран: {error}", project.id());
+        }
+        Ok(ProjectDto::of(&project))
+    })
+    .await
 }
 
 #[tauri::command]
@@ -119,6 +130,35 @@ pub async fn rename_project(app: AppHandle, id: String, title: String) -> Result
 #[specta::specta]
 pub async fn unbind_project(app: AppHandle, id: String) -> Result<ProjectDto, String> {
     blocking(app, move |state| Ok(ProjectDto::of(&ProjectService { state }.unbind(self::id(&id)?)?))).await
+}
+
+/// Итог смены папки игры.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RebindDto {
+    /// Папка сменена, игра считана заново.
+    Done { project: ProjectDto, report: ScanReportDto },
+    /// Общих реплик со старым снимком меньше половины: окно спрашивает, та ли это игра.
+    #[serde(rename_all = "camelCase")]
+    LooksLikeOtherGame { shared: u32, total: u32 },
+}
+
+/// Привязывает проект к другой папке игры и считывает её с переносом перевода.
+/// Без `confirmed` чужая на вид игра только возвращает предупреждение.
+#[tauri::command]
+#[specta::specta]
+pub async fn rebind_project(app: AppHandle, id: String, root: String, confirmed: bool) -> Result<RebindDto, String> {
+    blocking(app, move |state| {
+        let root = ProjectService::resolve_root(Path::new(&root))?;
+        let check = ProjectService { state }.rebind(self::id(&id)?, root, confirmed)?;
+        Ok(match check {
+            RebindCheck::Done { project, report } => RebindDto::Done { project: ProjectDto::of(&project), report: report.into() },
+            RebindCheck::LooksLikeOtherGame { shared, total } => {
+                RebindDto::LooksLikeOtherGame { shared: shared as u32, total: total as u32 }
+            }
+        })
+    })
+    .await
 }
 
 /// Удаляет проект и его папку данных. Папку игры не трогает.

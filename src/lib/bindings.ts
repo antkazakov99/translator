@@ -138,12 +138,26 @@ export const commands = {
 	findProjects: (root: string) => __TAURI_INVOKE<ProjectDto_Serialize[]>("find_projects", { root }),
 	/**  Создаёт проект по корневой папке игры: считывает её целиком. */
 	createProject: (root: string) => __TAURI_INVOKE<ProjectDto_Serialize>("create_project", { root }),
+	/**
+	 *  Открывает проект. Снимок, разобранный прошлой версией движка, пересобирается из файлов проекта:
+	 *  без папки игры, с переносом перевода. Сбой пересборки не мешает открыть проект со старым снимком.
+	 */
 	openProject: (id: string) => __TAURI_INVOKE<ProjectDto_Serialize>("open_project", { id }),
 	closeProject: (id: string) => __TAURI_INVOKE<null>("close_project", { id }),
 	archiveProject: (id: string) => __TAURI_INVOKE<ProjectDto_Serialize>("archive_project", { id }),
 	unarchiveProject: (id: string) => __TAURI_INVOKE<ProjectDto_Serialize>("unarchive_project", { id }),
 	renameProject: (id: string, title: string) => __TAURI_INVOKE<ProjectDto_Serialize>("rename_project", { id, title }),
 	unbindProject: (id: string) => __TAURI_INVOKE<ProjectDto_Serialize>("unbind_project", { id }),
+	/**
+	 *  Привязывает проект к другой папке игры и считывает её с переносом перевода.
+	 *  Без `confirmed` чужая на вид игра только возвращает предупреждение.
+	 */
+	rebindProject: (id: string, root: string, confirmed: boolean) => __TAURI_INVOKE<RebindDto_Serialize>("rebind_project", { id, root, confirmed }),
+	/**  Считывает привязанную папку игры заново и переносит перевод на новую версию. */
+	rescanGame: (project: string) => __TAURI_INVOKE<ScanReportDto>("rescan_game", { project }),
+	missingLines: (project: string) => __TAURI_INVOKE<MissingLineDto_Serialize[]>("missing_lines", { project }),
+	/**  Переносит перевод пропавшей реплики на реплику игры. */
+	attachMissingLine: (project: string, missing: RowRef, target: RowRef) => __TAURI_INVOKE<null>("attach_missing_line", { project, missing, target }),
 	/**  Удаляет проект и его папку данных. Папку игры не трогает. */
 	deleteProject: (id: string) => __TAURI_INVOKE<null>("delete_project", { id }),
 };
@@ -515,6 +529,29 @@ export type LlmSettingsDto_Serialize = {
 	defaultTimeoutSecs: number,
 };
 
+/**  Реплика прошлой версии игры с переводом или историей. */
+export type MissingLineDto = MissingLineDto_Serialize | MissingLineDto_Deserialize;
+
+/**  Реплика прошлой версии игры с переводом или историей. */
+export type MissingLineDto_Deserialize = {
+	id: RowRef,
+	scene?: string | null,
+	sourceText: string,
+	translation?: string | null,
+	file: string,
+	location?: string | null,
+};
+
+/**  Реплика прошлой версии игры с переводом или историей. */
+export type MissingLineDto_Serialize = {
+	id: RowRef,
+	scene: string | null,
+	sourceText: string,
+	translation: string | null,
+	file: string,
+	location: string | null,
+};
+
 /**  Итог сборки или установки мода. */
 export type ModResultDto = {
 	/**  Собранный архив в папке проекта. */
@@ -758,6 +795,23 @@ export type ProviderKind =
 /**  Другой OpenAI-совместимый сервер. */
 "compatible";
 
+/**  Итог смены папки игры. */
+export type RebindDto = RebindDto_Serialize | RebindDto_Deserialize;
+
+/**  Итог смены папки игры. */
+export type RebindDto_Deserialize = 
+/**  Папка сменена, игра считана заново. */
+{ kind: "done"; project: ProjectDto_Deserialize; report: ScanReportDto } | 
+/**  Общих реплик со старым снимком меньше половины: окно спрашивает, та ли это игра. */
+{ kind: "looksLikeOtherGame"; shared: number; total: number };
+
+/**  Итог смены папки игры. */
+export type RebindDto_Serialize = 
+/**  Папка сменена, игра считана заново. */
+{ kind: "done"; project: ProjectDto_Serialize; report: ScanReportDto } | 
+/**  Общих реплик со старым снимком меньше половины: окно спрашивает, та ли это игра. */
+{ kind: "looksLikeOtherGame"; shared: number; total: number };
+
 /**  Итог отката. */
 export type RollbackDto = {
 	rolled: number,
@@ -814,6 +868,19 @@ export type RunProgress_Serialize = {
 };
 
 export type RunStatus = "running" | "done" | "cancelled" | "failed";
+
+/**  Итог считывания. */
+export type ScanReportDto = {
+	lines: number,
+	/**  Новые реплики без пары в прошлой версии. */
+	newLines: number,
+	/**  Переводы, перенесённые на реплики с другим ключом. */
+	transferred: number,
+	/**  Переводы, ставшие черновиками: оригинал изменился или пара сомнительная. */
+	drafts: number,
+	/**  Реплик в «Пропавших». */
+	missing: number,
+};
 
 /**  Подряд идущие реплики одной сцены файла. */
 export type SceneDto = SceneDto_Serialize | SceneDto_Deserialize;

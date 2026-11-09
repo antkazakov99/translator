@@ -1,5 +1,6 @@
 //! Сценарии проектов: порядок шагов, диск и транзакции.
 
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use super::{GameRoot, Project, ProjectId, ProjectRepo, Title};
 use crate::common::{AppError, Timestamp};
 use crate::engines::{self, GameSource};
 use crate::files::FileStore;
-use crate::scan::ScanRepo;
+use crate::scan::{ScanReport, ScanRepo, ScanService};
 use crate::state::{AppState, OpenProject, remove_dir};
 use crate::storage::{DbError, ProjectDb};
 
@@ -16,7 +17,7 @@ use crate::storage::{DbError, ProjectDb};
 #[derive(Debug)]
 pub enum RebindCheck {
     /// Папка сменена, игра считана заново.
-    Done(Project),
+    Done { project: Project, report: ScanReport },
     /// Общих ключей реплик со старым снимком меньше половины: окно спрашивает, та ли это игра.
     LooksLikeOtherGame { shared: usize, total: usize },
 }
@@ -83,7 +84,26 @@ impl ProjectService<'_> {
     /// Привязывает другую папку: движок узнаёт игру, модель сверяет движок, игра считывается заново
     /// с переносом перевода. Без `confirmed` чужая на вид игра только возвращает предупреждение.
     pub fn rebind(&self, id: ProjectId, root: GameRoot, confirmed: bool) -> Result<RebindCheck, AppError> {
-        todo!()
+        let (engine, info) = engines::detect(&root).ok_or(AppError::UnknownGame)?;
+        // Правило модели до долгого чтения: другой движок или неготовый проект сразу дают ошибку.
+        self.get(id)?.rebind(root.clone(), engine.id())?;
+
+        self.open(id)?;
+        let open = self.state.open_project(id)?;
+        let _lock = open.snapshot_lock.lock();
+        let snapshot = engine.read(&GameSource::Folder(root.clone()), &info, &open.files)?;
+        if !confirmed {
+            let old: HashSet<String> = open.project.read(|tx| ScanRepo { conn: tx }.segment_keys())?.into_iter().collect();
+            let shared = snapshot.segments.iter().filter(|segment| old.contains(segment.key.as_str())).count();
+            if !old.is_empty() && shared * 2 < old.len() {
+                // Считанные файлы этой папки не нужны, пока пользователь не подтвердит её.
+                ScanService::clean_files(&open);
+                return Ok(RebindCheck::LooksLikeOtherGame { shared, total: old.len() });
+            }
+        }
+        let report = ScanService::apply(&open, engine, &snapshot, Some(&root))?;
+        let project = self.update(id, |project| Ok(project.rebind(root, engine.id())?))?;
+        Ok(RebindCheck::Done { project, report })
     }
 
     /// Отвязывает папку игры: проект работает дальше, недоступны установка мода и повторное считывание.

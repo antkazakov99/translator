@@ -55,7 +55,7 @@
   <div class="blank"></div>
 {:else if project}
   {#key project.id}
-    <Workspace {project} onBack={backToProjects} onSettings={() => (showLlmSettings = true)} />
+    <Workspace {project} onBack={backToProjects} onSettings={() => (showLlmSettings = true)} onProject={(next) => (project = next)} />
   {/key}
 {:else}
   <StartScreen onOpen={opened} onSettings={() => (showLlmSettings = true)} />

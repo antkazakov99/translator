@@ -248,7 +248,7 @@ impl DescribeService<'_> {
             let glossary = GlossaryData::load(tx)?;
             let context = GlossaryContext::new(&glossary);
             let lines = LineSampleRepo { conn: tx }.story_lines()?;
-            let Some(selection) = select_entry(tx, &context, &glossary, &lines, target)? else { return Ok(EntryParts::default()) };
+            let Some(selection) = select_entry(tx, &context, &glossary, &lines, target, false)? else { return Ok(EntryParts::default()) };
             let notes = NoteRepo { conn: tx }.all_of(&owner_of(target))?;
             let note_of = |hash: &str| {
                 let own = notes.iter().find(|note| note.part_hash == hash && Some(&note.model) == model.as_ref());
@@ -509,18 +509,20 @@ struct Selection {
 }
 
 /// `None`: записи нет или у персонажа нет имени, по которому его искать.
+/// Сцены и части персонажа или термина. `ignore_exclusions`: части по всем сценам, как будто ничего не исключено.
 fn select_entry(
     tx: &rusqlite::Connection,
     context: &GlossaryContext,
     glossary: &GlossaryData,
     lines: &[StoryLine],
     target: &DescribeTarget,
+    ignore_exclusions: bool,
 ) -> Result<Option<Selection>, DbError> {
     Ok(match target {
         DescribeTarget::Character(id) => {
             let Some(character) = glossary.characters.iter().find(|character| character.id() == Some(*id)) else { return Ok(None) };
             let Some(name) = character.full_name() else { return Ok(None) };
-            let excluded = CharacterRepo { conn: tx }.excluded_containers(*id)?;
+            let excluded = if ignore_exclusions { Vec::new() } else { CharacterRepo { conn: tx }.excluded_containers(*id)? };
             let speakers = glossary.links.iter().filter(|link| link.character == *id).map(|link| link.speaker.clone()).collect();
             let scenes = character_scenes(lines, &speakers, &character_names(character), &excluded);
             let parts = entry_parts(lines, &scenes, context);
@@ -528,13 +530,58 @@ fn select_entry(
         }
         DescribeTarget::Term(id) => {
             let Some(term) = glossary.terms.iter().find(|term| term.id() == Some(*id)) else { return Ok(None) };
-            let excluded = TermRepo { conn: tx }.excluded_containers(*id)?;
+            let excluded = if ignore_exclusions { Vec::new() } else { TermRepo { conn: tx }.excluded_containers(*id)? };
             let scenes = term_scenes(lines, &term_names(term), &excluded);
             let parts = entry_parts(lines, &scenes, context);
             Some(Selection { kind: EntryKind::Term, name: term.name().to_string(), parts, excluded, described: term.description().is_some() })
         }
         DescribeTarget::Scene(_) => None,
     })
+}
+
+/// После повторного считывания удаляет заметки, чьих частей больше нет у владельца. Части сцены берутся из её
+/// реплик, у пропавшей сцены их нет. Части персонажа и термина собираются из нескольких сцен и зависят от
+/// исключений: заметка остаётся, если её часть есть среди частей без исключений или при нынешних исключениях.
+/// Возвращает число удалённых заметок.
+pub(crate) fn prune_notes(tx: &rusqlite::Connection) -> Result<usize, DbError> {
+    let notes = NoteRepo { conn: tx };
+    let owners = notes.owners()?;
+    if owners.is_empty() {
+        return Ok(0);
+    }
+    let glossary = GlossaryData::load(tx)?;
+    let mut context = GlossaryContext::new(&glossary);
+    let lines = LineSampleRepo { conn: tx }.story_lines()?;
+    let mut removed = 0;
+    for owner in owners {
+        let hashes: Vec<String> = match &owner {
+            NoteOwner::Container(key) => {
+                scene_text(tx, &mut context, key)?.map(|(parts, _)| parts.into_iter().map(|part| part.hash).collect()).unwrap_or_default()
+            }
+            NoteOwner::Character(id) => entry_hashes(tx, &context, &glossary, &lines, &DescribeTarget::Character(*id))?,
+            NoteOwner::Term(id) => entry_hashes(tx, &context, &glossary, &lines, &DescribeTarget::Term(*id))?,
+        };
+        removed += notes.retain_parts(&owner, &hashes)?;
+    }
+    Ok(removed)
+}
+
+/// Отпечатки частей персонажа или термина без исключений и при нынешних исключениях.
+/// Удалённого владельца нет в глоссарии: частей у него нет.
+fn entry_hashes(
+    tx: &rusqlite::Connection,
+    context: &GlossaryContext,
+    glossary: &GlossaryData,
+    lines: &[StoryLine],
+    target: &DescribeTarget,
+) -> Result<Vec<String>, DbError> {
+    let mut hashes = Vec::new();
+    for ignore_exclusions in [true, false] {
+        if let Some(selection) = select_entry(tx, context, glossary, lines, target, ignore_exclusions)? {
+            hashes.extend(selection.parts.into_iter().map(|part| part.part.hash));
+        }
+    }
+    Ok(hashes)
 }
 
 /// План персонажа или термина. `None`: читать нечего или запись заполнена и новых частей нет.
@@ -549,7 +596,7 @@ fn plan_entry(
     choice: Choice,
     fill: Fill,
 ) -> Result<Option<EntryPlan>, DbError> {
-    let Some(selection) = select_entry(tx, context, glossary, lines, &target)? else { return Ok(None) };
+    let Some(selection) = select_entry(tx, context, glossary, lines, &target, false)? else { return Ok(None) };
     if selection.parts.is_empty() {
         return Ok(None);
     }
@@ -1666,6 +1713,60 @@ mod tests {
         let scenes: Vec<&str> = parts.parts[0].scenes.iter().map(ContainerKey::as_str).collect();
         assert_eq!(scenes, ["label:start"], "исключённая сцена модели не даётся");
         assert!(parts.parts[0].note.is_none(), "у новой части заметки нет");
+    }
+
+    #[test]
+    fn notes_of_parts_that_are_gone_are_pruned() {
+        let (url, _) = fake_model(|body| {
+            let system = system_text(body);
+            let answer = if system.contains("about one character") {
+                "```json
+{\"description\": \"Эйлин встречает героя.\"}
+```"
+            } else if system.contains("name a scene") {
+                "Знакомство"
+            } else {
+                "Эйлин здоровается."
+            };
+            completion(answer)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let glossary = GlossaryService { state: &state };
+        let service = DescribeService { state: &state };
+        let eileen = glossary.speaker_to_character(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
+        let character = DescribeTarget::Character(eileen);
+        let start = ContainerKey::new("label:start").unwrap();
+        let left = ContainerKey::new("label:left").unwrap();
+        tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(start.clone()), usize::MAX, None, silent())).unwrap();
+        tauri::async_runtime::block_on(service.describe(id, character.clone(), usize::MAX, None, silent())).unwrap();
+        // Заметка при исключённой сцене: её часть есть только при нынешних исключениях.
+        glossary.set_excluded_scene(id, crate::glossary::ExcludeOwner::Character(eileen), &left, true).unwrap();
+        tauri::async_runtime::block_on(service.describe(id, character.clone(), usize::MAX, None, silent())).unwrap();
+
+        let open = state.open_project(id).unwrap();
+        let count = |sql: &str| -> i64 { open.project.read(|tx| Ok(tx.query_row(sql, [], |row| row.get(0))?)).unwrap() };
+        let real = count("SELECT count(*) FROM notes");
+        assert!(real >= 3, "сцена и две части персонажа: {real}");
+        open.project
+            .write(|tx| {
+                for (kind, owner) in [("container", "label:start"), ("container", "label:gone"), ("character", "999999")] {
+                    tx.execute(
+                        "INSERT INTO notes (owner_kind, owner_ref, model, part_hash, text, created_at) VALUES (?1, ?2, 'm', 'stale', 'x', 0)",
+                        rusqlite::params![kind, owner],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO notes (owner_kind, owner_ref, model, part_hash, text, created_at) VALUES ('character', ?1, 'm', 'stale', 'x', 0)",
+                    [eileen.get()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(open.project.write(|tx| prune_notes(tx)).unwrap(), 4);
+        assert_eq!(count("SELECT count(*) FROM notes"), real);
+        assert_eq!(count("SELECT count(*) FROM notes WHERE part_hash = 'stale'"), 0);
     }
 
     #[test]

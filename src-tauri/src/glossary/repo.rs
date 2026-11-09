@@ -837,6 +837,17 @@ impl NoteRepo<'_> {
         Ok(self.conn.execute("DELETE FROM notes WHERE owner_kind = ?1 AND owner_ref = ?2", params![owner.kind(), owner.reference()])?)
     }
 
+    /// Все владельцы, у которых есть заметки.
+    pub fn owners(&self) -> Result<Vec<NoteOwner>, DbError> {
+        let mut statement = self.conn.prepare("SELECT DISTINCT owner_kind, owner_ref FROM notes ORDER BY owner_kind, owner_ref")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.iter()
+            .map(|(kind, reference)| NoteOwner::parse(kind, reference).map_err(|error| DbError::bad_value("notes", "owner_ref", error)))
+            .collect()
+    }
+
     /// После повторного считывания: удаляет заметки, чьих частей нет среди всех частей владельца.
     pub fn retain_parts(&self, owner: &NoteOwner, part_hashes: &[String]) -> Result<usize, DbError> {
         let mut statement = self.conn.prepare("SELECT DISTINCT part_hash FROM notes WHERE owner_kind = ?1 AND owner_ref = ?2")?;
