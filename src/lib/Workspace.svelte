@@ -574,27 +574,7 @@
       </div>
     </nav>
 
-    {#if selected?.kind === "scene"}
-      <aside class="scene-side" aria-label="Описание сцены">
-        {#if described?.key === selected.key}
-          <SceneCard
-            projectId={project.id}
-            scene={described}
-            sceneKey={described.key}
-            stale={item?.stale ?? false}
-            {busy}
-            describing={describe.active}
-            onDescribe={describeOne}
-            onSaved={patchScene}
-            onError={(message) => (error = message)}
-          />
-        {:else}
-          <div class="empty"><LoaderCircle size={18} class="spin" /></div>
-        {/if}
-      </aside>
-    {/if}
-
-    <section class="lines">
+    <section class="main">
       {#if selected && group}
         <div class="toolbar">
           <div class="toolbar-title">
@@ -628,195 +608,221 @@
             onclick={toggleRuns}><History size={15} /></button
           >
         </div>
-
-        <div class="actions" role="toolbar" aria-label="Действия с репликами">
-          <div class="segmented" role="tablist" aria-label="Какие реплики показать">
-            {#each [["all", "Все"], ["empty", "Пустые"], ["draft", "Модель"]] as [value, label] (value)}
-              <button role="tab" aria-selected={filter === value} class:on={filter === value} onclick={() => (filter = value as Filter)}>
-                {label}
-              </button>
-            {/each}
-          </div>
-          <span class="actions-gap"></span>
-          {#if sceneDrafts.length > 0}
-            <button class="btn small warning" title="Подтвердить все черновики модели в сцене" onclick={() => confirm(sceneDrafts)}>
-              <CheckCheck size={14} />
-              <span>Подтвердить · {sceneDrafts.length}</span>
-            </button>
-          {/if}
-          <button
-            class="btn small"
-            disabled={busy || working || sceneReady === 0}
-            title={sceneReady === 0 ? "В сцене нет переведённых реплик" : "Очистить перевод сцены: модель переведёт её заново"}
-            onclick={() => selected && (confirming = { kind: "reset", scope: scopeOf(selected), what: "сцены", count: sceneReady })}
-          >
-            <Eraser size={14} />
-            <span>Очистить</span>
-          </button>
-          <button
-            class="btn small"
-            disabled={busy || sceneReady === 0}
-            title={busy ? "Модель уже работает" : sceneReady === 0 ? "В сцене нет переведённых реплик" : "Модель вычитает переведённые реплики сцены"}
-            onclick={() => selected && startRun("review", scopeOf(selected))}
-          >
-            {#if run?.mode === "review"}<LoaderCircle size={14} class="spin" />{:else}<SpellCheck size={14} />{/if}
-            <span>Вычитать</span>
-          </button>
-          <button
-            class="btn small primary"
-            disabled={busy || sceneEmpty === 0}
-            title={busy ? "Модель уже работает" : sceneEmpty === 0 ? "В сцене нет пустых реплик" : "Модель переведёт пустые реплики сцены"}
-            onclick={() => selected && startRun("translate", scopeOf(selected))}
-          >
-            {#if run?.mode === "translate" && !wholeGame}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
-            <span>Перевести{sceneEmpty ? ` · ${sceneEmpty}` : ""}</span>
-          </button>
-        </div>
       {/if}
 
-      <SuggestStatus run={describe} onError={(message) => (error = message)} />
-
-      {#if run}
-        <div class="banner progress page-error" role="status">
-          <LoaderCircle size={14} class="spin" />
-          <span>{runText(run)}</span>
-          <button class="btn small" disabled={run.stopping} onclick={stopRun}>
-            <Square size={13} />
-            <span>Остановить</span>
-          </button>
-        </div>
-      {:else if notice}
-        <div class="banner page-error" role="status">
-          <Check size={14} />
-          <span>{notice}</span>
-          {#if lastRun !== null}
-            <button class="btn small" disabled={working} title="Вернуть реплики к виду до запуска" onclick={() => lastRun !== null && (confirming = { kind: "rollback", run: lastRun })}>
-              <Undo2 size={13} />
-              <span>Откатить</span>
-            </button>
-          {/if}
-          <button class="icon-button" aria-label="Скрыть итог" title="Скрыть итог" onclick={() => ((notice = ""), (lastRun = null))}><X size={14} /></button>
-        </div>
-      {/if}
-
-      {#if confirming}
-        <div class="banner warn choice page-error" role="alertdialog">
-          <TriangleAlert size={14} />
-          <span>
-            {#if confirming.kind === "rollback"}
-              Откатить запуск? Реплики, которые не правили после него, вернутся к виду до запуска
+      <div class="main-body">
+        {#if selected?.kind === "scene"}
+          <aside class="scene-side" aria-label="Описание сцены">
+            {#if described?.key === selected.key}
+              <SceneCard
+                projectId={project.id}
+                scene={described}
+                sceneKey={described.key}
+                stale={item?.stale ?? false}
+                {busy}
+                describing={describe.active}
+                onDescribe={describeOne}
+                onSaved={patchScene}
+                onError={(message) => (error = message)}
+              />
             {:else}
-              Очистить перевод {confirming.what}? Реплик с переводом: {confirming.count}. Модель переведёт их заново, история правок останется
+              <div class="empty"><LoaderCircle size={18} class="spin" /></div>
             {/if}
-          </span>
-          <div class="choice-actions">
-            <button class="btn small" disabled={working} onclick={() => (confirming = null)}>Отмена</button>
-            <button
-              class="btn small danger"
-              disabled={working}
-              onclick={() => {
-                if (!confirming) return;
-                if (confirming.kind === "rollback") rollback(confirming.run);
-                else reset(confirming.scope);
-              }}
-            >
-              {#if working}<LoaderCircle size={13} class="spin" />{/if}
-              <span>{confirming.kind === "rollback" ? "Откатить" : "Очистить"}</span>
-            </button>
-          </div>
-        </div>
-      {/if}
+          </aside>
+        {/if}
 
-      {#if runs}
-        <div class="card runs page-error">
-          <div class="runs-head">
-            <strong>Запуски перевода и редактуры</strong>
-            <button class="icon-button" aria-label="Закрыть запуски" title="Закрыть" onclick={() => (runs = null)}><X size={14} /></button>
-          </div>
-          {#each runs as entry (entry.id)}
-            <div class="run-row">
-              <span class="run-when">{runWhen(entry.startedAt)}</span>
-              <span class="run-what">{runActions[entry.action] ?? entry.action} · {entry.model}</span>
-              <span class="run-state" class:failed={entry.status === "failed"} title={entry.error ?? ""}>{runStatuses[entry.status]} · реплик: {entry.lines}</span>
+        <div class="lines">
+          {#if selected && group}
+            <div class="actions" role="toolbar" aria-label="Действия с репликами">
+              <div class="segmented" role="tablist" aria-label="Какие реплики показать">
+                {#each [["all", "Все"], ["empty", "Пустые"], ["draft", "Модель"]] as [value, label] (value)}
+                  <button role="tab" aria-selected={filter === value} class:on={filter === value} onclick={() => (filter = value as Filter)}>
+                    {label}
+                  </button>
+                {/each}
+              </div>
+              <span class="actions-gap"></span>
+              {#if sceneDrafts.length > 0}
+                <button class="btn small warning" title="Подтвердить все черновики модели в сцене" onclick={() => confirm(sceneDrafts)}>
+                  <CheckCheck size={14} />
+                  <span>Подтвердить · {sceneDrafts.length}</span>
+                </button>
+              {/if}
               <button
                 class="btn small"
-                disabled={working || busy || entry.status === "running" || entry.lines === 0}
-                title={entry.lines === 0 ? "Запуск ничего не записал" : "Вернуть реплики к виду до запуска"}
-                onclick={() => (confirming = { kind: "rollback", run: entry.id })}
+                disabled={busy || working || sceneReady === 0}
+                title={sceneReady === 0 ? "В сцене нет переведённых реплик" : "Очистить перевод сцены: модель переведёт её заново"}
+                onclick={() => selected && (confirming = { kind: "reset", scope: scopeOf(selected), what: "сцены", count: sceneReady })}
               >
-                <Undo2 size={13} />
-                <span>Откатить</span>
+                <Eraser size={14} />
+                <span>Очистить</span>
+              </button>
+              <button
+                class="btn small"
+                disabled={busy || sceneReady === 0}
+                title={busy ? "Модель уже работает" : sceneReady === 0 ? "В сцене нет переведённых реплик" : "Модель вычитает переведённые реплики сцены"}
+                onclick={() => selected && startRun("review", scopeOf(selected))}
+              >
+                {#if run?.mode === "review"}<LoaderCircle size={14} class="spin" />{:else}<SpellCheck size={14} />{/if}
+                <span>Вычитать</span>
+              </button>
+              <button
+                class="btn small primary"
+                disabled={busy || sceneEmpty === 0}
+                title={busy ? "Модель уже работает" : sceneEmpty === 0 ? "В сцене нет пустых реплик" : "Модель переведёт пустые реплики сцены"}
+                onclick={() => selected && startRun("translate", scopeOf(selected))}
+              >
+                {#if run?.mode === "translate" && !wholeGame}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
+                <span>Перевести{sceneEmpty ? ` · ${sceneEmpty}` : ""}</span>
               </button>
             </div>
-          {:else}
-            <p class="muted">Запусков ещё не было</p>
-          {/each}
-        </div>
-      {/if}
-
-      {#if error}
-        <div class="banner error page-error" role="alert">
-          <TriangleAlert size={14} />
-          <span>{error}</span>
-          <button class="icon-button" aria-label="Скрыть ошибку" onclick={() => (error = "")}><X size={14} /></button>
-        </div>
-      {/if}
-
-      {#if !selected}
-        <div class="empty">{loadedTree ? "Выберите сцену в списке слева" : ""}</div>
-      {:else if loadingLines}
-        <div class="empty"><LoaderCircle size={20} class="spin" /></div>
-      {:else}
-        <div class="table">
-          {#if shown.length === 0}
-            <div class="no-lines">{filter === "all" ? "В сцене нет реплик" : "Таких реплик нет"}</div>
           {/if}
-          {#each shown as scene, index (scene.key ?? `outside-${index}`)}
-            {#if selected.kind === "loose" && shown.length > 1}
-              <h3 class="subgroup">{scene.key ?? "Вне контейнеров"}</h3>
-            {/if}
-            {#each scene.lines as line (line.id)}
-              <div class="row" class:editing={editing?.id === line.id} class:highlighted={highlighted === line.id} data-row={line.id}>
-                {#if line.location}
-                  <button class="where" title="Строка {line.location} в исходнике" onclick={() => viewSource(group?.file.id ?? null, line.location)}>{line.location}</button>
+
+          <SuggestStatus run={describe} onError={(message) => (error = message)} />
+
+          {#if run}
+            <div class="banner progress page-error" role="status">
+              <LoaderCircle size={14} class="spin" />
+              <span>{runText(run)}</span>
+              <button class="btn small" disabled={run.stopping} onclick={stopRun}>
+                <Square size={13} />
+                <span>Остановить</span>
+              </button>
+            </div>
+          {:else if notice}
+            <div class="banner page-error" role="status">
+              <Check size={14} />
+              <span>{notice}</span>
+              {#if lastRun !== null}
+                <button class="btn small" disabled={working} title="Вернуть реплики к виду до запуска" onclick={() => lastRun !== null && (confirming = { kind: "rollback", run: lastRun })}>
+                  <Undo2 size={13} />
+                  <span>Откатить</span>
+                </button>
+              {/if}
+              <button class="icon-button" aria-label="Скрыть итог" title="Скрыть итог" onclick={() => ((notice = ""), (lastRun = null))}><X size={14} /></button>
+            </div>
+          {/if}
+
+          {#if confirming}
+            <div class="banner warn choice page-error" role="alertdialog">
+              <TriangleAlert size={14} />
+              <span>
+                {#if confirming.kind === "rollback"}
+                  Откатить запуск? Реплики, которые не правили после него, вернутся к виду до запуска
                 {:else}
-                  <span class="where"></span>
+                  Очистить перевод {confirming.what}? Реплик с переводом: {confirming.count}. Модель переведёт их заново, история правок останется
                 {/if}
-                <span class="speaker" title={line.speaker ?? "Рассказчик"}>{line.speaker ?? ""}</span>
-                <span class="source">{line.sourceText}</span>
-                <div class="target">
-                  {#if editing?.id === line.id}
-                    <textarea
-                      data-line={line.id}
-                      rows="2"
-                      bind:value={editing.text}
-                      disabled={saving}
-                      onkeydown={onKey}
-                      onblur={() => save()}
-                      aria-label="Перевод"
-                    ></textarea>
-                  {:else}
-                    <button class="text" class:placeholder={!line.text} onclick={() => edit(line)}>
-                      {line.text || "Нет перевода"}
-                    </button>
-                  {/if}
-                </div>
-                <span class="state {line.state}">
-                  {stateLabel[line.state]}
-                  {#if line.sourceChanged}
-                    <span class="changed" title="Игра изменила оригинал после перевода"><TriangleAlert size={11} /></span>
-                  {/if}
-                  {#if line.state === "draft"}
-                    <button class="confirm" aria-label="Подтвердить перевод модели" title="Подтвердить перевод модели" onclick={() => confirm([line])}>
-                      <Check size={12} />
-                    </button>
-                  {/if}
-                </span>
+              </span>
+              <div class="choice-actions">
+                <button class="btn small" disabled={working} onclick={() => (confirming = null)}>Отмена</button>
+                <button
+                  class="btn small danger"
+                  disabled={working}
+                  onclick={() => {
+                    if (!confirming) return;
+                    if (confirming.kind === "rollback") rollback(confirming.run);
+                    else reset(confirming.scope);
+                  }}
+                >
+                  {#if working}<LoaderCircle size={13} class="spin" />{/if}
+                  <span>{confirming.kind === "rollback" ? "Откатить" : "Очистить"}</span>
+                </button>
               </div>
-            {/each}
-          {/each}
+            </div>
+          {/if}
+
+          {#if runs}
+            <div class="card runs page-error">
+              <div class="runs-head">
+                <strong>Запуски перевода и редактуры</strong>
+                <button class="icon-button" aria-label="Закрыть запуски" title="Закрыть" onclick={() => (runs = null)}><X size={14} /></button>
+              </div>
+              {#each runs as entry (entry.id)}
+                <div class="run-row">
+                  <span class="run-when">{runWhen(entry.startedAt)}</span>
+                  <span class="run-what">{runActions[entry.action] ?? entry.action} · {entry.model}</span>
+                  <span class="run-state" class:failed={entry.status === "failed"} title={entry.error ?? ""}>{runStatuses[entry.status]} · реплик: {entry.lines}</span>
+                  <button
+                    class="btn small"
+                    disabled={working || busy || entry.status === "running" || entry.lines === 0}
+                    title={entry.lines === 0 ? "Запуск ничего не записал" : "Вернуть реплики к виду до запуска"}
+                    onclick={() => (confirming = { kind: "rollback", run: entry.id })}
+                  >
+                    <Undo2 size={13} />
+                    <span>Откатить</span>
+                  </button>
+                </div>
+              {:else}
+                <p class="muted">Запусков ещё не было</p>
+              {/each}
+            </div>
+          {/if}
+
+          {#if error}
+            <div class="banner error page-error" role="alert">
+              <TriangleAlert size={14} />
+              <span>{error}</span>
+              <button class="icon-button" aria-label="Скрыть ошибку" onclick={() => (error = "")}><X size={14} /></button>
+            </div>
+          {/if}
+
+          {#if !selected}
+            <div class="empty">{loadedTree ? "Выберите сцену в списке слева" : ""}</div>
+          {:else if loadingLines}
+            <div class="empty"><LoaderCircle size={20} class="spin" /></div>
+          {:else}
+            <div class="table">
+              {#if shown.length === 0}
+                <div class="no-lines">{filter === "all" ? "В сцене нет реплик" : "Таких реплик нет"}</div>
+              {/if}
+              {#each shown as scene, index (scene.key ?? `outside-${index}`)}
+                {#if selected.kind === "loose" && shown.length > 1}
+                  <h3 class="subgroup">{scene.key ?? "Вне контейнеров"}</h3>
+                {/if}
+                {#each scene.lines as line (line.id)}
+                  <div class="row" class:editing={editing?.id === line.id} class:highlighted={highlighted === line.id} data-row={line.id}>
+                    {#if line.location}
+                      <button class="where" title="Строка {line.location} в исходнике" onclick={() => viewSource(group?.file.id ?? null, line.location)}>{line.location}</button>
+                    {:else}
+                      <span class="where"></span>
+                    {/if}
+                    <span class="speaker" title={line.speaker ?? "Рассказчик"}>{line.speaker ?? ""}</span>
+                    <span class="source">{line.sourceText}</span>
+                    <div class="target">
+                      {#if editing?.id === line.id}
+                        <textarea
+                          data-line={line.id}
+                          rows="2"
+                          bind:value={editing.text}
+                          disabled={saving}
+                          onkeydown={onKey}
+                          onblur={() => save()}
+                          aria-label="Перевод"
+                        ></textarea>
+                      {:else}
+                        <button class="text" class:placeholder={!line.text} onclick={() => edit(line)}>
+                          {line.text || "Нет перевода"}
+                        </button>
+                      {/if}
+                    </div>
+                    <span class="state {line.state}">
+                      {stateLabel[line.state]}
+                      {#if line.sourceChanged}
+                        <span class="changed" title="Игра изменила оригинал после перевода"><TriangleAlert size={11} /></span>
+                      {/if}
+                      {#if line.state === "draft"}
+                        <button class="confirm" aria-label="Подтвердить перевод модели" title="Подтвердить перевод модели" onclick={() => confirm([line])}>
+                          <Check size={12} />
+                        </button>
+                      {/if}
+                    </span>
+                  </div>
+                {/each}
+              {/each}
+            </div>
+          {/if}
         </div>
-      {/if}
+      </div>
     </section>
   </div>
   {/if}
@@ -952,6 +958,19 @@
 
   .scene-percent.done {
     color: var(--success);
+  }
+
+  .main {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .main-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
   }
 
   .lines {
