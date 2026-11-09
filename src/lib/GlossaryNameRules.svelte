@@ -1,9 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { Channel } from "@tauri-apps/api/core";
-  import { LoaderCircle, Plus, Save, Sparkles, Square } from "lucide-svelte";
+  import { LoaderCircle, Plus, Save, Sparkles } from "lucide-svelte";
   import { commands, type LanguageRulesDto_Serialize as LanguageRules, type RunProgress_Deserialize as RunProgress } from "./bindings";
   import { languageName, matches, runsBusy, type GlossaryRuns } from "./glossary";
+  import { trackRun } from "./run-status.svelte";
 
   let { projectId, runs, onError }: { projectId: string; runs: GlossaryRuns; onError: (message: string) => void } = $props();
 
@@ -86,6 +87,15 @@
     drafting = true;
     stopping = false;
     notice = "";
+    const untrack = trackRun({
+      get text() {
+        return stopping ? "Черновик правил: останавливается после текущего запроса" : `Черновик правил: ${languageName(language)}`;
+      },
+      get stopping() {
+        return stopping;
+      },
+      stop: () => stop(),
+    });
     try {
       const channel = new Channel<RunProgress>();
       const result = await commands.draftNameRule(projectId, language, fields.rules.trim() || null, null, channel);
@@ -100,6 +110,7 @@
       onError(String(e));
     } finally {
       drafting = false;
+      untrack();
     }
   }
 
@@ -119,17 +130,6 @@
     <span>Как передавать по-русски имена каждого языка. Перевод имён берёт правила языков, которые нашёл разбор происхождения</span>
   </div>
 </div>
-
-{#if drafting}
-  <div class="banner progress page-error" role="status">
-    <LoaderCircle size={14} class="spin" />
-    <span>{stopping ? "Черновик правил: останавливается" : `Черновик правил: ${current ? languageName(current.language) : ""}`}</span>
-    <button class="btn small" disabled={stopping} onclick={stop}>
-      <Square size={13} />
-      <span>Остановить</span>
-    </button>
-  </div>
-{/if}
 
 <div class="master">
   <div class="list-side">

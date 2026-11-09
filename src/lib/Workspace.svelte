@@ -13,8 +13,7 @@
     LoaderCircle,
     Package,
     RefreshCw,
-    SpellCheck,
-    Square,
+    SpellCheck,
     TriangleAlert,
     Undo2,
     Waypoints,
@@ -26,7 +25,9 @@
   import SceneCard from "./SceneCard.svelte";
   import SceneGraph from "./SceneGraph.svelte";
   import SourceViewer from "./SourceViewer.svelte";
+  import RunBar from "./RunBar.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
+  import { trackRun, type RunSource } from "./run-status.svelte";
   import { WriteRun } from "./suggest-run.svelte";
   import { progressLabel, progressPercent } from "./progress";
   import { fileName, filterScenes, pickId, sceneItemName, sceneList, type ScenePick } from "./scene-tree";
@@ -115,8 +116,6 @@
   const found = $derived(filterScenes(list, query));
   /** Сцены файла открытой сцены: их описывает «Описать сцены файла». */
 
-  /** Пустые реплики всей игры: их переводит «Вся игра». */
-  const gameEmpty = $derived(tree.reduce((sum, entry) => sum + entry.file.total - entry.file.translated, 0));
   /** Карточка описания есть только у настоящей сцены. */
   const described = $derived(selected?.kind === "scene" ? (scenes[0] ?? null) : null);
 
@@ -288,13 +287,20 @@
     }
   }
 
-  /** Запускает перевод или редактуру. Черновики пишутся по пакетам, итог показывается баннером. */
-  /** Идущий запуск переводит всю игру: крутилка на кнопке «Вся игра». */
-  let wholeGame = $state(false);
+  /** Перевод или редактура этого окна в общей полосе запуска. */
+  const lineRun: RunSource = {
+    get text() {
+      return run ? runText(run) : "";
+    },
+    get stopping() {
+      return run?.stopping ?? false;
+    },
+    stop: () => stopRun(),
+  };
 
-  async function startRun(mode: RunMode, scope: ScopeDto, game = false) {
+  /** Запускает перевод или редактуру. Черновики пишутся по пакетам, ход идёт в общей полосе, итог баннером. */
+  async function startRun(mode: RunMode, scope: ScopeDto) {
     if (busy) return;
-    wholeGame = game;
     if (editing) await save();
     notice = "";
     lastRun = null;
@@ -302,6 +308,7 @@
     error = "";
     run = { mode, progress: { done: 0, total: 0, written: 0, message: null }, stopping: false };
     const channel = new Channel<RunProgress>();
+    const untrack = trackRun(lineRun);
     let written = 0;
     channel.onmessage = (progress) => {
       if (!run) return;
@@ -322,6 +329,7 @@
       error = String(e);
     } finally {
       run = null;
+      untrack();
       await refresh();
       if (runs) await loadRuns();
     }
@@ -532,6 +540,8 @@
     </button>
   </header>
 
+  <RunBar />
+
   {#if scanOpen}
     <ScanPanel {project} {onProject} onClose={() => (scanOpen = false)} onChanged={reloadSnapshot} />
   {/if}
@@ -584,15 +594,6 @@
                 · <span class="stale">описание устарело</span>{/if}
             </span>
           </div>
-          <button
-            class="btn small"
-            disabled={busy || gameEmpty === 0}
-            title={busy ? "Модель уже работает" : gameEmpty === 0 ? "В игре нет пустых реплик" : "Модель переведёт пустые реплики всей игры по файлам. Сцены без описания она сначала прочитает"}
-            onclick={() => startRun("translate", { kind: "project" }, true)}
-          >
-            {#if run?.mode === "translate" && wholeGame}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
-            <span>Вся игра{gameEmpty ? ` · ${gameEmpty}` : ""}</span>
-          </button>
           {#if selected.kind === "scene"}
             {@const key = selected.key}
             <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(key)}><Waypoints size={15} /></button>
@@ -672,7 +673,7 @@
                 title={busy ? "Модель уже работает" : sceneEmpty === 0 ? "В сцене нет пустых реплик" : "Модель переведёт пустые реплики сцены"}
                 onclick={() => selected && startRun("translate", scopeOf(selected))}
               >
-                {#if run?.mode === "translate" && !wholeGame}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
+                {#if run?.mode === "translate"}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
                 <span>Перевести{sceneEmpty ? ` · ${sceneEmpty}` : ""}</span>
               </button>
             </div>
@@ -680,16 +681,7 @@
 
           <SuggestStatus run={describe} onError={(message) => (error = message)} />
 
-          {#if run}
-            <div class="banner progress page-error" role="status">
-              <LoaderCircle size={14} class="spin" />
-              <span>{runText(run)}</span>
-              <button class="btn small" disabled={run.stopping} onclick={stopRun}>
-                <Square size={13} />
-                <span>Остановить</span>
-              </button>
-            </div>
-          {:else if notice}
+          {#if !run && notice}
             <div class="banner page-error" role="status">
               <Check size={14} />
               <span>{notice}</span>

@@ -1,20 +1,11 @@
 <script lang="ts" generics="T">
-  import { Check, LoaderCircle, Square, X } from "lucide-svelte";
+  import { Check, X } from "lucide-svelte";
   import type { SuggestRun, WriteRun } from "./suggest-run.svelte";
 
   let { run, onError }: { run: SuggestRun<T> | WriteRun; onError: (message: string) => void } = $props();
 </script>
 
-{#if run.active}
-  <div class="banner progress page-error" role="status">
-    <LoaderCircle size={14} class="spin" />
-    <span>{run.text}</span>
-    <button class="btn small" disabled={run.stopping} onclick={() => run.stop(onError)}>
-      <Square size={13} />
-      <span>Остановить</span>
-    </button>
-  </div>
-{:else if run.notice}
+{#if !run.active && run.notice}
   <div class="banner page-error" role="status">
     <Check size={14} />
     <span>{run.notice}</span>

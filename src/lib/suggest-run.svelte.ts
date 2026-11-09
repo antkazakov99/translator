@@ -1,6 +1,7 @@
 import { Channel } from "@tauri-apps/api/core";
 import { commands, type RunProgress_Deserialize as RunProgress } from "./bindings";
 import type { GlossaryRuns } from "./glossary";
+import { trackRun } from "./run-status.svelte";
 
 export function glossaryRuns(): GlossaryRuns {
   return {
@@ -51,6 +52,7 @@ export class SuggestRun<T> {
     channel.onmessage = (progress) => {
       if (this.progress) this.progress = progress;
     };
+    const untrack = trackRun(this);
     try {
       const result = await call(channel);
       if (result.error) onError(result.error);
@@ -63,6 +65,7 @@ export class SuggestRun<T> {
       onError(String(e));
     } finally {
       this.progress = null;
+      untrack();
     }
   }
 
@@ -132,6 +135,7 @@ export class WriteRun {
     channel.onmessage = (progress) => {
       if (this.progress) this.progress = progress;
     };
+    const untrack = trackRun(this);
     try {
       const result = await call(channel);
       if (result.error) onError(result.error);
@@ -142,6 +146,7 @@ export class WriteRun {
       return [];
     } finally {
       this.progress = null;
+      untrack();
     }
   }
 
