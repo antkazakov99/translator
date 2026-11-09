@@ -6,14 +6,17 @@
     Bot,
     Check,
     CheckCheck,
+    ChevronDown,
+    ChevronRight,
     Eraser,
     FileCode,
-    FileText,
     History,
     Languages,
     LoaderCircle,
     Package,
     RefreshCw,
+    SlidersHorizontal,
+    Sparkles,
     SpellCheck,
     Square,
     TriangleAlert,
@@ -23,20 +26,26 @@
   } from "lucide-svelte";
   import Glossary from "./Glossary.svelte";
   import ModPanel from "./ModPanel.svelte";
+  import ReadingDepthSettings from "./ReadingDepthSettings.svelte";
   import ScanPanel from "./ScanPanel.svelte";
+  import SceneCard from "./SceneCard.svelte";
   import SceneGraph from "./SceneGraph.svelte";
   import SourceViewer from "./SourceViewer.svelte";
+  import SuggestStatus from "./SuggestStatus.svelte";
+  import { WriteRun } from "./suggest-run.svelte";
   import { progressLabel, progressPercent } from "./progress";
-  import type { GraphScene } from "$lib/scene-graph";
+  import { pickId, sceneItemName, filterTree, type ScenePick } from "./scene-tree";
+  import { sceneLabel, type GraphScene } from "$lib/scene-graph";
   import {
     commands,
     type EntryLineDto_Serialize as EntryLine,
-    type FileDto,
+    type FileScenesDto_Serialize as FileScenes,
     type LineDto_Serialize as Line,
     type LineRunDto_Serialize as LineRun,
     type ProjectDto_Serialize as Project,
     type RunProgress_Deserialize as RunProgress,
     type SceneDto_Serialize as Scene,
+    type SceneItemDto_Serialize as SceneItem,
     type ScopeDto,
   } from "$lib/bindings";
 
@@ -49,8 +58,12 @@
 
   type Filter = "all" | "empty" | "draft";
 
-  let files = $state<FileDto[]>([]);
-  let fileId = $state<number | null>(null);
+  /** Файлы с прогрессом и их сцены. */
+  let tree = $state<FileScenes[]>([]);
+  let loadedTree = $state(false);
+  /** Открытая сцена или «Без сцены» файла. */
+  let selected = $state<ScenePick | null>(null);
+  /** Реплики открытой сцены: одна группа, у «Без сцены» по группе на контейнер. */
   let scenes = $state<Scene[]>([]);
   let loadingLines = $state(false);
   let error = $state("");
@@ -66,11 +79,19 @@
   let graphFocus = $state<string | null>(null);
   /** Открытый исходник: файл снимка и строка. */
   let viewing = $state<{ file: number; line: number | null } | null>(null);
-  /** Реплика, к которой перешли из глоссария: строка отмечена, пока не выбран другой файл. */
+  /** Реплика, к которой перешли из глоссария: строка отмечена, пока не выбрана другая сцена. */
   let highlighted = $state<number | null>(null);
+  /** Свёрнутые и раскрытые группы файлов: раскрыта только группа открытой сцены и раскрытые вручную. */
+  let expanded = $state<number[]>([]);
+  let query = $state("");
+  /** Сцены, отмеченные для группового описания. По умолчанию ничего: чтение всей игры дорого. */
+  let marked = $state<string[]>([]);
+  let depthOpen = $state(false);
+  /** Описание сцен моделью: одна сцена из карточки или отмеченные. */
+  const describe = new WriteRun("Описания");
 
   type RunMode = "translate" | "review";
-  /** Запуск модели из этого окна: перевод или редактура. */
+  /** Запуск перевода или редактуры из этого окна. */
   let run = $state<{ mode: RunMode; progress: RunProgress; stopping: boolean } | null>(null);
   /** Итог последнего запуска. */
   let notice = $state("");
@@ -78,79 +99,125 @@
   let lastRun = $state<number | null>(null);
   /** Меню «Запуски»: `null`, пока закрыто. */
   let runs = $state<LineRun[] | null>(null);
-  /** Что ждёт подтверждения: откат запуска, очистка файла или сцены. */
-  let confirming = $state<{ kind: "rollback"; run: number } | { kind: "file" } | { kind: "scene"; key: string } | null>(null);
+  /** Что ждёт подтверждения: откат запуска или очистка файла или сцены. */
+  let confirming = $state<{ kind: "rollback"; run: number } | { kind: "reset"; scope: ScopeDto; what: string; count: number } | null>(null);
   let working = $state(false);
 
-  const file = $derived(files.find((item) => item.id === fileId) ?? null);
-  const fileLines = $derived(scenes.flatMap((scene) => scene.lines));
-  const fileEmpty = $derived(fileLines.filter((line) => line.state === "empty").length);
-  const fileReady = $derived(fileLines.filter((line) => line.state !== "empty").length);
-  const visible = (line: Line) =>
-    filter === "all" || (filter === "empty" ? line.state === "empty" : line.state === "draft");
+  /** Модель занята: перевод, редактура или описание. Второй запуск Rust всё равно не даст. */
+  const busy = $derived(run !== null || describe.active);
+  const group = $derived.by(() => {
+    const pick = selected;
+    if (!pick) return null;
+    const file = fileOf(pick);
+    return tree.find((item) => item.file.id === file) ?? null;
+  });
+  const item = $derived(selected && group ? (group.scenes.find((scene) => pickId(asPick(scene, group.file.id)) === pickId(selected!)) ?? null) : null);
+  const sceneLines = $derived(scenes.flatMap((scene) => scene.lines));
+  const sceneEmpty = $derived(sceneLines.filter((line) => line.state === "empty").length);
+  const sceneReady = $derived(sceneLines.filter((line) => line.state !== "empty").length);
+  const sceneDrafts = $derived(sceneLines.filter((line) => line.state === "draft"));
+  const visible = (line: Line) => filter === "all" || (filter === "empty" ? line.state === "empty" : line.state === "draft");
   const shown = $derived(
     scenes.map((scene) => ({ ...scene, lines: scene.lines.filter(visible) })).filter((scene) => scene.lines.length > 0),
   );
   const order = $derived(shown.flatMap((scene) => scene.lines.map((line) => line.id)));
-  const fileDrafts = $derived(scenes.flatMap((scene) => scene.lines).filter((line) => line.state === "draft"));
+  const filtered = $derived(filterTree(tree, query));
+  const searching = $derived(query.trim() !== "");
+  /** Карточка описания есть только у настоящей сцены. */
+  const described = $derived(selected?.kind === "scene" ? (scenes[0] ?? null) : null);
 
-  /** Последний открытый файл проекта: после перезагрузки страница вернётся к нему. */
-  const fileKey = $derived(`translator.file.${project.id}`);
+  /** Последняя открытая сцена проекта: после перезагрузки страница вернётся к ней. */
+  const pickKey = $derived(`translator.scene.${project.id}`);
+
+  function fileOf(pick: ScenePick) {
+    if (pick.kind === "loose") return pick.file;
+    return tree.find((item) => item.scenes.some((scene) => scene.key === pick.key))?.file.id ?? null;
+  }
+
+  function asPick(scene: SceneItem, file: number): ScenePick {
+    return scene.key ? { kind: "scene", key: scene.key } : { kind: "loose", file };
+  }
+
+  function scopeOf(pick: ScenePick): ScopeDto {
+    return pick.kind === "scene" ? { kind: "scenes", keys: [pick.key] } : { kind: "loose", file: pick.file };
+  }
 
   onMount(async () => {
-    await loadFiles();
-    let saved: number | null = null;
+    await loadTree();
+    let saved: ScenePick | null = null;
     try {
-      saved = Number(sessionStorage.getItem(fileKey)) || null;
+      saved = JSON.parse(sessionStorage.getItem(pickKey) ?? "null");
     } catch {
       saved = null;
     }
-    const first = files.find((item) => item.id === saved) ?? files[0];
-    if (first) await selectFile(first.id);
+    const next = (saved && exists(saved) ? saved : null) ?? firstPick();
+    if (next) await select(next);
   });
 
-  async function loadFiles() {
+  async function loadTree() {
     try {
-      files = await commands.translationFiles(project.id);
+      tree = await commands.translationScenes(project.id);
     } catch (e) {
       error = String(e);
+    } finally {
+      loadedTree = true;
     }
   }
 
-  /** После считывания: файлы и реплики могли смениться, открытый файл мог исчезнуть. */
+  function exists(pick: ScenePick) {
+    if (pick.kind === "loose") return tree.some((item) => item.file.id === pick.file && item.scenes.some((scene) => scene.key === null));
+    return fileOf(pick) !== null;
+  }
+
+  function firstPick(): ScenePick | null {
+    const first = tree.find((item) => item.scenes.length > 0);
+    return first ? asPick(first.scenes[0], first.file.id) : null;
+  }
+
+  /** После считывания: сцены и реплики могли смениться, открытая сцена могла исчезнуть. */
   async function reloadSnapshot() {
     editing = null;
-    // Изменённый файл получает новую строку: его находят по пути.
-    const path = file?.path;
-    await loadFiles();
-    const next = files.find((item) => item.id === fileId) ?? files.find((item) => item.path === path) ?? files[0];
-    if (next) await selectFile(next.id);
+    await loadTree();
+    const next = (selected && exists(selected) ? selected : null) ?? firstPick();
+    if (next) await select(next);
     else {
-      fileId = null;
+      selected = null;
       scenes = [];
     }
   }
 
-  async function selectFile(id: number) {
+  /** Номер загрузки реплик: ответ для сцены, которую уже сменили, не показывается. */
+  let loadToken = 0;
+
+  async function select(pick: ScenePick) {
     if (editing) await save();
-    fileId = id;
+    const token = ++loadToken;
+    selected = pick;
     editing = null;
     highlighted = null;
+    const file = fileOf(pick);
+    if (file !== null && !expanded.includes(file)) expanded = [...expanded, file];
+    try {
+      sessionStorage.setItem(pickKey, JSON.stringify(pick));
+    } catch {
+      // Без хранилища сцена просто не запомнится.
+    }
     loadingLines = true;
     try {
-      sessionStorage.setItem(fileKey, String(id));
-    } catch {
-      // Без хранилища файл просто не запомнится.
-    }
-    try {
-      scenes = await commands.fileLines(project.id, id);
+      const found = await commands.sceneLines(project.id, pick);
+      // Пока шла загрузка, могли открыть другую сцену.
+      if (token === loadToken) scenes = found;
       error = "";
     } catch (e) {
       error = String(e);
       scenes = [];
     } finally {
-      loadingLines = false;
+      if (token === loadToken) loadingLines = false;
     }
+  }
+
+  function toggleGroup(file: number) {
+    expanded = expanded.includes(file) ? expanded.filter((item) => item !== file) : [...expanded, file];
   }
 
   function replace(line: Line) {
@@ -181,23 +248,22 @@
       // Пока шло сохранение по уходу фокуса, пользователь мог открыть другую реплику: её не закрываем.
       if (editing?.id === id) editing = null;
       error = "";
-      await loadFiles();
+      await loadTree();
     } catch (e) {
       error = String(e);
       return;
     } finally {
       saving = false;
     }
-    const nextLine = nextId === undefined ? null : scenes.flatMap((scene) => scene.lines).find((line) => line.id === nextId);
+    const nextLine = nextId === undefined ? null : sceneLines.find((line) => line.id === nextId);
     if (nextLine) await edit(nextLine);
   }
 
   async function confirm(lines: Line[]) {
-    if (lines.length === 0 || fileId === null) return;
+    if (lines.length === 0) return;
     try {
       await commands.confirmLines(project.id, lines.map((line) => line.id));
-      scenes = await commands.fileLines(project.id, fileId);
-      await loadFiles();
+      await refresh();
     } catch (e) {
       error = String(e);
     }
@@ -206,7 +272,7 @@
   let refreshing = false;
   let refreshAgain = false;
 
-  /** Перечитывает реплики файла и прогресс без крутилки: во время запуска черновики появляются по пакетам. */
+  /** Перечитывает реплики сцены и прогресс без крутилки: во время запуска черновики появляются по пакетам. */
   async function refresh() {
     if (refreshing) {
       refreshAgain = true;
@@ -216,8 +282,13 @@
     try {
       do {
         refreshAgain = false;
-        if (fileId !== null) scenes = await commands.fileLines(project.id, fileId);
-        await loadFiles();
+        const token = loadToken;
+        const pick = selected ? $state.snapshot(selected) : null;
+        if (pick) {
+          const found = await commands.sceneLines(project.id, pick);
+          if (token === loadToken) scenes = found;
+        }
+        await loadTree();
       } while (refreshAgain);
     } catch (e) {
       error = String(e);
@@ -228,7 +299,7 @@
 
   /** Запускает перевод или редактуру. Черновики пишутся по пакетам, итог показывается баннером. */
   async function startRun(mode: RunMode, scope: ScopeDto) {
-    if (run) return;
+    if (busy) return;
     if (editing) await save();
     notice = "";
     lastRun = null;
@@ -315,11 +386,6 @@
     return new Date(seconds * 1000).toLocaleString("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
   }
 
-  /** Непустые реплики сцены: их очистит очистка сцены. */
-  function sceneReady(key: string) {
-    return scenes.find((item) => item.key === key)?.lines.filter((line) => line.state !== "empty").length ?? 0;
-  }
-
   function resultText(mode: RunMode, count: number, stopped: boolean) {
     const prefix = stopped ? "Остановлено. " : "";
     if (mode === "translate") {
@@ -358,19 +424,17 @@
     }
   }
 
-  /** Из графа в таблицу: файл сцены, все реплики, прокрутка к сцене. */
+  /** Из графа в таблицу: та же сцена. Сцены без реплик в таблице нет. */
   async function openScene(scene: GraphScene) {
     view = "table";
     filter = "all";
     graphFocus = scene.key;
-    if (scene.file === null) return;
-    if (scene.file !== fileId) await selectFile(scene.file);
-    await tick();
-    const header = [...document.querySelectorAll<HTMLElement>("h3.scene")].find((item) => item.dataset.scene === scene.key);
-    header?.scrollIntoView({ block: "start" });
+    const pick: ScenePick = { kind: "scene", key: scene.key };
+    if (exists(pick)) await select(pick);
+    else error = `У сцены ${sceneLabel(scene.key)} нет реплик`;
   }
 
-  /** Реплика из глоссария: строка таблицы с отметкой или исходник на её строке. */
+  /** Реплика из глоссария: её сцена с отметкой строки или исходник на её строке. */
   async function openLine(found: EntryLine, where: "table" | "source") {
     if (where === "source") {
       const number = Number.parseInt(found.line.location ?? "", 10);
@@ -379,30 +443,73 @@
     }
     view = "table";
     filter = "all";
-    if (found.file !== fileId) await selectFile(found.file);
+    const scene: ScenePick | null = found.scene ? { kind: "scene", key: found.scene } : null;
+    await select(scene && exists(scene) ? scene : { kind: "loose", file: found.file });
     highlighted = found.line.id;
     await tick();
     document.querySelector<HTMLElement>(`[data-row="${found.line.id}"]`)?.scrollIntoView({ block: "center" });
   }
 
-  /** Исходник файла таблицы на строке реплики. */
-  function viewSource(line: string | null | undefined) {
-    if (fileId === null) return;
+  /** Исходник файла на строке реплики. */
+  function viewSource(file: number | null, line: string | null | undefined) {
+    if (file === null) return;
     const number = Number.parseInt(line ?? "", 10);
-    viewing = { file: fileId, line: Number.isFinite(number) && number > 0 ? number : null };
+    viewing = { file, line: Number.isFinite(number) && number > 0 ? number : null };
   }
 
   /** Из таблицы в граф: сцена в центре. */
-  function showOnGraph(key: string | null) {
-    if (!key) return;
+  function showOnGraph(key: string) {
     graphFocus = key;
     view = "graph";
   }
 
-  function sceneName(scene: Scene) {
-    if (!scene.key) return "Вне сцен";
-    const name = scene.key.replace(/^[a-z]+:/, "");
-    return scene.title ? `${scene.title} · ${name}` : name;
+  function toggleMark(key: string, on: boolean) {
+    marked = on ? [...marked, key] : marked.filter((item) => item !== key);
+  }
+
+  function describedNotice(written: number, stopped: boolean) {
+    const text = `Описано сцен: ${written}`;
+    return stopped ? `Остановлено. ${text}` : text;
+  }
+
+  async function describeMarked() {
+    const keys = [...marked];
+    const written = await describe.start((channel) => commands.describeScenes(project.id, keys, null, channel), (message) => (error = message), describedNotice);
+    marked = marked.filter((key) => !written.includes(key));
+    await refresh();
+  }
+
+  async function describeOne(key: string) {
+    await describe.start((channel) => commands.describeScene(project.id, key, null, channel), (message) => (error = message), describedNotice);
+    await refresh();
+  }
+
+  /** Правка названия и описания из карточки: список и карточка показывают новое без перечитывания. */
+  function patchScene(key: string, title: string | null, description: string | null) {
+    for (const scene of scenes) {
+      if (scene.key === key) {
+        scene.title = title;
+        scene.description = description;
+      }
+    }
+    for (const item of tree) {
+      for (const scene of item.scenes) {
+        if (scene.key === key) {
+          scene.title = title;
+          scene.described = description !== null;
+        }
+      }
+    }
+  }
+
+  function describeTitle(count: number) {
+    if (count === 0) return "Отметьте сцены в списке";
+    if (busy) return "Модель уже работает";
+    return "Модель прочитает часть каждой сцены и напишет описание. Описанные сцены без новых частей пропускаются";
+  }
+
+  function fileName(path: string) {
+    return path.replace(/^game\//, "");
   }
 
   const stateLabel: Record<Line["state"], string> = {
@@ -467,26 +574,118 @@
     </div>
   {:else}
   <div class="body">
-    <nav class="files" aria-label="Файлы">
-      {#each files as item (item.id)}
-        <button class="file" class:active={item.id === fileId} onclick={() => selectFile(item.id)} title={item.path}>
-          <span class="file-name"><FileText size={13} /> {item.path.replace(/^game\//, "")}</span>
-          <span class="file-progress">
-            <span class="bar-track"><span class="bar-fill" style:width="{progressPercent(item.translated, item.total)}%"></span></span>
-            <span class="file-count">{item.translated}/{item.total}{item.drafts ? ` · модель: ${item.drafts}` : ""}</span>
-          </span>
-        </button>
-      {:else}
-        <p class="muted">В снимке нет реплик</p>
-      {/each}
+    <nav class="scenes" aria-label="Сцены по файлам">
+      <div class="scenes-head">
+        <input class="input" placeholder="Поиск по названию и метке" bind:value={query} aria-label="Поиск сцен" />
+        <div class="describe-row">
+          <button class="btn small" class:active={depthOpen} title="Сколько частей читает модель для описаний" onclick={() => (depthOpen = !depthOpen)}>
+            <SlidersHorizontal size={13} />
+            <span>Глубина</span>
+          </button>
+          <button class="btn small primary" disabled={marked.length === 0 || busy} title={describeTitle(marked.length)} onclick={describeMarked}>
+            {#if describe.active}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
+            <span>Описать · {marked.length}</span>
+          </button>
+          {#if marked.length > 0}
+            <button class="icon-button" aria-label="Снять отметки" title="Снять отметки" onclick={() => (marked = [])}><X size={13} /></button>
+          {/if}
+        </div>
+      </div>
+
+      <div class="groups">
+        {#each filtered.groups as entry (entry.group.file.id)}
+          {@const file = entry.group.file}
+          {@const open = searching || expanded.includes(file.id)}
+          {@const empty = file.total - file.translated}
+          <div class="group" class:current={group?.file.id === file.id}>
+            <div class="group-head">
+              <button class="group-toggle" aria-expanded={open} title={file.path} onclick={() => toggleGroup(file.id)}>
+                {#if open}<ChevronDown size={13} />{:else}<ChevronRight size={13} />{/if}
+                <span class="group-name">{fileName(file.path)}</span>
+              </button>
+              <span class="progress-line">
+                <span class="bar-track"><span class="bar-fill" style:width="{progressPercent(file.translated, file.total)}%"></span></span>
+                <span class="count">{file.translated}/{file.total}{file.drafts ? ` · модель: ${file.drafts}` : ""}</span>
+              </span>
+              <span class="group-actions">
+                <button
+                  class="icon-button"
+                  disabled={busy || empty === 0}
+                  aria-label="Перевести пустые реплики файла"
+                  title={busy ? "Модель уже работает" : empty === 0 ? "В файле нет пустых реплик" : `Перевести пустые реплики файла: ${empty}`}
+                  onclick={() => startRun("translate", { kind: "file", file: file.id })}><Languages size={13} /></button
+                >
+                <button
+                  class="icon-button"
+                  disabled={busy || file.translated === 0}
+                  aria-label="Вычитать файл"
+                  title={busy ? "Модель уже работает" : file.translated === 0 ? "В файле нет переведённых реплик" : "Модель вычитает переведённые реплики файла"}
+                  onclick={() => startRun("review", { kind: "file", file: file.id })}><SpellCheck size={13} /></button
+                >
+                <button
+                  class="icon-button"
+                  disabled={busy || working || file.translated === 0}
+                  aria-label="Очистить перевод файла"
+                  title={file.translated === 0 ? "В файле нет переведённых реплик" : "Очистить перевод всех реплик файла"}
+                  onclick={() => (confirming = { kind: "reset", scope: { kind: "file", file: file.id }, what: "файла", count: file.translated })}
+                  ><Eraser size={13} /></button
+                >
+                <button class="icon-button" aria-label="Исходник файла" title="Текст файла с подсветкой и поиском" onclick={() => viewSource(file.id, null)}
+                  ><FileCode size={13} /></button
+                >
+              </span>
+            </div>
+            {#if open}
+              {#each entry.scenes as scene (scene.key ?? "loose")}
+                {@const pick = asPick(scene, file.id)}
+                <div class="scene-item">
+                  {#if scene.key}
+                    <input
+                      type="checkbox"
+                      checked={marked.includes(scene.key)}
+                      onchange={(event) => scene.key && toggleMark(scene.key, event.currentTarget.checked)}
+                      aria-label="Отметить сцену {sceneLabel(scene.key)}"
+                    />
+                  {:else}
+                    <span class="no-mark"></span>
+                  {/if}
+                  <button
+                    class="scene"
+                    class:active={selected !== null && pickId(selected) === pickId(pick)}
+                    class:loose={!scene.key}
+                    onclick={() => select(pick)}
+                    title={scene.key ?? "Реплики вне сцен: строки интерфейса, экраны, код вне меток"}
+                  >
+                    <span class="scene-name">
+                      <span class="scene-title">{sceneItemName(scene)}</span>
+                      {#if scene.stale}<span class="mark warn">устарело</span>{:else if scene.key && !scene.described}<span class="mark">без описания</span>{/if}
+                    </span>
+                    <span class="progress-line">
+                      <span class="bar-track"><span class="bar-fill" style:width="{progressPercent(scene.translated, scene.total)}%"></span></span>
+                      <span class="count">{scene.translated}/{scene.total}{scene.drafts ? ` · модель: ${scene.drafts}` : ""}</span>
+                    </span>
+                  </button>
+                </div>
+              {/each}
+            {/if}
+          </div>
+        {:else}
+          <p class="muted">{!loadedTree ? "Загрузка" : tree.length ? "Ничего не нашлось" : "В снимке нет реплик"}</p>
+        {/each}
+        {#if filtered.hidden > 0}
+          <p class="muted">Показаны первые сцены, ещё {filtered.hidden} найдутся точнее</p>
+        {/if}
+      </div>
     </nav>
 
     <section class="lines">
-      {#if file}
+      {#if selected && group}
         <div class="toolbar">
           <div class="toolbar-title">
-            <strong>{file.path}</strong>
-            <span>{file.translated} из {file.total} · {progressLabel(file.translated, file.total)}</span>
+            <strong>{item ? sceneItemName(item) : selected.kind === "scene" ? sceneLabel(selected.key) : "Без сцены"}</strong>
+            <span>
+              {fileName(group.file.path)}{#if item} · {item.translated} из {item.total} · {progressLabel(item.translated, item.total)}{/if}
+            </span>
           </div>
           <div class="segmented" role="tablist" aria-label="Какие реплики показать">
             {#each [["all", "Все"], ["empty", "Пустые"], ["draft", "Модель"]] as [value, label] (value)}
@@ -495,49 +694,58 @@
               </button>
             {/each}
           </div>
-          {#if fileDrafts.length > 0}
-            <button class="btn small warning" onclick={() => confirm(fileDrafts)}>
+          {#if sceneDrafts.length > 0}
+            <button class="btn small warning" title="Подтвердить все черновики модели в сцене" onclick={() => confirm(sceneDrafts)}>
               <CheckCheck size={14} />
-              <span>Подтвердить модель · {fileDrafts.length}</span>
+              <span>Подтвердить · {sceneDrafts.length}</span>
             </button>
           {/if}
-          <button class="btn small" title="Текст файла с подсветкой и поиском" onclick={() => viewSource(null)}>
-            <FileCode size={14} />
-            <span>Исходник</span>
-          </button>
+          {#if selected.kind === "scene"}
+            {@const key = selected.key}
+            <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(key)}><Waypoints size={14} /></button>
+          {/if}
+          <button
+            class="icon-button"
+            aria-label="Сцена в исходнике"
+            title="Сцена в исходнике"
+            onclick={() => viewSource(group?.file.id ?? null, sceneLines[0]?.location)}><FileCode size={14} /></button
+          >
           <button class="btn small" title="Последние запуски перевода и редактуры: их можно откатить" onclick={toggleRuns}>
             <History size={14} />
             <span>Запуски</span>
           </button>
           <button
             class="btn small"
-            disabled={run !== null || working || fileReady === 0}
-            title={fileReady === 0 ? "В файле нет переведённых реплик" : "Очистить перевод всех реплик файла: модель переведёт их заново"}
-            onclick={() => (confirming = { kind: "file" })}
+            disabled={busy || working || sceneReady === 0}
+            title={sceneReady === 0 ? "В сцене нет переведённых реплик" : "Очистить перевод сцены: модель переведёт её заново"}
+            onclick={() => selected && (confirming = { kind: "reset", scope: scopeOf(selected), what: "сцены", count: sceneReady })}
           >
             <Eraser size={14} />
             <span>Очистить</span>
           </button>
           <button
             class="btn small"
-            disabled={run !== null || fileReady === 0}
-            title={run ? "Модель уже работает" : fileReady === 0 ? "В файле нет переведённых реплик" : "Модель вычитает переведённые реплики файла"}
-            onclick={() => fileId !== null && startRun("review", { kind: "file", file: fileId })}
+            disabled={busy || sceneReady === 0}
+            title={busy ? "Модель уже работает" : sceneReady === 0 ? "В сцене нет переведённых реплик" : "Модель вычитает переведённые реплики сцены"}
+            onclick={() => selected && startRun("review", scopeOf(selected))}
           >
             {#if run?.mode === "review"}<LoaderCircle size={14} class="spin" />{:else}<SpellCheck size={14} />{/if}
             <span>Вычитать</span>
           </button>
           <button
             class="btn small primary"
-            disabled={run !== null || fileEmpty === 0}
-            title={run ? "Модель уже работает" : fileEmpty === 0 ? "В файле нет пустых реплик" : "Модель переведёт пустые реплики файла"}
-            onclick={() => fileId !== null && startRun("translate", { kind: "file", file: fileId })}
+            disabled={busy || sceneEmpty === 0}
+            title={busy ? "Модель уже работает" : sceneEmpty === 0 ? "В сцене нет пустых реплик" : "Модель переведёт пустые реплики сцены"}
+            onclick={() => selected && startRun("translate", scopeOf(selected))}
           >
             {#if run?.mode === "translate"}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
-            <span>Перевести{fileEmpty ? ` · ${fileEmpty}` : ""}</span>
+            <span>Перевести{sceneEmpty ? ` · ${sceneEmpty}` : ""}</span>
           </button>
         </div>
       {/if}
+
+      {#if depthOpen}<div class="page-error"><ReadingDepthSettings projectId={project.id} onClose={() => (depthOpen = false)} /></div>{/if}
+      <SuggestStatus run={describe} onError={(message) => (error = message)} />
 
       {#if run}
         <div class="banner progress page-error" role="status">
@@ -568,10 +776,8 @@
           <span>
             {#if confirming.kind === "rollback"}
               Откатить запуск? Реплики, которые не правили после него, вернутся к виду до запуска
-            {:else if confirming.kind === "file"}
-              Очистить перевод файла? Реплик с переводом: {fileReady}. Модель переведёт их заново, история правок останется
             {:else}
-              Очистить перевод сцены? Реплик с переводом: {sceneReady(confirming.key)}. Модель переведёт их заново, история правок останется
+              Очистить перевод {confirming.what}? Реплик с переводом: {confirming.count}. Модель переведёт их заново, история правок останется
             {/if}
           </span>
           <div class="choice-actions">
@@ -582,8 +788,7 @@
               onclick={() => {
                 if (!confirming) return;
                 if (confirming.kind === "rollback") rollback(confirming.run);
-                else if (confirming.kind === "file") fileId !== null && reset({ kind: "file", file: fileId });
-                else reset({ kind: "scenes", keys: [confirming.key] });
+                else reset(confirming.scope);
               }}
             >
               {#if working}<LoaderCircle size={13} class="spin" />{/if}
@@ -599,16 +804,16 @@
             <strong>Запуски перевода и редактуры</strong>
             <button class="icon-button" aria-label="Закрыть запуски" title="Закрыть" onclick={() => (runs = null)}><X size={14} /></button>
           </div>
-          {#each runs as item (item.id)}
+          {#each runs as entry (entry.id)}
             <div class="run-row">
-              <span class="run-when">{runWhen(item.startedAt)}</span>
-              <span class="run-what">{runActions[item.action] ?? item.action} · {item.model}</span>
-              <span class="run-state" class:failed={item.status === "failed"} title={item.error ?? ""}>{runStatuses[item.status]} · реплик: {item.lines}</span>
+              <span class="run-when">{runWhen(entry.startedAt)}</span>
+              <span class="run-what">{runActions[entry.action] ?? entry.action} · {entry.model}</span>
+              <span class="run-state" class:failed={entry.status === "failed"} title={entry.error ?? ""}>{runStatuses[entry.status]} · реплик: {entry.lines}</span>
               <button
                 class="btn small"
-                disabled={working || run !== null || item.status === "running" || item.lines === 0}
-                title={item.lines === 0 ? "Запуск ничего не записал" : "Вернуть реплики к виду до запуска"}
-                onclick={() => (confirming = { kind: "rollback", run: item.id })}
+                disabled={working || busy || entry.status === "running" || entry.lines === 0}
+                title={entry.lines === 0 ? "Запуск ничего не записал" : "Вернуть реплики к виду до запуска"}
+                onclick={() => (confirming = { kind: "rollback", run: entry.id })}
               >
                 <Undo2 size={13} />
                 <span>Откатить</span>
@@ -628,48 +833,36 @@
         </div>
       {/if}
 
-      {#if loadingLines}
+      {#if !selected}
+        <div class="empty">{loadedTree ? "Выберите сцену в списке слева" : ""}</div>
+      {:else if loadingLines}
         <div class="empty"><LoaderCircle size={20} class="spin" /></div>
-      {:else if file && shown.length === 0}
-        <div class="empty">{filter === "all" ? "В файле нет реплик" : "Таких реплик нет"}</div>
       {:else}
         <div class="table">
+          {#if described?.key}
+            <SceneCard
+              projectId={project.id}
+              scene={described}
+              sceneKey={described.key}
+              stale={item?.stale ?? false}
+              {busy}
+              describing={describe.active}
+              onDescribe={describeOne}
+              onSaved={patchScene}
+              onError={(message) => (error = message)}
+            />
+          {/if}
+          {#if shown.length === 0}
+            <div class="no-lines">{filter === "all" ? "В сцене нет реплик" : "Таких реплик нет"}</div>
+          {/if}
           {#each shown as scene, index (scene.key ?? `outside-${index}`)}
-            <h3 class="scene" data-scene={scene.key}>
-              <span>{sceneName(scene)}</span>
-              {#if scene.key}
-                <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(scene.key)}>
-                  <Waypoints size={13} />
-                </button>
-                <button class="icon-button" aria-label="Сцена в исходнике" title="Сцена в исходнике" onclick={() => viewSource(scene.lines[0]?.location)}>
-                  <FileCode size={13} />
-                </button>
-                {#if run === null && scenes.find((item) => item.key === scene.key)?.lines.some((line) => line.state === "empty")}
-                  <button
-                    class="icon-button"
-                    aria-label="Перевести пустые реплики сцены"
-                    title="Перевести пустые реплики сцены"
-                    onclick={() => scene.key && startRun("translate", { kind: "scenes", keys: [scene.key] })}
-                  >
-                    <Languages size={13} />
-                  </button>
-                {/if}
-                {#if run === null && !working && sceneReady(scene.key) > 0}
-                  <button
-                    class="icon-button"
-                    aria-label="Очистить перевод сцены"
-                    title="Очистить перевод сцены: модель переведёт её заново"
-                    onclick={() => scene.key && (confirming = { kind: "scene", key: scene.key })}
-                  >
-                    <Eraser size={13} />
-                  </button>
-                {/if}
-              {/if}
-            </h3>
+            {#if selected.kind === "loose" && shown.length > 1}
+              <h3 class="subgroup">{scene.key ?? "Вне контейнеров"}</h3>
+            {/if}
             {#each scene.lines as line (line.id)}
               <div class="row" class:editing={editing?.id === line.id} class:highlighted={highlighted === line.id} data-row={line.id}>
                 {#if line.location}
-                  <button class="where" title="Строка {line.location} в исходнике" onclick={() => viewSource(line.location)}>{line.location}</button>
+                  <button class="where" title="Строка {line.location} в исходнике" onclick={() => viewSource(group?.file.id ?? null, line.location)}>{line.location}</button>
                 {:else}
                   <span class="where"></span>
                 {/if}
@@ -714,7 +907,7 @@
 </main>
 
 {#if viewing}
-  <SourceViewer projectId={project.id} files={files.map((item) => ({ id: item.id, path: item.path }))} file={viewing.file} line={viewing.line} onClose={() => (viewing = null)} />
+  <SourceViewer projectId={project.id} files={tree.map((entry) => ({ id: entry.file.id, path: entry.file.path }))} file={viewing.file} line={viewing.line} onClose={() => (viewing = null)} />
 {/if}
 
 <style>
@@ -767,54 +960,164 @@
     min-height: 0;
   }
 
-  .files {
+  .scenes {
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    width: 260px;
+    width: 290px;
     flex: 0 0 auto;
-    overflow-y: auto;
-    padding: 10px 8px;
+    min-height: 0;
     border-right: 1px solid var(--divider);
     background: var(--surface-side);
   }
 
-  .file {
+  .scenes-head {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 8px 10px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: transparent;
-    color: var(--text-soft);
-    text-align: left;
+    gap: 8px;
+    padding: 10px 8px 8px;
+    border-bottom: 1px solid var(--divider);
   }
 
-  .file:hover,
-  .file.active {
-    border-color: var(--border-selected);
-    background: var(--hover);
-  }
-
-  .file-name {
+  .describe-row {
     display: flex;
     align-items: center;
     gap: 6px;
-    overflow: hidden;
+  }
+
+  .groups {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 2px;
+    overflow-y: auto;
+    padding: 6px 8px 12px;
+  }
+
+  .group {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .group-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px 6px;
+    align-items: center;
+    padding: 6px 4px 6px 2px;
+    border-radius: 8px;
+  }
+
+  .group-head:hover {
+    background: var(--hover-row);
+  }
+
+  .group-toggle {
+    display: flex;
+    grid-column: 1 / -1;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--text-soft);
     font-size: 12px;
+    font-weight: 600;
+    text-align: left;
+  }
+
+  .group.current .group-toggle {
+    color: var(--text-strong);
+  }
+
+  .group-name,
+  .scene-title {
+    overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .file-progress {
+  .group-head .progress-line {
+    padding-left: 17px;
+  }
+
+  .group-actions {
+    display: flex;
+    gap: 2px;
+  }
+
+  .group-actions .icon-button {
+    width: 22px;
+    height: 22px;
+  }
+
+  .scene-item {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding-left: 17px;
+  }
+
+  .no-mark {
+    width: 13px;
+    flex: 0 0 auto;
+  }
+
+  .scene {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    padding: 6px 8px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--text-soft);
+    font-size: 12px;
+    text-align: left;
+  }
+
+  .scene:hover,
+  .scene.active {
+    border-color: var(--border-selected);
+    background: var(--hover);
+  }
+
+  .scene.loose {
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .scene-name {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .mark {
+    flex: 0 0 auto;
+    color: var(--text-ghost);
+    font-size: 10px;
+    font-style: normal;
+  }
+
+  .mark.warn {
+    color: var(--warning);
+  }
+
+  .progress-line {
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
   }
 
   .bar-track {
     flex: 1;
+    min-width: 30px;
     height: 4px;
     overflow: hidden;
     border-radius: 999px;
@@ -827,9 +1130,10 @@
     background: var(--accent);
   }
 
-  .file-count {
+  .count {
     color: var(--text-faint);
     font-size: 10px;
+    font-style: normal;
     white-space: nowrap;
   }
 
@@ -844,14 +1148,14 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 8px 14px;
+    gap: 8px 10px;
     padding: 10px 16px;
     border-bottom: 1px solid var(--divider);
   }
 
   .toolbar-title {
     display: flex;
-    flex: 1 1 160px;
+    flex: 1 1 120px;
     flex-direction: column;
     gap: 2px;
     min-width: 0;
@@ -867,6 +1171,8 @@
   }
 
   .toolbar-title span {
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
 
@@ -876,7 +1182,8 @@
     font-size: 11px;
   }
 
-  .page-error {
+  /* Баннеры таблицы, и баннер описаний из `SuggestStatus` тоже. */
+  .lines :global(.page-error) {
     margin: 10px 16px 0;
   }
 
@@ -889,20 +1196,24 @@
     font-size: 12px;
   }
 
+  .no-lines {
+    padding: 24px 0;
+    color: var(--text-faint);
+    font-size: 12px;
+    text-align: center;
+  }
+
   .table {
     flex: 1;
     overflow-y: auto;
-    padding: 0 16px 24px;
+    padding: 12px 16px 24px;
   }
 
-  .scene {
+  .subgroup {
     position: sticky;
-    top: 0;
+    top: -12px;
     z-index: 1;
     margin: 0;
-    display: flex;
-    align-items: center;
-    gap: 4px;
     padding: 10px 0 4px;
     background: var(--bg);
     color: var(--accent-text);
