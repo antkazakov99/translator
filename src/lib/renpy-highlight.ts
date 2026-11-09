@@ -45,3 +45,14 @@ export function highlightRenpyLine(text: string): string {
   }
   return out + escapeHtml(text.slice(end));
 }
+
+/**
+ * Номер строки (с единицы) с меткой `label name:` или `label name(...):`. `null`: метки в тексте нет,
+ * например в файле перевода `tl`.
+ */
+export function labelLine(lines: string[], name: string): number | null {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^\\s*label\\s+${escaped}\\s*(?:\\(.*\\))?\\s*:`);
+  const index = lines.findIndex((text) => pattern.test(text));
+  return index < 0 ? null : index + 1;
+}

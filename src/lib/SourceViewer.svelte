@@ -2,7 +2,7 @@
   import { tick } from "svelte";
   import { Check, ChevronDown, ChevronUp, Copy, FileCode, LoaderCircle, Search, TriangleAlert, X } from "lucide-svelte";
   import { commands, type SourceFileDto } from "./bindings";
-  import { highlightRenpyLine } from "./renpy-highlight";
+  import { highlightRenpyLine, labelLine } from "./renpy-highlight";
   import { matchingLines } from "./source-search";
 
   /**
@@ -14,6 +14,7 @@
     files,
     file,
     line = null,
+    label = null,
     onClose,
   }: {
     projectId: string;
@@ -22,6 +23,11 @@
     file: number;
     /** Строка, к которой прокрутить и которую подсветить. */
     line?: number | null;
+    /**
+     * Метка сцены: открыть файл на её начале. Строка метки встаёт вверх окна; если метки в файле нет
+     * или она ниже `line`, вверх встаёт `line`.
+     */
+    label?: string | null;
     onClose: () => void;
   } = $props();
 
@@ -41,6 +47,11 @@
   }
   function untrackedLine() {
     return line;
+  }
+  /** Метка сцены нужна только при первом открытии: другой файл из списка открывается сверху. */
+  let sceneLabel = untrackedLabel();
+  function untrackedLabel() {
+    return label;
   }
 
   const lines = $derived(source ? source.text.split(/\r?\n/) : []);
@@ -64,9 +75,18 @@
       const loaded = await commands.sourceFile(projectId, id);
       if (id !== current) return;
       source = loaded;
+      // Строки появляются в разметке только без «Читаю файл»: прокрутка до этого ничего не находит.
+      loading = false;
       await tick();
-      if (target !== null) scrollTo(target - 1, "auto");
-      else viewport?.scrollTo({ top: 0 });
+      const atStart = sceneLabel !== null;
+      const start = sceneLabel ? labelLine(lines, sceneLabel) : null;
+      const wanted = start !== null && (target === null || start <= target) ? start : target;
+      sceneLabel = null;
+      if (wanted !== null) {
+        target = wanted;
+        // Начало сцены встаёт вверх окна, отдельная строка в середину.
+        scrollTo(wanted - 1, "auto", atStart ? "start" : "center");
+      } else viewport?.scrollTo({ top: 0 });
     } catch (e) {
       if (id === current) error = String(e);
     } finally {
@@ -74,8 +94,8 @@
     }
   }
 
-  function scrollTo(index: number, behavior: ScrollBehavior = "smooth") {
-    viewport?.querySelector(`[data-index="${index}"]`)?.scrollIntoView({ block: "center", behavior });
+  function scrollTo(index: number, behavior: ScrollBehavior = "smooth", block: ScrollLogicalPosition = "center") {
+    viewport?.querySelector(`[data-index="${index}"]`)?.scrollIntoView({ block, behavior });
   }
 
   function jump(step: number) {

@@ -74,7 +74,7 @@
   /** Сцена в центре графа: переживает переключение вида. */
   let graphFocus = $state<string | null>(null);
   /** Открытый исходник: файл снимка и строка. */
-  let viewing = $state<{ file: number; line: number | null } | null>(null);
+  let viewing = $state<{ file: number; line: number | null; label?: string | null } | null>(null);
   /** Реплика, к которой перешли из глоссария: строка отмечена, пока не выбрана другая сцена. */
   let highlighted = $state<number | null>(null);
   let query = $state("");
@@ -454,6 +454,17 @@
   }
 
   /** Исходник файла на строке реплики. */
+  /** Сцена в исходнике: файл на строке её метки, а без метки в файле на первой по номеру строке реплики. */
+  function viewScene() {
+    if (!group || !selected) return;
+    const numbers = sceneLines.map((line) => Number.parseInt(line.location ?? "", 10)).filter((number) => Number.isFinite(number) && number > 0);
+    viewing = {
+      file: group.file.id,
+      line: numbers.length > 0 ? Math.min(...numbers) : null,
+      label: selected.kind === "scene" ? sceneLabel(selected.key) : null,
+    };
+  }
+
   function viewSource(file: number | null, line: string | null | undefined) {
     if (file === null) return;
     const number = Number.parseInt(line ?? "", 10);
@@ -598,7 +609,7 @@
             {@const key = selected.key}
             <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(key)}><Waypoints size={15} /></button>
           {/if}
-          <button class="icon-button" aria-label="Сцена в исходнике" title="Сцена в исходнике" onclick={() => viewSource(group?.file.id ?? null, sceneLines[0]?.location)}
+          <button class="icon-button" aria-label="Сцена в исходнике" title="Сцена в исходнике" onclick={viewScene}
             ><FileCode size={15} /></button
           >
           <button
@@ -821,7 +832,7 @@
 </main>
 
 {#if viewing}
-  <SourceViewer projectId={project.id} files={tree.map((entry) => ({ id: entry.file.id, path: entry.file.path }))} file={viewing.file} line={viewing.line} onClose={() => (viewing = null)} />
+  <SourceViewer projectId={project.id} files={tree.map((entry) => ({ id: entry.file.id, path: entry.file.path }))} file={viewing.file} line={viewing.line} label={viewing.label ?? null} onClose={() => (viewing = null)} />
 {/if}
 
 <style>
