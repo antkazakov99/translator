@@ -24,6 +24,7 @@
   import ModPanel from "./ModPanel.svelte";
   import ScanPanel from "./ScanPanel.svelte";
   import SceneGraph from "./SceneGraph.svelte";
+  import { progressLabel, progressPercent } from "./progress";
   import type { GraphScene } from "$lib/scene-graph";
   import {
     commands,
@@ -368,10 +369,6 @@
     view = "graph";
   }
 
-  function percent(item: FileDto) {
-    return item.total === 0 ? 0 : Math.round((item.translated / item.total) * 100);
-  }
-
   function sceneName(scene: Scene) {
     if (!scene.key) return "Вне сцен";
     const name = scene.key.replace(/^[a-z]+:/, "");
@@ -445,7 +442,7 @@
         <button class="file" class:active={item.id === fileId} onclick={() => selectFile(item.id)} title={item.path}>
           <span class="file-name"><FileText size={13} /> {item.path.replace(/^game\//, "")}</span>
           <span class="file-progress">
-            <span class="bar-track"><span class="bar-fill" style:width="{percent(item)}%"></span></span>
+            <span class="bar-track"><span class="bar-fill" style:width="{progressPercent(item.translated, item.total)}%"></span></span>
             <span class="file-count">{item.translated}/{item.total}{item.drafts ? ` · модель: ${item.drafts}` : ""}</span>
           </span>
         </button>
@@ -459,7 +456,7 @@
         <div class="toolbar">
           <div class="toolbar-title">
             <strong>{file.path}</strong>
-            <span>{file.translated} из {file.total} · {percent(file)}%</span>
+            <span>{file.translated} из {file.total} · {progressLabel(file.translated, file.total)}</span>
           </div>
           <div class="segmented" role="tablist" aria-label="Какие реплики показать">
             {#each [["all", "Все"], ["empty", "Пустые"], ["draft", "Модель"]] as [value, label] (value)}

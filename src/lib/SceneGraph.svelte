@@ -2,6 +2,7 @@
   import { onMount, tick, untrack } from "svelte";
   import { ChevronLeft, ChevronRight, Clapperboard, LoaderCircle, Route, TableProperties, TriangleAlert, X } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
+  import { progressPercent } from "./progress";
   import { commands } from "$lib/bindings";
   import {
     NODE_HEIGHT,
@@ -152,7 +153,6 @@
     return found.slice(0, 200).map((scene) => ({ id: scene.key, label: sceneName(scene.key, scene) }));
   }
 
-  const percent = (scene: GraphScene) => (scene.total === 0 ? 0 : Math.round((scene.translated / scene.total) * 100));
 </script>
 
 {#snippet columnHead(title: string, info: Column, x: number, filter: string, setFilter: (text: string) => void, setPage: (page: number) => void)}
@@ -233,7 +233,7 @@
   </span>
   {#if scene && scene.total > 0}
     <span class="node-progress">
-      <span class="track"><span class="fill" style:width="{percent(scene)}%"></span></span>
+      <span class="track"><span class="fill" style:width="{progressPercent(scene.translated, scene.total)}%"></span></span>
       <span class="count">{scene.translated}/{scene.total}{scene.drafts ? ` · модель: ${scene.drafts}` : ""}</span>
     </span>
   {/if}
