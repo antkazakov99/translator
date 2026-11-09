@@ -285,7 +285,7 @@
     </button>
   </div>
 {:else}
-<div class="master">
+<div class="master with-lines">
   <div class="list-side">
     <input class="input" placeholder="Поиск по имени и формам" bind:value={query} aria-label="Поиск персонажей" />
     <div class="marks">
@@ -367,7 +367,6 @@
       <label class="field">Манера речи<input class="input" bind:value={draft.speech} onchange={save} placeholder="Например: грубит, говорит коротко" /></label>
       <label class="field">Описание<textarea class="input" rows="4" bind:value={draft.description} onchange={save}></textarea></label>
       <DescribeParts {projectId} owner={{ kind: "character", id: draft.id }} {runs} onDescribed={described} {onError} />
-      <EntryLines {projectId} owner={{ kind: "character", id: draft.id }} revision={linesRevision} {onOpenLine} {onError} />
 
       <div class="field">
         <span>Говорящие</span>
@@ -382,6 +381,7 @@
 
       {#if fieldError}<p class="error-text">{fieldError}</p>{/if}
     </div>
+    <EntryLines {projectId} owner={{ kind: "character", id: draft.id }} revision={linesRevision} {onOpenLine} {onError} />
   {:else}
     <div class="empty">
       <strong>Персонаж не выбран</strong>

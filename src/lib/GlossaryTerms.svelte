@@ -372,7 +372,7 @@
     {/each}
   </div>
 {:else}
-  <div class="master">
+  <div class="master with-lines">
     <div class="list-side">
       <input class="input" placeholder="Поиск по названию и переводу" bind:value={query} aria-label="Поиск терминов" />
       <div class="marks">
@@ -448,7 +448,6 @@
         <GlossaryForms forms={draft.forms} hint="Сокращения и короткие формы" onchange={(forms: NameForm[]) => save({ forms })} />
         <label class="field">Описание<textarea class="input" rows="4" bind:value={draft.description} onchange={() => save()}></textarea></label>
         <DescribeParts {projectId} owner={{ kind: "term", id: draft.id }} {runs} onDescribed={described} {onError} />
-        <EntryLines {projectId} owner={{ kind: "term", id: draft.id }} revision={linesRevision} {onOpenLine} {onError} />
 
         <div class="card-actions">
           {#if giving}
@@ -490,6 +489,7 @@
 
         {#if fieldError}<p class="error-text">{fieldError}</p>{/if}
       </div>
+      <EntryLines {projectId} owner={{ kind: "term", id: draft.id }} revision={linesRevision} {onOpenLine} {onError} />
     {:else}
       <div class="empty">
         <strong>Термин не выбран</strong>

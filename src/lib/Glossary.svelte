@@ -302,6 +302,17 @@
     min-height: 0;
   }
 
+  /* Персонажи и термины: список, карточка и панель реплик. Ряд по высоте раздела, колонки листаются сами. */
+  .glossary :global(.master.with-lines) {
+    grid-template-columns: clamp(180px, 22%, 280px) minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  /* Высота карточки с отступами не больше ряда: иначе её низ уходит за край окна. */
+  .glossary :global(.master.with-lines > .editor) {
+    box-sizing: border-box;
+  }
+
   .glossary :global(.items) {
     display: flex;
     flex: 1;

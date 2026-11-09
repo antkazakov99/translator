@@ -94,9 +94,9 @@
   }
 </script>
 
-<div class="field entry-lines">
+<section class="card entry-lines" aria-label="Реплики">
   <div class="head">
-    <span>Реплики</span>
+    <strong>Реплики</strong>
     {#if loading && !lines}<LoaderCircle size={12} class="spin" />{/if}
     <span class="faint">{summary()}</span>
     <span class="spacer"></span>
@@ -119,6 +119,8 @@
     <input class="input" type="search" bind:value={query} placeholder="Поиск по оригиналу и переводу" aria-label="Поиск по репликам" />
     <div class="lines">
       {#each groups as group, index (`${group.scene}-${index}`)}
+        <!-- Своя обёртка у сцены: её заголовок прилипает, пока видны её реплики, и уступает место следующему. -->
+        <div class="group">
         <div class="scene">
           <span>{sceneTitle(group.scene, group.title)}</span>
         </div>
@@ -136,17 +138,24 @@
             </button>
           </div>
         {/each}
+        </div>
       {:else}
-        <span class="faint">Таких реплик нет</span>
+        <span class="faint nothing">Таких реплик нет</span>
       {/each}
+      {#if shown.length > limit}
+        <button class="btn small more" onclick={() => (limit += PAGE)}>Показать ещё {Math.min(PAGE, shown.length - limit)} из {shown.length - limit}</button>
+      {/if}
     </div>
-    {#if shown.length > limit}
-      <button class="btn small more" onclick={() => (limit += PAGE)}>Показать ещё {Math.min(PAGE, shown.length - limit)} из {shown.length - limit}</button>
-    {/if}
   {/if}
-</div>
+</section>
 
 <style>
+  /* Панель рядом с карточкой записи: заголовок, фильтр и поиск на месте, листаются только реплики. */
+  .entry-lines {
+    min-height: 0;
+    overflow: hidden;
+  }
+
   .head {
     display: flex;
     flex-wrap: wrap;
@@ -154,23 +163,34 @@
     align-items: center;
   }
 
+  .head strong {
+    color: var(--text-strong);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
   .spacer {
     flex: 1;
   }
 
-  /* Без своей прокрутки: реплики листаются вместе с карточкой, заголовок сцены прилипает к её верху. */
   .lines {
     display: flex;
+    flex: 1;
     flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg-sunken);
   }
 
+  .nothing {
+    padding: 8px;
+  }
+
   .scene {
     position: sticky;
-    /* Отступ `.card`: заголовок прилипает к самому краю карточки, а не под отступом. */
-    top: -12px;
+    top: 0;
     z-index: 1;
     padding: 6px 8px;
     border-bottom: 1px solid var(--divider);
@@ -260,5 +280,6 @@
 
   .more {
     align-self: flex-start;
+    margin: 8px;
   }
 </style>
