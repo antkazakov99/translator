@@ -1,6 +1,6 @@
 [package]
 name = "translator-app"
-version = "0.1.1"
+version = "0.2.0"
 description = "Universal Game Localization & Translation Tool"
 authors = ["Anton Kazakov"]
 edition = "2024"
