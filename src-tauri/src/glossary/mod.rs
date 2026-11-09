@@ -23,7 +23,7 @@ pub(crate) use describe::prune_notes;
 pub use describe::{DescribeService, DescribeTarget, Described, NamesService, ReadingDepth, Suggestions};
 pub use key::NameKey;
 pub use notes::{Note, NoteOwner};
-pub use repo::{CharacterRepo, LineSampleRepo, NoteRepo, SampleLine, SceneDescriptionRepo, StoryLine, SpeakerRepo, SpeakerUse, TermRepo, TokenRepo};
+pub use repo::{CharacterRepo, LineSampleRepo, NoteRepo, ReadingDepthRepo, SampleLine, SceneDescriptionRepo, StoryLine, SpeakerRepo, SpeakerUse, TermRepo, TokenRepo};
 pub use names::{NameSuggestion, NameVariant};
 pub use suggest::{SpeakerSuggestion, TermSuggestion, TokenSuggestion};
 pub use scenes::{SceneDescription, SceneSource};

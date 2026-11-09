@@ -11,7 +11,7 @@ use super::describe_prompt::{
 };
 use super::entries::{character_names, character_scenes, entry_parts, term_names, term_scenes};
 use super::parts::{MAX_PART_TEXT, Part, ScenesPart, pick_parts, scene_hash, script_line, split_lines};
-use super::repo::{LineSampleRepo, NoteRepo, SampleLine, SceneDescriptionRepo, StoryLine, TermRepo};
+use super::repo::{LineSampleRepo, NoteRepo, ReadingDepthRepo, SampleLine, SceneDescriptionRepo, StoryLine, TermRepo};
 use super::{Note, NoteOwner, SceneDescription};
 use crate::common::Timestamp;
 use crate::storage::DbError;
@@ -57,11 +57,12 @@ pub enum DescribeTarget {
 }
 
 /// Глубина чтения в массовом обновлении: минимум и максимум частей и желаемый процент.
+/// Своя у проекта (`reading_depth`), без неё действует `default`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadingDepth {
-    pub min_parts: usize,
-    pub max_parts: usize,
-    pub percent: u8,
+    min_parts: usize,
+    max_parts: usize,
+    percent: u8,
 }
 
 impl Default for ReadingDepth {
@@ -71,6 +72,32 @@ impl Default for ReadingDepth {
 }
 
 impl ReadingDepth {
+    /// Минимум не меньше одной части, максимум не меньше минимума, процент от 1 до 100.
+    pub fn new(min_parts: usize, max_parts: usize, percent: u8) -> Result<Self, ValidationError> {
+        if min_parts == 0 {
+            return Err(ValidationError::OutOfRange("минимум частей"));
+        }
+        if max_parts < min_parts {
+            return Err(ValidationError::OutOfRange("максимум частей меньше минимума"));
+        }
+        if !(1..=100).contains(&percent) {
+            return Err(ValidationError::OutOfRange("процент чтения"));
+        }
+        Ok(Self { min_parts, max_parts, percent })
+    }
+
+    pub fn min_parts(&self) -> usize {
+        self.min_parts
+    }
+
+    pub fn max_parts(&self) -> usize {
+        self.max_parts
+    }
+
+    pub fn percent(&self) -> u8 {
+        self.percent
+    }
+
     /// Процент от всех частей округляется вверх и ограничивается минимумом и максимумом.
     /// У кого частей меньше минимума, тот читается целиком (`partsForDepth`).
     pub fn parts_for(&self, total: usize) -> usize {
@@ -217,15 +244,15 @@ impl DescribeService<'_> {
         self.run(project, vec![target], Choice::Count(parts), Fill::Replace, one_off, progress).await
     }
 
-    /// Группа по очереди с глубиной чтения. Заполненная запись без новых частей в запуск не входит.
+    /// Группа по очереди с глубиной чтения проекта. Заполненная запись без новых частей в запуск не входит.
     pub async fn describe_many(
         &self,
         project: ProjectId,
         targets: Vec<DescribeTarget>,
-        depth: ReadingDepth,
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
     ) -> Result<Described, AppError> {
+        let depth = self.state.open_project(project)?.project.read(|tx| ReadingDepthRepo { conn: tx }.get())?;
         self.run(project, targets, Choice::Depth(depth), Fill::ReplaceUnlessRead, one_off, progress).await
     }
 
@@ -255,7 +282,8 @@ impl DescribeService<'_> {
                 own.or_else(|| notes.iter().find(|note| note.part_hash == hash && model.is_none()))
             };
             let ready: Vec<bool> = selection.parts.iter().map(|part| note_of(&part.part.hash).is_some()).collect();
-            let picked = pick_parts(&ready, ReadingDepth::default().parts_for(selection.parts.len()));
+            let depth = ReadingDepthRepo { conn: tx }.get()?;
+            let picked = pick_parts(&ready, depth.parts_for(selection.parts.len()));
             let parts = selection
                 .parts
                 .iter()
@@ -387,9 +415,9 @@ impl SceneReader {
         let model = target.profile.model().to_string();
         let plans = open.project.read(|tx| {
             let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
+            let choice = Choice::Depth(ReadingDepthRepo { conn: tx }.get()?);
             let mut plans = Vec::new();
             for key in keys {
-                let choice = Choice::Depth(ReadingDepth::default());
                 if let Some(plan) = plan_scene(tx, context, key, &model, choice, Fill::Empty, first.as_ref())? {
                     plans.push(plan);
                 }
@@ -1625,7 +1653,6 @@ mod tests {
         let described = tauri::async_runtime::block_on(service.describe_many(
             id,
             vec![DescribeTarget::Scene(start.clone()), DescribeTarget::Scene(left.clone())],
-            ReadingDepth::default(),
             None,
             silent(),
         ))
@@ -1676,7 +1703,7 @@ mod tests {
         assert_eq!((parts.picked, parts.parts[0].note.is_none()), (1, true));
 
         let described =
-            tauri::async_runtime::block_on(service.describe_many(id, vec![character.clone(), term.clone()], ReadingDepth::default(), None, silent()))
+            tauri::async_runtime::block_on(service.describe_many(id, vec![character.clone(), term.clone()], None, silent()))
                 .unwrap();
         assert_eq!(described, Described { written: vec![character.clone(), term.clone()], error: None });
         {
@@ -1766,5 +1793,28 @@ mod tests {
         assert_eq!(depth.parts_for(10), 5);
         assert_eq!(depth.parts_for(21), 7);
         assert_eq!(depth.parts_for(1000), 50);
+    }
+
+    #[test]
+    fn depth_rejects_bad_bounds() {
+        assert!(ReadingDepth::new(0, 10, 30).is_err());
+        assert!(ReadingDepth::new(5, 4, 30).is_err());
+        assert!(ReadingDepth::new(1, 4, 0).is_err());
+        assert!(ReadingDepth::new(1, 4, 101).is_err());
+        let depth = ReadingDepth::new(2, 4, 100).unwrap();
+        assert_eq!(depth.parts_for(10), 4);
+        assert_eq!(depth.parts_for(2), 2);
+    }
+
+    #[test]
+    fn project_keeps_its_own_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9");
+        let glossary = super::super::GlossaryService { state: &state };
+        assert_eq!(glossary.reading_depth(id).unwrap(), ReadingDepth::default());
+        let depth = ReadingDepth::new(1, 3, 100).unwrap();
+        glossary.save_reading_depth(id, &depth).unwrap();
+        glossary.save_reading_depth(id, &depth).unwrap();
+        assert_eq!(glossary.reading_depth(id).unwrap(), depth);
     }
 }

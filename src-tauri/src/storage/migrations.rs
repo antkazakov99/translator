@@ -38,11 +38,10 @@ pub const APP: &[Migration] = &[Migration {
 }];
 
 /// Шаги project.db.
-pub const PROJECT: &[Migration] = &[Migration {
-    version: 1,
-    name: "init",
-    sql: include_str!("schema/project/0001_init.sql"),
-}];
+pub const PROJECT: &[Migration] = &[
+    Migration { version: 1, name: "init", sql: include_str!("schema/project/0001_init.sql") },
+    Migration { version: 2, name: "reading_depth", sql: include_str!("schema/project/0002_reading_depth.sql") },
+];
 
 /// История шагов. Её создаёт механизм миграций, в самих шагах её нет.
 const HISTORY: &str = "

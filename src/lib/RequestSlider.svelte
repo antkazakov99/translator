@@ -70,7 +70,7 @@
     gap: 4px;
     margin-top: 10px;
     font-size: 12px;
-    color: #cbd5e1;
+    color: var(--text-soft);
   }
 
   .slider-head {
@@ -82,15 +82,15 @@
   .slider-status {
     margin-left: auto;
     font-size: 11px;
-    color: #94a3b8;
+    color: var(--text-muted);
   }
 
   .slider input {
-    --track: linear-gradient(
+    --fill: linear-gradient(
       to right,
-      #38bdf8 var(--ready-stop),
-      #10b981 var(--ready-stop) var(--parts-stop),
-      #1e293b var(--parts-stop)
+      var(--accent-icon) var(--ready-stop),
+      var(--accent) var(--ready-stop) var(--parts-stop),
+      var(--track) var(--parts-stop)
     );
     appearance: none;
     width: 100%;
@@ -107,7 +107,7 @@
   .slider input::-webkit-slider-runnable-track {
     height: 8px;
     border-radius: 4px;
-    background-image: var(--track);
+    background-image: var(--fill);
   }
 
   /* Зазоры уже шкалы на ширину бегунка: его центр ходит ровно по границам сегментов.
@@ -117,9 +117,9 @@
       repeating-linear-gradient(
         to right,
         transparent 0 calc(var(--segment) - 2px),
-        #0f172a calc(var(--segment) - 2px) var(--segment)
+        var(--surface) calc(var(--segment) - 2px) var(--segment)
       ),
-      var(--track);
+      var(--fill);
     background-position: 7px center, 0 0;
     background-repeat: no-repeat;
     background-size: calc(100% - 16px) 100%, 100% 100%;
@@ -130,17 +130,17 @@
     width: 14px;
     height: 14px;
     margin-top: -3px;
-    border: 2px solid #0f172a;
+    border: 2px solid var(--surface);
     border-radius: 50%;
-    background: #f8fafc;
+    background: var(--text-strong);
   }
 
   .slider input:disabled::-webkit-slider-thumb {
-    background: #64748b;
+    background: var(--text-ghost);
   }
 
   .slider input:focus-visible {
-    outline: 1px solid #10b981;
+    outline: 1px solid var(--accent);
     outline-offset: 2px;
     border-radius: 4px;
   }
@@ -149,6 +149,6 @@
     display: flex;
     justify-content: space-between;
     font-size: 11px;
-    color: #64748b;
+    color: var(--text-faint);
   }
 </style>

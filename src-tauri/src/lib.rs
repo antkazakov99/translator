@@ -77,6 +77,8 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             restore_term_name,
             new_terms,
             save_token,
+            reading_depth,
+            save_reading_depth,
             suggest_names,
             name_rules,
             save_name_rule,

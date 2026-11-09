@@ -309,6 +309,16 @@ impl GlossaryService<'_> {
         })
     }
 
+    /// Глубина чтения проекта для описаний моделью.
+    pub fn reading_depth(&self, project: ProjectId) -> Result<super::ReadingDepth, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| super::ReadingDepthRepo { conn: tx }.get())?)
+    }
+
+    pub fn save_reading_depth(&self, project: ProjectId, depth: &super::ReadingDepth) -> Result<(), AppError> {
+        self.write(project, |tx| super::ReadingDepthRepo { conn: tx }.save(depth))
+    }
+
     fn write<T>(&self, project: ProjectId, work: impl FnOnce(&rusqlite::Transaction) -> Result<T, DbError>) -> Result<T, AppError> {
         let open = self.state.open_project(project)?;
         Ok(open.project.write(work)?)

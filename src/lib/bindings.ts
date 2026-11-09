@@ -71,6 +71,9 @@ export const commands = {
 	newTerms: (project: string) => __TAURI_INVOKE<TermCandidateDto[]>("new_terms", { project }),
 	/**  Значение или пояснение токена. Пустые оба удаляют запись. */
 	saveToken: (project: string, name: string, value: string, note: string) => __TAURI_INVOKE<null>("save_token", { project, name, value, note }),
+	/**  Глубина чтения проекта. Пока её не меняли, действует значение из кода. */
+	readingDepth: (project: string) => __TAURI_INVOKE<ReadingDepthDto>("reading_depth", { project }),
+	saveReadingDepth: (project: string, depth: ReadingDepthDto) => __TAURI_INVOKE<null>("save_reading_depth", { project, depth }),
 	/**  Перевод имён, фамилий и форм персонажей без перевода. Отмеченное окно записывает через `save_character`. */
 	suggestNames: (project: string, characters: RowRef[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<NameSuggestionsDto_Serialize>("suggest_names", { project, characters, profile, progress }),
 	/**  Языки имён проекта и библиотеки с правилами. */
@@ -97,14 +100,14 @@ export const commands = {
 	resetSceneNotes: (project: string, key: string) => __TAURI_INVOKE<number>("reset_scene_notes", { project, key }),
 	/**  Описывает одну сцену целиком: заменяет описание, название пишет только в пустое поле. */
 	describeScene: (project: string, key: string, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scene", { project, key, profile, progress }),
-	/**  Описывает сцены по очереди с глубиной чтения по умолчанию. Описанные сцены без новых частей пропускаются. */
+	/**  Описывает сцены по очереди с глубиной чтения проекта. Описанные сцены без новых частей пропускаются. */
 	describeScenes: (project: string, keys: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scenes", { project, keys, profile, progress }),
 	/**  Части сцен персонажа или термина с заметками модели. */
 	entryParts: (project: string, owner: OwnerDto) => __TAURI_INVOKE<EntryPartsDto_Serialize>("entry_parts", { project, owner }),
-	/**  Описывает персонажа или термин по частям сцен с глубиной чтения по умолчанию и заменяет описание. */
+	/**  Описывает персонажа или термин по частям сцен с глубиной чтения проекта и заменяет описание. */
 	describeEntry: (project: string, owner: OwnerDto, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_entry", { project, owner, profile, progress }),
 	/**
-	 *  Описывает отмеченных персонажей и термины по очереди с глубиной чтения по умолчанию.
+	 *  Описывает отмеченных персонажей и термины по очереди с глубиной чтения проекта.
 	 *  Описанные записи без новых частей пропускаются.
 	 */
 	describeEntries: (project: string, owners: OwnerDto[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_entries", { project, owners, profile, progress }),
@@ -859,6 +862,13 @@ export type ProviderKind =
 "gemini" | 
 /**  Другой OpenAI-совместимый сервер. */
 "compatible";
+
+/**  Глубина чтения для описаний моделью: минимум и максимум частей и процент. */
+export type ReadingDepthDto = {
+	min: number,
+	max: number,
+	percent: number,
+};
 
 /**  Итог смены папки игры. */
 export type RebindDto = RebindDto_Serialize | RebindDto_Deserialize;

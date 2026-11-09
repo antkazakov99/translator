@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, TriangleAlert } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, TriangleAlert, SlidersHorizontal } from "lucide-svelte";
   import DescribeParts from "./DescribeParts.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
+  import ReadingDepthSettings from "./ReadingDepthSettings.svelte";
   import { commands } from "./bindings";
   import {
     characterName,
@@ -205,6 +206,9 @@
       onError(String(e));
     }
   }
+
+  /** Карточка глубины чтения под шапкой раздела. */
+  let depthOpen = $state(false);
 </script>
 
 <div class="toolbar">
@@ -212,12 +216,17 @@
     <strong>Персонажи</strong>
     <span>Имена с переводом и родом: модель видит их в каждой реплике, где они встречаются</span>
   </div>
+  <button class="btn small" class:active={depthOpen} title="Сколько частей читает модель для описаний" onclick={() => (depthOpen = !depthOpen)}>
+    <SlidersHorizontal size={13} />
+    <span>Глубина чтения</span>
+  </button>
   <button class="btn small primary" disabled={untranslated === 0 || runsBusy(runs)} title={runTitle()} onclick={startRun}>
     {#if run.active}<LoaderCircle size={13} class="spin" />{:else}<Languages size={13} />{/if}
     <span>Перевести имена · {untranslated}</span>
   </button>
 </div>
 
+{#if depthOpen}<ReadingDepthSettings {projectId} onClose={() => (depthOpen = false)} />{/if}
 <SuggestStatus {run} {onError} />
 {#if !draft}<SuggestStatus run={entriesRun} {onError} />{/if}
 

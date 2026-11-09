@@ -454,6 +454,39 @@ pub async fn new_terms(app: AppHandle, project: String) -> Result<Vec<TermCandid
     .await
 }
 
+/// Глубина чтения для описаний моделью: минимум и максимум частей и процент.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadingDepthDto {
+    pub min: u32,
+    pub max: u32,
+    pub percent: u8,
+}
+
+impl From<ReadingDepth> for ReadingDepthDto {
+    fn from(depth: ReadingDepth) -> Self {
+        let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
+        Self { min: count(depth.min_parts()), max: count(depth.max_parts()), percent: depth.percent() }
+    }
+}
+
+/// Глубина чтения проекта. Пока её не меняли, действует значение из кода.
+#[tauri::command]
+#[specta::specta]
+pub async fn reading_depth(app: AppHandle, project: String) -> Result<ReadingDepthDto, String> {
+    blocking(app, move |state| Ok(GlossaryService { state }.reading_depth(self::project(&project)?)?.into())).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_reading_depth(app: AppHandle, project: String, depth: ReadingDepthDto) -> Result<(), String> {
+    blocking(app, move |state| {
+        let depth = ReadingDepth::new(depth.min as usize, depth.max as usize, depth.percent)?;
+        GlossaryService { state }.save_reading_depth(self::project(&project)?, &depth)
+    })
+    .await
+}
+
 /// Значение или пояснение токена. Пустые оба удаляют запись.
 #[tauri::command]
 #[specta::specta]
@@ -937,7 +970,7 @@ pub async fn entry_parts(app: AppHandle, project: String, owner: OwnerDto) -> Re
     .await
 }
 
-/// Описывает персонажа или термин по частям сцен с глубиной чтения по умолчанию и заменяет описание.
+/// Описывает персонажа или термин по частям сцен с глубиной чтения проекта и заменяет описание.
 #[tauri::command]
 #[specta::specta]
 pub async fn describe_entry(
@@ -948,12 +981,12 @@ pub async fn describe_entry(
     progress: Channel<RunProgress>,
 ) -> Result<DescribedDto, String> {
     let described = DescribeService { state: &state }
-        .describe_many(self::project(&project)?, vec![owner.target()], ReadingDepth::default(), self::profile(profile)?, progress)
+        .describe_many(self::project(&project)?, vec![owner.target()], self::profile(profile)?, progress)
         .await?;
     Ok(described.into())
 }
 
-/// Описывает отмеченных персонажей и термины по очереди с глубиной чтения по умолчанию.
+/// Описывает отмеченных персонажей и термины по очереди с глубиной чтения проекта.
 /// Описанные записи без новых частей пропускаются.
 #[tauri::command]
 #[specta::specta]
@@ -966,7 +999,7 @@ pub async fn describe_entries(
 ) -> Result<DescribedDto, String> {
     let targets = owners.into_iter().map(OwnerDto::target).collect();
     let described = DescribeService { state: &state }
-        .describe_many(self::project(&project)?, targets, ReadingDepth::default(), self::profile(profile)?, progress)
+        .describe_many(self::project(&project)?, targets, self::profile(profile)?, progress)
         .await?;
     Ok(described.into())
 }
@@ -999,7 +1032,7 @@ pub async fn exclude_scene(app: AppHandle, project: String, owner: OwnerDto, key
     .await
 }
 
-/// Описывает сцены по очереди с глубиной чтения по умолчанию. Описанные сцены без новых частей пропускаются.
+/// Описывает сцены по очереди с глубиной чтения проекта. Описанные сцены без новых частей пропускаются.
 #[tauri::command]
 #[specta::specta]
 pub async fn describe_scenes(
@@ -1011,7 +1044,7 @@ pub async fn describe_scenes(
 ) -> Result<DescribedDto, String> {
     let targets = keys.into_iter().map(|key| Ok(DescribeTarget::Scene(scene_key(key)?))).collect::<Result<Vec<_>, AppError>>()?;
     let described = DescribeService { state: &state }
-        .describe_many(self::project(&project)?, targets, ReadingDepth::default(), self::profile(profile)?, progress)
+        .describe_many(self::project(&project)?, targets, self::profile(profile)?, progress)
         .await?;
     Ok(described.into())
 }

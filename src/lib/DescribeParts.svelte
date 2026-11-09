@@ -5,6 +5,7 @@
   import { commands, type EntryPartsDto_Serialize as EntryParts, type OwnerDto } from "./bindings";
   import { runsBusy, type GlossaryRuns } from "./glossary";
   import { sceneLabel } from "./scene-graph";
+  import { depthChanges } from "./reading-depth.svelte";
 
   /** Части сцен персонажа или термина с заметками модели: описание по ним, исключение заметок и сцен. */
   let {
@@ -32,6 +33,8 @@
 
   $effect(() => {
     ownerKey;
+    // Новая глубина чтения меняет части следующего запуска.
+    depthChanges.count;
     untrack(() => {
       confirmReset = false;
       parts = null;

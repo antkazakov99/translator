@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Eraser, FileText, LoaderCircle, Sparkles, TriangleAlert } from "lucide-svelte";
+  import { Eraser, FileText, LoaderCircle, Sparkles, TriangleAlert, SlidersHorizontal } from "lucide-svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
+  import ReadingDepthSettings from "./ReadingDepthSettings.svelte";
   import { commands, type PartNoteDto_Serialize as PartNote, type SceneEntryDto_Serialize as SceneEntry } from "./bindings";
   import { matches, runsBusy, type GlossaryRuns } from "./glossary";
   import { sceneLabel } from "./scene-graph";
@@ -142,6 +143,9 @@
     if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
     return "Модель прочитает часть каждой сцены и напишет описание. Описанные сцены без новых частей пропускаются";
   }
+
+  /** Карточка глубины чтения под шапкой раздела. */
+  let depthOpen = $state(false);
 </script>
 
 <div class="toolbar">
@@ -149,12 +153,17 @@
     <strong>Сцены</strong>
     <span>Описание сцены уходит модели в каждом запросе перевода её реплик: кто говорит, что происходит, на «ты» или на «вы»</span>
   </div>
+  <button class="btn small" class:active={depthOpen} title="Сколько частей читает модель для описаний" onclick={() => (depthOpen = !depthOpen)}>
+    <SlidersHorizontal size={13} />
+    <span>Глубина чтения</span>
+  </button>
   <button class="btn small primary" disabled={marked.length === 0 || runsBusy(runs)} title={runTitle(marked.length)} onclick={describeMarked}>
     {#if run.active}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
     <span>Описать отмеченные · {marked.length}</span>
   </button>
 </div>
 
+{#if depthOpen}<ReadingDepthSettings {projectId} onClose={() => (depthOpen = false)} />{/if}
 <SuggestStatus {run} {onError} />
 
 {#if !scenes}
