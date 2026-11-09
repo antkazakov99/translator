@@ -2,7 +2,7 @@ import type { FileDto, FileScenesDto_Serialize, SceneItemDto_Serialize } from ".
 
 /**
  * Список сцен таблицы перевода: плоский, по алфавиту оригинального имени сцены (метки). Пункт показывает
- * перевод названия, под ним оригинал. Реплики файла вне сцен идут в конце пунктами «Без сцены · файл».
+ * перевод названия (или пометку, что его нет), под ним оригинал. Реплики файла вне сцен идут в конце пунктами «Без сцены · файл».
  * Поиск идёт по названию, метке и пути файла: в больших играх сотни сцен.
  */
 
@@ -20,10 +20,10 @@ export interface SceneEntry {
   file: FileDto;
   /** Полное имя для шапки и поиска: «Название · метка». */
   name: string;
-  /** Первая строка пункта: перевод названия, без него оригинал. */
-  title: string;
-  /** Вторая строка: оригинальное имя, когда в первой перевод. */
-  original: string | null;
+  /** Первая строка пункта: перевод названия, у «Без сцены» сама подпись. `null`: названия ещё нет. */
+  title: string | null;
+  /** Вторая строка, есть у каждого пункта: оригинальное имя сцены, у «Без сцены» файл. */
+  original: string;
 }
 
 /** Подпись псевдосцены с репликами вне сцен. */
@@ -57,8 +57,10 @@ export function sceneList(tree: FileScenes[]): SceneEntry[] {
       const pick: ScenePick = scene.key ? { kind: "scene", key: scene.key } : { kind: "loose", file: group.file.id };
       const name = sceneItemName(scene, group.file.path);
       const label = scene.key ? sceneLabel(scene.key) : null;
-      const title = label === null ? name : (scene.title ?? label);
-      return { id: pickId(pick), pick, scene, file: group.file, name, title, original: label !== null && scene.title ? label : null };
+      // Две строки у каждого пункта: при смеси переведённых и непереведённых пункты одной высоты.
+      const title = label === null ? LOOSE_NAME : scene.title;
+      const original = label ?? fileName(group.file.path);
+      return { id: pickId(pick), pick, scene, file: group.file, name, title, original };
     }),
   );
   const order = (entry: SceneEntry) => (entry.scene.key ? sceneLabel(entry.scene.key) : fileName(entry.file.path));
@@ -68,10 +70,25 @@ export function sceneList(tree: FileScenes[]): SceneEntry[] {
   });
 }
 
-/** Пункты, подходящие поиску: по названию, метке и пути файла, без учёта регистра. */
-export function filterScenes(list: SceneEntry[], query: string): SceneEntry[] {
+/**
+ * Пункты, подходящие поиску: по названию, метке и пути файла без учёта регистра, а также пункты, где поиск
+ * по репликам (`search_scenes`) нашёл совпадения. `hits` это число найденных реплик по `SceneEntry.id`.
+ */
+export function filterScenes(list: SceneEntry[], query: string, hits: ReadonlyMap<string, number> = new Map()): SceneEntry[] {
   const needle = query.trim().toLowerCase();
   if (!needle) return list;
   const has = (text: string | null | undefined) => !!text && text.toLowerCase().includes(needle);
-  return list.filter((entry) => has(entry.name) || has(entry.file.path));
+  return list.filter((entry) => has(entry.name) || has(entry.file.path) || hits.has(entry.id));
+}
+
+/** Ключи найденных реплик для `filterScenes`: сцена по ключу, «Без сцены» по файлу. */
+export function hitMap(hits: { key: string | null; file: number; lines: number }[]): Map<string, number> {
+  return new Map(hits.map((hit) => [pickId(hit.key ? { kind: "scene", key: hit.key } : { kind: "loose", file: hit.file }), hit.lines]));
+}
+
+/** Реплика подходит поиску: подстрока в оригинале или переводе без учёта регистра, запрос не короче двух символов. */
+export function lineMatches(query: string, ...texts: (string | null | undefined)[]): boolean {
+  const needle = query.trim().toLowerCase();
+  if ([...needle].length < 2) return false;
+  return texts.some((text) => !!text && text.toLowerCase().includes(needle));
 }

@@ -106,6 +106,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             file_lines,
             translation_scenes,
             scene_lines,
+            search_scenes,
             save_line,
             confirm_lines,
             translate_lines,

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
-use super::{FileProgress, FileScenes, LineRun, LineState, LinesRun, Scene, SceneLine, SceneProgress, SceneRef, TranslationScope, TranslationService};
+use super::{FileProgress, FileScenes, LineRun, LineState, LinesRun, Scene, SceneHit, SceneLine, SceneProgress, SceneRef, TranslationScope, TranslationService};
 use crate::common::AppError;
 use crate::engines::ContainerKey;
 use crate::llm::{ProfileId, RunId, RunProgress, RunStatus};
@@ -322,6 +322,33 @@ pub async fn translation_files(app: AppHandle, project: String) -> Result<Vec<Fi
 pub async fn translation_scenes(app: AppHandle, project: String) -> Result<Vec<FileScenesDto>, String> {
     blocking(app, move |state| {
         Ok(TranslationService { state }.scene_tree(self::project(&project)?)?.into_iter().map(FileScenesDto::from).collect())
+    })
+    .await
+}
+
+/// Сцена, где нашлись реплики. `key = None`: реплики файла `file` вне сцен.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneHitDto {
+    pub key: Option<String>,
+    pub file: RowRef,
+    pub lines: u32,
+}
+
+/// Сцены, где в оригинале или переводе реплик есть `query`, без учёта регистра. Запрос короче двух символов ничего не находит.
+#[tauri::command]
+#[specta::specta]
+pub async fn search_scenes(app: AppHandle, project: String, query: String) -> Result<Vec<SceneHitDto>, String> {
+    blocking(app, move |state| {
+        let hits = TranslationService { state }.search(self::project(&project)?, &query)?;
+        Ok(hits
+            .into_iter()
+            .map(|hit: SceneHit| SceneHitDto {
+                key: hit.scene.map(|key| key.to_string()),
+                file: RowRef(hit.file.get()),
+                lines: u32::try_from(hit.lines).unwrap_or(u32::MAX),
+            })
+            .collect())
     })
     .await
 }

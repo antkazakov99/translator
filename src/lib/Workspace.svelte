@@ -30,7 +30,7 @@
   import { trackRun, type RunSource } from "./run-status.svelte";
   import { WriteRun } from "./suggest-run.svelte";
   import { progressLabel, progressPercent } from "./progress";
-  import { fileName, filterScenes, pickId, sceneItemName, sceneList, type ScenePick } from "./scene-tree";
+  import { fileName, filterScenes, hitMap, lineMatches, pickId, sceneItemName, sceneList, type ScenePick } from "./scene-tree";
   import { sceneLabel, type GraphScene } from "$lib/scene-graph";
   import {
     commands,
@@ -78,6 +78,29 @@
   /** Реплика, к которой перешли из глоссария: строка отмечена, пока не выбрана другая сцена. */
   let highlighted = $state<number | null>(null);
   let query = $state("");
+  /** Сколько реплик нашёл поиск по репликам в каждой сцене (`SceneEntry.id`). Пусто, пока запроса нет. */
+  let hits = $state<Map<string, number>>(new Map());
+  /** Поиск по репликам идёт в Rust: ждём, пока пользователь допечатает. */
+  const SEARCH_DELAY = 300;
+  let searchToken = 0;
+
+  $effect(() => {
+    const text = query.trim();
+    const token = ++searchToken;
+    if ([...text].length < 2) {
+      hits = new Map();
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const found = await commands.searchScenes(project.id, text);
+        if (token === searchToken) hits = hitMap(found);
+      } catch (e) {
+        if (token === searchToken) error = String(e);
+      }
+    }, SEARCH_DELAY);
+    return () => clearTimeout(timer);
+  });
   /** Описание открытой сцены моделью. */
   const describe = new WriteRun("Описания");
 
@@ -113,7 +136,7 @@
   );
   const order = $derived(shown.flatMap((scene) => scene.lines.map((line) => line.id)));
   const list = $derived(sceneList(tree));
-  const found = $derived(filterScenes(list, query));
+  const found = $derived(filterScenes(list, query, hits));
   /** Сцены файла открытой сцены: их описывает «Описать сцены файла». */
 
   /** Карточка описания есть только у настоящей сцены. */
@@ -572,7 +595,7 @@
   <div class="body">
     <nav class="scenes" aria-label="Сцены">
       <div class="scenes-head">
-        <input class="input" placeholder="Поиск сцены или файла" bind:value={query} aria-label="Поиск сцен" />
+        <input class="input" placeholder="Поиск по сценам и репликам" bind:value={query} aria-label="Поиск по сценам и репликам" />
       </div>
       <div class="scene-list">
         {#each found as entry (entry.id)}
@@ -585,8 +608,10 @@
             onclick={() => select(entry.pick)}
           >
             <span class="scene-name">
-              <span class="scene-title">{entry.title}</span>
-              {#if entry.original}<span class="scene-original">{entry.original}</span>{/if}
+              <span class="scene-title" class:untitled={entry.title === null}>{entry.title ?? "без названия"}</span>
+              <span class="scene-original"
+                >{entry.original}{#if hits.has(entry.id)}<span class="scene-hits"> · реплик: {hits.get(entry.id)}</span>{/if}</span
+              >
             </span>
             <span class="scene-percent" class:done={entry.scene.total > 0 && entry.scene.translated >= entry.scene.total}
               >{progressLabel(entry.scene.translated, entry.scene.total)}</span
@@ -786,7 +811,7 @@
                   <h3 class="subgroup">{scene.key ?? "Вне контейнеров"}</h3>
                 {/if}
                 {#each scene.lines as line (line.id)}
-                  <div class="row" class:editing={editing?.id === line.id} class:highlighted={highlighted === line.id} data-row={line.id}>
+                  <div class="row" class:editing={editing?.id === line.id} class:highlighted={highlighted === line.id} class:found={lineMatches(query, line.sourceText, line.text)} data-row={line.id}>
                     {#if line.location}
                       <button class="where" title="Строка {line.location} в исходнике" onclick={() => viewSource(group?.file.id ?? null, line.location)}>{line.location}</button>
                     {:else}
@@ -963,6 +988,17 @@
   }
 
   /* Оригинальное имя под переводом: мельче и тише, по нему идёт порядок списка. */
+  /* Названия ещё нет: пометка тише названия, чтобы пункт держал две строки, как переведённые. */
+  .scene-title.untitled {
+    color: var(--text-ghost);
+    font-style: italic;
+  }
+
+  .scene-hits {
+    color: var(--info);
+    font-family: var(--font);
+  }
+
   .scene-original {
     color: var(--text-faint);
     font-family: var(--font-mono);
@@ -1120,6 +1156,11 @@
   .row:hover,
   .row.editing {
     background: var(--hover-row);
+  }
+
+  /* Реплика подходит поиску из списка сцен. */
+  .row.found {
+    background: var(--info-bg);
   }
 
   .row.highlighted {

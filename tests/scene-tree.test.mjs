@@ -1,7 +1,7 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { filterScenes, pickId, sceneItemName, sceneList } from "../src/lib/scene-tree.ts";
+import { filterScenes, hitMap, lineMatches, pickId, sceneItemName, sceneList } from "../src/lib/scene-tree.ts";
 
 const scene = (key, title = null) => ({ key, title, described: false, stale: false, total: 2, translated: 1, drafts: 0 });
 const file = (id, path, scenes) => ({ file: { id, path, total: 10, translated: 5, drafts: 0 }, scenes });
@@ -35,9 +35,9 @@ test("scenes go by their original name, loose lines last by file", () => {
 test("the translated title comes first and the original under it", () => {
   const [beach, left] = sceneList(tree);
   assert.deepEqual([beach.title, beach.original], ["Пляж", "beach"]);
-  assert.deepEqual([left.title, left.original], ["left", null], "без перевода только оригинал");
+  assert.deepEqual([left.title, left.original], [null, "left"], "без перевода названия нет, оригинал на месте");
   const loose = sceneList(tree).at(-1);
-  assert.deepEqual([loose.title, loose.original], ["Без сцены · script.rpy", null]);
+  assert.deepEqual([loose.title, loose.original], ["Без сцены", "script.rpy"]);
 });
 
 test("numbers in names compare as numbers and case is ignored", () => {
@@ -60,4 +60,21 @@ test("query matches titles, labels and loose lines", () => {
 
 test("a matching file path keeps the whole file", () => {
   assert.deepEqual(names(filterScenes(sceneList(tree), "day2")), ["Пляж · beach", "left_beach", "Без сцены · day2.rpy"]);
+});
+
+test("scenes found by their lines join the ones found by name", () => {
+  const list = sceneList(tree);
+  const hits = hitMap([
+    { key: "label:start", file: 1, lines: 3 },
+    { key: null, file: 2, lines: 1 },
+  ]);
+  assert.equal(hits.get("scene:label:start"), 3);
+  assert.deepEqual(names(filterScenes(list, "пляж", hits)), ["Пляж · beach", "Пробуждение · start", "Без сцены · day2.rpy"]);
+});
+
+test("a line matches by original or translation, ignoring case", () => {
+  assert.ok(lineMatches(" эйлин ", "Hello.", "Привет, Эйлин."));
+  assert.ok(lineMatches("HELLO", "Hello.", null));
+  assert.ok(!lineMatches("bye", "Hello.", "Привет."));
+  assert.ok(!lineMatches("h", "Hello."), "один символ не ищется");
 });

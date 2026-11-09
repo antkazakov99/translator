@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::{Draft, FileProgress, LineRun, LineState, PlacedLine, RevisionKind, Scene, SceneLine, SceneProgress};
+use super::{Draft, FileProgress, LineRun, LineState, PlacedLine, RevisionKind, Scene, SceneLine, SceneProgress, SearchText};
 use crate::common::{Timestamp, ValidationError};
 use crate::engines::{ContainerKey, SpeakerKey};
 use crate::llm::{Action, RunId, RunStatus};
@@ -212,6 +212,31 @@ impl TranslationRepo<'_> {
             .collect::<Result<Vec<_>, _>>()?;
         scenes.extend(loose);
         Ok(scenes)
+    }
+
+    /// Реплики текущего снимка для поиска сцен: сцена (только контейнер вида `scene`), файл, оригинал и действующий текст.
+    pub fn search_texts(&self) -> Result<Vec<SearchText>, DbError> {
+        let mut statement = self.conn.prepare(
+            "SELECT CASE WHEN c.kind = 'scene' THEN c.key END, s.file_id, s.source_text, coalesce(t.text, s.game_text, '')
+             FROM segments s
+             LEFT JOIN containers c ON c.id = s.container_id
+             LEFT JOIN translations t ON t.segment_id = s.id
+             WHERE s.missing = 0
+             ORDER BY s.id",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(scene, file, source_text, text)| {
+                Ok(SearchText {
+                    scene: scene.map(ContainerKey::new).transpose().map_err(|error| DbError::bad_value("containers", "key", error))?,
+                    file: FileId::from_row(file),
+                    source_text,
+                    text,
+                })
+            })
+            .collect()
     }
 
     /// Все реплики текущего снимка по сюжету: сцены в порядке сюжета, реплики вне сцен в конце.

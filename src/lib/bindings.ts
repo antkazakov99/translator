@@ -134,6 +134,8 @@ export const commands = {
 	translationScenes: (project: string) => __TAURI_INVOKE<FileScenesDto_Serialize[]>("translation_scenes", { project }),
 	/**  Реплики одной сцены или реплики файла вне сцен. */
 	sceneLines: (project: string, scene: SceneRefDto) => __TAURI_INVOKE<SceneDto_Serialize[]>("scene_lines", { project, scene }),
+	/**  Сцены, где в оригинале или переводе реплик есть `query`, без учёта регистра. Запрос короче двух символов ничего не находит. */
+	searchScenes: (project: string, query: string) => __TAURI_INVOKE<SceneHitDto_Serialize[]>("search_scenes", { project, query }),
 	/**  Правка пользователя. Пустой текст очищает реплику. Возвращает реплику после правки. */
 	saveLine: (project: string, line: RowRef, text: string) => __TAURI_INVOKE<LineDto_Serialize>("save_line", { project, line, text }),
 	/**  Подтверждает черновики модели. Возвращает число подтверждённых. */
@@ -1039,6 +1041,23 @@ export type SceneGraphDto_Serialize = {
 	/**  В порядке сюжета. */
 	scenes: GraphSceneDto_Serialize[],
 	edges: GraphEdgeDto[],
+};
+
+/**  Сцена, где нашлись реплики. `key = None`: реплики файла `file` вне сцен. */
+export type SceneHitDto = SceneHitDto_Serialize | SceneHitDto_Deserialize;
+
+/**  Сцена, где нашлись реплики. `key = None`: реплики файла `file` вне сцен. */
+export type SceneHitDto_Deserialize = {
+	key?: string | null,
+	file: RowRef,
+	lines: number,
+};
+
+/**  Сцена, где нашлись реплики. `key = None`: реплики файла `file` вне сцен. */
+export type SceneHitDto_Serialize = {
+	key: string | null,
+	file: RowRef,
+	lines: number,
 };
 
 /**  Сцена в списке таблицы. `key = None`: реплики файла вне сцен («Без сцены»). */

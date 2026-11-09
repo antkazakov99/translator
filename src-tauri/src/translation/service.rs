@@ -9,8 +9,8 @@ use super::batcher::LINE_CONTEXT;
 use super::hints::GlossaryContext;
 use super::text::is_wordless;
 use super::{
-    Batch, Batcher, Draft, FileProgress, FileScenes, Hints, LineRun, LineState, LinesAnswer, LinesMode, LinesPrompt, Scene, SceneLine, SceneProgress, SceneRef, SentState,
-    TranslationRepo, TranslationScope,
+    Batch, Batcher, Draft, FileProgress, FileScenes, Hints, LineRun, LineState, LinesAnswer, LinesMode, LinesPrompt, Scene, SceneHit, SceneLine, SceneProgress, SceneRef, SentState,
+    TranslationRepo, TranslationScope, scene_hits,
 };
 use crate::common::{AppError, Timestamp};
 use crate::glossary::describe::{RunAsk, SceneReader};
@@ -178,6 +178,16 @@ impl TranslationService<'_> {
             by_file.entry(scene.file).or_default().push(scene);
         }
         Ok(files.into_iter().map(|file| FileScenes { scenes: by_file.remove(&file.id).unwrap_or_default(), file }).collect())
+    }
+
+    /// Сцены, где в оригинале или действующем переводе реплик есть `query`, и число таких реплик.
+    pub fn search(&self, project: ProjectId, query: &str) -> Result<Vec<SceneHit>, AppError> {
+        if query.trim().chars().count() < super::search::MIN_QUERY {
+            return Ok(Vec::new());
+        }
+        let open = self.state.open_project(project)?;
+        let texts = open.project.read(|tx| TranslationRepo { conn: tx }.search_texts())?;
+        Ok(scene_hits(&texts, query))
     }
 
     /// Реплики одной сцены по сюжету или реплики файла вне сцен по контейнерам.
@@ -546,6 +556,26 @@ mod tests {
 
         assert_eq!(service.reset(id, TranslationScope::Loose(group.file.id)).unwrap(), 1);
         assert_eq!(service.scene_tree(id).unwrap()[0].scenes[2].translated, 0);
+    }
+
+    #[test]
+    fn search_finds_scenes_by_original_and_translation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path());
+        let service = TranslationService { state: &state };
+        let keys = |hits: Vec<SceneHit>| -> Vec<(Option<String>, usize)> {
+            hits.into_iter().map(|hit| (hit.scene.map(|key| key.to_string()), hit.lines)).collect()
+        };
+
+        assert_eq!(keys(service.search(id, "hello").unwrap()), [(Some("label:start".to_string()), 2)], "две реплики «Hello.»");
+        assert_eq!(keys(service.search(id, "LEFT SIDE").unwrap()), [(Some("label:left".to_string()), 1)]);
+        assert!(service.search(id, "привет").unwrap().is_empty());
+
+        let file = service.files(id).unwrap()[0].id;
+        let left = lines(&service, id, file).into_iter().find(|line| line.source_text == "Left side.").unwrap();
+        service.save_text(id, left.id, "Левая сторона, привет.").unwrap();
+        assert_eq!(keys(service.search(id, "ПРИВЕТ").unwrap()), [(Some("label:left".to_string()), 1)], "ищется и перевод");
+        assert!(service.search(id, "l").unwrap().is_empty(), "один символ не ищется");
     }
 
     #[test]
