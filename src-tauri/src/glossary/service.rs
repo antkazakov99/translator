@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use rusqlite::Connection;
 
 use super::candidates::{TERM_CANDIDATES_VERSION, find_candidates, name_words, without_names};
+use super::entries::{EntryLine, character_lines, character_names, term_lines, term_names};
 use super::{
     Character, CharacterId, CharacterRepo, DiscardReason, DiscardedTerm, Form, LineSampleRepo, NameKey, NoteOwner, NoteRepo,
     SceneDescription, SceneDescriptionRepo, SceneSource, Speaker, SpeakerEntry, SpeakerLink, SpeakerRepo, SpeakerUse, Term, TermCandidate,
@@ -16,6 +17,7 @@ use crate::projects::ProjectId;
 use crate::scan::ScanRepo;
 use crate::state::AppState;
 use crate::storage::DbError;
+use crate::translation::TranslationRepo;
 
 /// Глоссарий проекта целиком: для окна и для подсказок модели.
 #[derive(Debug, Clone, Default)]
@@ -301,6 +303,26 @@ impl GlossaryService<'_> {
         })?)
     }
 
+    /// Реплики персонажа или термина по сюжету с переводом и местом в игре. Исключённые из описания
+    /// сцены здесь не исключаются: это список всех реплик записи. Удалённой записи соответствует пустой список.
+    pub fn entry_lines(&self, project: ProjectId, owner: ExcludeOwner) -> Result<Vec<EntryLine>, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| {
+            let glossary = GlossaryData::load(tx)?;
+            Ok(match owner {
+                ExcludeOwner::Character(id) => {
+                    let Some(character) = glossary.characters.iter().find(|character| character.id() == Some(id)) else { return Ok(Vec::new()) };
+                    let speakers = glossary.links.iter().filter(|link| link.character == id).map(|link| link.speaker.clone()).collect();
+                    character_lines(TranslationRepo { conn: tx }.story()?, &speakers, &character_names(character))
+                }
+                ExcludeOwner::Term(id) => {
+                    let Some(term) = glossary.terms.iter().find(|term| term.id() == Some(id)) else { return Ok(Vec::new()) };
+                    term_lines(TranslationRepo { conn: tx }.story()?, &term_names(term))
+                }
+            })
+        })?)
+    }
+
     /// Сцена не передаётся модели при описании персонажа или термина.
     pub fn set_excluded_scene(&self, project: ProjectId, owner: ExcludeOwner, container: &ContainerKey, excluded: bool) -> Result<(), AppError> {
         self.write(project, |tx| match owner {
@@ -549,5 +571,41 @@ mod tests {
             [("Silver Order".to_string(), 1)],
             "термин, корзина и слова имён вычитаются, а кандидаты собраны по прежнему считыванию"
         );
+    }
+
+    #[test]
+    fn entry_lines_follow_story_with_translation_and_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path());
+        let service = GlossaryService { state: &state };
+        let eileen = service.speaker_to_character(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
+
+        let lines = |owner| service.entry_lines(id, owner).unwrap();
+        let found = lines(ExcludeOwner::Character(eileen));
+        let texts: Vec<(&str, bool)> = found.iter().map(|line| (line.placed.line.source_text.as_str(), line.spoken)).collect();
+        assert_eq!(texts, [("Hello.", true), ("Hello.", true), ("Left side.", true)], "реплики говорящего по сюжету");
+        let scenes: Vec<&str> = found.iter().filter_map(|line| line.placed.scene.as_ref().map(ContainerKey::as_str)).collect();
+        assert_eq!(scenes, ["label:start", "label:start", "label:left"]);
+        assert!(found.iter().all(|line| line.placed.line.location.is_some()), "номер строки ведёт в исходник");
+
+        let first = found[0].placed.line.id;
+        crate::translation::TranslationService { state: &state }.save_text(id, first, "Привет.").unwrap();
+        let mut static_noise = Character::new("Static");
+        static_noise.set_description("Помехи в эфире");
+        let open = state.open_project(id).unwrap();
+        let noise = open.project.write(|tx| CharacterRepo { conn: tx }.save(&static_noise)).unwrap();
+        let mentioned = lines(ExcludeOwner::Character(noise));
+        assert_eq!(mentioned.len(), 1);
+        assert!(!mentioned[0].spoken, "персонажа без говорящих только упоминают");
+        assert_eq!(mentioned[0].placed.line.speaker.as_deref(), Some("Radio Chatter"));
+        assert_eq!(lines(ExcludeOwner::Character(eileen))[0].placed.line.text, "Привет.");
+        assert_eq!(found[0].placed.file, mentioned[0].placed.file);
+
+        let term = service.take_term(id, "narration", TermCategory::General).unwrap();
+        let narration = lines(ExcludeOwner::Term(term));
+        assert_eq!(narration.iter().map(|line| line.placed.line.source_text.as_str()).collect::<Vec<_>>(), ["Narration."]);
+
+        service.delete_character(id, noise).unwrap();
+        assert!(lines(ExcludeOwner::Character(noise)).is_empty(), "удалённой записи нечего показать");
     }
 }

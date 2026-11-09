@@ -99,6 +99,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             reset_entry_notes,
             exclude_note,
             exclude_scene,
+            entry_lines,
             build_mod,
             install_mod,
             uninstall_mod,

@@ -2,7 +2,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::{Draft, FileProgress, LineRun, LineState, RevisionKind, Scene, SceneLine};
+use super::{Draft, FileProgress, LineRun, LineState, PlacedLine, RevisionKind, Scene, SceneLine};
 use crate::common::{Timestamp, ValidationError};
 use crate::engines::{ContainerKey, SpeakerKey};
 use crate::llm::{Action, RunId, RunStatus};
@@ -16,7 +16,7 @@ SELECT s.id, c.key, d.title, d.description,
        CASE WHEN sp.label IS NOT NULL THEN sp.label
             WHEN s.speaker_key IS NOT NULL THEN substr(s.speaker_key, instr(s.speaker_key, ':') + 1) END,
        s.source_text, s.source_hash, s.game_text, s.location,
-       t.text, t.draft, t.source_hash, s.speaker_key
+       t.text, t.draft, t.source_hash, s.speaker_key, s.file_id
 FROM segments s
 LEFT JOIN containers c ON c.id = s.container_id
 LEFT JOIN scene_descriptions d ON d.container_key = c.key
@@ -24,9 +24,10 @@ LEFT JOIN speakers sp ON sp.key = s.speaker_key
 LEFT JOIN translations t ON t.segment_id = s.id
 WHERE s.missing = 0";
 
-/// Строка `LINE_SELECT`: сцена (ключ, название, описание) и реплика.
+/// Строка `LINE_SELECT`: сцена (ключ, название, описание), файл и реплика.
 struct LineRow {
     scene: Option<String>,
+    file: FileId,
     title: Option<String>,
     description: Option<String>,
     line: SceneLine,
@@ -43,6 +44,7 @@ fn read_line(row: &Row) -> rusqlite::Result<LineRow> {
     let source_changed = sent_hash.as_deref().is_some_and(|hash| hash != source_hash);
     Ok(LineRow {
         scene: row.get(1)?,
+        file: FileId::from_row(row.get(13)?),
         title: row.get(2)?,
         description: row.get(3)?,
         line: SceneLine {
@@ -126,6 +128,18 @@ impl TranslationRepo<'_> {
         let sql = format!("{LINE_SELECT} AND s.file_id = ?1 ORDER BY s.id");
         let rows = self.conn.prepare(&sql)?.query_map([file.get()], read_line)?.collect::<Result<Vec<_>, _>>()?;
         group_scenes(rows)
+    }
+
+    /// Все реплики текущего снимка по сюжету: сцены в порядке сюжета, реплики вне сцен в конце.
+    pub fn story(&self) -> Result<Vec<PlacedLine>, DbError> {
+        let sql = format!("{LINE_SELECT} ORDER BY c.story_order IS NULL, c.story_order, s.story_order IS NULL, s.story_order, s.id");
+        let rows = self.conn.prepare(&sql)?.query_map([], read_line)?.collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|row| {
+                let scene = row.scene.map(ContainerKey::new).transpose().map_err(|error| DbError::bad_value("containers", "key", error))?;
+                Ok(PlacedLine { scene, scene_title: row.title, file: row.file, line: row.line })
+            })
+            .collect()
     }
 
     /// Одна реплика: окно перерисовывает строку после правки.

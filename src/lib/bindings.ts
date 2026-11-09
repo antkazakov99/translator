@@ -117,6 +117,8 @@ export const commands = {
 	excludeNote: (project: string, owner: OwnerDto, model: string, hash: string, excluded: boolean) => __TAURI_INVOKE<null>("exclude_note", { project, owner, model, hash, excluded }),
 	/**  Сцена не даётся модели при описании персонажа или термина, или возвращается. */
 	excludeScene: (project: string, owner: OwnerDto, key: string, excluded: boolean) => __TAURI_INVOKE<null>("exclude_scene", { project, owner, key, excluded }),
+	/**  Реплики персонажа или термина по сюжету: где персонаж говорит или его упоминают, где есть термин. */
+	entryLines: (project: string, owner: OwnerDto) => __TAURI_INVOKE<EntryLineDto_Serialize[]>("entry_lines", { project, owner }),
 	/**  Собирает `ru_lang.rpa` в папке проекта. Папка игры не нужна. */
 	buildMod: (project: string) => __TAURI_INVOKE<ModResultDto>("build_mod", { project }),
 	/**  Собирает мод заново и ставит в привязанную папку игры. */
@@ -288,6 +290,31 @@ export type DiscardedTermDto = {
 	text: string,
 	/**  Передано персонажу, а не мусор. */
 	givenToCharacter: boolean,
+};
+
+/**  Реплика, где встречается персонаж или термин: строка таблицы, её сцена и файл. */
+export type EntryLineDto = EntryLineDto_Serialize | EntryLineDto_Deserialize;
+
+/**  Реплика, где встречается персонаж или термин: строка таблицы, её сцена и файл. */
+export type EntryLineDto_Deserialize = {
+	line: LineDto_Deserialize,
+	/**  Ключ сцены. `None`: реплика вне сцен. */
+	scene?: string | null,
+	sceneTitle?: string | null,
+	file: RowRef,
+	/**  Говорит сам персонаж. `false`: его упоминают, у термина всегда. */
+	spoken: boolean,
+};
+
+/**  Реплика, где встречается персонаж или термин: строка таблицы, её сцена и файл. */
+export type EntryLineDto_Serialize = {
+	line: LineDto_Serialize,
+	/**  Ключ сцены. `None`: реплика вне сцен. */
+	scene: string | null,
+	sceneTitle: string | null,
+	file: RowRef,
+	/**  Говорит сам персонаж. `false`: его упоминают, у термина всегда. */
+	spoken: boolean,
 };
 
 /**  Часть сцен персонажа или термина. */

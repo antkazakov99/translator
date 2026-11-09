@@ -64,6 +64,15 @@ impl LineState {
     }
 }
 
+/// Реплика текущего снимка с местом в игре: сцена и файл. Глоссарий показывает по ним реплики записи.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedLine {
+    pub scene: Option<ContainerKey>,
+    pub scene_title: Option<String>,
+    pub file: FileId,
+    pub line: SceneLine,
+}
+
 /// Файл с репликами текущего снимка и прогресс перевода в нём.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileProgress {

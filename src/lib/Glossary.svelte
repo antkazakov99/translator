@@ -7,11 +7,18 @@
   import GlossarySpeakers from "./GlossarySpeakers.svelte";
   import GlossaryTerms from "./GlossaryTerms.svelte";
   import GlossaryTokens from "./GlossaryTokens.svelte";
-  import { commands } from "./bindings";
+  import { commands, type EntryLineDto_Serialize as EntryLine } from "./bindings";
   import type { Character, Glossary, Term, Token } from "./glossary";
   import { glossaryRuns } from "./suggest-run.svelte";
 
-  let { projectId }: { projectId: string } = $props();
+  let {
+    projectId,
+    onOpenLine,
+  }: {
+    projectId: string;
+    /** Реплика персонажа или термина в таблице перевода или в исходнике. */
+    onOpenLine: (line: EntryLine, where: "table" | "source") => void;
+  } = $props();
 
   /** Запуски модели и их отбор переживают переход между разделами. */
   const runs = glossaryRuns();
@@ -20,19 +27,34 @@
   let data = $state<Glossary | null>(null);
   let error = $state("");
   let character = $state<number | null>(null);
+  let term = $state<number | null>(null);
 
   /** Раздел переживает перезагрузку страницы. */
   const sectionKey = $derived(`translator.glossary.${projectId}`);
+  /** Выбранные персонаж и термин переживают переход к реплике в таблицу и обратно. */
+  const pickedKey = $derived(`translator.glossary-picked.${projectId}`);
   let section = $state<Section>("speakers");
 
   onMount(() => {
     try {
       const saved = sessionStorage.getItem(sectionKey);
       if (saved === "speakers" || saved === "characters" || saved === "rules" || saved === "terms" || saved === "tokens" || saved === "scenes") section = saved;
+      const picked = JSON.parse(sessionStorage.getItem(pickedKey) ?? "{}");
+      if (typeof picked.character === "number") character = picked.character;
+      if (typeof picked.term === "number") term = picked.term;
     } catch {
-      // Без хранилища раздел просто не запомнится.
+      // Без хранилища раздел и выбор просто не запомнятся.
     }
     load();
+  });
+
+  $effect(() => {
+    const picked = JSON.stringify({ character, term });
+    try {
+      sessionStorage.setItem(pickedKey, picked);
+    } catch {
+      // Без хранилища выбор просто не запомнится.
+    }
   });
 
   function open(next: Section) {
@@ -117,12 +139,22 @@
         bind:selected={character}
         reload={load}
         patch={patchCharacter}
+        {onOpenLine}
         onError={(message) => (error = message)}
       />
     {:else if section === "rules"}
       <GlossaryNameRules {projectId} {runs} onError={(message) => (error = message)} />
     {:else if section === "terms"}
-      <GlossaryTerms {projectId} {data} {runs} reload={load} patch={patchTerm} onError={(message) => (error = message)} />
+      <GlossaryTerms
+        {projectId}
+        {data}
+        {runs}
+        bind:selected={term}
+        reload={load}
+        patch={patchTerm}
+        {onOpenLine}
+        onError={(message) => (error = message)}
+      />
     {:else if section === "scenes"}
       <GlossaryScenes {projectId} {runs} onError={(message) => (error = message)} />
     {:else}

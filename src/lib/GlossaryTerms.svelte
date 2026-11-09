@@ -1,12 +1,13 @@
 <script lang="ts">
   import DescribeParts from "./DescribeParts.svelte";
+  import EntryLines from "./EntryLines.svelte";
   import { onMount } from "svelte";
   import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, Undo2, UserRound, SlidersHorizontal } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
   import ReadingDepthSettings from "./ReadingDepthSettings.svelte";
-  import { commands, type TermCandidateDto as TermCandidate, type TermCategory } from "./bindings";
+  import { commands, type EntryLineDto_Serialize as EntryLine, type TermCandidateDto as TermCandidate, type TermCategory } from "./bindings";
   import {
     categories,
     categoryLabel,
@@ -23,15 +24,20 @@
     projectId,
     data,
     runs,
+    selected = $bindable(null),
     reload,
     patch,
+    onOpenLine,
     onError,
   }: {
     projectId: string;
     data: Glossary;
     runs: GlossaryRuns;
+    selected: number | null;
     reload: () => Promise<void>;
     patch: (term: Term) => void;
+    /** Реплика термина в таблице перевода или в исходнике. */
+    onOpenLine: (line: EntryLine, where: "table" | "source") => void;
     onError: (message: string) => void;
   } = $props();
 
@@ -109,7 +115,6 @@
     }
   }
   let query = $state("");
-  let selected = $state<number | null>(null);
   let newName = $state("");
   let newCategory = $state<TermCategory>("general");
   let creating = $state(false);
@@ -159,6 +164,12 @@
       .filter((term) => filter !== "guess" || term.guess)
       .filter((term) => matches(query, term.name, term.translation, ...term.forms.map((form) => form.text))),
   );
+
+  /** Сохранённое название и формы: по ним ищутся реплики термина. */
+  const linesRevision = $derived.by(() => {
+    const saved = data.terms.find((term) => term.id === draft?.id);
+    return JSON.stringify([saved?.name, saved?.forms.map((form) => form.text)]);
+  });
 
   $effect.pre(() => {
     const id = selected ?? shown[0]?.id ?? null;
@@ -437,6 +448,7 @@
         <GlossaryForms forms={draft.forms} hint="Сокращения и короткие формы" onchange={(forms: NameForm[]) => save({ forms })} />
         <label class="field">Описание<textarea class="input" rows="4" bind:value={draft.description} onchange={() => save()}></textarea></label>
         <DescribeParts {projectId} owner={{ kind: "term", id: draft.id }} {runs} onDescribed={described} {onError} />
+        <EntryLines {projectId} owner={{ kind: "term", id: draft.id }} revision={linesRevision} {onOpenLine} {onError} />
 
         <div class="card-actions">
           {#if giving}

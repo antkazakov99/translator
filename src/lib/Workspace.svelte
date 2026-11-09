@@ -30,6 +30,7 @@
   import type { GraphScene } from "$lib/scene-graph";
   import {
     commands,
+    type EntryLineDto_Serialize as EntryLine,
     type FileDto,
     type LineDto_Serialize as Line,
     type LineRunDto_Serialize as LineRun,
@@ -65,6 +66,8 @@
   let graphFocus = $state<string | null>(null);
   /** Открытый исходник: файл снимка и строка. */
   let viewing = $state<{ file: number; line: number | null } | null>(null);
+  /** Реплика, к которой перешли из глоссария: строка отмечена, пока не выбран другой файл. */
+  let highlighted = $state<number | null>(null);
 
   type RunMode = "translate" | "review";
   /** Запуск модели из этого окна: перевод или редактура. */
@@ -132,6 +135,7 @@
     if (editing) await save();
     fileId = id;
     editing = null;
+    highlighted = null;
     loadingLines = true;
     try {
       sessionStorage.setItem(fileKey, String(id));
@@ -366,6 +370,21 @@
     header?.scrollIntoView({ block: "start" });
   }
 
+  /** Реплика из глоссария: строка таблицы с отметкой или исходник на её строке. */
+  async function openLine(found: EntryLine, where: "table" | "source") {
+    if (where === "source") {
+      const number = Number.parseInt(found.line.location ?? "", 10);
+      viewing = { file: found.file, line: Number.isFinite(number) && number > 0 ? number : null };
+      return;
+    }
+    view = "table";
+    filter = "all";
+    if (found.file !== fileId) await selectFile(found.file);
+    highlighted = found.line.id;
+    await tick();
+    document.querySelector<HTMLElement>(`[data-row="${found.line.id}"]`)?.scrollIntoView({ block: "center" });
+  }
+
   /** Исходник файла таблицы на строке реплики. */
   function viewSource(line: string | null | undefined) {
     if (fileId === null) return;
@@ -444,7 +463,7 @@
     </div>
   {:else if view === "glossary"}
     <div class="body">
-      <Glossary projectId={project.id} />
+      <Glossary projectId={project.id} onOpenLine={openLine} />
     </div>
   {:else}
   <div class="body">
@@ -648,7 +667,7 @@
               {/if}
             </h3>
             {#each scene.lines as line (line.id)}
-              <div class="row" class:editing={editing?.id === line.id}>
+              <div class="row" class:editing={editing?.id === line.id} class:highlighted={highlighted === line.id} data-row={line.id}>
                 {#if line.location}
                   <button class="where" title="Строка {line.location} в исходнике" onclick={() => viewSource(line.location)}>{line.location}</button>
                 {:else}
@@ -905,6 +924,10 @@
   .row:hover,
   .row.editing {
     background: var(--hover-row);
+  }
+
+  .row.highlighted {
+    background: var(--selected);
   }
 
   .where {

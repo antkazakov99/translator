@@ -7,6 +7,7 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
 use super::describe::{EntryPart, PartNote};
+use super::entries::EntryLine;
 use super::{
     Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, SceneEntry, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
     SpeakerSuggestion, Term,
@@ -18,7 +19,7 @@ use crate::name_rules::{LanguageRules, LanguageTag, NameRuleService};
 use crate::llm::{ProfileId, RunProgress};
 use crate::projects::ProjectId;
 use crate::state::{AppState, blocking};
-use crate::translation::commands::RowRef;
+use crate::translation::commands::{LineDto, RowRef};
 
 /// Как разобран говорящий.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
@@ -1028,6 +1029,39 @@ pub async fn exclude_note(app: AppHandle, project: String, owner: OwnerDto, mode
 pub async fn exclude_scene(app: AppHandle, project: String, owner: OwnerDto, key: String, excluded: bool) -> Result<(), String> {
     blocking(app, move |state| {
         GlossaryService { state }.set_excluded_scene(self::project(&project)?, owner.exclude(), &scene_key(key)?, excluded)
+    })
+    .await
+}
+
+/// Реплика, где встречается персонаж или термин: строка таблицы, её сцена и файл.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryLineDto {
+    pub line: LineDto,
+    /// Ключ сцены. `None`: реплика вне сцен.
+    pub scene: Option<String>,
+    pub scene_title: Option<String>,
+    pub file: RowRef,
+    /// Говорит сам персонаж. `false`: его упоминают, у термина всегда.
+    pub spoken: bool,
+}
+
+/// Реплики персонажа или термина по сюжету: где персонаж говорит или его упоминают, где есть термин.
+#[tauri::command]
+#[specta::specta]
+pub async fn entry_lines(app: AppHandle, project: String, owner: OwnerDto) -> Result<Vec<EntryLineDto>, String> {
+    blocking(app, move |state| {
+        let lines = GlossaryService { state }.entry_lines(self::project(&project)?, owner.exclude())?;
+        Ok(lines
+            .into_iter()
+            .map(|found: EntryLine| EntryLineDto {
+                scene: found.placed.scene.map(|key| key.to_string()),
+                scene_title: found.placed.scene_title,
+                file: RowRef(found.placed.file.get()),
+                line: found.placed.line.into(),
+                spoken: found.spoken,
+            })
+            .collect())
     })
     .await
 }

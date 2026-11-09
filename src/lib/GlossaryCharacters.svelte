@@ -1,10 +1,11 @@
 <script lang="ts">
   import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, TriangleAlert, SlidersHorizontal } from "lucide-svelte";
   import DescribeParts from "./DescribeParts.svelte";
+  import EntryLines from "./EntryLines.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
   import ReadingDepthSettings from "./ReadingDepthSettings.svelte";
-  import { commands } from "./bindings";
+  import { commands, type EntryLineDto_Serialize as EntryLine } from "./bindings";
   import {
     characterName,
     characterTranslation,
@@ -29,6 +30,7 @@
     selected = $bindable(null),
     reload,
     patch,
+    onOpenLine,
     onError,
   }: {
     projectId: string;
@@ -38,6 +40,8 @@
     reload: () => Promise<void>;
     /** Сохранённый персонаж без перечитывания глоссария: правка в соседнем поле не теряется. */
     patch: (character: Character) => void;
+    /** Реплика персонажа в таблице перевода или в исходнике. */
+    onOpenLine: (line: EntryLine, where: "table" | "source") => void;
     onError: (message: string) => void;
   } = $props();
 
@@ -138,6 +142,11 @@
     ),
   );
   const speakers = $derived(draft ? data.speakers.filter((speaker) => speaker.characters.includes(draft!.id)) : []);
+  /** Сохранённые имена, формы и говорящие: по ним ищутся реплики персонажа. */
+  const linesRevision = $derived.by(() => {
+    const saved = data.characters.find((character) => character.id === draft?.id);
+    return JSON.stringify([saved?.firstName, saved?.lastName, saved?.forms.map((form) => form.text), speakers.map((speaker) => speaker.key)]);
+  });
 
   $effect.pre(() => {
     const id = selected ?? data.characters[0]?.id ?? null;
@@ -358,6 +367,7 @@
       <label class="field">Манера речи<input class="input" bind:value={draft.speech} onchange={save} placeholder="Например: грубит, говорит коротко" /></label>
       <label class="field">Описание<textarea class="input" rows="4" bind:value={draft.description} onchange={save}></textarea></label>
       <DescribeParts {projectId} owner={{ kind: "character", id: draft.id }} {runs} onDescribed={described} {onError} />
+      <EntryLines {projectId} owner={{ kind: "character", id: draft.id }} revision={linesRevision} {onOpenLine} {onError} />
 
       <div class="field">
         <span>Говорящие</span>
