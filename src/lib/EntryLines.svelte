@@ -117,7 +117,7 @@
     </span>
   {:else if lines}
     <input class="input" type="search" bind:value={query} placeholder="Поиск по оригиналу и переводу" aria-label="Поиск по репликам" />
-    <div class="list">
+    <div class="lines">
       {#each groups as group, index (`${group.scene}-${index}`)}
         <div class="scene">
           <span>{sceneTitle(group.scene, group.title)}</span>
@@ -158,11 +158,10 @@
     flex: 1;
   }
 
-  .list {
+  /* Без своей прокрутки: реплики листаются вместе с карточкой, заголовок сцены прилипает к её верху. */
+  .lines {
     display: flex;
     flex-direction: column;
-    max-height: 420px;
-    overflow-y: auto;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg-sunken);
@@ -170,7 +169,9 @@
 
   .scene {
     position: sticky;
-    top: 0;
+    /* Отступ `.card`: заголовок прилипает к самому краю карточки, а не под отступом. */
+    top: -12px;
+    z-index: 1;
     padding: 6px 8px;
     border-bottom: 1px solid var(--divider);
     background: var(--surface);
