@@ -1,8 +1,9 @@
-import type { FileScenesDto_Serialize, SceneItemDto_Serialize } from "./bindings";
+import type { FileDto, FileScenesDto_Serialize, SceneItemDto_Serialize } from "./bindings";
 
 /**
- * Список сцен таблицы перевода: сцены по файлам, у каждого файла «Без сцены» последней. Поиск идёт по
- * названию и метке сцены и по пути файла: в больших играх сотни сцен.
+ * Список сцен таблицы перевода: плоский, по файлам и внутри файла по сюжету. Реплики файла вне сцен идут
+ * пунктом «Без сцены · файл» после сцен своего файла. Поиск идёт по названию и метке сцены и по пути файла:
+ * в больших играх сотни сцен.
  */
 
 export type FileScenes = FileScenesDto_Serialize;
@@ -11,8 +12,14 @@ export type SceneItem = SceneItemDto_Serialize;
 /** Открытая в таблице сцена или реплики файла вне сцен. */
 export type ScenePick = { kind: "scene"; key: string } | { kind: "loose"; file: number };
 
-/** Сколько сцен показывает поиск: остальные находятся точнее. */
-export const SHOWN = 300;
+/** Пункт списка сцен. */
+export interface SceneEntry {
+  id: string;
+  pick: ScenePick;
+  scene: SceneItem;
+  file: FileDto;
+  name: string;
+}
 
 /** Подпись псевдосцены с репликами вне сцен. */
 export const LOOSE_NAME = "Без сцены";
@@ -25,40 +32,30 @@ export function pickId(pick: ScenePick): string {
 /** Метка сцены без вида ключа: `label:start` → `start`. */
 export const sceneLabel = (key: string) => key.replace(/^[a-z]+:/, "");
 
-/** «Название · метка», метка без названия или «Без сцены». */
-export function sceneItemName(scene: Pick<SceneItem, "key" | "title">): string {
-  if (!scene.key) return LOOSE_NAME;
+/** Путь файла без папки `game/`. */
+export const fileName = (path: string) => path.replace(/^game\//, "");
+
+/** «Название · метка», метка без названия или «Без сцены · файл». */
+export function sceneItemName(scene: Pick<SceneItem, "key" | "title">, path?: string): string {
+  if (!scene.key) return path ? `${LOOSE_NAME} · ${fileName(path)}` : LOOSE_NAME;
   const label = sceneLabel(scene.key);
   return scene.title ? `${scene.title} · ${label}` : label;
 }
 
-export interface TreeView {
-  groups: { group: FileScenes; scenes: SceneItem[] }[];
-  /** Сцены, которые подошли поиску, но не показаны. */
-  hidden: number;
+/** Все пункты списка по порядку файлов. */
+export function sceneList(tree: FileScenes[]): SceneEntry[] {
+  return tree.flatMap((group) =>
+    group.scenes.map((scene) => {
+      const pick: ScenePick = scene.key ? { kind: "scene", key: scene.key } : { kind: "loose", file: group.file.id };
+      return { id: pickId(pick), pick, scene, file: group.file, name: sceneItemName(scene, group.file.path) };
+    }),
+  );
 }
 
-/**
- * Группы и сцены для показа. Без поиска все группы со всеми сценами. С поиском файл, путь которого подошёл,
- * показывается целиком, у остальных только подошедшие сцены, пустые группы пропадают. Показывается не больше
- * `shown` сцен.
- */
-export function filterTree(tree: FileScenes[], query: string, shown = SHOWN): TreeView {
+/** Пункты, подходящие поиску: по названию, метке и пути файла, без учёта регистра. */
+export function filterScenes(list: SceneEntry[], query: string): SceneEntry[] {
   const needle = query.trim().toLowerCase();
-  if (!needle) return { groups: tree.map((group) => ({ group, scenes: group.scenes })), hidden: 0 };
+  if (!needle) return list;
   const has = (text: string | null | undefined) => !!text && text.toLowerCase().includes(needle);
-  const groups: TreeView["groups"] = [];
-  let left = shown;
-  let hidden = 0;
-  for (const group of tree) {
-    const whole = has(group.file.path);
-    const found = whole
-      ? group.scenes
-      : group.scenes.filter((scene) => (scene.key ? has(scene.title) || has(sceneLabel(scene.key)) : has(LOOSE_NAME)));
-    const taken = found.slice(0, Math.max(left, 0));
-    hidden += found.length - taken.length;
-    left -= taken.length;
-    if (taken.length > 0) groups.push({ group, scenes: taken });
-  }
-  return { groups, hidden };
+  return list.filter((entry) => has(entry.name) || (entry.scene.key && has(entry.scene.key.replace(/^[a-z]+:/, ""))) || has(entry.file.path));
 }

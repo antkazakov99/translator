@@ -6,18 +6,14 @@
     Bot,
     Check,
     CheckCheck,
-    ChevronDown,
-    ChevronRight,
     Eraser,
     FileCode,
     History,
     Languages,
     LoaderCircle,
     Package,
-    PanelRight,
+    PanelLeft,
     RefreshCw,
-    SlidersHorizontal,
-    Sparkles,
     SpellCheck,
     Square,
     TriangleAlert,
@@ -35,7 +31,7 @@
   import SuggestStatus from "./SuggestStatus.svelte";
   import { WriteRun } from "./suggest-run.svelte";
   import { progressLabel, progressPercent } from "./progress";
-  import { pickId, sceneItemName, filterTree, type ScenePick } from "./scene-tree";
+  import { fileName, filterScenes, pickId, sceneItemName, sceneList, type ScenePick } from "./scene-tree";
   import { sceneLabel, type GraphScene } from "$lib/scene-graph";
   import {
     commands,
@@ -82,13 +78,11 @@
   let viewing = $state<{ file: number; line: number | null } | null>(null);
   /** Реплика, к которой перешли из глоссария: строка отмечена, пока не выбрана другая сцена. */
   let highlighted = $state<number | null>(null);
-  /** Свёрнутые и раскрытые группы файлов: раскрыта только группа открытой сцены и раскрытые вручную. */
-  let expanded = $state<number[]>([]);
   let query = $state("");
-  /** Сцены, отмеченные для группового описания. По умолчанию ничего: чтение всей игры дорого. */
-  let marked = $state<string[]>([]);
   let depthOpen = $state(false);
-  /** Боковая панель с описанием сцены: открыта, пока её не скрыли. Помнится до закрытия окна. */
+  /** К чему относятся «Перевести», «Вычитать» и «Очистить»: к открытой сцене или ко всему её файлу. */
+  let scope = $state<"scene" | "file">("scene");
+  /** Панель с описанием сцены слева от реплик: открыта, пока её не скрыли. Помнится до закрытия окна. */
   let sideOpen = $state(true);
   const SIDE_KEY = "translator.scene-side";
 
@@ -100,7 +94,7 @@
       // Без хранилища выбор просто не запомнится.
     }
   }
-  /** Описание сцен моделью: одна сцена из карточки или отмеченные. */
+  /** Описание сцен моделью: открытая сцена или все сцены её файла. */
   const describe = new WriteRun("Описания");
 
   type RunMode = "translate" | "review";
@@ -134,11 +128,17 @@
     scenes.map((scene) => ({ ...scene, lines: scene.lines.filter(visible) })).filter((scene) => scene.lines.length > 0),
   );
   const order = $derived(shown.flatMap((scene) => scene.lines.map((line) => line.id)));
-  const filtered = $derived(filterTree(tree, query));
-  const searching = $derived(query.trim() !== "");
-  /** Сцены, которые сейчас показывает список: их отмечает общий флажок. */
-  const shownKeys = $derived(filtered.groups.flatMap((entry) => markable(entry.scenes)));
-  const shownMarks = $derived(markState(shownKeys));
+  const list = $derived(sceneList(tree));
+  const found = $derived(filterScenes(list, query));
+  /** Сцены файла открытой сцены: их описывает «Описать сцены файла». */
+  const fileKeys = $derived(group ? group.scenes.flatMap((scene) => (scene.key ? [scene.key] : [])) : []);
+  /** Счётчики действий по выбранной области: у сцены по загруженным репликам, у файла по прогрессу. */
+  const actionEmpty = $derived(scope === "file" ? (group ? group.file.total - group.file.translated : 0) : sceneEmpty);
+  const actionReady = $derived(scope === "file" ? (group?.file.translated ?? 0) : sceneReady);
+  const actionScope = $derived<ScopeDto | null>(
+    !selected ? null : scope === "file" ? (group ? { kind: "file", file: group.file.id } : null) : scopeOf(selected),
+  );
+  const scopeWord = $derived(scope === "file" ? "файла" : "сцены");
   /** Карточка описания есть только у настоящей сцены. */
   const described = $derived(selected?.kind === "scene" ? (scenes[0] ?? null) : null);
 
@@ -216,8 +216,6 @@
     selected = pick;
     editing = null;
     highlighted = null;
-    const file = fileOf(pick);
-    if (file !== null && !expanded.includes(file)) expanded = [...expanded, file];
     try {
       sessionStorage.setItem(pickKey, JSON.stringify(pick));
     } catch {
@@ -235,10 +233,9 @@
     } finally {
       if (token === loadToken) loadingLines = false;
     }
-  }
-
-  function toggleGroup(file: number) {
-    expanded = expanded.includes(file) ? expanded.filter((item) => item !== file) : [...expanded, file];
+    // Сцену могли открыть из графа или глоссария: список показывает её.
+    await tick();
+    document.querySelector(`[data-pick="${pickId(pick)}"]`)?.scrollIntoView({ block: "nearest" });
   }
 
   function replace(line: Line) {
@@ -484,45 +481,16 @@
     view = "graph";
   }
 
-  function toggleMark(key: string, on: boolean) {
-    marked = on ? [...marked, key] : marked.filter((item) => item !== key);
-  }
-
-  /** Отмечает или снимает сразу несколько сцен: файл целиком или все показанные. */
-  function setMarks(keys: string[], on: boolean) {
-    const set = new Set(marked);
-    for (const key of keys) {
-      if (on) set.add(key);
-      else set.delete(key);
-    }
-    marked = [...set];
-  }
-
-  /** Сцены, которые можно отметить: «Без сцены» не описывается. */
-  function markable(scenes: SceneItem[]) {
-    return scenes.flatMap((scene) => (scene.key ? [scene.key] : []));
-  }
-
-  /** Отмечены все, часть или ни одной: по этому рисуется общий флажок. */
-  function markState(keys: string[]): "all" | "some" | "none" {
-    const count = keys.filter((key) => marked.includes(key)).length;
-    return count === 0 ? "none" : count === keys.length ? "all" : "some";
-  }
-
-  /** Флажок «часть отмечена» задаётся только свойством, не атрибутом. */
-  const partly = (on: boolean) => (node: HTMLInputElement) => {
-    node.indeterminate = on;
-  };
-
   function describedNotice(written: number, stopped: boolean) {
     const text = `Описано сцен: ${written}`;
     return stopped ? `Остановлено. ${text}` : text;
   }
 
-  async function describeMarked() {
-    const keys = [...marked];
-    const written = await describe.start((channel) => commands.describeScenes(project.id, keys, null, channel), (message) => (error = message), describedNotice);
-    marked = marked.filter((key) => !written.includes(key));
+  /** Все сцены файла с глубиной чтения проекта. Описанные сцены без новых частей пропускаются. */
+  async function describeFile() {
+    const keys = [...fileKeys];
+    if (keys.length === 0) return;
+    await describe.start((channel) => commands.describeScenes(project.id, keys, null, channel), (message) => (error = message), describedNotice);
     await refresh();
   }
 
@@ -547,16 +515,6 @@
         }
       }
     }
-  }
-
-  function describeTitle(count: number) {
-    if (count === 0) return "Отметьте сцены в списке";
-    if (busy) return "Модель уже работает";
-    return "Модель прочитает часть каждой сцены и напишет описание. Описанные сцены без новых частей пропускаются";
-  }
-
-  function fileName(path: string) {
-    return path.replace(/^game\//, "");
   }
 
   const stateLabel: Record<Line["state"], string> = {
@@ -621,130 +579,28 @@
     </div>
   {:else}
   <div class="body">
-    <nav class="scenes" aria-label="Сцены по файлам">
+    <nav class="scenes" aria-label="Сцены">
       <div class="scenes-head">
-        <input class="input" placeholder="Поиск по названию и метке" bind:value={query} aria-label="Поиск сцен" />
-        <div class="describe-row">
-          <input
-            type="checkbox"
-            checked={shownMarks === "all"}
-            disabled={shownKeys.length === 0}
-            {@attach partly(shownMarks === "some")}
-            onchange={() => setMarks(shownKeys, shownMarks !== "all")}
-            aria-label={searching ? "Отметить все найденные сцены" : "Отметить все сцены"}
-            title={shownMarks === "all" ? "Снять отметки со всех показанных сцен" : searching ? "Отметить все найденные сцены" : "Отметить все сцены"}
-          />
-          <button class="btn small" class:active={depthOpen} title="Сколько частей читает модель для описаний" onclick={() => (depthOpen = !depthOpen)}>
-            <SlidersHorizontal size={13} />
-            <span>Глубина</span>
-          </button>
-          <button class="btn small primary" disabled={marked.length === 0 || busy} title={describeTitle(marked.length)} onclick={describeMarked}>
-            {#if describe.active}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
-            <span>Описать · {marked.length}</span>
-          </button>
-          {#if marked.length > 0}
-            <button class="icon-button" aria-label="Снять отметки" title="Снять отметки" onclick={() => (marked = [])}><X size={13} /></button>
-          {/if}
-        </div>
+        <input class="input" placeholder="Поиск сцены или файла" bind:value={query} aria-label="Поиск сцен" />
       </div>
-
-      <div class="groups">
-        {#each filtered.groups as entry (entry.group.file.id)}
-          {@const file = entry.group.file}
-          {@const open = searching || expanded.includes(file.id)}
-          {@const empty = file.total - file.translated}
-          {@const keys = markable(entry.scenes)}
-          {@const marks = markState(keys)}
-          <div class="group" class:current={group?.file.id === file.id}>
-            <div class="group-head">
-              {#if keys.length > 0}
-                <input
-                  type="checkbox"
-                  checked={marks === "all"}
-                  {@attach partly(marks === "some")}
-                  onchange={() => setMarks(keys, marks !== "all")}
-                  aria-label="Отметить все сцены файла {fileName(file.path)}"
-                  title={marks === "all" ? "Снять отметки со сцен файла" : searching ? "Отметить найденные сцены файла" : "Отметить все сцены файла"}
-                />
-              {:else}
-                <span class="no-mark"></span>
-              {/if}
-              <button class="group-toggle" aria-expanded={open} title={file.path} onclick={() => toggleGroup(file.id)}>
-                {#if open}<ChevronDown size={13} />{:else}<ChevronRight size={13} />{/if}
-                <span class="group-name">{fileName(file.path)}</span>
-              </button>
-              <span class="progress-line">
-                <span class="bar-track"><span class="bar-fill" style:width="{progressPercent(file.translated, file.total)}%"></span></span>
-                <span class="count">{file.translated}/{file.total}{file.drafts ? ` · модель: ${file.drafts}` : ""}</span>
-              </span>
-              <span class="group-actions">
-                <button
-                  class="icon-button"
-                  disabled={busy || empty === 0}
-                  aria-label="Перевести пустые реплики файла"
-                  title={busy ? "Модель уже работает" : empty === 0 ? "В файле нет пустых реплик" : `Перевести пустые реплики файла: ${empty}`}
-                  onclick={() => startRun("translate", { kind: "file", file: file.id })}><Languages size={13} /></button
-                >
-                <button
-                  class="icon-button"
-                  disabled={busy || file.translated === 0}
-                  aria-label="Вычитать файл"
-                  title={busy ? "Модель уже работает" : file.translated === 0 ? "В файле нет переведённых реплик" : "Модель вычитает переведённые реплики файла"}
-                  onclick={() => startRun("review", { kind: "file", file: file.id })}><SpellCheck size={13} /></button
-                >
-                <button
-                  class="icon-button"
-                  disabled={busy || working || file.translated === 0}
-                  aria-label="Очистить перевод файла"
-                  title={file.translated === 0 ? "В файле нет переведённых реплик" : "Очистить перевод всех реплик файла"}
-                  onclick={() => (confirming = { kind: "reset", scope: { kind: "file", file: file.id }, what: "файла", count: file.translated })}
-                  ><Eraser size={13} /></button
-                >
-                <button class="icon-button" aria-label="Исходник файла" title="Текст файла с подсветкой и поиском" onclick={() => viewSource(file.id, null)}
-                  ><FileCode size={13} /></button
-                >
-              </span>
-            </div>
-            {#if open}
-              {#each entry.scenes as scene (scene.key ?? "loose")}
-                {@const pick = asPick(scene, file.id)}
-                <div class="scene-item">
-                  {#if scene.key}
-                    <input
-                      type="checkbox"
-                      checked={marked.includes(scene.key)}
-                      onchange={(event) => scene.key && toggleMark(scene.key, event.currentTarget.checked)}
-                      aria-label="Отметить сцену {sceneLabel(scene.key)}"
-                    />
-                  {:else}
-                    <span class="no-mark"></span>
-                  {/if}
-                  <button
-                    class="scene"
-                    class:active={selected !== null && pickId(selected) === pickId(pick)}
-                    class:loose={!scene.key}
-                    onclick={() => select(pick)}
-                    title={scene.key ?? "Реплики вне сцен: строки интерфейса, экраны, код вне меток"}
-                  >
-                    <span class="scene-name">
-                      <span class="scene-title">{sceneItemName(scene)}</span>
-                      {#if scene.stale}<span class="mark warn">устарело</span>{:else if scene.key && !scene.described}<span class="mark">без описания</span>{/if}
-                    </span>
-                    <span class="progress-line">
-                      <span class="bar-track"><span class="bar-fill" style:width="{progressPercent(scene.translated, scene.total)}%"></span></span>
-                      <span class="count">{scene.translated}/{scene.total}{scene.drafts ? ` · модель: ${scene.drafts}` : ""}</span>
-                    </span>
-                  </button>
-                </div>
-              {/each}
-            {/if}
-          </div>
+      <div class="scene-list">
+        {#each found as entry (entry.id)}
+          <button
+            class="scene"
+            class:active={selected !== null && pickId(selected) === entry.id}
+            class:loose={entry.pick.kind === "loose"}
+            data-pick={entry.id}
+            title={entry.pick.kind === "loose" ? `${entry.file.path}: строки интерфейса, экраны, код вне меток` : `${entry.scene.key} · ${entry.file.path}`}
+            onclick={() => select(entry.pick)}
+          >
+            <span class="scene-name">{entry.name}</span>
+            <span class="scene-percent" class:done={entry.scene.total > 0 && entry.scene.translated >= entry.scene.total}
+              >{progressLabel(entry.scene.translated, entry.scene.total)}</span
+            >
+          </button>
         {:else}
           <p class="muted">{!loadedTree ? "Загрузка" : tree.length ? "Ничего не нашлось" : "В снимке нет реплик"}</p>
         {/each}
-        {#if filtered.hidden > 0}
-          <p class="muted">Показаны первые сцены, ещё {filtered.hidden} найдутся точнее</p>
-        {/if}
       </div>
     </nav>
 
@@ -754,22 +610,10 @@
           <div class="toolbar-title">
             <strong>{item ? sceneItemName(item) : selected.kind === "scene" ? sceneLabel(selected.key) : "Без сцены"}</strong>
             <span>
-              {fileName(group.file.path)}{#if item} · {item.translated} из {item.total} · {progressLabel(item.translated, item.total)}{/if}
+              {fileName(group.file.path)}{#if item} · {item.translated} из {item.total} · {progressLabel(item.translated, item.total)}{/if}{#if item?.stale}
+                · <span class="stale">описание устарело</span>{/if}
             </span>
           </div>
-          <div class="segmented" role="tablist" aria-label="Какие реплики показать">
-            {#each [["all", "Все"], ["empty", "Пустые"], ["draft", "Модель"]] as [value, label] (value)}
-              <button role="tab" aria-selected={filter === value} class:on={filter === value} onclick={() => (filter = value as Filter)}>
-                {label}
-              </button>
-            {/each}
-          </div>
-          {#if sceneDrafts.length > 0}
-            <button class="btn small warning" title="Подтвердить все черновики модели в сцене" onclick={() => confirm(sceneDrafts)}>
-              <CheckCheck size={14} />
-              <span>Подтвердить · {sceneDrafts.length}</span>
-            </button>
-          {/if}
           {#if selected.kind === "scene"}
             {@const key = selected.key}
             <button
@@ -778,46 +622,69 @@
               aria-pressed={sideOpen}
               aria-label="Описание сцены"
               title={sideOpen ? "Скрыть описание сцены" : "Показать описание сцены"}
-              onclick={() => setSide(!sideOpen)}><PanelRight size={14} /></button
+              onclick={() => setSide(!sideOpen)}><PanelLeft size={15} /></button
             >
-            <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(key)}><Waypoints size={14} /></button>
+            <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(key)}><Waypoints size={15} /></button>
           {/if}
+          <button class="icon-button" aria-label="Сцена в исходнике" title="Сцена в исходнике" onclick={() => viewSource(group?.file.id ?? null, sceneLines[0]?.location)}
+            ><FileCode size={15} /></button
+          >
           <button
             class="icon-button"
-            aria-label="Сцена в исходнике"
-            title="Сцена в исходнике"
-            onclick={() => viewSource(group?.file.id ?? null, sceneLines[0]?.location)}><FileCode size={14} /></button
+            class:active={runs !== null}
+            aria-label="Запуски"
+            title="Последние запуски перевода и редактуры: их можно откатить"
+            onclick={toggleRuns}><History size={15} /></button
           >
-          <button class="btn small" title="Последние запуски перевода и редактуры: их можно откатить" onclick={toggleRuns}>
-            <History size={14} />
-            <span>Запуски</span>
-          </button>
+        </div>
+
+        <div class="actions" role="toolbar" aria-label="Действия с репликами">
+          <div class="segmented" role="radiogroup" aria-label="Область действий">
+            <button role="radio" aria-checked={scope === "scene"} class:on={scope === "scene"} onclick={() => (scope = "scene")}>Сцена</button>
+            <button role="radio" aria-checked={scope === "file"} class:on={scope === "file"} title="Действия для всех реплик файла {group.file.path}" onclick={() => (scope = "file")}
+              >Файл</button
+            >
+          </div>
+          <div class="segmented" role="tablist" aria-label="Какие реплики показать">
+            {#each [["all", "Все"], ["empty", "Пустые"], ["draft", "Модель"]] as [value, label] (value)}
+              <button role="tab" aria-selected={filter === value} class:on={filter === value} onclick={() => (filter = value as Filter)}>
+                {label}
+              </button>
+            {/each}
+          </div>
+          <span class="actions-gap"></span>
+          {#if sceneDrafts.length > 0}
+            <button class="btn small warning" title="Подтвердить все черновики модели в сцене" onclick={() => confirm(sceneDrafts)}>
+              <CheckCheck size={14} />
+              <span>Подтвердить · {sceneDrafts.length}</span>
+            </button>
+          {/if}
           <button
             class="btn small"
-            disabled={busy || working || sceneReady === 0}
-            title={sceneReady === 0 ? "В сцене нет переведённых реплик" : "Очистить перевод сцены: модель переведёт её заново"}
-            onclick={() => selected && (confirming = { kind: "reset", scope: scopeOf(selected), what: "сцены", count: sceneReady })}
+            disabled={busy || working || actionReady === 0 || !actionScope}
+            title={actionReady === 0 ? `В ${scope === "file" ? "файле" : "сцене"} нет переведённых реплик` : `Очистить перевод ${scopeWord}: модель переведёт его заново`}
+            onclick={() => actionScope && (confirming = { kind: "reset", scope: actionScope, what: scopeWord, count: actionReady })}
           >
             <Eraser size={14} />
             <span>Очистить</span>
           </button>
           <button
             class="btn small"
-            disabled={busy || sceneReady === 0}
-            title={busy ? "Модель уже работает" : sceneReady === 0 ? "В сцене нет переведённых реплик" : "Модель вычитает переведённые реплики сцены"}
-            onclick={() => selected && startRun("review", scopeOf(selected))}
+            disabled={busy || actionReady === 0 || !actionScope}
+            title={busy ? "Модель уже работает" : actionReady === 0 ? `В ${scope === "file" ? "файле" : "сцене"} нет переведённых реплик` : `Модель вычитает переведённые реплики ${scopeWord}`}
+            onclick={() => actionScope && startRun("review", actionScope)}
           >
             {#if run?.mode === "review"}<LoaderCircle size={14} class="spin" />{:else}<SpellCheck size={14} />{/if}
             <span>Вычитать</span>
           </button>
           <button
             class="btn small primary"
-            disabled={busy || sceneEmpty === 0}
-            title={busy ? "Модель уже работает" : sceneEmpty === 0 ? "В сцене нет пустых реплик" : "Модель переведёт пустые реплики сцены"}
-            onclick={() => selected && startRun("translate", scopeOf(selected))}
+            disabled={busy || actionEmpty === 0 || !actionScope}
+            title={busy ? "Модель уже работает" : actionEmpty === 0 ? `В ${scope === "file" ? "файле" : "сцене"} нет пустых реплик` : `Модель переведёт пустые реплики ${scopeWord}`}
+            onclick={() => actionScope && startRun("translate", actionScope)}
           >
             {#if run?.mode === "translate"}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
-            <span>Перевести{sceneEmpty ? ` · ${sceneEmpty}` : ""}</span>
+            <span>Перевести{actionEmpty ? ` · ${actionEmpty}` : ""}</span>
           </button>
         </div>
       {/if}
@@ -916,6 +783,27 @@
       {:else if loadingLines}
         <div class="empty"><LoaderCircle size={20} class="spin" /></div>
       {:else}
+        <div class="content">
+          {#if described?.key && sideOpen}
+            <aside class="scene-side" aria-label="Описание сцены">
+              <SceneCard
+                projectId={project.id}
+                scene={described}
+                sceneKey={described.key}
+                stale={item?.stale ?? false}
+                {busy}
+                describing={describe.active}
+                fileScenes={fileKeys.length}
+                {depthOpen}
+                onDescribe={describeOne}
+                onDescribeFile={describeFile}
+                onDepth={() => (depthOpen = !depthOpen)}
+                onSaved={patchScene}
+                onClose={() => setSide(false)}
+                onError={(message) => (error = message)}
+              />
+            </aside>
+          {/if}
         <div class="table">
           {#if shown.length === 0}
             <div class="no-lines">{filter === "all" ? "В сцене нет реплик" : "Таких реплик нет"}</div>
@@ -965,25 +853,9 @@
             {/each}
           {/each}
         </div>
+        </div>
       {/if}
     </section>
-
-    {#if described?.key && sideOpen && !loadingLines}
-      <aside class="scene-side" aria-label="Описание сцены">
-        <SceneCard
-          projectId={project.id}
-          scene={described}
-          sceneKey={described.key}
-          stale={item?.stale ?? false}
-          {busy}
-          describing={describe.active}
-          onDescribe={describeOne}
-          onSaved={patchScene}
-          onClose={() => setSide(false)}
-          onError={(message) => (error = message)}
-        />
-      </aside>
-    {/if}
   </div>
   {/if}
 </main>
@@ -1045,7 +917,7 @@
   .scenes {
     display: flex;
     flex-direction: column;
-    width: 290px;
+    width: 260px;
     flex: 0 0 auto;
     min-height: 0;
     border-right: 1px solid var(--divider);
@@ -1054,127 +926,46 @@
 
   .scenes-head {
     display: flex;
-    flex-direction: column;
-    gap: 8px;
     padding: 10px 8px 8px;
-    border-bottom: 1px solid var(--divider);
   }
 
-  .describe-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
+  .scenes-head .input {
+    flex: 1;
+    min-width: 0;
   }
 
-  .groups {
+  .scene-list {
     display: flex;
     flex: 1;
     flex-direction: column;
-    gap: 2px;
-    overflow-y: auto;
-    padding: 6px 8px 12px;
-  }
-
-  .group {
-    display: flex;
-    flex-direction: column;
     gap: 1px;
-  }
-
-  .group-head {
-    display: grid;
-    grid-template-columns: 13px minmax(0, 1fr) auto;
-    gap: 4px 6px;
-    align-items: center;
-    padding: 6px 4px 6px 2px;
-    border-radius: 8px;
-  }
-
-  .group-head:hover {
-    background: var(--hover-row);
-  }
-
-  .group-toggle {
-    display: flex;
-    grid-column: 2 / -1;
-    align-items: center;
-    gap: 4px;
-    min-width: 0;
-    padding: 0;
-    border: 0;
-    background: none;
-    color: var(--text-soft);
-    font-size: 12px;
-    font-weight: 600;
-    text-align: left;
-  }
-
-  .group.current .group-toggle {
-    color: var(--text-strong);
-  }
-
-  .group-name,
-  .scene-title {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .group-head .progress-line {
-    grid-column: 2;
-    padding-left: 17px;
-  }
-
-  .group-actions {
-    display: flex;
-    gap: 2px;
-  }
-
-  .group-actions .icon-button {
-    width: 22px;
-    height: 22px;
-  }
-
-  .scene-item {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-    padding-left: 17px;
-  }
-
-  .group-head input,
-  .scene-item input,
-  .describe-row input {
-    width: 13px;
-    height: 13px;
-    margin: 0;
-    flex: 0 0 auto;
-  }
-
-  .no-mark {
-    width: 13px;
-    flex: 0 0 auto;
+    overflow-y: auto;
+    padding: 0 8px 12px;
   }
 
   .scene {
     display: flex;
-    flex: 1;
-    flex-direction: column;
-    gap: 4px;
+    flex: 0 0 auto;
+    align-items: baseline;
+    gap: 8px;
     min-width: 0;
-    padding: 6px 8px;
+    padding: 5px 8px;
     border: 1px solid transparent;
-    border-radius: 8px;
+    border-radius: 6px;
     background: transparent;
     color: var(--text-soft);
     font-size: 12px;
     text-align: left;
   }
 
-  .scene:hover,
+  .scene:hover {
+    background: var(--hover);
+  }
+
   .scene.active {
     border-color: var(--border-selected);
-    background: var(--hover);
+    background: var(--selected);
+    color: var(--text-strong);
   }
 
   .scene.loose {
@@ -1183,62 +974,22 @@
   }
 
   .scene-name {
-    display: flex;
-    align-items: center;
-    gap: 6px;
+    flex: 1;
     min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .mark {
+  .scene-percent {
     flex: 0 0 auto;
     color: var(--text-ghost);
     font-size: 10px;
     font-style: normal;
   }
 
-  .mark.warn {
-    color: var(--warning);
-  }
-
-  .progress-line {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    min-width: 0;
-  }
-
-  .bar-track {
-    flex: 1;
-    min-width: 30px;
-    height: 4px;
-    overflow: hidden;
-    border-radius: 999px;
-    background: var(--track);
-  }
-
-  .bar-fill {
-    display: block;
-    height: 100%;
-    background: var(--accent);
-  }
-
-  .count {
-    color: var(--text-faint);
-    font-size: 10px;
-    font-style: normal;
-    white-space: nowrap;
-  }
-
-  .scene-side {
-    display: flex;
-    flex-direction: column;
-    width: 320px;
-    flex: 0 0 auto;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 12px;
-    border-left: 1px solid var(--divider);
-    background: var(--surface-side);
+  .scene-percent.done {
+    color: var(--success);
   }
 
   .lines {
@@ -1246,6 +997,38 @@
     flex: 1;
     flex-direction: column;
     min-width: 0;
+  }
+
+  .content {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .scene-side {
+    width: 320px;
+    flex: 0 0 auto;
+    overflow-y: auto;
+    padding: 12px 14px;
+    border-right: 1px solid var(--divider);
+  }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--divider);
+    background: var(--surface-side);
+  }
+
+  .actions-gap {
+    flex: 1;
+  }
+
+  .stale {
+    color: var(--warning);
   }
 
   .toolbar {
@@ -1515,7 +1298,7 @@
   /* На узком окне три колонки делят место: список и панель сужаются, реплики остаются читаемыми. */
   @media (max-width: 1180px) {
     .scenes {
-      width: 250px;
+      width: 220px;
     }
 
     .scene-side {

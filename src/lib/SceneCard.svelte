@@ -1,7 +1,6 @@
 <script lang="ts">
-  import { ChevronDown, ChevronRight, Eraser, LoaderCircle, Sparkles, TriangleAlert, X } from "lucide-svelte";
+  import { ChevronDown, ChevronRight, Eraser, LoaderCircle, SlidersHorizontal, Sparkles, TriangleAlert, X } from "lucide-svelte";
   import { commands, type PartNoteDto_Serialize as PartNote, type SceneDto_Serialize as Scene } from "./bindings";
-  import { sceneItemName } from "./scene-tree";
 
   let {
     projectId,
@@ -10,7 +9,11 @@
     stale,
     busy,
     describing,
+    fileScenes,
+    depthOpen,
     onDescribe,
+    onDescribeFile,
+    onDepth,
     onSaved,
     onClose,
     onError,
@@ -24,7 +27,13 @@
     /** Модель занята другим запуском. */
     busy: boolean;
     describing: boolean;
+    /** Сколько сцен в файле открытой сцены: их описывает «Описать сцены файла». */
+    fileScenes: number;
+    /** Открыта карточка глубины чтения. */
+    depthOpen: boolean;
     onDescribe: (key: string) => void;
+    onDescribeFile: () => void;
+    onDepth: () => void;
     onSaved: (key: string, title: string | null, description: string | null) => void;
     /** Скрыть боковую панель. */
     onClose: () => void;
@@ -98,9 +107,8 @@
   const read = $derived(notes?.filter((part) => part.note !== null).length ?? 0);
 </script>
 
-<div class="card scene-card" class:saving>
+<div class="scene-card" class:saving>
   <div class="card-head">
-    <strong>{sceneItemName({ key: sceneKey, title: scene.title })}</strong>
     <button
       class="btn small"
       disabled={busy}
@@ -110,6 +118,18 @@
       {#if describing}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
       <span>Описать</span>
     </button>
+    <button
+      class="btn small"
+      disabled={busy || fileScenes < 2}
+      title={busy ? "Модель уже работает" : "Модель прочитает часть каждой сцены файла с глубиной чтения проекта. Описанные сцены без новых частей пропускаются"}
+      onclick={onDescribeFile}
+    >
+      <span>Сцены файла · {fileScenes}</span>
+    </button>
+    <button class="icon-button" class:active={depthOpen} aria-label="Глубина чтения" title="Сколько частей читает модель для описаний" onclick={onDepth}
+      ><SlidersHorizontal size={14} /></button
+    >
+    <span class="head-gap"></span>
     <button class="icon-button" aria-label="Скрыть описание сцены" title="Скрыть описание сцены" onclick={onClose}><X size={14} /></button>
   </div>
 
@@ -174,7 +194,9 @@
 
 <style>
   .scene-card {
-    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
   }
 
   .scene-card.saving {
@@ -187,14 +209,8 @@
     gap: 6px;
   }
 
-  .card-head strong {
+  .head-gap {
     flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    color: var(--text-strong);
-    font-size: 13px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .fields {
