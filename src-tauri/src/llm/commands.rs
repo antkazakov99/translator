@@ -10,6 +10,7 @@ use super::{
     ProviderKind, Temperature,
 };
 use crate::common::{AppError, ValidationError};
+use crate::projects::ProjectId;
 use crate::state::blocking;
 
 /// Провайдер для окна. Ключа нет, только признак, что он задан.
@@ -287,6 +288,29 @@ pub async fn save_llm_action(app: AppHandle, action: Action, settings: ActionInp
     blocking(app, move |state| {
         let parsed = settings.settings()?;
         LlmSettingsService { state }.save_action(action, &parsed)?;
+        Ok(ActionDto::new(action, &parsed))
+    })
+    .await
+}
+
+/// Переопределения настроек действий в проекте. Пустое поле: значение из настроек приложения.
+#[tauri::command]
+#[specta::specta]
+pub async fn project_llm_actions(app: AppHandle, project: String) -> Result<Vec<ActionDto>, String> {
+    blocking(app, move |state| {
+        let actions = LlmSettingsService { state }.project_actions(ProjectId::parse(&project)?)?;
+        Ok(actions.iter().map(|(action, settings)| ActionDto::new(*action, settings)).collect())
+    })
+    .await
+}
+
+/// Настройки действия в проекте: важнее настроек приложения.
+#[tauri::command]
+#[specta::specta]
+pub async fn save_project_llm_action(app: AppHandle, project: String, action: Action, settings: ActionInput) -> Result<ActionDto, String> {
+    blocking(app, move |state| {
+        let parsed = settings.settings()?;
+        LlmSettingsService { state }.save_project_action(ProjectId::parse(&project)?, action, &parsed)?;
         Ok(ActionDto::new(action, &parsed))
     })
     .await

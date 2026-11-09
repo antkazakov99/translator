@@ -20,6 +20,10 @@ export const commands = {
 	reorderLlmProfiles: (ids: string[]) => __TAURI_INVOKE<null>("reorder_llm_profiles", { ids }),
 	/**  Настройки действия в приложении. */
 	saveLlmAction: (action: Action, settings: ActionInput_Deserialize) => __TAURI_INVOKE<ActionDto_Serialize>("save_llm_action", { action, settings }),
+	/**  Переопределения настроек действий в проекте. Пустое поле: значение из настроек приложения. */
+	projectLlmActions: (project: string) => __TAURI_INVOKE<ActionDto_Serialize[]>("project_llm_actions", { project }),
+	/**  Настройки действия в проекте: важнее настроек приложения. */
+	saveProjectLlmAction: (project: string, action: Action, settings: ActionInput_Deserialize) => __TAURI_INVOKE<ActionDto_Serialize>("save_project_llm_action", { project, action, settings }),
 	/**
 	 *  Модели провайдера: и сохранённого, и того, что ещё правится в окне.
 	 *  Без нового ключа берётся сохранённый ключ провайдера.
@@ -99,6 +103,11 @@ export const commands = {
 	entryParts: (project: string, owner: OwnerDto) => __TAURI_INVOKE<EntryPartsDto_Serialize>("entry_parts", { project, owner }),
 	/**  Описывает персонажа или термин по частям сцен с глубиной чтения по умолчанию и заменяет описание. */
 	describeEntry: (project: string, owner: OwnerDto, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_entry", { project, owner, profile, progress }),
+	/**
+	 *  Описывает отмеченных персонажей и термины по очереди с глубиной чтения по умолчанию.
+	 *  Описанные записи без новых частей пропускаются.
+	 */
+	describeEntries: (project: string, owners: OwnerDto[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_entries", { project, owners, profile, progress }),
 	/**  Сбрасывает заметки персонажа или термина. Возвращает число удалённых. */
 	resetEntryNotes: (project: string, owner: OwnerDto) => __TAURI_INVOKE<number>("reset_entry_notes", { project, owner }),
 	/**  Заметка не идёт в описание или возвращается в него. */
@@ -158,6 +167,13 @@ export const commands = {
 	missingLines: (project: string) => __TAURI_INVOKE<MissingLineDto_Serialize[]>("missing_lines", { project }),
 	/**  Переносит перевод пропавшей реплики на реплику игры. */
 	attachMissingLine: (project: string, missing: RowRef, target: RowRef) => __TAURI_INVOKE<null>("attach_missing_line", { project, missing, target }),
+	/**  Шрифты игры с недостающими символами и заменами. */
+	gameFonts: (project: string) => __TAURI_INVOKE<GameFontDto_Serialize[]>("game_fonts", { project }),
+	/**  Копирует выбранный файл в проект и ставит его заменой шрифта игры. */
+	replaceFont: (project: string, target: string, file: string) => __TAURI_INVOKE<null>("replace_font", { project, target, file }),
+	removeFontReplacement: (project: string, target: string) => __TAURI_INVOKE<null>("remove_font_replacement", { project, target }),
+	/**  Файл шрифта для предпросмотра в base64. */
+	fontData: (project: string, hash: string) => __TAURI_INVOKE<string>("font_data", { project, hash }),
 	/**  Удаляет проект и его папку данных. Папку игры не трогает. */
 	deleteProject: (id: string) => __TAURI_INVOKE<null>("delete_project", { id }),
 };
@@ -332,6 +348,22 @@ export type FileDto = {
 	drafts: number,
 };
 
+/**  Каких символов нет в шрифте. */
+export type FontCoverageDto = {
+	/**  Шрифт не прочитан: о символах ничего не известно. */
+	unreadable: boolean,
+	missingOriginal: string,
+	missingTarget: string,
+};
+
+/**  Замена шрифта. */
+export type FontReplacementDto = {
+	/**  Имя загруженного файла. */
+	sourceName: string,
+	hash: string,
+	coverage: FontCoverageDto,
+};
+
 export type FormDto = FormDto_Serialize | FormDto_Deserialize;
 
 export type FormDto_Deserialize = {
@@ -342,6 +374,39 @@ export type FormDto_Deserialize = {
 export type FormDto_Serialize = {
 	text: string,
 	translation: string | null,
+};
+
+/**  Шрифт игры. */
+export type GameFontDto = GameFontDto_Serialize | GameFontDto_Deserialize;
+
+/**  Шрифт игры. */
+export type GameFontDto_Deserialize = {
+	/**  Путь файла снимка: по нему ставится и убирается замена. */
+	path: string,
+	/**  Путь для показа, без папки `game/`. */
+	name: string,
+	hash: string,
+	/**  Сколько скриптов упоминают файл. */
+	references: number,
+	coverage: FontCoverageDto,
+	/**  Почему замена не подействует. */
+	locked?: string | null,
+	replacement?: FontReplacementDto | null,
+};
+
+/**  Шрифт игры. */
+export type GameFontDto_Serialize = {
+	/**  Путь файла снимка: по нему ставится и убирается замена. */
+	path: string,
+	/**  Путь для показа, без папки `game/`. */
+	name: string,
+	hash: string,
+	/**  Сколько скриптов упоминают файл. */
+	references: number,
+	coverage: FontCoverageDto,
+	/**  Почему замена не подействует. */
+	locked: string | null,
+	replacement: FontReplacementDto | null,
 };
 
 /**  Род: с ним согласуются глаголы в переводе. `None` в полях значит «неизвестен». */

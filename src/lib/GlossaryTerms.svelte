@@ -1,7 +1,7 @@
 <script lang="ts">
   import DescribeParts from "./DescribeParts.svelte";
   import { onMount } from "svelte";
-  import { Check, Languages, LoaderCircle, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
@@ -120,6 +120,39 @@
   let draft = $state<Term | null>(null);
 
   const guesses = $derived(data.terms.filter((term) => term.guess).length);
+  /** Отмеченные для описания моделью. По умолчанию ничего: чтение сцен дорого. */
+  let marked = $state<number[]>([]);
+  const entriesRun = $derived(runs.entries);
+
+  function toggleMark(id: number, on: boolean) {
+    marked = on ? [...marked, id] : marked.filter((item) => item !== id);
+  }
+
+  function markShown() {
+    marked = [...new Set([...marked, ...shown.map((item) => item.id)])];
+  }
+
+  function describeTitle() {
+    if (marked.length === 0) return "Отметьте термины в списке";
+    if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
+    return "Модель прочитает части сцен каждого термина и напишет описание. Описанные без новых частей пропускаются";
+  }
+
+  async function describeMarked() {
+    const owners = marked.map((id) => ({ kind: "term" as const, id }));
+    const written = await entriesRun.start(
+      (channel) => commands.describeEntries(projectId, owners, null, channel),
+      onError,
+      (count, stopped) => {
+        const text = `Описано: ${count}`;
+        return stopped ? `Остановлено. ${text}` : text;
+      },
+    );
+    const done = new Set(written);
+    marked = marked.filter((id) => !done.has(`term:${id}`));
+    if (written.length > 0) await reload();
+  }
+
   const shown = $derived(
     data.terms
       .filter((term) => filter !== "guess" || term.guess)
@@ -224,6 +257,7 @@
 </div>
 
 <SuggestStatus {run} {onError} />
+{#if !draft}<SuggestStatus run={entriesRun} {onError} />{/if}
 
 {#if run.review}
   <div class="list">
@@ -321,12 +355,28 @@
   <div class="master">
     <div class="list-side">
       <input class="input" placeholder="Поиск по названию и переводу" bind:value={query} aria-label="Поиск терминов" />
+      <div class="marks">
+        <button class="btn small" disabled={shown.length === 0} onclick={markShown}>Отметить показанные</button>
+        <button class="btn small" disabled={marked.length === 0} onclick={() => (marked = [])}>Снять</button>
+        <button class="btn small primary" disabled={marked.length === 0 || runsBusy(runs)} title={describeTitle()} onclick={describeMarked}>
+          {#if entriesRun.active}<LoaderCircle size={12} class="spin" />{:else}<Sparkles size={12} />{/if}
+          <span>Описать · {marked.length}</span>
+        </button>
+      </div>
       <div class="items">
         {#each shown as term (term.id)}
-          <button class="item" class:active={term.id === draft?.id} onclick={() => (selected = term.id)}>
-            <strong>{term.name}{#if term.guess}<span class="guess">Модель</span>{/if}</strong>
-            <span>{term.translation ?? "Нет перевода"} · {categoryLabel(term.category)}</span>
-          </button>
+          <div class="marked-item">
+            <input
+              type="checkbox"
+              checked={marked.includes(term.id)}
+              onchange={(event) => toggleMark(term.id, event.currentTarget.checked)}
+              aria-label="Отметить {term.name}"
+            />
+            <button class="item" class:active={term.id === draft?.id} onclick={() => (selected = term.id)}>
+              <strong>{term.name}{#if term.guess}<span class="guess">Модель</span>{/if}</strong>
+              <span>{term.translation ?? "Нет перевода"} · {categoryLabel(term.category)}</span>
+            </button>
+          </div>
         {:else}
           <p class="faint">{data.terms.length ? "Ничего не нашлось" : "Терминов пока нет: модель предложит их при переводе, или добавьте ниже"}</p>
         {/each}
@@ -429,6 +479,23 @@
 {/if}
 
 <style>
+  .marks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .marked-item {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .marked-item .item {
+    flex: 1;
+    min-width: 0;
+  }
+
   .fresh-head {
     display: flex;
     flex-direction: column;

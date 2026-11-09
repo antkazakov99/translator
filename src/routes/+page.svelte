@@ -62,7 +62,7 @@
 {/if}
 
 {#if showLlmSettings}
-  <LlmSettings onClose={() => (showLlmSettings = false)} />
+  <LlmSettings {project} onClose={() => (showLlmSettings = false)} />
 {/if}
 
 <style>

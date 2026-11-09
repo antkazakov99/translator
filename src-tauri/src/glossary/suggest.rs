@@ -140,7 +140,6 @@ pub(super) struct AnswerItem {
     note: Option<String>,
     gender: Option<String>,
     value: Option<String>,
-    pub(super) origin: Option<String>,
     /// Написания имени значением, а не полем записи: сломанный список не теряет всей записи.
     pub(super) variants: Option<serde_json::Value>,
     /// Замечания проверки написаний имён.

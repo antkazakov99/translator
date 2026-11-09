@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Check, Languages, LoaderCircle, Plus, Trash2, TriangleAlert } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, TriangleAlert } from "lucide-svelte";
   import DescribeParts from "./DescribeParts.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
@@ -98,6 +98,39 @@
   /** Карточка в правке. Сбрасывается только при выборе другого персонажа. */
   let draft = $state<Character | null>(null);
 
+  /** Отмеченные для описания моделью. По умолчанию ничего: чтение сцен дорого. */
+  let marked = $state<number[]>([]);
+  const entriesRun = $derived(runs.entries);
+
+  function toggleMark(id: number, on: boolean) {
+    marked = on ? [...marked, id] : marked.filter((item) => item !== id);
+  }
+
+  function markShown() {
+    marked = [...new Set([...marked, ...shown.map((item) => item.id)])];
+  }
+
+  function describeTitle() {
+    if (marked.length === 0) return "Отметьте персонажей в списке";
+    if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
+    return "Модель прочитает части сцен каждого персонажа и напишет описание. Описанные без новых частей пропускаются";
+  }
+
+  async function describeMarked() {
+    const owners = marked.map((id) => ({ kind: "character" as const, id }));
+    const written = await entriesRun.start(
+      (channel) => commands.describeEntries(projectId, owners, null, channel),
+      onError,
+      (count, stopped) => {
+        const text = `Описано: ${count}`;
+        return stopped ? `Остановлено. ${text}` : text;
+      },
+    );
+    const done = new Set(written);
+    marked = marked.filter((id) => !done.has(`character:${id}`));
+    if (written.length > 0) await reload();
+  }
+
   const shown = $derived(
     data.characters.filter((character) =>
       matches(query, characterName(character), characterTranslation(character), ...character.forms.map((form) => form.text)),
@@ -186,6 +219,7 @@
 </div>
 
 <SuggestStatus {run} {onError} />
+{#if !draft}<SuggestStatus run={entriesRun} {onError} />{/if}
 
 {#if run.review}
   {#if run.warning}
@@ -236,12 +270,28 @@
 <div class="master">
   <div class="list-side">
     <input class="input" placeholder="Поиск по имени и формам" bind:value={query} aria-label="Поиск персонажей" />
+    <div class="marks">
+      <button class="btn small" disabled={shown.length === 0} onclick={markShown}>Отметить показанных</button>
+      <button class="btn small" disabled={marked.length === 0} onclick={() => (marked = [])}>Снять</button>
+      <button class="btn small primary" disabled={marked.length === 0 || runsBusy(runs)} title={describeTitle()} onclick={describeMarked}>
+        {#if entriesRun.active}<LoaderCircle size={12} class="spin" />{:else}<Sparkles size={12} />{/if}
+        <span>Описать · {marked.length}</span>
+      </button>
+    </div>
     <div class="items">
       {#each shown as character (character.id)}
-        <button class="item" class:active={character.id === draft?.id} onclick={() => (selected = character.id)}>
-          <strong>{characterName(character)}</strong>
-          <span>{characterTranslation(character) || "Нет перевода"}</span>
-        </button>
+        <div class="marked-item">
+          <input
+            type="checkbox"
+            checked={marked.includes(character.id)}
+            onchange={(event) => toggleMark(character.id, event.currentTarget.checked)}
+            aria-label="Отметить {characterName(character)}"
+          />
+          <button class="item" class:active={character.id === draft?.id} onclick={() => (selected = character.id)}>
+            <strong>{characterName(character)}</strong>
+            <span>{characterTranslation(character) || "Нет перевода"}</span>
+          </button>
+        </div>
       {:else}
         <p class="faint">{data.characters.length ? "Никого не нашлось" : "Персонажей пока нет: возьмите их из «Говорящих» или добавьте ниже"}</p>
       {/each}
@@ -323,6 +373,23 @@
 {/if}
 
 <style>
+  .marks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .marked-item {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .marked-item .item {
+    flex: 1;
+    min-width: 0;
+  }
+
   .variants {
     display: flex;
     flex-direction: column;

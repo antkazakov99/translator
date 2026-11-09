@@ -84,6 +84,8 @@ pub enum AppError {
     GameMissing,
     #[error("Перевод не перенесён: у пропавшей реплики нет перевода или реплика игры уже пропала")]
     NothingToAttach,
+    #[error("{0}")]
+    Font(String),
     #[error("Добавьте модель в настройках")]
     NoProfiles,
     #[error("Профиль модели не найден")]

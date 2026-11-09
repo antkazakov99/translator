@@ -814,42 +814,6 @@ pub(crate) fn game_archives(game_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(archives)
 }
 
-/// Рекурсивно собирает файлы для создания мода
-pub(crate) fn collect_folder_files_for_mod(
-    root: &Path,
-    current: &Path,
-    depth: usize,
-    acc: &mut Vec<(String, PathBuf)>,
-) -> Result<(), String> {
-    if depth > crate::engines::renpy::MAX_SCAN_DEPTH {
-        return Err(format!("Слишком глубокая вложенность папки мода: {:?}", current));
-    }
-    let entries = fs::read_dir(current)
-        .map_err(|e| format!("Не удалось прочитать папку мода {:?}: {}", current, e))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Ошибка чтения папки мода: {}", e))?;
-        let path = entry.path();
-        let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-
-        // Пропускаем бэкапы и скрытые файлы
-        if file_name.starts_with('.') || file_name.contains("backup") || file_name.ends_with(".bak")
-        {
-            continue;
-        }
-
-        if path.is_dir() {
-            collect_folder_files_for_mod(root, &path, depth + 1, acc)?;
-        } else if path.is_file() {
-            let rel_path = path
-                .strip_prefix(root)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .map_err(|e| format!("Не удалось определить путь файла мода {:?}: {}", path, e))?;
-            acc.push((rel_path, path));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

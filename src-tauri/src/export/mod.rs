@@ -3,7 +3,6 @@
 pub mod commands;
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
 
 use rusqlite::Connection;
 
@@ -163,7 +162,7 @@ impl ExportService<'_> {
                 snapshot: GameSnapshot { info: scan.game_info, files, containers: Vec::new(), segments, speakers, edges: Vec::new() },
                 translations,
                 speaker_labels,
-                fonts: Vec::new(),
+                fonts: crate::fonts::FontService::swaps(tx)?,
                 target_language,
             })
         })?)

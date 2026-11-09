@@ -1,6 +1,7 @@
 <script lang="ts">
   import { revealItemInDir } from "@tauri-apps/plugin-opener";
-  import { Check, FolderOpen, LoaderCircle, Package, PackageMinus, PackagePlus, TriangleAlert, X } from "lucide-svelte";
+  import { Check, FolderOpen, LoaderCircle, Package, PackageMinus, PackagePlus, TriangleAlert, Type, X } from "lucide-svelte";
+  import FontPanel from "./FontPanel.svelte";
   import { commands, type ModResultDto, type ProjectDto_Serialize as Project } from "./bindings";
 
   /** Сборка `ru_lang.rpa`, установка в привязанную папку игры и снятие. */
@@ -10,6 +11,8 @@
   let busy = $state<Action | null>(null);
   let result = $state<{ text: string; path: string | null; warning: string; leftOut: string[] } | null>(null);
   let error = $state("");
+  /** Раздел шрифтов под кнопками. */
+  let fontsOpen = $state(false);
 
   const gameReady = $derived(Boolean(project.gameRoot) && !project.gameMissing);
   const gameHint = $derived(
@@ -87,6 +90,10 @@
       {#if busy === "uninstall"}<LoaderCircle size={13} class="spin" />{:else}<PackageMinus size={13} />{/if}
       <span>Снять с игры</span>
     </button>
+    <button class="btn small" class:active={fontsOpen} title="Шрифты игры без кириллицы и их замены в моде" onclick={() => (fontsOpen = !fontsOpen)}>
+      <Type size={13} />
+      <span>Шрифты</span>
+    </button>
     {#if gameHint}<span class="faint">{gameHint}: установка недоступна</span>{/if}
   </div>
 
@@ -120,6 +127,9 @@
       <span>{error}</span>
     </div>
   {/if}
+  {#if fontsOpen}
+    <FontPanel projectId={project.id} />
+  {/if}
 </div>
 
 <style>
@@ -128,6 +138,8 @@
     flex-direction: column;
     gap: 10px;
     margin: 10px 16px 0;
+    max-height: 60vh;
+    overflow-y: auto;
   }
 
   .head {

@@ -1,10 +1,7 @@
 //! Translator 2.0: проект не зависит от папки игры, данные лежат в SQLite.
 //!
 //! Слои и классы описаны на странице «Структура приложения» в Docmost, схемы баз в разделе «Хранилище 2.0».
-//! Подключены команды списка проектов, остальные фичи ещё с телами `todo!()`.
-
-// Снять, когда заглушки получат реализацию: пока реэкспорты и параметры заглушек никто не использует.
-#![allow(dead_code, unused_variables, unused_imports)]
+//! Команды окна перечислены в `commands()`, типы для окна пересобирает тест `export_bindings`.
 
 pub mod common;
 pub mod engines;
@@ -29,11 +26,13 @@ use crate::secrets::SecretStore;
 use crate::state::AppState;
 
 /// Куда пишутся типы и вызовы команд для окна.
+#[cfg(test)]
 const BINDINGS: &str = "../src/lib/bindings.ts";
 
 /// Команды окна. Типы TypeScript к ним генерируются из этого же списка.
 fn commands() -> tauri_specta::Builder<tauri::Wry> {
     use export::commands::*;
+    use fonts::commands::*;
     use glossary::commands::*;
     use graph::commands::*;
     use llm::commands::*;
@@ -51,6 +50,8 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             delete_llm_profile,
             reorder_llm_profiles,
             save_llm_action,
+            project_llm_actions,
+            save_project_llm_action,
             llm_models,
             cancel_llm_run,
             llm_run_active,
@@ -92,6 +93,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             describe_scenes,
             entry_parts,
             describe_entry,
+            describe_entries,
             reset_entry_notes,
             exclude_note,
             exclude_scene,
@@ -120,10 +122,15 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             rescan_game,
             missing_lines,
             attach_missing_line,
+            game_fonts,
+            replace_font,
+            remove_font_replacement,
+            font_data,
             delete_project,
         ])
 }
 
+#[cfg(test)]
 fn typescript() -> specta_typescript::Typescript {
     specta_typescript::Typescript::default()
         .header("// Сгенерировано из Rust (tauri-specta), руками не править: cargo test --lib export_bindings")

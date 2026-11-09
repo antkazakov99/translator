@@ -953,6 +953,24 @@ pub async fn describe_entry(
     Ok(described.into())
 }
 
+/// Описывает отмеченных персонажей и термины по очереди с глубиной чтения по умолчанию.
+/// Описанные записи без новых частей пропускаются.
+#[tauri::command]
+#[specta::specta]
+pub async fn describe_entries(
+    state: State<'_, AppState>,
+    project: String,
+    owners: Vec<OwnerDto>,
+    profile: Option<String>,
+    progress: Channel<RunProgress>,
+) -> Result<DescribedDto, String> {
+    let targets = owners.into_iter().map(OwnerDto::target).collect();
+    let described = DescribeService { state: &state }
+        .describe_many(self::project(&project)?, targets, ReadingDepth::default(), self::profile(profile)?, progress)
+        .await?;
+    Ok(described.into())
+}
+
 /// Сбрасывает заметки персонажа или термина. Возвращает число удалённых.
 #[tauri::command]
 #[specta::specta]

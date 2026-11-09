@@ -1065,16 +1065,6 @@ impl NamesService<'_> {
         run_batches(self.state, &open, Action::Speakers, &target, progress, requests, |index, text| SpeakersPrompt::accept(text, &batches[index]))
             .await
     }
-
-    /// Запрос для чат-бота без API: правила и данные одним текстом.
-    pub fn chat_request(&self, project: ProjectId, characters: &[CharacterId]) -> Result<String, AppError> {
-        todo!()
-    }
-
-    /// Ответ чат-бота проходит те же проверки и попадает в тот же отбор.
-    pub fn read_chat_answer(&self, project: ProjectId, answer: &str) -> Result<serde_json::Value, AppError> {
-        todo!()
-    }
 }
 
 /// Значения токенов: подставляются в реплики образцов, как при переводе.

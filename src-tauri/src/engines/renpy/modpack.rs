@@ -179,9 +179,10 @@ pub(crate) fn build(input: &ModInput, store: &FileStore, out_dir: &Path) -> Resu
     if !offers_language {
         pack.compile(format, LANGUAGE_FILE, &language_script())?;
     }
+    // Движок ищет файл сначала в tl/<язык>: замена действует только на языке перевода.
     for font in &input.fonts {
-        let Some(name) = font.target_path.strip_prefix(&game_prefix) else { continue };
-        pack.files.push((name.to_string(), store.read(&font.hash)?));
+        let Some(name) = super::fonts::mod_path(&font.target_path) else { continue };
+        pack.files.push((name, store.read(&font.hash)?));
     }
 
     pack.files.sort_by(|a, b| a.0.cmp(&b.0));

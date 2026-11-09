@@ -1,5 +1,6 @@
 //! Адаптер Ren'Py: архивы RPA, декомпиляция и компиляция `.rpyc`, разбор скриптов, считывание игры.
 
+pub mod fonts;
 pub mod graph;
 pub mod modpack;
 pub mod pickle;
@@ -18,7 +19,7 @@ use parking_lot::Mutex;
 use regex::Regex;
 
 use super::{
-    EngineError, EngineId, FileKind, GameEngine, GameInfo, GameSnapshot, GameSource, ModArchive, ModInput,
+    EngineError, EngineFont, EngineId, FileKind, GameEngine, GameInfo, GameSnapshot, GameSource, ModArchive, ModInput,
     SnapshotEdge, SnapshotFile,
 };
 use crate::files::FileStore;
@@ -98,6 +99,11 @@ impl GameEngine for RenpyEngine {
             .collect()
     }
 
+    /// Шрифты вне `tl/`. Замена ляжет в `tl/<язык>` мода под тем же путём.
+    fn fonts(&self, files: &[SnapshotFile], store: &FileStore) -> Result<Vec<EngineFont>, EngineError> {
+        fonts::game_fonts(files, store)
+    }
+
     /// `ru_lang.rpa`: переводы `tl/<язык>`, строковые переводы, подписи говорящих, включение языка, шрифты.
     fn build_mod(&self, input: &ModInput, files: &FileStore, out_dir: &Path) -> Result<ModArchive, EngineError> {
         modpack::build(input, files, out_dir)
@@ -137,6 +143,7 @@ pub(crate) fn path_lock(path: &Path) -> Arc<Mutex<()>> {
 pub(crate) const MAX_SCAN_DEPTH: usize = 20;
 
 /// Все файлы `.rpy` без скрытых папок, `_mods` и бэкапов.
+#[cfg(test)]
 pub(crate) fn collect_rpy_files(dir: &Path, files: &mut Vec<PathBuf>) {
     collect_files_depth(dir, Some(&["rpy"]), files, 0);
 }

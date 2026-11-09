@@ -202,6 +202,17 @@ pub struct SegmentTranslation {
 }
 
 /// Замена шрифта игры загруженным.
+/// Шрифт игры, который можно заменить для языка перевода.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineFont {
+    /// Путь файла снимка.
+    pub path: String,
+    /// Сколько скриптов упоминают файл. Имя, собранное в коде, поиск не найдёт.
+    pub mentions: usize,
+    /// Почему замена в моде не подействует. `None`: подействует.
+    pub locked: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontSwap {
     pub target_path: String,
@@ -257,6 +268,9 @@ pub trait GameEngine: Sync {
 
     /// Файлы, от которых зависит разбор `file`. По их хэшам cache.db видит, что разбор устарел.
     fn parse_dependencies(&self, file: &SnapshotFile, all: &[SnapshotFile]) -> Vec<String>;
+
+    /// Шрифты игры по файлам снимка: упоминания в скриптах и то, что помешает замене.
+    fn fonts(&self, files: &[SnapshotFile], store: &FileStore) -> Result<Vec<EngineFont>, EngineError>;
 
     /// Собирает мод без папки игры: всё нужное лежит в `input` и `files`.
     fn build_mod(&self, input: &ModInput, files: &FileStore, out_dir: &std::path::Path) -> Result<ModArchive, EngineError>;

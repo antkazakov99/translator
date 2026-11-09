@@ -20,12 +20,14 @@
     type ActionDto_Serialize as ActionDto,
     type LlmSettingsDto_Serialize as Settings,
     type ProfileDto_Serialize as ProfileDto,
+    type ProjectDto_Serialize as Project,
     type ProviderDto,
     type ProviderKind,
   } from "$lib/bindings";
   import { PROVIDER_KINDS, kindOf, newProviderName, optionalInteger, optionalTemperature, textModels } from "$lib/llm-catalog";
 
-  let { onClose }: { onClose: () => void } = $props();
+  /** `project`: окно открыто из проекта, у действий есть его собственные настройки. */
+  let { onClose, project = null }: { onClose: () => void; project?: Project | null } = $props();
 
   type Tab = "providers" | "profiles" | "actions";
 
@@ -60,6 +62,8 @@
   }
 
   interface ActionDraft {
+    /** Чьи это настройки: приложения или открытого проекта. */
+    scope: "app" | "project";
     saved: ActionDto;
     profile: string;
     temperature: string;
@@ -89,6 +93,10 @@
   let providers = $state<ProviderDraft[]>([]);
   let profiles = $state<ProfileDraft[]>([]);
   let actions = $state<ActionDraft[]>([]);
+  /** Переопределения открытого проекта. */
+  let projectActions = $state<ActionDraft[]>([]);
+  let actionScope = $state<"app" | "project">("app");
+  const shownActions = $derived(actionScope === "project" ? projectActions : actions);
   /** Списки моделей по `uid` провайдера. */
   let modelLists = $state<Record<string, ModelList>>({});
   let confirmClose = $state(false);
@@ -122,8 +130,9 @@
     };
   }
 
-  function actionDraft(saved: ActionDto): ActionDraft {
+  function actionDraft(saved: ActionDto, scope: "app" | "project" = "app"): ActionDraft {
     return {
+      scope,
       saved,
       profile: saved.profile ?? "",
       temperature: numberText(saved.temperature),
@@ -140,12 +149,13 @@
     if (withProviders) providers = settings.providers.map(providerDraft);
     const unsaved = profiles.filter((draft) => !draft.saved && settings.providers.some((provider) => provider.id === draft.providerId));
     profiles = [...settings.profiles.map(profileDraft), ...unsaved];
-    actions = settings.actions.map(actionDraft);
+    actions = settings.actions.map((saved) => actionDraft(saved));
   }
 
   async function load(withProviders = true) {
     try {
       apply(await commands.llmSettings(), withProviders);
+      if (project) projectActions = (await commands.projectLlmActions(project.id)).map((saved) => actionDraft(saved, "project"));
       loadError = "";
     } catch (e) {
       loadError = String(e);
@@ -363,7 +373,7 @@
       await commands.deleteLlmProfile(draft.saved.id);
       profiles = profiles.filter((other) => other.uid !== draft.uid);
       // У действий с этим профилем он обнулился.
-      actions = (await commands.llmSettings()).actions.map(actionDraft);
+      actions = (await commands.llmSettings()).actions.map((saved) => actionDraft(saved));
     } catch (e) {
       draft.error = String(e);
       draft.busy = false;
@@ -385,9 +395,33 @@
 
   // Действия
 
-  /** Провайдер, которому уйдёт действие: свой профиль или первый в списке. */
+  /** Настройки того же действия в приложении: их берёт пустое поле проекта. */
+  function appAction(draft: ActionDraft) {
+    return actions.find((item) => item.saved.id === draft.saved.id)?.saved ?? null;
+  }
+
+  /** Профиль действия, если поле модели пустое. */
+  function fallbackProfile(draft: ActionDraft) {
+    const inherited = draft.scope === "project" ? appAction(draft)?.profile : null;
+    return savedProfiles.find((item) => item.id === inherited) ?? savedProfiles[0] ?? null;
+  }
+
+  function fallbackLabel(draft: ActionDraft) {
+    const profile = fallbackProfile(draft);
+    const base = draft.scope === "project" ? "Как в приложении" : "По умолчанию";
+    return profile ? `${base} (${profile.name})` : base;
+  }
+
+  /** Подсказка пустого поля: у проекта значение приложения, у приложения значение из кода. */
+  function fallbackNumber(draft: ActionDraft, field: "temperature" | "batchSize") {
+    const app = draft.scope === "project" ? appAction(draft) : null;
+    const value = app?.[field] ?? (field === "temperature" ? draft.saved.defaultTemperature : draft.saved.defaultBatchSize);
+    return String(value);
+  }
+
+  /** Провайдер, которому уйдёт действие: свой профиль или тот, что действует при пустом поле. */
   function actionProvider(draft: ActionDraft) {
-    const id = draft.profile || savedProfiles[0]?.id;
+    const id = draft.profile || fallbackProfile(draft)?.id;
     const profile = savedProfiles.find((item) => item.id === id);
     return savedProviders.find((provider) => provider.id === profile?.providerId) ?? null;
   }
@@ -406,8 +440,12 @@
     draft.busy = true;
     draft.error = "";
     try {
-      const saved = await commands.saveLlmAction(draft.saved.id, { profile: draft.profile || null, temperature, batchSize: batch });
-      Object.assign(draft, actionDraft(saved));
+      const settings = { profile: draft.profile || null, temperature, batchSize: batch };
+      const saved =
+        draft.scope === "project" && project
+          ? await commands.saveProjectLlmAction(project.id, draft.saved.id, settings)
+          : await commands.saveLlmAction(draft.saved.id, settings);
+      Object.assign(draft, actionDraft(saved, draft.scope));
     } catch (e) {
       draft.error = String(e);
     } finally {
@@ -633,7 +671,19 @@
           </div>
         {/if}
       {:else}
-        <p class="hint">Пустое поле значит значение по умолчанию. Здесь настройки всех проектов.</p>
+        {#if project}
+          <div class="segmented scope" role="tablist" aria-label="Чьи настройки">
+            <button role="tab" aria-selected={actionScope === "app"} class:on={actionScope === "app"} onclick={() => (actionScope = "app")}>Все проекты</button>
+            <button role="tab" aria-selected={actionScope === "project"} class:on={actionScope === "project"} onclick={() => (actionScope = "project")}
+              >Проект «{project.title}»</button
+            >
+          </div>
+        {/if}
+        <p class="hint">
+          {actionScope === "project"
+            ? "Пустое поле значит значение из настроек всех проектов. Здесь настройки только этого проекта"
+            : "Пустое поле значит значение по умолчанию. Здесь настройки всех проектов"}
+        </p>
         <div class="actions">
           <div class="actions-head">
             <span>Действие</span>
@@ -641,12 +691,12 @@
             <span>Температура</span>
             <span>Пакет</span>
           </div>
-          {#each actions as draft (draft.saved.id)}
+          {#each shownActions as draft (`${draft.scope}:${draft.saved.id}`)}
             {@const provider = actionProvider(draft)}
             <div class="action-row" class:busy={draft.busy}>
               <span class="action-title">{draft.saved.title}</span>
               <select class="input" bind:value={draft.profile} onchange={() => saveAction(draft)} aria-label={`Модель: ${draft.saved.title}`}>
-                <option value="">{savedProfiles[0] ? `По умолчанию (${savedProfiles[0].name})` : "По умолчанию"}</option>
+                <option value="">{fallbackLabel(draft)}</option>
                 {#each savedProfiles as profile (profile.id)}
                   <option value={profile.id}>{profile.name}</option>
                 {/each}
@@ -656,7 +706,7 @@
                 inputmode="decimal"
                 bind:value={draft.temperature}
                 onchange={() => saveAction(draft)}
-                placeholder={String(draft.saved.defaultTemperature)}
+                placeholder={fallbackNumber(draft, "temperature")}
                 disabled={provider !== null && !provider.takesTemperature}
                 title={provider !== null && !provider.takesTemperature ? "ChatGPT не принимает температуру" : ""}
                 aria-label={`Температура: ${draft.saved.title}`}
@@ -666,7 +716,7 @@
                 inputmode="numeric"
                 bind:value={draft.batch}
                 onchange={() => saveAction(draft)}
-                placeholder={String(draft.saved.defaultBatchSize)}
+                placeholder={fallbackNumber(draft, "batchSize")}
                 aria-label={`Размер пакета: ${draft.saved.title}`}
               />
               {#if draft.error}<p class="error-text wide">{draft.error}</p>{/if}
@@ -859,6 +909,10 @@
 
   .hint.warn-text {
     font-size: 11px;
+  }
+
+  .scope {
+    align-self: flex-start;
   }
 
   .actions {
