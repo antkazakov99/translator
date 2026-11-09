@@ -1,9 +1,9 @@
 import type { FileDto, FileScenesDto_Serialize, SceneItemDto_Serialize } from "./bindings";
 
 /**
- * Список сцен таблицы перевода: плоский, по файлам и внутри файла по сюжету. Реплики файла вне сцен идут
- * пунктом «Без сцены · файл» после сцен своего файла. Поиск идёт по названию и метке сцены и по пути файла:
- * в больших играх сотни сцен.
+ * Список сцен таблицы перевода: плоский, по алфавиту оригинального имени сцены (метки). Пункт показывает
+ * перевод названия, под ним оригинал. Реплики файла вне сцен идут в конце пунктами «Без сцены · файл».
+ * Поиск идёт по названию, метке и пути файла: в больших играх сотни сцен.
  */
 
 export type FileScenes = FileScenesDto_Serialize;
@@ -18,7 +18,12 @@ export interface SceneEntry {
   pick: ScenePick;
   scene: SceneItem;
   file: FileDto;
+  /** Полное имя для шапки и поиска: «Название · метка». */
   name: string;
+  /** Первая строка пункта: перевод названия, без него оригинал. */
+  title: string;
+  /** Вторая строка: оригинальное имя, когда в первой перевод. */
+  original: string | null;
 }
 
 /** Подпись псевдосцены с репликами вне сцен. */
@@ -42,14 +47,25 @@ export function sceneItemName(scene: Pick<SceneItem, "key" | "title">, path?: st
   return scene.title ? `${scene.title} · ${label}` : label;
 }
 
-/** Все пункты списка по порядку файлов. */
+/** Сравнение имён без учёта регистра, числа внутри сравниваются как числа: `day2` раньше `day10`. */
+const byName = new Intl.Collator("en", { numeric: true, sensitivity: "base" }).compare;
+
+/** Все пункты списка: сцены по алфавиту оригинального имени, за ними «Без сцены» по имени файла. */
 export function sceneList(tree: FileScenes[]): SceneEntry[] {
-  return tree.flatMap((group) =>
-    group.scenes.map((scene) => {
+  const entries = tree.flatMap((group) =>
+    group.scenes.map((scene): SceneEntry => {
       const pick: ScenePick = scene.key ? { kind: "scene", key: scene.key } : { kind: "loose", file: group.file.id };
-      return { id: pickId(pick), pick, scene, file: group.file, name: sceneItemName(scene, group.file.path) };
+      const name = sceneItemName(scene, group.file.path);
+      const label = scene.key ? sceneLabel(scene.key) : null;
+      const title = label === null ? name : (scene.title ?? label);
+      return { id: pickId(pick), pick, scene, file: group.file, name, title, original: label !== null && scene.title ? label : null };
     }),
   );
+  const order = (entry: SceneEntry) => (entry.scene.key ? sceneLabel(entry.scene.key) : fileName(entry.file.path));
+  return entries.sort((a, b) => {
+    const loose = Number(a.pick.kind === "loose") - Number(b.pick.kind === "loose");
+    return loose !== 0 ? loose : byName(order(a), order(b));
+  });
 }
 
 /** Пункты, подходящие поиску: по названию, метке и пути файла, без учёта регистра. */
@@ -57,5 +73,5 @@ export function filterScenes(list: SceneEntry[], query: string): SceneEntry[] {
   const needle = query.trim().toLowerCase();
   if (!needle) return list;
   const has = (text: string | null | undefined) => !!text && text.toLowerCase().includes(needle);
-  return list.filter((entry) => has(entry.name) || (entry.scene.key && has(entry.scene.key.replace(/^[a-z]+:/, ""))) || has(entry.file.path));
+  return list.filter((entry) => has(entry.name) || has(entry.file.path));
 }

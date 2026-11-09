@@ -8,7 +8,7 @@ const file = (id, path, scenes) => ({ file: { id, path, total: 10, translated: 5
 
 const tree = [
   file(1, "game/script.rpy", [scene("label:start", "Пробуждение"), scene("label:left"), scene(null)]),
-  file(2, "game/day2.rpy", [scene("label:beach", "Пляж"), scene("label:left_beach")]),
+  file(2, "game/day2.rpy", [scene("label:beach", "Пляж"), scene("label:left_beach"), scene(null)]),
 ];
 
 const names = (list) => list.map((entry) => entry.name);
@@ -26,11 +26,23 @@ test("pick ids tell a scene from loose lines of a file", () => {
   assert.notEqual(pickId({ kind: "loose", file: 3 }), pickId({ kind: "loose", file: 4 }));
 });
 
-test("the list is flat in file order with loose lines after the scenes of their file", () => {
+test("scenes go by their original name, loose lines last by file", () => {
   const list = sceneList(tree);
-  assert.deepEqual(names(list), ["Пробуждение · start", "left", "Без сцены · script.rpy", "Пляж · beach", "left_beach"]);
-  assert.deepEqual(list[2].pick, { kind: "loose", file: 1 });
-  assert.equal(list[3].file.id, 2);
+  assert.deepEqual(names(list), ["Пляж · beach", "left", "left_beach", "Пробуждение · start", "Без сцены · day2.rpy", "Без сцены · script.rpy"]);
+  assert.deepEqual(list[4].pick, { kind: "loose", file: 2 });
+});
+
+test("the translated title comes first and the original under it", () => {
+  const [beach, left] = sceneList(tree);
+  assert.deepEqual([beach.title, beach.original], ["Пляж", "beach"]);
+  assert.deepEqual([left.title, left.original], ["left", null], "без перевода только оригинал");
+  const loose = sceneList(tree).at(-1);
+  assert.deepEqual([loose.title, loose.original], ["Без сцены · script.rpy", null]);
+});
+
+test("numbers in names compare as numbers and case is ignored", () => {
+  const list = sceneList([file(1, "game/a.rpy", [scene("label:day10"), scene("label:Day2"), scene("label:day1")])]);
+  assert.deepEqual(names(list), ["day1", "Day2", "day10"]);
 });
 
 test("without a query everything stays", () => {
@@ -42,10 +54,10 @@ test("query matches titles, labels and loose lines", () => {
   const list = sceneList(tree);
   assert.deepEqual(names(filterScenes(list, "пляж")), ["Пляж · beach"]);
   assert.deepEqual(names(filterScenes(list, "LEFT")), ["left", "left_beach"]);
-  assert.deepEqual(names(filterScenes(list, "без сцены")), ["Без сцены · script.rpy"]);
+  assert.deepEqual(names(filterScenes(list, "без сцены")), ["Без сцены · day2.rpy", "Без сцены · script.rpy"]);
   assert.deepEqual(names(filterScenes(list, "label:")), [], "вид ключа не ищется");
 });
 
 test("a matching file path keeps the whole file", () => {
-  assert.deepEqual(names(filterScenes(sceneList(tree), "day2")), ["Пляж · beach", "left_beach"]);
+  assert.deepEqual(names(filterScenes(sceneList(tree), "day2")), ["Пляж · beach", "left_beach", "Без сцены · day2.rpy"]);
 });

@@ -13,7 +13,7 @@
     LoaderCircle,
     Package,
     RefreshCw,
-    SpellCheck,
+    SpellCheck,
     TriangleAlert,
     Undo2,
     Waypoints,
@@ -584,7 +584,10 @@
             title={entry.pick.kind === "loose" ? `${entry.file.path}: строки интерфейса, экраны, код вне меток` : `${entry.scene.key} · ${entry.file.path}`}
             onclick={() => select(entry.pick)}
           >
-            <span class="scene-name">{entry.name}</span>
+            <span class="scene-name">
+              <span class="scene-title">{entry.title}</span>
+              {#if entry.original}<span class="scene-original">{entry.original}</span>{/if}
+            </span>
             <span class="scene-percent" class:done={entry.scene.total > 0 && entry.scene.translated >= entry.scene.total}
               >{progressLabel(entry.scene.translated, entry.scene.total)}</span
             >
@@ -945,11 +948,25 @@
   }
 
   .scene-name {
+    display: flex;
     flex: 1;
+    flex-direction: column;
+    gap: 1px;
     min-width: 0;
+  }
+
+  .scene-title,
+  .scene-original {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* Оригинальное имя под переводом: мельче и тише, по нему идёт порядок списка. */
+  .scene-original {
+    color: var(--text-faint);
+    font-family: var(--font-mono);
+    font-size: 10px;
   }
 
   .scene-percent {
