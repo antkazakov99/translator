@@ -394,6 +394,63 @@ label west:
     /// пересборку из `files/` и повторное считывание той же версии без потерь и черновиков.
     #[test]
     #[ignore]
+    fn real_game_source_lines_point_to_their_segments() {
+        let Some(path) = std::env::var_os("TRANSLATOR_TEST_RESCAN_GAME") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(dir.path());
+        let root = crate::projects::ProjectService::resolve_root(Path::new(&path)).unwrap();
+        let id = project(&state, &root);
+        let open = state.open_project(id).unwrap();
+        let segments: Vec<(i64, String, String, Option<String>)> = open
+            .project
+            .read(|tx| {
+                let mut statement =
+                    tx.prepare("SELECT file_id, location, source_text, game_text FROM segments WHERE missing = 0 AND location IS NOT NULL")?;
+                let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        let mut by_file: HashMap<i64, Vec<(String, String, Option<String>)>> = HashMap::new();
+        for (file, location, source, game) in segments {
+            by_file.entry(file).or_default().push((location, source, game));
+        }
+        // Текст без экранирования и лишних пробелов: в файле кавычки и переводы строк записаны через `\`,
+        // а движок сворачивает пробелы в тексте реплики.
+        let plain = |text: &str| text.replace("\\n", " ").replace(['\\', '"', '\n'], " ").split_whitespace().collect::<Vec<_>>().join(" ");
+        let head = |text: &str| plain(text).chars().take(20).collect::<String>();
+        let scans = ScanService { state: &state };
+        let (mut checked, mut wrong) = (0, Vec::new());
+        let mut files: Vec<_> = by_file.into_iter().collect();
+        files.sort_by_key(|(file, _)| *file);
+        for (file, lines) in files {
+            let started = std::time::Instant::now();
+            let (path, source) = scans.source(id, FileId::from_row(file)).unwrap();
+            let elapsed = started.elapsed();
+            if elapsed.as_millis() > 500 {
+                eprintln!("{path}: {:?}, декомпилирован: {}", elapsed, source.decompiled);
+            }
+            let text: Vec<String> = source.text.lines().map(plain).collect();
+            for (location, original, game) in lines {
+                checked += 1;
+                let line = location.parse::<usize>().ok().and_then(|number| text.get(number.wrapping_sub(1)));
+                let found = line.is_some_and(|line| {
+                    line.contains(&head(&original)) || game.as_deref().is_some_and(|game| line.contains(&head(game)))
+                });
+                if !found {
+                    wrong.push(format!("{path}:{location} «{}» → {:?}", head(&original), line));
+                }
+            }
+        }
+        eprintln!("строк проверено: {checked}, не совпало: {}", wrong.len());
+        for item in wrong.iter().take(20) {
+            eprintln!("  {item}");
+        }
+        assert!(checked > 0);
+        assert!(wrong.is_empty(), "номер строки реплики не указывает на неё");
+    }
+
+    #[test]
+    #[ignore]
     fn real_game_keeps_every_translation_across_scans() {
         let Some(path) = std::env::var_os("TRANSLATOR_TEST_RESCAN_GAME") else { return };
         let dir = tempfile::tempdir().unwrap();

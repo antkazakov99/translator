@@ -314,8 +314,13 @@ pub(crate) fn source_text(file: &SnapshotFile, files: &[SnapshotFile], store: &F
         RpycParser::decompile_to_rpy_text(&RpycParser::parse_rpyc_bytes(&data).map_err(|error| unreadable(&error.to_string()))?)
     } else {
         // Перевод в .rpyc восстанавливается по репликам оригинала, как при считывании.
+        // Текст скриптов здесь не нужен: из скомпилированных берутся только реплики.
         let mut originals = HashMap::new();
-        script_texts(files, store, Some(&mut originals))?;
+        for script in files.iter().filter(|f| f.kind == FileKind::Script && f.path.ends_with(".rpyc")) {
+            if let Err(error) = RpycParser::collect_original_dialogue(&store.read(&script.hash)?, &mut originals) {
+                tracing::warn!(file = %script.path, %error, "Реплики оригинала не прочитаны");
+            }
+        }
         RpycParser::decompile_translation(&data, &originals).map_err(|error| unreadable(&error.to_string()))?
     };
     Ok(SourceText { text, decompiled: true })
