@@ -3,7 +3,7 @@
 use serde::Serialize;
 use tauri::AppHandle;
 
-use super::{MissingSegment, ScanReport, ScanService, SegmentId};
+use super::{FileId, MissingSegment, ScanReport, ScanService, SegmentId};
 use crate::common::AppError;
 use crate::projects::ProjectId;
 use crate::state::blocking;
@@ -87,6 +87,27 @@ pub async fn missing_lines(app: AppHandle, project: String) -> Result<Vec<Missin
 pub async fn attach_missing_line(app: AppHandle, project: String, missing: RowRef, target: RowRef) -> Result<(), String> {
     blocking(app, move |state| {
         ScanService { state }.attach_missing(self::project(&project)?, SegmentId::from_row(missing.0), SegmentId::from_row(target.0))
+    })
+    .await
+}
+
+/// Текст файла снимка для просмотра исходника.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFileDto {
+    pub path: String,
+    pub text: String,
+    /// Восстановлен из скомпилированного файла: так его видит приложение, а не автор игры.
+    pub decompiled: bool,
+}
+
+/// Текст скрипта или файла перевода текущего снимка. Номера строк совпадают с `location` реплик.
+#[tauri::command]
+#[specta::specta]
+pub async fn source_file(app: AppHandle, project: String, file: RowRef) -> Result<SourceFileDto, String> {
+    blocking(app, move |state| {
+        let (path, source) = ScanService { state }.source(self::project(&project)?, FileId::from_row(file.0))?;
+        Ok(SourceFileDto { path, text: source.text, decompiled: source.decompiled })
     })
     .await
 }

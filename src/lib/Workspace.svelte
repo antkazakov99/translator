@@ -7,6 +7,7 @@
     Check,
     CheckCheck,
     Eraser,
+    FileCode,
     FileText,
     History,
     Languages,
@@ -24,6 +25,7 @@
   import ModPanel from "./ModPanel.svelte";
   import ScanPanel from "./ScanPanel.svelte";
   import SceneGraph from "./SceneGraph.svelte";
+  import SourceViewer from "./SourceViewer.svelte";
   import { progressLabel, progressPercent } from "./progress";
   import type { GraphScene } from "$lib/scene-graph";
   import {
@@ -61,6 +63,8 @@
   let scanOpen = $state(false);
   /** Сцена в центре графа: переживает переключение вида. */
   let graphFocus = $state<string | null>(null);
+  /** Открытый исходник: файл снимка и строка. */
+  let viewing = $state<{ file: number; line: number | null } | null>(null);
 
   type RunMode = "translate" | "review";
   /** Запуск модели из этого окна: перевод или редактура. */
@@ -362,6 +366,13 @@
     header?.scrollIntoView({ block: "start" });
   }
 
+  /** Исходник файла таблицы на строке реплики. */
+  function viewSource(line: string | null | undefined) {
+    if (fileId === null) return;
+    const number = Number.parseInt(line ?? "", 10);
+    viewing = { file: fileId, line: Number.isFinite(number) && number > 0 ? number : null };
+  }
+
   /** Из таблицы в граф: сцена в центре. */
   function showOnGraph(key: string | null) {
     if (!key) return;
@@ -471,6 +482,10 @@
               <span>Подтвердить модель · {fileDrafts.length}</span>
             </button>
           {/if}
+          <button class="btn small" title="Текст файла с подсветкой и поиском" onclick={() => viewSource(null)}>
+            <FileCode size={14} />
+            <span>Исходник</span>
+          </button>
           <button class="btn small" title="Последние запуски перевода и редактуры: их можно откатить" onclick={toggleRuns}>
             <History size={14} />
             <span>Запуски</span>
@@ -607,6 +622,9 @@
                 <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(scene.key)}>
                   <Waypoints size={13} />
                 </button>
+                <button class="icon-button" aria-label="Сцена в исходнике" title="Сцена в исходнике" onclick={() => viewSource(scene.lines[0]?.location)}>
+                  <FileCode size={13} />
+                </button>
                 {#if run === null && scenes.find((item) => item.key === scene.key)?.lines.some((line) => line.state === "empty")}
                   <button
                     class="icon-button"
@@ -631,7 +649,11 @@
             </h3>
             {#each scene.lines as line (line.id)}
               <div class="row" class:editing={editing?.id === line.id}>
-                <span class="where">{line.location ?? ""}</span>
+                {#if line.location}
+                  <button class="where" title="Строка {line.location} в исходнике" onclick={() => viewSource(line.location)}>{line.location}</button>
+                {:else}
+                  <span class="where"></span>
+                {/if}
                 <span class="speaker" title={line.speaker ?? "Рассказчик"}>{line.speaker ?? ""}</span>
                 <span class="source">{line.sourceText}</span>
                 <div class="target">
@@ -671,6 +693,10 @@
   </div>
   {/if}
 </main>
+
+{#if viewing}
+  <SourceViewer projectId={project.id} files={files.map((item) => ({ id: item.id, path: item.path }))} file={viewing.file} line={viewing.line} onClose={() => (viewing = null)} />
+{/if}
 
 <style>
   .workspace {
@@ -882,10 +908,23 @@
   }
 
   .where {
-    padding-top: 2px;
+    padding: 2px 0 0;
+    border: 0;
+    background: none;
     color: var(--text-ghost);
+    font: inherit;
     font-size: 10px;
     text-align: right;
+  }
+
+  button.where {
+    align-self: start;
+    cursor: pointer;
+  }
+
+  button.where:hover {
+    color: var(--accent-text);
+    text-decoration: underline;
   }
 
   .speaker {

@@ -15,7 +15,7 @@ use super::script::{OUTSIDE_LABELS, RenpyParser, ScriptStructure};
 use super::{TL_LANG, collect_game_files};
 use crate::engines::{
     ContainerKey, EngineError, FileKind, GameInfo, GameSnapshot, SegmentKey, SnapshotContainer, SnapshotFile,
-    SnapshotEdge, SnapshotSegment, SnapshotSpeaker, SpeakerKey,
+    SnapshotEdge, SnapshotSegment, SnapshotSpeaker, SourceText, SpeakerKey,
 };
 use crate::files::{ContentHash, FileStore};
 use crate::projects::GameRoot;
@@ -298,6 +298,27 @@ fn translations_and_scripts<'a>(
         sources.push((file, text));
     }
     Ok((sources, texts))
+}
+
+/// Текст одного файла для просмотра: тот же, по которому считаны номера строк реплик.
+pub(crate) fn source_text(file: &SnapshotFile, files: &[SnapshotFile], store: &FileStore) -> Result<SourceText, EngineError> {
+    let unreadable = |reason: &str| EngineError::Format { path: file.path.clone(), reason: reason.to_string() };
+    if !matches!(file.kind, FileKind::Script | FileKind::Translation) || !is_script(&file.path) {
+        return Err(unreadable("это не скрипт"));
+    }
+    if !file.path.ends_with(".rpyc") {
+        return Ok(SourceText { text: decode_text(&store.read(&file.hash)?), decompiled: false });
+    }
+    let data = store.read(&file.hash)?;
+    let text = if file.kind == FileKind::Script {
+        RpycParser::decompile_to_rpy_text(&RpycParser::parse_rpyc_bytes(&data).map_err(|error| unreadable(&error.to_string()))?)
+    } else {
+        // Перевод в .rpyc восстанавливается по репликам оригинала, как при считывании.
+        let mut originals = HashMap::new();
+        script_texts(files, store, Some(&mut originals))?;
+        RpycParser::decompile_translation(&data, &originals).map_err(|error| unreadable(&error.to_string()))?
+    };
+    Ok(SourceText { text, decompiled: true })
 }
 
 pub(crate) fn analyze(files: Vec<SnapshotFile>, store: &FileStore, info: &GameInfo) -> Result<GameSnapshot, EngineError> {

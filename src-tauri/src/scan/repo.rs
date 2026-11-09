@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{MatchPlan, MatchSegment, MissingSegment, Scan, ScanId, ScanReport, SegmentId};
+use super::{FileId, MatchPlan, MatchSegment, MissingSegment, Scan, ScanId, ScanReport, SegmentId};
 use crate::common::Timestamp;
 use crate::engines::{ContainerKey, FileKind, GameInfo, GameSnapshot, SegmentKey, SnapshotEdge, SnapshotFile, SnapshotSegment};
 use crate::files::ContentHash;
@@ -76,6 +76,18 @@ impl ScanRepo<'_> {
             parser_version,
             game_info,
         }))
+    }
+
+    /// Путь файла, если строка из текущего снимка.
+    pub fn current_path(&self, file: FileId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT path FROM files WHERE id = ?1 AND last_seen_scan = (SELECT max(id) FROM scans)",
+                [file.get()],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// Файлы текущего снимка: для пересборки из `files/` и сборки мода.

@@ -122,6 +122,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             unbind_project,
             rebind_project,
             rescan_game,
+            source_file,
             missing_lines,
             attach_missing_line,
             game_fonts,

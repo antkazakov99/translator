@@ -167,6 +167,8 @@ export const commands = {
 	rebindProject: (id: string, root: string, confirmed: boolean) => __TAURI_INVOKE<RebindDto_Serialize>("rebind_project", { id, root, confirmed }),
 	/**  Считывает привязанную папку игры заново и переносит перевод на новую версию. */
 	rescanGame: (project: string) => __TAURI_INVOKE<ScanReportDto>("rescan_game", { project }),
+	/**  Текст скрипта или файла перевода текущего снимка. Номера строк совпадают с `location` реплик. */
+	sourceFile: (project: string, file: RowRef) => __TAURI_INVOKE<SourceFileDto>("source_file", { project, file }),
 	missingLines: (project: string) => __TAURI_INVOKE<MissingLineDto_Serialize[]>("missing_lines", { project }),
 	/**  Переносит перевод пропавшей реплики на реплику игры. */
 	attachMissingLine: (project: string, missing: RowRef, target: RowRef) => __TAURI_INVOKE<null>("attach_missing_line", { project, missing, target }),
@@ -1025,6 +1027,14 @@ export type ScopeDto =
 { kind: "scenes"; keys: string[] } | { kind: "file"; file: RowRef } | { kind: "line"; line: RowRef } | 
 /**  Все файлы проекта. */
 { kind: "project" };
+
+/**  Текст файла снимка для просмотра исходника. */
+export type SourceFileDto = {
+	path: string,
+	text: string,
+	/**  Восстановлен из скомпилированного файла: так его видит приложение, а не автор игры. */
+	decompiled: boolean,
+};
 
 /**  Говорящий текущего снимка. */
 export type SpeakerDto = SpeakerDto_Serialize | SpeakerDto_Deserialize;

@@ -53,6 +53,14 @@ pub enum EngineError {
     Build(String),
 }
 
+/// Текст файла для просмотра исходника.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceText {
+    pub text: String,
+    /// Текст восстановлен из скомпилированного файла, а не взят как есть.
+    pub decompiled: bool,
+}
+
 /// Что движок узнал при распознавании и что нужно для сборки мода без папки игры.
 /// У Ren'Py в `details`: формат `.rpyc` и раскладка `AstLayout`, предлагает ли игра сама переключить язык.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -268,6 +276,10 @@ pub trait GameEngine: Sync {
 
     /// Файлы, от которых зависит разбор `file`. По их хэшам cache.db видит, что разбор устарел.
     fn parse_dependencies(&self, file: &SnapshotFile, all: &[SnapshotFile]) -> Vec<String>;
+
+    /// Текст скрипта или файла перевода снимка для просмотра. Номера строк совпадают с `SnapshotSegment::location`.
+    /// Файл, который движок не показывает текстом, даёт `EngineError::Format`.
+    fn source_text(&self, file: &SnapshotFile, files: &[SnapshotFile], store: &FileStore) -> Result<SourceText, EngineError>;
 
     /// Шрифты игры по файлам снимка: упоминания в скриптах и то, что помешает замене.
     fn fonts(&self, files: &[SnapshotFile], store: &FileStore) -> Result<Vec<EngineFont>, EngineError>;

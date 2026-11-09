@@ -20,7 +20,7 @@ use regex::Regex;
 
 use super::{
     EngineError, EngineFont, EngineId, FileKind, GameEngine, GameInfo, GameSnapshot, GameSource, ModArchive, ModInput,
-    SnapshotEdge, SnapshotFile,
+    SnapshotEdge, SnapshotFile, SourceText,
 };
 use crate::files::FileStore;
 use crate::projects::GameRoot;
@@ -100,6 +100,11 @@ impl GameEngine for RenpyEngine {
     }
 
     /// Шрифты вне `tl/`. Замена ляжет в `tl/<язык>` мода под тем же путём.
+    /// `.rpy` как есть, `.rpyc` декомпилирован тем же путём, что при считывании.
+    fn source_text(&self, file: &SnapshotFile, files: &[SnapshotFile], store: &FileStore) -> Result<SourceText, EngineError> {
+        snapshot::source_text(file, files, store)
+    }
+
     fn fonts(&self, files: &[SnapshotFile], store: &FileStore) -> Result<Vec<EngineFont>, EngineError> {
         fonts::game_fonts(files, store)
     }

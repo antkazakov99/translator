@@ -1,8 +1,8 @@
 //! Повторное считывание и пересборка снимка.
 
-use super::{EdgeRepo, MatchSegment, Matcher, MissingSegment, ScanReport, ScanRepo, SegmentId};
+use super::{EdgeRepo, FileId, MatchSegment, Matcher, MissingSegment, ScanReport, ScanRepo, SegmentId};
 use crate::common::{AppError, ValidationError};
-use crate::engines::{self, GameEngine, GameSnapshot, GameSource};
+use crate::engines::{self, GameEngine, GameSnapshot, GameSource, SourceText};
 use crate::projects::{GameRoot, ProjectId, ProjectInfoRepo, ProjectRepo};
 use crate::state::{AppState, OpenProject};
 use crate::storage::DbError;
@@ -29,6 +29,21 @@ impl ScanService<'_> {
         // Долго и вне транзакции: файлы пишутся в files/ по мере чтения.
         let snapshot = engine.read(&GameSource::Folder(root.clone()), &info, &open.files)?;
         Self::apply(&open, engine, &snapshot, Some(&root))
+    }
+
+    /// Текст файла текущего снимка для просмотра исходника. Папка игры не нужна.
+    pub fn source(&self, project: ProjectId, file: FileId) -> Result<(String, SourceText), AppError> {
+        let open = self.state.open_project(project)?;
+        let _lock = open.snapshot_lock.lock();
+        let (info, path, files) = open.project.read(|tx| {
+            let repo = ScanRepo { conn: tx };
+            Ok((ProjectInfoRepo { conn: tx }.get()?, repo.current_path(file)?, repo.current_files()?))
+        })?;
+        let path = path.ok_or(AppError::Db(DbError::NotFound))?;
+        let current = files.iter().find(|item| item.path == path).ok_or(AppError::Db(DbError::NotFound))?;
+        let engine = engines::by_id(info.engine).ok_or(AppError::UnsupportedEngine(info.engine))?;
+        // Долго для .rpyc перевода: декомпилируются все скрипты. Вне транзакции.
+        Ok((path, engine.source_text(current, &files, &open.files)?))
     }
 
     /// Пересобирает снимок из `files/` последнего считывания, без папки игры. `GameInfo` берётся из того же считывания.
@@ -320,6 +335,33 @@ label west:
         assert_eq!(translation(&state, id, line(&state, id, "Narration.")), Some(("Рассказ.".into(), false)));
         assert_eq!(scalar(&state, id, "SELECT count(*) FROM scans WHERE game_root IS NULL"), 1);
         assert!(matches!(scans.rescan(id), Err(AppError::GameMissing)));
+    }
+
+    #[test]
+    fn source_shows_the_file_lines_point_to_without_the_game() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state(&dir.path().join("data"));
+        let root = game(&dir.path().join("Game"), SCRIPT);
+        let id = project(&state, &root);
+        std::fs::remove_dir_all(root.as_path()).unwrap();
+
+        let (file, location) = state
+            .open_project(id)
+            .unwrap()
+            .project
+            .read(|tx| {
+                Ok(tx.query_row("SELECT file_id, location FROM segments WHERE source_text = 'Narration.'", [], |row| {
+                    Ok((FileId::from_row(row.get(0)?), row.get::<_, String>(1)?))
+                })?)
+            })
+            .unwrap();
+        let scans = ScanService { state: &state };
+        let (path, source) = scans.source(id, file).unwrap();
+        assert_eq!(path, "game/script.rpy");
+        assert!(!source.decompiled);
+        let line: usize = location.parse().unwrap();
+        assert_eq!(source.text.lines().nth(line - 1).map(str::trim), Some("\"Narration.\""), "номер строки реплики указывает на неё");
+        assert!(matches!(scans.source(id, FileId::from_row(9999)), Err(AppError::Db(DbError::NotFound))));
     }
 
     #[test]
