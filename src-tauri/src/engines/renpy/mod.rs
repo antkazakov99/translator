@@ -29,7 +29,8 @@ use crate::projects::GameRoot;
 pub struct RenpyEngine;
 
 /// Версия разбора: заменяет `CACHE_VERSION` из `rpa.rs`. Выросла: снимок пересобирается из `files/`.
-const PARSER_VERSION: u32 = 1;
+/// 2: строка `old` в строковом переводе получает свой номер строки, а не номер из комментария над ней.
+const PARSER_VERSION: u32 = 2;
 
 /// Версия сборки переходов между метками (`scenes::scene_edges`). Выросла: таблица `edges` пересобирается.
 const EDGES_VERSION: u32 = 1;

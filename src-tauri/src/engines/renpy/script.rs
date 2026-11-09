@@ -129,10 +129,6 @@ static RE_CODE_STRING: LazyLock<Regex> = LazyLock::new(|| {
 
 static RE_REPEATED_SPACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(" {2,}").unwrap());
 
-static RE_SOURCE_COMMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^\s*#\s*(?:game[/\\])?(?P<file>.+?\.rpy):(?P<line>\d+)"#).unwrap()
-});
-
 static RE_LABEL_HASH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"_[0-9a-fA-F]{6,10}(?:_\d+)*$"#).unwrap());
 
@@ -955,7 +951,6 @@ impl RenpyParser {
         let mut in_block = false;
         let mut current_block_id: Option<String> = None;
         let mut current_scene_name: Option<String> = None;
-        let mut pending_comment_line: Option<usize> = None;
         let mut pending_old: Option<(String, usize)> = None;
         let mut pending_source: Option<(Option<String>, String, usize)> = None;
         let mut last_node_idx = None;
@@ -1001,17 +996,10 @@ impl RenpyParser {
             }
 
             if in_strings {
-                if let Some(caps) = RE_SOURCE_COMMENT.captures(line) {
-                    if let Ok(line_val) = caps.name("line").unwrap().as_str().parse::<usize>() {
-                        pending_comment_line = Some(line_val);
-                    }
-                    continue;
-                }
-
                 if let Some(caps) = RE_OLD.captures(line) {
                     let text = Self::unescape_renpy_string(caps.name("text").unwrap().as_str());
-                    let src_line = pending_comment_line.take().unwrap_or(line_num);
-                    pending_old = (!text.trim().is_empty()).then_some((text, src_line));
+                    // Строка `old` в этом файле. Комментарий над ней указывает строку в другом файле игры.
+                    pending_old = (!text.trim().is_empty()).then_some((text, line_num));
                 } else if let Some(caps) = RE_NEW.captures(line)
                     && let Some((old_text, old_line)) = pending_old.take()
                 {
@@ -1331,6 +1319,17 @@ translate russian strings:
             "Дублирующиеся строки UI должны быть схлопнуты в 1 запись"
         );
         assert_eq!(translated, 1);
+    }
+
+    #[test]
+    fn string_line_is_the_old_line_of_this_file() {
+        let rpy = "translate russian strings:\n\n    # renpy/common/00gui.rpy:450\n    old \"Are you sure?\"\n    new \"Вы уверены?\"\n";
+        let graph = RenpyParser::new().parse_file(Path::new("common.rpy"), rpy).unwrap();
+        let lines: Vec<(usize, Vec<usize>)> = graph
+            .node_indices()
+            .filter_map(|idx| graph.get_node(idx)?.as_dialogue().map(|d| (d.line_number, d.target_lines.clone())))
+            .collect();
+        assert_eq!(lines, [(4, vec![5])], "номер из комментария указывает в другой файл");
     }
 
     #[test]
