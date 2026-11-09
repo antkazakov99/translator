@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ChevronDown, ChevronRight, Eraser, LoaderCircle, Sparkles, TriangleAlert } from "lucide-svelte";
+  import { ChevronDown, ChevronRight, Eraser, LoaderCircle, Sparkles, TriangleAlert, X } from "lucide-svelte";
   import { commands, type PartNoteDto_Serialize as PartNote, type SceneDto_Serialize as Scene } from "./bindings";
   import { sceneItemName } from "./scene-tree";
 
@@ -12,6 +12,7 @@
     describing,
     onDescribe,
     onSaved,
+    onClose,
     onError,
   }: {
     projectId: string;
@@ -25,6 +26,8 @@
     describing: boolean;
     onDescribe: (key: string) => void;
     onSaved: (key: string, title: string | null, description: string | null) => void;
+    /** Скрыть боковую панель. */
+    onClose: () => void;
     onError: (message: string) => void;
   } = $props();
 
@@ -107,6 +110,7 @@
       {#if describing}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
       <span>Описать</span>
     </button>
+    <button class="icon-button" aria-label="Скрыть описание сцены" title="Скрыть описание сцены" onclick={onClose}><X size={14} /></button>
   </div>
 
   {#if stale}
@@ -121,7 +125,7 @@
     <label class="field"
       >Описание<textarea
         class="input"
-        rows="3"
+        rows="8"
         bind:value={draftDescription}
         onchange={save}
         placeholder="Что происходит, кто участвует, на «ты» или на «вы». Уходит модели в каждом запросе перевода сцены"
@@ -170,7 +174,7 @@
 
 <style>
   .scene-card {
-    margin-bottom: 12px;
+    flex: 0 0 auto;
   }
 
   .scene-card.saving {
@@ -180,11 +184,12 @@
   .card-head {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 8px;
+    gap: 6px;
   }
 
   .card-head strong {
+    flex: 1;
+    min-width: 0;
     overflow: hidden;
     color: var(--text-strong);
     font-size: 13px;
@@ -193,10 +198,9 @@
   }
 
   .fields {
-    display: grid;
-    grid-template-columns: minmax(160px, 1fr) minmax(0, 3fr);
+    display: flex;
+    flex-direction: column;
     gap: 10px;
-    align-items: start;
   }
 
   textarea {

@@ -14,6 +14,7 @@
     Languages,
     LoaderCircle,
     Package,
+    PanelRight,
     RefreshCw,
     SlidersHorizontal,
     Sparkles,
@@ -87,6 +88,18 @@
   /** Сцены, отмеченные для группового описания. По умолчанию ничего: чтение всей игры дорого. */
   let marked = $state<string[]>([]);
   let depthOpen = $state(false);
+  /** Боковая панель с описанием сцены: открыта, пока её не скрыли. Помнится до закрытия окна. */
+  let sideOpen = $state(true);
+  const SIDE_KEY = "translator.scene-side";
+
+  function setSide(open: boolean) {
+    sideOpen = open;
+    try {
+      sessionStorage.setItem(SIDE_KEY, open ? "open" : "closed");
+    } catch {
+      // Без хранилища выбор просто не запомнится.
+    }
+  }
   /** Описание сцен моделью: одна сцена из карточки или отмеченные. */
   const describe = new WriteRun("Описания");
 
@@ -123,6 +136,9 @@
   const order = $derived(shown.flatMap((scene) => scene.lines.map((line) => line.id)));
   const filtered = $derived(filterTree(tree, query));
   const searching = $derived(query.trim() !== "");
+  /** Сцены, которые сейчас показывает список: их отмечает общий флажок. */
+  const shownKeys = $derived(filtered.groups.flatMap((entry) => markable(entry.scenes)));
+  const shownMarks = $derived(markState(shownKeys));
   /** Карточка описания есть только у настоящей сцены. */
   const described = $derived(selected?.kind === "scene" ? (scenes[0] ?? null) : null);
 
@@ -143,6 +159,11 @@
   }
 
   onMount(async () => {
+    try {
+      sideOpen = sessionStorage.getItem(SIDE_KEY) !== "closed";
+    } catch {
+      sideOpen = true;
+    }
     await loadTree();
     let saved: ScenePick | null = null;
     try {
@@ -467,6 +488,32 @@
     marked = on ? [...marked, key] : marked.filter((item) => item !== key);
   }
 
+  /** Отмечает или снимает сразу несколько сцен: файл целиком или все показанные. */
+  function setMarks(keys: string[], on: boolean) {
+    const set = new Set(marked);
+    for (const key of keys) {
+      if (on) set.add(key);
+      else set.delete(key);
+    }
+    marked = [...set];
+  }
+
+  /** Сцены, которые можно отметить: «Без сцены» не описывается. */
+  function markable(scenes: SceneItem[]) {
+    return scenes.flatMap((scene) => (scene.key ? [scene.key] : []));
+  }
+
+  /** Отмечены все, часть или ни одной: по этому рисуется общий флажок. */
+  function markState(keys: string[]): "all" | "some" | "none" {
+    const count = keys.filter((key) => marked.includes(key)).length;
+    return count === 0 ? "none" : count === keys.length ? "all" : "some";
+  }
+
+  /** Флажок «часть отмечена» задаётся только свойством, не атрибутом. */
+  const partly = (on: boolean) => (node: HTMLInputElement) => {
+    node.indeterminate = on;
+  };
+
   function describedNotice(written: number, stopped: boolean) {
     const text = `Описано сцен: ${written}`;
     return stopped ? `Остановлено. ${text}` : text;
@@ -578,6 +625,15 @@
       <div class="scenes-head">
         <input class="input" placeholder="Поиск по названию и метке" bind:value={query} aria-label="Поиск сцен" />
         <div class="describe-row">
+          <input
+            type="checkbox"
+            checked={shownMarks === "all"}
+            disabled={shownKeys.length === 0}
+            {@attach partly(shownMarks === "some")}
+            onchange={() => setMarks(shownKeys, shownMarks !== "all")}
+            aria-label={searching ? "Отметить все найденные сцены" : "Отметить все сцены"}
+            title={shownMarks === "all" ? "Снять отметки со всех показанных сцен" : searching ? "Отметить все найденные сцены" : "Отметить все сцены"}
+          />
           <button class="btn small" class:active={depthOpen} title="Сколько частей читает модель для описаний" onclick={() => (depthOpen = !depthOpen)}>
             <SlidersHorizontal size={13} />
             <span>Глубина</span>
@@ -597,8 +653,22 @@
           {@const file = entry.group.file}
           {@const open = searching || expanded.includes(file.id)}
           {@const empty = file.total - file.translated}
+          {@const keys = markable(entry.scenes)}
+          {@const marks = markState(keys)}
           <div class="group" class:current={group?.file.id === file.id}>
             <div class="group-head">
+              {#if keys.length > 0}
+                <input
+                  type="checkbox"
+                  checked={marks === "all"}
+                  {@attach partly(marks === "some")}
+                  onchange={() => setMarks(keys, marks !== "all")}
+                  aria-label="Отметить все сцены файла {fileName(file.path)}"
+                  title={marks === "all" ? "Снять отметки со сцен файла" : searching ? "Отметить найденные сцены файла" : "Отметить все сцены файла"}
+                />
+              {:else}
+                <span class="no-mark"></span>
+              {/if}
               <button class="group-toggle" aria-expanded={open} title={file.path} onclick={() => toggleGroup(file.id)}>
                 {#if open}<ChevronDown size={13} />{:else}<ChevronRight size={13} />{/if}
                 <span class="group-name">{fileName(file.path)}</span>
@@ -702,6 +772,14 @@
           {/if}
           {#if selected.kind === "scene"}
             {@const key = selected.key}
+            <button
+              class="icon-button"
+              class:active={sideOpen}
+              aria-pressed={sideOpen}
+              aria-label="Описание сцены"
+              title={sideOpen ? "Скрыть описание сцены" : "Показать описание сцены"}
+              onclick={() => setSide(!sideOpen)}><PanelRight size={14} /></button
+            >
             <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(key)}><Waypoints size={14} /></button>
           {/if}
           <button
@@ -839,19 +917,6 @@
         <div class="empty"><LoaderCircle size={20} class="spin" /></div>
       {:else}
         <div class="table">
-          {#if described?.key}
-            <SceneCard
-              projectId={project.id}
-              scene={described}
-              sceneKey={described.key}
-              stale={item?.stale ?? false}
-              {busy}
-              describing={describe.active}
-              onDescribe={describeOne}
-              onSaved={patchScene}
-              onError={(message) => (error = message)}
-            />
-          {/if}
           {#if shown.length === 0}
             <div class="no-lines">{filter === "all" ? "В сцене нет реплик" : "Таких реплик нет"}</div>
           {/if}
@@ -902,6 +967,23 @@
         </div>
       {/if}
     </section>
+
+    {#if described?.key && sideOpen && !loadingLines}
+      <aside class="scene-side" aria-label="Описание сцены">
+        <SceneCard
+          projectId={project.id}
+          scene={described}
+          sceneKey={described.key}
+          stale={item?.stale ?? false}
+          {busy}
+          describing={describe.active}
+          onDescribe={describeOne}
+          onSaved={patchScene}
+          onClose={() => setSide(false)}
+          onError={(message) => (error = message)}
+        />
+      </aside>
+    {/if}
   </div>
   {/if}
 </main>
@@ -1001,7 +1083,7 @@
 
   .group-head {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: 13px minmax(0, 1fr) auto;
     gap: 4px 6px;
     align-items: center;
     padding: 6px 4px 6px 2px;
@@ -1014,7 +1096,7 @@
 
   .group-toggle {
     display: flex;
-    grid-column: 1 / -1;
+    grid-column: 2 / -1;
     align-items: center;
     gap: 4px;
     min-width: 0;
@@ -1039,6 +1121,7 @@
   }
 
   .group-head .progress-line {
+    grid-column: 2;
     padding-left: 17px;
   }
 
@@ -1057,6 +1140,15 @@
     gap: 6px;
     align-items: center;
     padding-left: 17px;
+  }
+
+  .group-head input,
+  .scene-item input,
+  .describe-row input {
+    width: 13px;
+    height: 13px;
+    margin: 0;
+    flex: 0 0 auto;
   }
 
   .no-mark {
@@ -1135,6 +1227,18 @@
     font-size: 10px;
     font-style: normal;
     white-space: nowrap;
+  }
+
+  .scene-side {
+    display: flex;
+    flex-direction: column;
+    width: 320px;
+    flex: 0 0 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px;
+    border-left: 1px solid var(--divider);
+    background: var(--surface-side);
   }
 
   .lines {
@@ -1406,5 +1510,21 @@
 
   .run-state.failed {
     color: var(--danger-banner);
+  }
+
+  /* На узком окне три колонки делят место: список и панель сужаются, реплики остаются читаемыми. */
+  @media (max-width: 1180px) {
+    .scenes {
+      width: 250px;
+    }
+
+    .scene-side {
+      width: 260px;
+    }
+
+    .row {
+      grid-template-columns: 36px 84px minmax(0, 1fr) minmax(0, 1fr) 76px;
+      gap: 8px;
+    }
   }
 </style>
