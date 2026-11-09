@@ -1,6 +1,9 @@
 <script lang="ts">
-  import { ChevronDown, ChevronRight, Eraser, LoaderCircle, SlidersHorizontal, Sparkles, TriangleAlert, X } from "lucide-svelte";
+  import { onMount } from "svelte";
+  import { ChevronDown, ChevronRight, Eraser, LoaderCircle, Sparkles, TriangleAlert } from "lucide-svelte";
+  import RequestSlider from "./RequestSlider.svelte";
   import { commands, type PartNoteDto_Serialize as PartNote, type SceneDto_Serialize as Scene } from "./bindings";
+  import { DEFAULT_READING_DEPTH, partsFor, type ReadingDepth } from "./reading-depth";
 
   let {
     projectId,
@@ -9,13 +12,8 @@
     stale,
     busy,
     describing,
-    fileScenes,
-    depthOpen,
     onDescribe,
-    onDescribeFile,
-    onDepth,
     onSaved,
-    onClose,
     onError,
   }: {
     projectId: string;
@@ -27,16 +25,9 @@
     /** Модель занята другим запуском. */
     busy: boolean;
     describing: boolean;
-    /** Сколько сцен в файле открытой сцены: их описывает «Описать сцены файла». */
-    fileScenes: number;
-    /** Открыта карточка глубины чтения. */
-    depthOpen: boolean;
-    onDescribe: (key: string) => void;
-    onDescribeFile: () => void;
-    onDepth: () => void;
+    /** Описать сцену по `parts` частям. */
+    onDescribe: (key: string, parts: number) => void;
     onSaved: (key: string, title: string | null, description: string | null) => void;
-    /** Скрыть боковую панель. */
-    onClose: () => void;
     onError: (message: string) => void;
   } = $props();
 
@@ -46,6 +37,18 @@
   let notesOpen = $state(false);
   let notes = $state<PartNote[] | null>(null);
   let confirmReset = $state(false);
+  /** Глубина чтения проекта: по ней ставится число частей, пока его не сдвинули. */
+  let depth = $state<ReadingDepth>(DEFAULT_READING_DEPTH);
+  /** Сколько частей прочитает «Описать». `null`: по глубине чтения проекта. */
+  let picked = $state<number | null>(null);
+
+  onMount(async () => {
+    try {
+      depth = await commands.readingDepth(projectId);
+    } catch (e) {
+      onError(String(e));
+    }
+  });
 
   /** Что последним пришло из базы: поля перезаписываются, только когда это меняется, а не на каждый перечит реплик. */
   let seen = { key: "", title: null as string | null, description: null as string | null };
@@ -56,12 +59,15 @@
     const description = scene.description ?? null;
     const other = key !== seen.key;
     if (other || title !== seen.title) draftTitle = title ?? "";
+    if (other) {
+      picked = null;
+      notes = null;
+    }
     if (other || description !== seen.description) {
       draftDescription = description ?? "";
       confirmReset = false;
-      // Новое описание значит новые заметки: открытый список перечитывается.
-      if (notesOpen) loadNotes(key);
-      else notes = null;
+      // Части нужны слайдеру, а новое описание значит новые заметки.
+      loadNotes(key);
     }
     seen = { key, title, description };
   });
@@ -77,7 +83,6 @@
 
   function toggleNotes() {
     notesOpen = !notesOpen;
-    if (notesOpen && notes === null) loadNotes(sceneKey);
   }
 
   async function save() {
@@ -105,34 +110,11 @@
   }
 
   const read = $derived(notes?.filter((part) => part.note !== null).length ?? 0);
+  const total = $derived(notes?.length ?? 0);
+  const parts = $derived(Math.min(picked ?? partsFor(depth, total), total));
 </script>
 
 <div class="scene-card" class:saving>
-  <div class="card-head">
-    <button
-      class="btn small"
-      disabled={busy}
-      title={busy ? "Модель уже работает" : "Модель прочитает всю сцену и заменит описание"}
-      onclick={() => onDescribe(sceneKey)}
-    >
-      {#if describing}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
-      <span>Описать</span>
-    </button>
-    <button
-      class="btn small"
-      disabled={busy || fileScenes < 2}
-      title={busy ? "Модель уже работает" : "Модель прочитает часть каждой сцены файла с глубиной чтения проекта. Описанные сцены без новых частей пропускаются"}
-      onclick={onDescribeFile}
-    >
-      <span>Сцены файла · {fileScenes}</span>
-    </button>
-    <button class="icon-button" class:active={depthOpen} aria-label="Глубина чтения" title="Сколько частей читает модель для описаний" onclick={onDepth}
-      ><SlidersHorizontal size={14} /></button
-    >
-    <span class="head-gap"></span>
-    <button class="icon-button" aria-label="Скрыть описание сцены" title="Скрыть описание сцены" onclick={onClose}><X size={14} /></button>
-  </div>
-
   {#if stale}
     <div class="banner warn" role="status">
       <TriangleAlert size={14} />
@@ -151,6 +133,33 @@
         placeholder="Что происходит, кто участвует, на «ты» или на «вы». Уходит модели в каждом запросе перевода сцены"
       ></textarea></label
     >
+  </div>
+
+  <div class="describe">
+    {#if total > 1}
+      <RequestSlider
+        id="scene-parts-{sceneKey}"
+        label="Читать частей"
+        status="{parts} из {total}{picked === null ? ' · по глубине чтения' : ''}"
+        max={total}
+        value={parts}
+        disabled={busy}
+        onchange={(value) => (picked = value)}
+      >
+        {#snippet ends()}<span>1</span><span>все</span>{/snippet}
+      </RequestSlider>
+    {/if}
+    <button
+      class="btn small primary"
+      disabled={busy || notes === null}
+      title={busy
+        ? "Модель уже работает"
+        : "Модель прочитает выбранные части сцены, сначала уже прочитанные, и заменит описание. Название она пишет только в пустое поле"}
+      onclick={() => onDescribe(sceneKey, Math.max(parts, 1))}
+    >
+      {#if describing}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
+      <span>Описать моделью</span>
+    </button>
   </div>
 
   <div class="notes">
@@ -203,14 +212,15 @@
     opacity: 0.8;
   }
 
-  .card-head {
+  .describe {
     display: flex;
-    align-items: center;
-    gap: 6px;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
   }
 
-  .head-gap {
-    flex: 1;
+  .describe > .btn {
+    align-self: flex-start;
   }
 
   .fields {

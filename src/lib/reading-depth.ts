@@ -14,3 +14,11 @@ export function normalizeReadingDepth(depth: ReadingDepth): ReadingDepth {
   const percent = Number.isFinite(depth.percent) ? Math.min(100, Math.max(1, Math.round(depth.percent))) : 100;
   return { min, max, percent };
 }
+
+/** Сколько частей из `total` прочитает модель при этой глубине: как `ReadingDepth::parts_for` в Rust. */
+export function partsFor(depth: ReadingDepth, total: number): number {
+  const { min, max, percent } = normalizeReadingDepth(depth);
+  if (total <= min) return Math.max(total, 0);
+  const wanted = Math.ceil((total * percent) / 100);
+  return Math.min(Math.min(Math.max(wanted, min), Math.max(max, min)), total);
+}

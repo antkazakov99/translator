@@ -890,19 +890,22 @@ pub async fn reset_scene_notes(app: AppHandle, project: String, key: String) -> 
     .await
 }
 
-/// Описывает одну сцену целиком: заменяет описание, название пишет только в пустое поле.
+/// Описывает одну сцену: заменяет описание, название пишет только в пустое поле. `parts` это сколько частей
+/// прочитать: сначала уже прочитанные, остальные равномерно по сцене. `None`: сцена целиком.
 #[tauri::command]
 #[specta::specta]
 pub async fn describe_scene(
     state: State<'_, AppState>,
     project: String,
     key: String,
+    parts: Option<u32>,
     profile: Option<String>,
     progress: Channel<RunProgress>,
 ) -> Result<DescribedDto, String> {
     let target = DescribeTarget::Scene(scene_key(key)?);
+    let parts = parts.map_or(usize::MAX, |parts| usize::try_from(parts.max(1)).unwrap_or(usize::MAX));
     let described =
-        DescribeService { state: &state }.describe(self::project(&project)?, target, usize::MAX, self::profile(profile)?, progress).await?;
+        DescribeService { state: &state }.describe(self::project(&project)?, target, parts, self::profile(profile)?, progress).await?;
     Ok(described.into())
 }
 

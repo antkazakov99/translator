@@ -96,8 +96,11 @@ export const commands = {
 	sceneNotes: (project: string, key: string) => __TAURI_INVOKE<PartNoteDto_Serialize[]>("scene_notes", { project, key }),
 	/**  Сбрасывает заметки сцены: следующий запуск прочитает её заново. Возвращает число удалённых. */
 	resetSceneNotes: (project: string, key: string) => __TAURI_INVOKE<number>("reset_scene_notes", { project, key }),
-	/**  Описывает одну сцену целиком: заменяет описание, название пишет только в пустое поле. */
-	describeScene: (project: string, key: string, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scene", { project, key, profile, progress }),
+	/**
+	 *  Описывает одну сцену: заменяет описание, название пишет только в пустое поле. `parts` это сколько частей
+	 *  прочитать: сначала уже прочитанные, остальные равномерно по сцене. `None`: сцена целиком.
+	 */
+	describeScene: (project: string, key: string, parts: number | null, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scene", { project, key, parts, profile, progress }),
 	/**  Описывает сцены по очереди с глубиной чтения проекта. Описанные сцены без новых частей пропускаются. */
 	describeScenes: (project: string, keys: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scenes", { project, keys, profile, progress }),
 	/**  Части сцен персонажа или термина с заметками модели. */

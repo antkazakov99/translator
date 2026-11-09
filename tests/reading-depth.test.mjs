@@ -1,7 +1,7 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeReadingDepth } from '../src/lib/reading-depth.ts';
+import { normalizeReadingDepth, partsFor } from '../src/lib/reading-depth.ts';
 
 test('depth normalizes invalid input and inconsistent bounds', () => {
   assert.deepEqual(normalizeReadingDepth({ min: NaN, max: Infinity, percent: NaN }), { min: 1, max: 1, percent: 100 });
@@ -11,4 +11,14 @@ test('depth normalizes invalid input and inconsistent bounds', () => {
 
 test('percent is a whole number: Rust keeps it as u8', () => {
   assert.equal(normalizeReadingDepth({ min: 1, max: 5, percent: 33.6 }).percent, 34);
+});
+
+test("parts follow the Rust formula: percent rounded up, kept within min and max", () => {
+  const depth = { min: 5, max: 50, percent: 30 };
+  assert.equal(partsFor(depth, 3), 3, "меньше минимума: все части");
+  assert.equal(partsFor(depth, 5), 5);
+  assert.equal(partsFor(depth, 10), 5, "3 поднимается до минимума");
+  assert.equal(partsFor(depth, 21), 7, "6,3 округляется вверх");
+  assert.equal(partsFor(depth, 1000), 50, "не больше максимума");
+  assert.equal(partsFor(depth, 0), 0);
 });

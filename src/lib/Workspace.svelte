@@ -12,7 +12,6 @@
     Languages,
     LoaderCircle,
     Package,
-    PanelLeft,
     RefreshCw,
     SpellCheck,
     Square,
@@ -23,7 +22,6 @@
   } from "lucide-svelte";
   import Glossary from "./Glossary.svelte";
   import ModPanel from "./ModPanel.svelte";
-  import ReadingDepthSettings from "./ReadingDepthSettings.svelte";
   import ScanPanel from "./ScanPanel.svelte";
   import SceneCard from "./SceneCard.svelte";
   import SceneGraph from "./SceneGraph.svelte";
@@ -79,22 +77,7 @@
   /** Реплика, к которой перешли из глоссария: строка отмечена, пока не выбрана другая сцена. */
   let highlighted = $state<number | null>(null);
   let query = $state("");
-  let depthOpen = $state(false);
-  /** К чему относятся «Перевести», «Вычитать» и «Очистить»: к открытой сцене или ко всему её файлу. */
-  let scope = $state<"scene" | "file">("scene");
-  /** Панель с описанием сцены слева от реплик: открыта, пока её не скрыли. Помнится до закрытия окна. */
-  let sideOpen = $state(true);
-  const SIDE_KEY = "translator.scene-side";
-
-  function setSide(open: boolean) {
-    sideOpen = open;
-    try {
-      sessionStorage.setItem(SIDE_KEY, open ? "open" : "closed");
-    } catch {
-      // Без хранилища выбор просто не запомнится.
-    }
-  }
-  /** Описание сцен моделью: открытая сцена или все сцены её файла. */
+  /** Описание открытой сцены моделью. */
   const describe = new WriteRun("Описания");
 
   type RunMode = "translate" | "review";
@@ -131,14 +114,9 @@
   const list = $derived(sceneList(tree));
   const found = $derived(filterScenes(list, query));
   /** Сцены файла открытой сцены: их описывает «Описать сцены файла». */
-  const fileKeys = $derived(group ? group.scenes.flatMap((scene) => (scene.key ? [scene.key] : [])) : []);
-  /** Счётчики действий по выбранной области: у сцены по загруженным репликам, у файла по прогрессу. */
-  const actionEmpty = $derived(scope === "file" ? (group ? group.file.total - group.file.translated : 0) : sceneEmpty);
-  const actionReady = $derived(scope === "file" ? (group?.file.translated ?? 0) : sceneReady);
-  const actionScope = $derived<ScopeDto | null>(
-    !selected ? null : scope === "file" ? (group ? { kind: "file", file: group.file.id } : null) : scopeOf(selected),
-  );
-  const scopeWord = $derived(scope === "file" ? "файла" : "сцены");
+
+  /** Пустые реплики всей игры: их переводит «Вся игра». */
+  const gameEmpty = $derived(tree.reduce((sum, entry) => sum + entry.file.total - entry.file.translated, 0));
   /** Карточка описания есть только у настоящей сцены. */
   const described = $derived(selected?.kind === "scene" ? (scenes[0] ?? null) : null);
 
@@ -159,11 +137,6 @@
   }
 
   onMount(async () => {
-    try {
-      sideOpen = sessionStorage.getItem(SIDE_KEY) !== "closed";
-    } catch {
-      sideOpen = true;
-    }
     await loadTree();
     let saved: ScenePick | null = null;
     try {
@@ -316,8 +289,12 @@
   }
 
   /** Запускает перевод или редактуру. Черновики пишутся по пакетам, итог показывается баннером. */
-  async function startRun(mode: RunMode, scope: ScopeDto) {
+  /** Идущий запуск переводит всю игру: крутилка на кнопке «Вся игра». */
+  let wholeGame = $state(false);
+
+  async function startRun(mode: RunMode, scope: ScopeDto, game = false) {
     if (busy) return;
+    wholeGame = game;
     if (editing) await save();
     notice = "";
     lastRun = null;
@@ -486,16 +463,9 @@
     return stopped ? `Остановлено. ${text}` : text;
   }
 
-  /** Все сцены файла с глубиной чтения проекта. Описанные сцены без новых частей пропускаются. */
-  async function describeFile() {
-    const keys = [...fileKeys];
-    if (keys.length === 0) return;
-    await describe.start((channel) => commands.describeScenes(project.id, keys, null, channel), (message) => (error = message), describedNotice);
-    await refresh();
-  }
-
-  async function describeOne(key: string) {
-    await describe.start((channel) => commands.describeScene(project.id, key, null, channel), (message) => (error = message), describedNotice);
+  /** Описывает сцену по `parts` частям: сначала прочитанные, остальные равномерно по сцене. */
+  async function describeOne(key: string, parts: number) {
+    await describe.start((channel) => commands.describeScene(project.id, key, parts, null, channel), (message) => (error = message), describedNotice);
     await refresh();
   }
 
@@ -604,6 +574,26 @@
       </div>
     </nav>
 
+    {#if selected?.kind === "scene"}
+      <aside class="scene-side" aria-label="Описание сцены">
+        {#if described?.key === selected.key}
+          <SceneCard
+            projectId={project.id}
+            scene={described}
+            sceneKey={described.key}
+            stale={item?.stale ?? false}
+            {busy}
+            describing={describe.active}
+            onDescribe={describeOne}
+            onSaved={patchScene}
+            onError={(message) => (error = message)}
+          />
+        {:else}
+          <div class="empty"><LoaderCircle size={18} class="spin" /></div>
+        {/if}
+      </aside>
+    {/if}
+
     <section class="lines">
       {#if selected && group}
         <div class="toolbar">
@@ -614,16 +604,17 @@
                 · <span class="stale">описание устарело</span>{/if}
             </span>
           </div>
+          <button
+            class="btn small"
+            disabled={busy || gameEmpty === 0}
+            title={busy ? "Модель уже работает" : gameEmpty === 0 ? "В игре нет пустых реплик" : "Модель переведёт пустые реплики всей игры по файлам. Сцены без описания она сначала прочитает"}
+            onclick={() => startRun("translate", { kind: "project" }, true)}
+          >
+            {#if run?.mode === "translate" && wholeGame}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
+            <span>Вся игра{gameEmpty ? ` · ${gameEmpty}` : ""}</span>
+          </button>
           {#if selected.kind === "scene"}
             {@const key = selected.key}
-            <button
-              class="icon-button"
-              class:active={sideOpen}
-              aria-pressed={sideOpen}
-              aria-label="Описание сцены"
-              title={sideOpen ? "Скрыть описание сцены" : "Показать описание сцены"}
-              onclick={() => setSide(!sideOpen)}><PanelLeft size={15} /></button
-            >
             <button class="icon-button" aria-label="Показать на графе" title="Показать на графе" onclick={() => showOnGraph(key)}><Waypoints size={15} /></button>
           {/if}
           <button class="icon-button" aria-label="Сцена в исходнике" title="Сцена в исходнике" onclick={() => viewSource(group?.file.id ?? null, sceneLines[0]?.location)}
@@ -639,12 +630,6 @@
         </div>
 
         <div class="actions" role="toolbar" aria-label="Действия с репликами">
-          <div class="segmented" role="radiogroup" aria-label="Область действий">
-            <button role="radio" aria-checked={scope === "scene"} class:on={scope === "scene"} onclick={() => (scope = "scene")}>Сцена</button>
-            <button role="radio" aria-checked={scope === "file"} class:on={scope === "file"} title="Действия для всех реплик файла {group.file.path}" onclick={() => (scope = "file")}
-              >Файл</button
-            >
-          </div>
           <div class="segmented" role="tablist" aria-label="Какие реплики показать">
             {#each [["all", "Все"], ["empty", "Пустые"], ["draft", "Модель"]] as [value, label] (value)}
               <button role="tab" aria-selected={filter === value} class:on={filter === value} onclick={() => (filter = value as Filter)}>
@@ -661,35 +646,34 @@
           {/if}
           <button
             class="btn small"
-            disabled={busy || working || actionReady === 0 || !actionScope}
-            title={actionReady === 0 ? `В ${scope === "file" ? "файле" : "сцене"} нет переведённых реплик` : `Очистить перевод ${scopeWord}: модель переведёт его заново`}
-            onclick={() => actionScope && (confirming = { kind: "reset", scope: actionScope, what: scopeWord, count: actionReady })}
+            disabled={busy || working || sceneReady === 0}
+            title={sceneReady === 0 ? "В сцене нет переведённых реплик" : "Очистить перевод сцены: модель переведёт её заново"}
+            onclick={() => selected && (confirming = { kind: "reset", scope: scopeOf(selected), what: "сцены", count: sceneReady })}
           >
             <Eraser size={14} />
             <span>Очистить</span>
           </button>
           <button
             class="btn small"
-            disabled={busy || actionReady === 0 || !actionScope}
-            title={busy ? "Модель уже работает" : actionReady === 0 ? `В ${scope === "file" ? "файле" : "сцене"} нет переведённых реплик` : `Модель вычитает переведённые реплики ${scopeWord}`}
-            onclick={() => actionScope && startRun("review", actionScope)}
+            disabled={busy || sceneReady === 0}
+            title={busy ? "Модель уже работает" : sceneReady === 0 ? "В сцене нет переведённых реплик" : "Модель вычитает переведённые реплики сцены"}
+            onclick={() => selected && startRun("review", scopeOf(selected))}
           >
             {#if run?.mode === "review"}<LoaderCircle size={14} class="spin" />{:else}<SpellCheck size={14} />{/if}
             <span>Вычитать</span>
           </button>
           <button
             class="btn small primary"
-            disabled={busy || actionEmpty === 0 || !actionScope}
-            title={busy ? "Модель уже работает" : actionEmpty === 0 ? `В ${scope === "file" ? "файле" : "сцене"} нет пустых реплик` : `Модель переведёт пустые реплики ${scopeWord}`}
-            onclick={() => actionScope && startRun("translate", actionScope)}
+            disabled={busy || sceneEmpty === 0}
+            title={busy ? "Модель уже работает" : sceneEmpty === 0 ? "В сцене нет пустых реплик" : "Модель переведёт пустые реплики сцены"}
+            onclick={() => selected && startRun("translate", scopeOf(selected))}
           >
-            {#if run?.mode === "translate"}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
-            <span>Перевести{actionEmpty ? ` · ${actionEmpty}` : ""}</span>
+            {#if run?.mode === "translate" && !wholeGame}<LoaderCircle size={14} class="spin" />{:else}<Languages size={14} />{/if}
+            <span>Перевести{sceneEmpty ? ` · ${sceneEmpty}` : ""}</span>
           </button>
         </div>
       {/if}
 
-      {#if depthOpen}<div class="page-error"><ReadingDepthSettings projectId={project.id} onClose={() => (depthOpen = false)} /></div>{/if}
       <SuggestStatus run={describe} onError={(message) => (error = message)} />
 
       {#if run}
@@ -783,27 +767,6 @@
       {:else if loadingLines}
         <div class="empty"><LoaderCircle size={20} class="spin" /></div>
       {:else}
-        <div class="content">
-          {#if described?.key && sideOpen}
-            <aside class="scene-side" aria-label="Описание сцены">
-              <SceneCard
-                projectId={project.id}
-                scene={described}
-                sceneKey={described.key}
-                stale={item?.stale ?? false}
-                {busy}
-                describing={describe.active}
-                fileScenes={fileKeys.length}
-                {depthOpen}
-                onDescribe={describeOne}
-                onDescribeFile={describeFile}
-                onDepth={() => (depthOpen = !depthOpen)}
-                onSaved={patchScene}
-                onClose={() => setSide(false)}
-                onError={(message) => (error = message)}
-              />
-            </aside>
-          {/if}
         <div class="table">
           {#if shown.length === 0}
             <div class="no-lines">{filter === "all" ? "В сцене нет реплик" : "Таких реплик нет"}</div>
@@ -852,7 +815,6 @@
               </div>
             {/each}
           {/each}
-        </div>
         </div>
       {/if}
     </section>
@@ -999,15 +961,12 @@
     min-width: 0;
   }
 
-  .content {
-    display: flex;
-    flex: 1;
-    min-height: 0;
-  }
-
   .scene-side {
-    width: 320px;
+    display: flex;
+    flex-direction: column;
+    width: 300px;
     flex: 0 0 auto;
+    min-height: 0;
     overflow-y: auto;
     padding: 12px 14px;
     border-right: 1px solid var(--divider);
