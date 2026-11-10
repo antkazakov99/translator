@@ -69,7 +69,7 @@ pub struct ReadingDepth {
 
 impl Default for ReadingDepth {
     fn default() -> Self {
-        Self { min_parts: 5, max_parts: Some(50), percent: 30 }
+        Self { min_parts: 5, max_parts: Some(50), percent: 60 }
     }
 }
 
@@ -1975,8 +1975,9 @@ mod tests {
     fn depth_rounds_up_and_clamps() {
         let depth = ReadingDepth::default();
         assert_eq!(depth.parts_for(3), 3);
-        assert_eq!(depth.parts_for(10), 5);
-        assert_eq!(depth.parts_for(21), 7);
+        assert_eq!(depth.parts_for(6), 5, "3,6 округляется до 4 и поднимается до минимума");
+        assert_eq!(depth.parts_for(10), 6);
+        assert_eq!(depth.parts_for(21), 13);
         assert_eq!(depth.parts_for(1000), 50);
     }
 

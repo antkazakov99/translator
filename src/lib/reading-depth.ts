@@ -6,7 +6,7 @@ export interface ReadingDepth {
   percent: number;
 }
 
-export const DEFAULT_READING_DEPTH: ReadingDepth = { min: 5, max: 50, percent: 30 };
+export const DEFAULT_READING_DEPTH: ReadingDepth = { min: 5, max: 50, percent: 60 };
 
 /** Защищает от пустых полей, дробного числа частей и неверных границ. Максимум `null` или не число: без предела. */
 export function normalizeReadingDepth(depth: ReadingDepth): ReadingDepth {

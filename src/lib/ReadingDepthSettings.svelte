@@ -75,7 +75,7 @@
       <span>Сколько частей модель читает, когда описывает сцены, их персонажей и термины. Общая для всех проектов</span>
     </div>
     {#if saving}<LoaderCircle size={13} class="spin" />{/if}
-    <button class="btn small" disabled={saved === null || isDefault || saving} title="От 5 до 50 частей, 30%" onclick={() => save({ ...DEFAULT_READING_DEPTH })}>
+    <button class="btn small" disabled={saved === null || isDefault || saving} title="От 5 до 50 частей, 60%" onclick={() => save({ ...DEFAULT_READING_DEPTH })}>
       <RotateCcw size={13} />
       <span>По умолчанию</span>
     </button>
