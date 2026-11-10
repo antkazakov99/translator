@@ -11,7 +11,7 @@ pub mod search;
 pub mod service;
 pub mod text;
 
-pub use answer::{AnswerTerm, LinesAnswer};
+pub use answer::LinesAnswer;
 pub use batcher::{Batch, Batcher};
 pub use model::{Draft, FileProgress, FileScenes, Hints, LineRun, LineState, PlacedLine, RevisionKind, Scene, SceneLine, SceneProgress, SceneRef, SentState, TranslationScope};
 pub use prompt::{LinesMode, LinesPrompt};

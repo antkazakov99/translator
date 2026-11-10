@@ -6,7 +6,6 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::parts::scene_hash;
 use super::scenes::SceneSource;
-use super::terms::TermCandidate;
 use super::{
     Character, CharacterId, DiscardReason, DiscardedTerm, Form, NameField, NameKey, NameOrigin, Note, NoteOwner, SceneDescription, Speaker,
     SpeakerEntry, SpeakerLink, Term, TermCategory, TermId, Token,
@@ -14,7 +13,6 @@ use super::{
 use crate::common::{Gender, Timestamp, ValidationError};
 use crate::name_rules::LanguageTag;
 use crate::engines::{ContainerKey, SpeakerKey};
-use crate::scan::ScanId;
 use crate::storage::DbError;
 
 fn speaker_key(table: &'static str, key: String) -> Result<SpeakerKey, DbError> {
@@ -406,16 +404,14 @@ impl CharacterRow {
     }
 }
 
-/// `terms`, `term_forms`, `term_excluded_containers`, `discarded_terms`, `term_candidates`.
+/// `terms`, `term_forms`, `term_excluded_containers`, `discarded_terms`.
 pub struct TermRepo<'c> {
     pub conn: &'c Connection,
 }
 
-const TERM_SELECT: &str = "SELECT id, name, translation, category, guess, description FROM terms";
-/// Имя таблицы кандидатов в `derived`.
-const TERM_CANDIDATES: &str = "term_candidates";
+const TERM_SELECT: &str = "SELECT id, name, translation, category, description FROM terms";
 
-type TermRow = (i64, String, Option<String>, String, bool, Option<String>);
+type TermRow = (i64, String, Option<String>, String, Option<String>);
 
 impl TermRepo<'_> {
     pub fn get(&self, id: TermId) -> Result<Term, DbError> {
@@ -434,13 +430,13 @@ impl TermRepo<'_> {
     }
 
     fn read(row: &Row) -> rusqlite::Result<TermRow> {
-        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
     }
 
-    fn term((id, name, translation, category, guess, description): TermRow, forms: &mut HashMap<i64, Vec<Form>>) -> Result<Term, DbError> {
+    fn term((id, name, translation, category, description): TermRow, forms: &mut HashMap<i64, Vec<Form>>) -> Result<Term, DbError> {
         let category = TermCategory::parse(&category).map_err(|error| DbError::bad_value("terms", "category", error))?;
         let forms = forms.remove(&id).unwrap_or_default();
-        Term::restore(TermId::from_row(id), &name, translation, category, guess, description, forms)
+        Term::restore(TermId::from_row(id), &name, translation, category, description, forms)
             .map_err(|error| DbError::bad_value("terms", "name", error))
     }
 
@@ -462,14 +458,13 @@ impl TermRepo<'_> {
         let id = match term.id() {
             Some(id) => {
                 let changed = self.conn.execute(
-                    "UPDATE terms SET name = ?1, name_key = ?2, translation = ?3, category = ?4, guess = ?5, description = ?6
-                     WHERE id = ?7",
+                    "UPDATE terms SET name = ?1, name_key = ?2, translation = ?3, category = ?4, description = ?5
+                     WHERE id = ?6",
                     params![
                         term.name(),
                         term.name_key().as_str(),
                         term.translation(),
                         term.category().as_str(),
-                        term.is_guess(),
                         term.description(),
                         id.get()
                     ],
@@ -481,13 +476,12 @@ impl TermRepo<'_> {
             }
             None => {
                 self.conn.execute(
-                    "INSERT INTO terms (name, name_key, translation, category, guess, description) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO terms (name, name_key, translation, category, description) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         term.name(),
                         term.name_key().as_str(),
                         term.translation(),
                         term.category().as_str(),
-                        term.is_guess(),
                         term.description()
                     ],
                 )?;
@@ -509,53 +503,7 @@ impl TermRepo<'_> {
         Ok(())
     }
 
-    /// «Новые термины»: кандидаты без терминов, имён персонажей, подписей разобранных говорящих и корзины.
-    /// Частые первыми.
-    pub fn new_candidates(&self) -> Result<Vec<TermCandidate>, DbError> {
-        let mut statement = self.conn.prepare(
-            "SELECT c.text, c.occurrences, c.example FROM term_candidates c
-             WHERE c.text_key NOT IN (SELECT name_key FROM terms)
-               AND c.text_key NOT IN (SELECT text_key FROM term_forms)
-               AND c.text_key NOT IN (SELECT text_key FROM glossary_name_keys WHERE text_key IS NOT NULL)
-               AND c.text_key NOT IN (SELECT text_key FROM discarded_terms)
-             ORDER BY c.occurrences DESC, c.text_key",
-        )?;
-        let rows = statement
-            .query_map([], |row| Ok(TermCandidate { text: row.get(0)?, occurrences: row.get(1)?, example: row.get(2)? }))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    /// Версия сборки и считывание, по которому собраны кандидаты. `None`: ещё не собирались.
-    pub fn candidates_state(&self) -> Result<Option<(u32, ScanId)>, DbError> {
-        Ok(self
-            .conn
-            .query_row("SELECT version, scan_id FROM derived WHERE name = ?1", [TERM_CANDIDATES], |row| {
-                Ok((row.get::<_, u32>(0)?, ScanId::from_row(row.get(1)?)))
-            })
-            .optional()?)
-    }
-
-    /// Заменяет `term_candidates` целиком и отмечает версию и считывание в `derived`. Транзакцию открывает сервис.
-    /// Написания с одним ключом сливаются: побеждает первое, то есть более частое.
-    pub fn replace_candidates(&self, candidates: &[TermCandidate], version: u32, scan: ScanId) -> Result<(), DbError> {
-        self.conn.execute("DELETE FROM term_candidates", [])?;
-        let mut insert = self.conn.prepare(
-            "INSERT INTO term_candidates (text_key, text, occurrences, example) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
-        )?;
-        for candidate in candidates {
-            let Some(key) = NameKey::new(&candidate.text) else { continue };
-            insert.execute(params![key.as_str(), candidate.text, candidate.occurrences, candidate.example])?;
-        }
-        self.conn.execute(
-            "INSERT INTO derived (name, version, scan_id) VALUES (?1, ?2, ?3)
-             ON CONFLICT (name) DO UPDATE SET version = excluded.version, scan_id = excluded.scan_id",
-            params![TERM_CANDIDATES, version, scan.get()],
-        )?;
-        Ok(())
-    }
-
-    /// Есть ли название среди терминов, их форм, имён глоссария и корзины: так проверяются предположения модели.
+    /// Есть ли название среди терминов, их форм, имён глоссария и корзины: так разбор сцены отсеивает известное.
     pub fn is_known(&self, key: &NameKey) -> Result<bool, DbError> {
         Ok(self.conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM terms WHERE name_key = ?1)
@@ -931,16 +879,25 @@ impl LineSampleRepo<'_> {
 
     /// Реплики всех сцен текущего снимка по сюжету: из них выбираются сцены персонажа и термина.
     pub fn story_lines(&self) -> Result<Vec<StoryLine>, DbError> {
+        self.lines_of(None)
+    }
+
+    /// Реплики одной сцены по сюжету: по ним ищутся её персонажи и термины.
+    pub fn scene_lines(&self, scene: &ContainerKey) -> Result<Vec<StoryLine>, DbError> {
+        self.lines_of(Some(scene))
+    }
+
+    fn lines_of(&self, scene: Option<&ContainerKey>) -> Result<Vec<StoryLine>, DbError> {
         let mut statement = self.conn.prepare(&format!(
             "SELECT c.key, s.speaker_key, sp.label, s.source_text
              FROM segments s
              JOIN containers c ON c.id = s.container_id AND c.kind = 'scene'
              LEFT JOIN speakers sp ON sp.key = s.speaker_key
-             WHERE s.missing = 0 {}",
+             WHERE s.missing = 0 AND (?1 IS NULL OR c.key = ?1) {}",
             Self::ORDER
         ))?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map([scene.map(ContainerKey::as_str)], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -956,14 +913,7 @@ impl LineSampleRepo<'_> {
             .collect()
     }
 
-    /// Тексты всех реплик текущего снимка: по ним ищутся кандидаты в термины.
-    pub fn all_texts(&self) -> Result<Vec<String>, DbError> {
-        let mut statement = self.conn.prepare("SELECT source_text FROM segments WHERE missing = 0 ORDER BY id")?;
-        let texts = statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
-        Ok(texts)
-    }
-
-    /// Подписи говорящих текущего снимка: их слова тоже имена.
+    /// Подписи говорящих текущего снимка: разбор сцены их не предлагает.
     pub fn speaker_labels(&self) -> Result<Vec<String>, DbError> {
         let mut statement = self.conn.prepare(
             "SELECT label FROM speakers WHERE label IS NOT NULL AND last_seen_scan = (SELECT max(id) FROM scans)",

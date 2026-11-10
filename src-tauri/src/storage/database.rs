@@ -314,7 +314,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = AppDb::open(&dir.path().join("data").join("app.db")).unwrap();
         let actions: i64 = db.read(|tx| Ok(tx.query_row("SELECT count(*) FROM llm_actions", [], |row| row.get(0))?)).unwrap();
-        assert_eq!(actions, 7);
+        assert_eq!(actions, 8);
     }
 
     #[test]

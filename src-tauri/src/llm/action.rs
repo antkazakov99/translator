@@ -11,6 +11,7 @@ use crate::common::ValidationError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum Action {
+    Analysis,
     Descriptions,
     Names,
     Terms,
@@ -22,9 +23,10 @@ pub enum Action {
 
 impl Action {
     /// Порядок в меню.
-    pub const ALL: [Action; 7] = [
+    pub const ALL: [Action; 8] = [
         Self::Lines,
         Self::Review,
+        Self::Analysis,
         Self::Descriptions,
         Self::Names,
         Self::Terms,
@@ -34,6 +36,7 @@ impl Action {
 
     pub fn id(self) -> &'static str {
         match self {
+            Self::Analysis => "analysis",
             Self::Descriptions => "descriptions",
             Self::Names => "names",
             Self::Terms => "terms",
@@ -51,6 +54,7 @@ impl Action {
 
     pub fn title(self) -> &'static str {
         match self {
+            Self::Analysis => "Разбор сцен",
             Self::Descriptions => "Обновление описаний",
             Self::Names => "Перевод имён",
             Self::Terms => "Перевод терминов",
@@ -63,7 +67,7 @@ impl Action {
 
     pub fn default_temperature(self) -> Temperature {
         let value = match self {
-            Self::Names => 0.0,
+            Self::Names | Self::Analysis => 0.0,
             Self::Descriptions | Self::Terms | Self::Tokens | Self::Speakers => 0.2,
             Self::Lines | Self::Review => 0.3,
         };
@@ -74,7 +78,7 @@ impl Action {
         let value = match self {
             Self::Lines | Self::Review => 30,
             Self::Descriptions => 3,
-            Self::Names => 1,
+            Self::Names | Self::Analysis => 1,
             Self::Tokens => 10,
             Self::Speakers => 15,
             Self::Terms => 20,

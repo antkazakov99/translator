@@ -43,7 +43,7 @@ impl TermCategory {
     }
 }
 
-/// Термин. Предположение модели (`guess`) идёт в запросы с пометкой «не подтверждено».
+/// Термин глоссария.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Term {
     id: Option<TermId>,
@@ -51,13 +51,12 @@ pub struct Term {
     name_key: NameKey,
     translation: Option<String>,
     category: TermCategory,
-    guess: bool,
     description: Option<String>,
     forms: Vec<Form>,
 }
 
 impl Term {
-    /// Взят пользователем из «Новых».
+    /// Новый термин: взят пользователем или из отбора разбора сцены.
     pub fn new(name: &str, category: TermCategory) -> Result<Self, ValidationError> {
         let name_key = NameKey::new(name).ok_or(ValidationError::Empty("name"))?;
         Ok(Self {
@@ -66,42 +65,25 @@ impl Term {
             name_key,
             translation: None,
             category,
-            guess: false,
             description: None,
             forms: Vec::new(),
         })
     }
 
-    /// Новое название из ответа модели при переводе реплик.
-    pub fn guess(name: &str, translation: &str, category: TermCategory) -> Result<Self, ValidationError> {
-        let mut term = Self::new(name, category)?;
-        term.translation = non_empty(translation);
-        term.guess = true;
-        Ok(term)
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub fn restore(
         id: TermId,
         name: &str,
         translation: Option<String>,
         category: TermCategory,
-        guess: bool,
         description: Option<String>,
         forms: Vec<Form>,
     ) -> Result<Self, ValidationError> {
         let mut term = Self::new(name, category)?;
         term.id = Some(id);
         term.translation = translation;
-        term.guess = guess;
         term.description = description;
         term.forms = forms;
         Ok(term)
-    }
-
-    /// Подтверждение пользователем.
-    pub fn confirm(&mut self) {
-        self.guess = false;
     }
 
     pub fn rename(&mut self, name: &str) -> Result<(), ValidationError> {
@@ -155,10 +137,6 @@ impl Term {
         self.category
     }
 
-    pub fn is_guess(&self) -> bool {
-        self.guess
-    }
-
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
     }
@@ -194,19 +172,11 @@ impl DiscardReason {
     }
 }
 
-/// Название в корзине: его вычитает раздел «Новые термины».
+/// Название в корзине: разбор сцены его не предлагает.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscardedTerm {
     pub text: String,
     pub key: NameKey,
     pub reason: DiscardReason,
     pub discarded_at: Timestamp,
-}
-
-/// Кандидат в термины из `term_candidates`, которого нет в глоссарии и корзине.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct TermCandidate {
-    pub text: String,
-    pub occurrences: u32,
-    pub example: String,
 }

@@ -351,12 +351,6 @@
     white-space: nowrap;
   }
 
-  .glossary :global(.guess) {
-    color: var(--warning);
-    font-size: 10px;
-    font-weight: 600;
-  }
-
   .glossary :global(.add) {
     display: flex;
     gap: 6px;

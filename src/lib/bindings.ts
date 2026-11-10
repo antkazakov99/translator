@@ -59,7 +59,7 @@ export const commands = {
 	deleteCharacter: (project: string, character: RowRef) => __TAURI_INVOKE<null>("delete_character", { project, character }),
 	/**  Новый термин. Возвращает его id. */
 	takeTerm: (project: string, name: string, category: TermCategory) => __TAURI_INVOKE<RowRef>("take_term", { project, name, category }),
-	/**  Сохраняет термин целиком. Подтверждение предположения это `guess: false`. */
+	/**  Сохраняет термин целиком. */
 	saveTerm: (project: string, term: TermDto_Deserialize) => __TAURI_INVOKE<null>("save_term", { project, term }),
 	deleteTerm: (project: string, term: RowRef) => __TAURI_INVOKE<null>("delete_term", { project, term }),
 	/**  Термин становится формой персонажа, название уходит в корзину. */
@@ -67,8 +67,6 @@ export const commands = {
 	/**  Название в корзину: модель не предложит его снова. */
 	discardTermName: (project: string, name: string) => __TAURI_INVOKE<null>("discard_term_name", { project, name }),
 	restoreTermName: (project: string, key: string) => __TAURI_INVOKE<null>("restore_term_name", { project, key }),
-	/**  «Новые термины»: названия из текста игры, которых нет в глоссарии. Первый вызов после считывания их собирает. */
-	newTerms: (project: string) => __TAURI_INVOKE<TermCandidateDto[]>("new_terms", { project }),
 	/**  Значение или пояснение токена. Пустые оба удаляют запись. */
 	saveToken: (project: string, name: string, value: string, note: string) => __TAURI_INVOKE<null>("save_token", { project, name, value, note }),
 	/**  Глубина чтения проекта. Пока её не меняли, действует значение из кода. */
@@ -101,6 +99,8 @@ export const commands = {
 	 *  прочитать: сначала уже прочитанные, остальные равномерно по сцене. `None`: сцена целиком.
 	 */
 	describeScene: (project: string, key: string, parts: number | null, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scene", { project, key, parts, profile, progress }),
+	/**  Персонажи и термины сцены: кто говорит или упомянут в её репликах, какие термины названы. */
+	sceneEntries: (project: string, key: string) => __TAURI_INVOKE<SceneEntriesDto_Serialize>("scene_entries", { project, key }),
 	/**  Описывает сцены по очереди с глубиной чтения проекта. Описанные сцены без новых частей пропускаются. */
 	describeScenes: (project: string, keys: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scenes", { project, keys, profile, progress }),
 	/**  Части сцен персонажа или термина с заметками модели. */
@@ -194,7 +194,7 @@ export const commands = {
 
 /* Types */
 /**  Действие модели. Совпадает со справочником `llm_actions`: новое действие это новый вариант и новая миграция. */
-export type Action = "descriptions" | "names" | "terms" | "tokens" | "speakers" | "lines" | "review";
+export type Action = "analysis" | "descriptions" | "names" | "terms" | "tokens" | "speakers" | "lines" | "review";
 
 /**  Настройки действия в приложении и значения из кода, которые действуют при пустом поле. */
 export type ActionDto = ActionDto_Serialize | ActionDto_Deserialize;
@@ -279,6 +279,8 @@ export type DescribedDto = DescribedDto_Serialize | DescribedDto_Deserialize;
  */
 export type DescribedDto_Deserialize = {
 	written: string[],
+	/**  Персонажи и термины, которые разбор сцен добавил в глоссарий. */
+	added: string[],
 	error?: string | null,
 };
 
@@ -288,6 +290,8 @@ export type DescribedDto_Deserialize = {
  */
 export type DescribedDto_Serialize = {
 	written: string[],
+	/**  Персонажи и термины, которые разбор сцен добавил в глоссарий. */
+	added: string[],
 	error: string | null,
 };
 
@@ -1029,6 +1033,37 @@ export type SceneDto_Serialize = {
 	lines: LineDto_Serialize[],
 };
 
+export type SceneEntriesDto = SceneEntriesDto_Serialize | SceneEntriesDto_Deserialize;
+
+export type SceneEntriesDto_Deserialize = {
+	characters: SceneEntryDto_Deserialize[],
+	terms: SceneEntryDto_Deserialize[],
+};
+
+export type SceneEntriesDto_Serialize = {
+	characters: SceneEntryDto_Serialize[],
+	terms: SceneEntryDto_Serialize[],
+};
+
+/**  Персонаж или термин сцены для карточки. */
+export type SceneEntryDto = SceneEntryDto_Serialize | SceneEntryDto_Deserialize;
+
+/**  Персонаж или термин сцены для карточки. */
+export type SceneEntryDto_Deserialize = {
+	id: RowRef,
+	name: string,
+	translation?: string | null,
+	description?: string | null,
+};
+
+/**  Персонаж или термин сцены для карточки. */
+export type SceneEntryDto_Serialize = {
+	id: RowRef,
+	name: string,
+	translation: string | null,
+	description: string | null,
+};
+
 export type SceneGraphDto = SceneGraphDto_Serialize | SceneGraphDto_Deserialize;
 
 export type SceneGraphDto_Deserialize = {
@@ -1177,15 +1212,6 @@ export type SpeakerSuggestionsDto_Serialize = {
 	error: string | null,
 };
 
-/**  Кандидат в термины из текста игры. */
-export type TermCandidateDto = {
-	text: string,
-	/**  В скольких разных репликах встретилось. */
-	occurrences: number,
-	/**  Кусок реплики вокруг названия. */
-	example: string,
-};
-
 export type TermCategory = "general" | "location" | "organization" | "title" | "item" | "event";
 
 export type TermDto = TermDto_Serialize | TermDto_Deserialize;
@@ -1195,8 +1221,6 @@ export type TermDto_Deserialize = {
 	name: string,
 	translation?: string | null,
 	category: TermCategory,
-	/**  Предположение модели: идёт в запросы с пометкой, пока его не подтвердят. */
-	guess: boolean,
 	description?: string | null,
 	forms: FormDto_Deserialize[],
 };
@@ -1206,8 +1230,6 @@ export type TermDto_Serialize = {
 	name: string,
 	translation: string | null,
 	category: TermCategory,
-	/**  Предположение модели: идёт в запросы с пометкой, пока его не подтвердят. */
-	guess: boolean,
 	description: string | null,
 	forms: FormDto_Serialize[],
 };

@@ -6,9 +6,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::Deserialize;
 
-use super::text::{letters, mentions, usable_translation};
+use super::text::{letters, usable_translation};
 use super::{Batch, Draft, LinesMode, Scene, SceneLine};
-use crate::glossary::{NameKey, Term, TermCategory};
 use crate::scan::SegmentId;
 
 /// С какой длины одинаковые переводы разных реплик считаются сдвигом: короткие вроде «Да.» совпадают законно.
@@ -20,23 +19,14 @@ static LINE_ITEM: LazyLock<Regex> = LazyLock::new(|| {
         .expect("регулярное выражение реплики")
 });
 
-/// Новый термин из ответа.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnswerTerm {
-    pub name: String,
-    pub translation: String,
-    pub category: Option<String>,
-}
-
-/// Ответ модели: номера реплик с текстом и новые термины.
+/// Ответ модели: номера реплик с текстом.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LinesAnswer {
     /// Номер реплики в пакете (с единицы) и текст.
     pub lines: Vec<(usize, String)>,
-    pub terms: Vec<AnswerTerm>,
 }
 
-/// Элемент ответа: перевод реплики или новый термин. Они идут одним массивом: локальные модели надёжнее держат простую форму.
+/// Элемент ответа: перевод реплики. Элемент без номера (например, термин по старой привычке модели) пропускается.
 #[derive(Debug, Default, Deserialize)]
 struct Item {
     #[serde(default)]
@@ -44,11 +34,7 @@ struct Item {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
-    term: Option<String>,
-    #[serde(default)]
     translation: Option<String>,
-    #[serde(default)]
-    category: Option<String>,
 }
 
 impl Item {
@@ -61,9 +47,9 @@ impl Item {
         }
     }
 
-    /// Перевод реплики. Локальные модели пишут его и в поле `translation`, как у реплик контекста и терминов.
+    /// Перевод реплики. Локальные модели пишут его и в поле `translation`, как у реплик контекста.
     fn line_text(&self) -> Option<&str> {
-        self.text.as_deref().or_else(|| self.translation.as_deref().filter(|_| self.term.is_none()))
+        self.text.as_deref().or(self.translation.as_deref())
     }
 }
 
@@ -83,20 +69,14 @@ pub(crate) fn json_array(raw: &str) -> &str {
 
 impl LinesAnswer {
     /// JSON ответа, а сломанный (комментарии, пояснения вне строк, пропущенные кавычки) запасным разбором
-    /// пар номера и перевода (`line_answer`). Перевод принимается и из поля `translation`. Термины из сломанного
-    /// ответа теряются. `None`: в ответе нет ни одной реплики и ни одного термина.
+    /// пар номера и перевода (`line_answer`). Перевод принимается и из поля `translation`.
+    /// `None`: в ответе нет ни одной реплики.
     pub fn parse(text: &str) -> Option<Self> {
         if let Ok(items) = serde_json::from_str::<Vec<Item>>(json_array(text)) {
             let mut answer = Self::default();
             for item in items {
                 if let (Some(number), Some(line)) = (item.number(), item.line_text()) {
                     answer.lines.push((number, line.trim().to_string()));
-                } else if let (Some(name), Some(translation)) = (item.term.as_deref(), item.translation.as_deref()) {
-                    answer.terms.push(AnswerTerm {
-                        name: name.trim().to_string(),
-                        translation: translation.trim().to_string(),
-                        category: item.category,
-                    });
                 }
             }
             return Some(answer);
@@ -109,7 +89,7 @@ impl LinesAnswer {
                 Some((number, line.trim().to_string()))
             })
             .collect();
-        (!lines.is_empty()).then_some(Self { lines, terms: Vec::new() })
+        (!lines.is_empty()).then_some(Self { lines })
     }
 
     /// Отбрасывает перевод без токенов и тегов оригинала (`usable_translation`), правку редактуры без изменений
@@ -142,24 +122,6 @@ impl LinesAnswer {
             .collect()
     }
 
-    /// Новые термины, которые есть в тексте пакета: в глоссарий они попадут предположениями (`new_terms`).
-    /// Выдуманный термин, которого нет в тексте, и повтор не проходят. Известные глоссарию отсеивает сервис.
-    pub fn new_terms(&self, scene: &Scene, batch: &Batch) -> Vec<Term> {
-        let ids: HashSet<&SegmentId> = batch.lines.iter().collect();
-        let text: String =
-            scene.lines.iter().filter(|line| ids.contains(&line.id)).map(|line| format!("{}\n", line.source_text)).collect();
-        let text = text.to_lowercase();
-        let mut seen: HashSet<NameKey> = HashSet::new();
-        self.terms
-            .iter()
-            .filter(|term| !term.translation.is_empty() && mentions(&text, &term.name.to_lowercase()))
-            .filter_map(|term| {
-                let category = term.category.as_deref().and_then(|category| TermCategory::parse(category).ok());
-                Term::guess(&term.name, &term.translation, category.unwrap_or(TermCategory::General)).ok()
-            })
-            .filter(|term| seen.insert(term.name_key().clone()))
-            .collect()
-    }
 }
 
 /// Реплики с одинаковым длинным переводом при разных оригиналах: и новые, и уже переведённые в сцене.
@@ -195,13 +157,11 @@ mod tests {
     }
 
     #[test]
-    fn json_inside_text_and_terms_are_read() {
+    fn json_inside_text_is_read_and_items_without_id_skipped() {
         let raw = "Вот перевод:\n```json\n[{\"id\": \"1\", \"text\": \"Привет.\"}, {\"id\": 2, \"translation\": \"Пока.\"},\
                    {\"term\": \"Silver Key\", \"translation\": \"Серебряный ключ\", \"category\": \"item\"}]\n```";
         let answer = LinesAnswer::parse(raw).unwrap();
         assert_eq!(answer.lines, [(1, "Привет.".to_string()), (2, "Пока.".to_string())]);
-        assert_eq!(answer.terms.len(), 1);
-        assert_eq!(answer.terms[0].category.as_deref(), Some("item"));
     }
 
     #[test]
@@ -209,7 +169,6 @@ mod tests {
         let raw = "[{\"id\": \"1\", \"speaker\": \"Max\", text: \"Привет, \\\"друг\\\".\"} // комментарий\n{\"id\": 2, \"text\": \"Пока.\"}]";
         let answer = LinesAnswer::parse(raw).unwrap();
         assert_eq!(answer.lines, [(1, "Привет, \"друг\".".to_string()), (2, "Пока.".to_string())]);
-        assert!(answer.terms.is_empty());
         assert_eq!(LinesAnswer::parse("Не могу помочь."), None);
     }
 
@@ -233,7 +192,6 @@ mod tests {
                 (4, shifted.to_string()),
                 (9, "Лишний номер.".to_string()),
             ],
-            terms: Vec::new(),
         };
         let drafts = answer.accept(LinesMode::Translate, &scene, &batch(&[1, 2, 3, 4]));
         assert_eq!(drafts.len(), 1, "токен потерян, сдвиг и лишний номер не проходят");
@@ -245,22 +203,9 @@ mod tests {
     #[test]
     fn review_keeps_only_real_changes() {
         let scene = scene(vec![line(1, "Sleep well, honey.", "Спи хорошо, медок."), line(2, "Yes.", "Да.")]);
-        let answer = LinesAnswer {
-            lines: vec![(1, "Спокойной ночи, милый.".to_string()), (2, "Да.".to_string())],
-            terms: Vec::new(),
-        };
+        let answer = LinesAnswer { lines: vec![(1, "Спокойной ночи, милый.".to_string()), (2, "Да.".to_string())] };
         let drafts = answer.accept(LinesMode::Review, &scene, &batch(&[1, 2]));
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].sent.text, "Спи хорошо, медок.");
-    }
-
-    #[test]
-    fn new_terms_must_be_in_the_batch_text() {
-        let scene = scene(vec![line(1, "Take the Silver Key.", ""), line(2, "Go.", "")]);
-        let term = |name: &str| AnswerTerm { name: name.to_string(), translation: "Перевод".to_string(), category: Some("item".to_string()) };
-        let answer = LinesAnswer { lines: Vec::new(), terms: vec![term("Silver Key"), term("silver key"), term("Golden Gate")] };
-        let terms = answer.new_terms(&scene, &batch(&[1, 2]));
-        assert_eq!(terms.len(), 1);
-        assert!(terms[0].is_guess());
     }
 }

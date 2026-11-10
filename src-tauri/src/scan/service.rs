@@ -56,8 +56,7 @@ impl ScanService<'_> {
         self.rebuild(project, false)
     }
 
-    /// Пересобирает отставшие производные таблицы. Пока это `edges`: `term_candidates` соберёт шаг глоссария,
-    /// cache.db шаг поиска.
+    /// Пересобирает отставшие производные таблицы. Это `edges`; cache.db собирает шаг поиска.
     pub fn refresh_derived(&self, project: ProjectId) -> Result<(), AppError> {
         self.refresh_edges(project)?;
         Ok(())

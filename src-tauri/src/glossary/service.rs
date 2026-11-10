@@ -4,17 +4,15 @@ use std::collections::BTreeMap;
 
 use rusqlite::Connection;
 
-use super::candidates::{TERM_CANDIDATES_VERSION, find_candidates, name_words, without_names};
-use super::entries::{EntryLine, character_lines, character_names, term_lines, term_names};
+use super::entries::{EntryLine, character_lines, character_names, scene_entries, term_lines, term_names};
 use super::{
     Character, CharacterId, CharacterRepo, DiscardReason, DiscardedTerm, Form, LineSampleRepo, NameKey, NoteOwner, NoteRepo,
-    SceneDescription, SceneDescriptionRepo, Speaker, SpeakerEntry, SpeakerLink, SpeakerRepo, SpeakerUse, Term, TermCandidate,
+    SceneDescription, SceneDescriptionRepo, Speaker, SpeakerEntry, SpeakerLink, SpeakerRepo, SpeakerUse, Term,
     TermCategory, TermId, TermRepo, Token, TokenRepo,
 };
 use crate::common::{AppError, Timestamp, ValidationError};
 use crate::engines::{ContainerKey, SpeakerKey};
 use crate::projects::ProjectId;
-use crate::scan::ScanRepo;
 use crate::state::AppState;
 use crate::storage::DbError;
 use crate::translation::TranslationRepo;
@@ -74,31 +72,6 @@ impl GlossaryService<'_> {
                 scenes: SceneDescriptionRepo { conn: tx }.list()?,
             })
         })?)
-    }
-
-    /// «Новые термины»: кандидаты из текста игры без известного глоссарию и без названий, все слова которых
-    /// это слова имён персонажей и подписей говорящих. Отставшую таблицу кандидатов сначала пересобирает.
-    pub fn new_terms(&self, project: ProjectId) -> Result<Vec<TermCandidate>, AppError> {
-        let open = self.state.open_project(project)?;
-        let (state, scan, texts) = open.project.read(|tx| {
-            let state = TermRepo { conn: tx }.candidates_state()?;
-            let scan = ScanRepo { conn: tx }.latest()?.map(|scan| scan.id);
-            let fresh = scan.is_none_or(|scan| state == Some((TERM_CANDIDATES_VERSION, scan)));
-            Ok((state, scan, if fresh { Vec::new() } else { LineSampleRepo { conn: tx }.all_texts()? }))
-        })?;
-        if let Some(scan) = scan
-            && state != Some((TERM_CANDIDATES_VERSION, scan))
-        {
-            let found = find_candidates(&texts);
-            open.project.write(|tx| TermRepo { conn: tx }.replace_candidates(&found, TERM_CANDIDATES_VERSION, scan))?;
-        }
-        let (candidates, data, labels) = open.project.read(|tx| {
-            Ok((TermRepo { conn: tx }.new_candidates()?, GlossaryData::load(tx)?, LineSampleRepo { conn: tx }.speaker_labels()?))
-        })?;
-        let names = data.characters.iter().flat_map(|character| {
-            [character.first_name(), character.last_name()].into_iter().flatten().chain(character.forms().iter().map(|form| form.text()))
-        });
-        Ok(without_names(candidates, &name_words(names.chain(labels.iter().map(String::as_str)))))
     }
 
     /// «Персонаж»: создаёт персонажа с именем из подписи и связывает с ним говорящего основным кодом.
@@ -273,6 +246,18 @@ impl GlossaryService<'_> {
             scene.edit(title, description, Timestamp::now());
             repo.save(&scene)
         })
+    }
+
+    /// Персонажи и термины сцены: говорят или упомянуты в её репликах, термин назван. Порядок глоссария.
+    pub fn scene_entries(&self, project: ProjectId, key: &ContainerKey) -> Result<(Vec<Character>, Vec<Term>), AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| {
+            let glossary = GlossaryData::load(tx)?;
+            let (characters, terms) = scene_entries(&glossary, &LineSampleRepo { conn: tx }.scene_lines(key)?);
+            let characters = glossary.characters.iter().filter(|item| item.id().is_some_and(|id| characters.contains(&id))).cloned().collect();
+            let terms = glossary.terms.iter().filter(|item| item.id().is_some_and(|id| terms.contains(&id))).cloned().collect();
+            Ok((characters, terms))
+        })?)
     }
 
     /// Реплики персонажа или термина по сюжету с переводом и местом в игре. Исключённые из описания
@@ -498,51 +483,6 @@ mod tests {
         scene.edit("", "", Timestamp::now());
         service.save_scene(id, &scene).unwrap();
         assert!(service.overview(id).unwrap().scenes.is_empty());
-    }
-
-    #[test]
-    fn new_terms_are_built_once_per_scan_and_skip_what_the_glossary_knows() {
-        let dir = tempfile::tempdir().unwrap();
-        let (state, id) = project(dir.path());
-        let service = GlossaryService { state: &state };
-        let open = state.open_project(id).unwrap();
-        let set_texts = |texts: &[&str]| {
-            open.project
-                .write(|tx| {
-                    let ids: Vec<i64> =
-                        tx.prepare("SELECT id FROM segments ORDER BY id")?.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
-                    for (id, text) in ids.iter().zip(texts) {
-                        tx.execute("UPDATE segments SET source_text = ?1 WHERE id = ?2", rusqlite::params![text, id])?;
-                    }
-                    Ok(())
-                })
-                .unwrap();
-        };
-        set_texts(&[
-            "We met at the Ninja Academy.",
-            "Is the Ninja Academy far, Eileen?",
-            "Ask the PPF and the Silver Order.",
-            "Grab the Old Lantern.",
-            "so grab it, is it far?",
-        ]);
-        let texts = |found: Vec<TermCandidate>| found.into_iter().map(|item| (item.text, item.occurrences)).collect::<Vec<_>>();
-        assert_eq!(
-            texts(service.new_terms(id).unwrap()),
-            [("Ninja Academy".to_string(), 2), ("Old Lantern".to_string(), 1), ("PPF".to_string(), 1), ("Silver Order".to_string(), 1)],
-            "Eileen это подпись говорящего"
-        );
-
-        service.take_term(id, "Ninja Academy", TermCategory::Location).unwrap();
-        service.discard_term_name(id, "PPF").unwrap();
-        let mut character = Character::new("Lantern");
-        character.set_last_name("Old");
-        open.project.write(|tx| CharacterRepo { conn: tx }.save(&character).map(|_| ())).unwrap();
-        set_texts(&["Nothing here."]);
-        assert_eq!(
-            texts(service.new_terms(id).unwrap()),
-            [("Silver Order".to_string(), 1)],
-            "термин, корзина и слова имён вычитаются, а кандидаты собраны по прежнему считыванию"
-        );
     }
 
     #[test]

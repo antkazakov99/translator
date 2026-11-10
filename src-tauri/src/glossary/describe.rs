@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use tauri::ipc::Channel;
 
+use super::analyze::{AnalysisPrompt, known_for_prompt, merge, save_found};
 use super::describe_prompt::{
     CharacterAnswer, CharacterPrompt, CondensePrompt, EntryKind, EntryPartPrompt, PartPrompt, ScenePrompt, TermPrompt, TitlePrompt, clean_note,
     is_useful,
 };
-use super::entries::{character_names, character_scenes, entry_parts, term_names, term_scenes};
+use super::entries::{character_names, character_scenes, entry_parts, scene_entries, term_names, term_scenes};
 use super::parts::{MAX_PART_TEXT, Part, ScenesPart, pick_parts, scene_hash, script_line, split_lines};
 use super::repo::{LineSampleRepo, NoteRepo, ReadingDepthRepo, SampleLine, SceneDescriptionRepo, StoryLine, TermRepo};
 use super::{Note, NoteOwner, SceneDescription};
@@ -112,10 +113,12 @@ impl ReadingDepth {
 /// Сколько раз сжимаются заметки, которые не помещаются в запрос сборки.
 const CONDENSE_ROUNDS: usize = 3;
 
-/// Итог запуска описаний: описанные записи и ошибка, которая оборвала запуск.
+/// Итог запуска описаний: описанные записи, добавленные разбором сцен имена и названия и ошибка,
+/// которая оборвала запуск.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Described {
     pub written: Vec<DescribeTarget>,
+    pub added: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -343,9 +346,16 @@ impl DescribeService<'_> {
         progress: Channel<RunProgress>,
     ) -> Result<Described, AppError> {
         let open = self.state.open_project(project)?;
-        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Descriptions, one_off)?;
+        let service = LlmTargetService { state: self.state };
+        let target = service.target(Some(&open), Action::Descriptions, one_off)?;
         let model = target.profile.model().to_string();
-        let (plans, hints) = open.project.read(|tx| {
+        // Сцена сначала разбирается: новые персонажи и термины пишутся в глоссарий до её описания.
+        let analysis = if targets.iter().any(|target| matches!(target, DescribeTarget::Scene(_))) {
+            Some(service.target(Some(&open), Action::Analysis, one_off)?)
+        } else {
+            None
+        };
+        let (plans, hints, mut known) = open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let mut context = GlossaryContext::new(&glossary);
             let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
@@ -359,19 +369,54 @@ impl DescribeService<'_> {
                 };
                 plans.extend(plan);
             }
-            Ok((plans, context.hints))
+            let known = if analysis.is_some() { known_for_prompt(tx)? } else { Vec::new() };
+            Ok((plans, context.hints, known))
         })?;
         let mut described = Described::default();
         if plans.is_empty() {
             return Ok(described);
         }
-        let total = plans.iter().map(Plan::requests).sum();
+        let analyses: usize = match analysis {
+            Some(_) => plans.iter().map(|plan| if let Plan::Scene(scene) = plan { scene.parts.len() } else { 0 }).sum(),
+            None => 0,
+        };
+        let total = plans.iter().map(Plan::requests).sum::<usize>() + analyses;
         let mut run = BatchRun::begin(self.state, &open, Action::Descriptions, &target, progress, total)?;
         let writer = SceneWriter { open: &open, hints: &hints, target: &target, model: &model };
         for plan in plans {
             let done = described.written.len();
             let outcome = match &plan {
-                Plan::Scene(scene) => writer.scene(&mut run, scene, done).await,
+                Plan::Scene(scene) => {
+                    let mut going = true;
+                    if let Some(analysis) = &analysis {
+                        match analyze_scene(&open, &mut run, analysis, scene, &mut known, done).await {
+                            Ok((added, still)) => {
+                                described.added.extend(added);
+                                going = still;
+                            }
+                            Err(error) => {
+                                run.error = Some(error.to_string());
+                                break;
+                            }
+                        }
+                        if going {
+                            match writer.scene_entries(&mut run, &scene.key, done).await {
+                                Ok((written, still)) => {
+                                    described.written.extend(written);
+                                    going = still;
+                                }
+                                Err(error) => {
+                                    run.error = Some(error.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !going {
+                        break;
+                    }
+                    writer.scene(&mut run, scene, done).await
+                }
                 Plan::Entry(entry) => writer.entry(&mut run, entry, done).await,
             };
             match outcome {
@@ -390,7 +435,7 @@ impl DescribeService<'_> {
             }
         }
         let result = run.finish(described.written)?;
-        Ok(Described { written: result.items, error: result.error })
+        Ok(Described { written: result.items, added: described.added, error: result.error })
     }
 }
 
@@ -457,6 +502,38 @@ pub struct PartNote {
     pub model: Option<String>,
     /// Заметка пойдёт в описание: не пустая и не отказ.
     pub useful: bool,
+}
+
+/// Разбор частей сцены моделью действия `analysis` и запись новых персонажей и терминов в глоссарий.
+/// Остановленный разбор записывает найденное до остановки. Возвращает добавленное и идёт ли запуск дальше.
+async fn analyze_scene(
+    open: &Arc<OpenProject>,
+    run: &mut BatchRun<'_>,
+    target: &LlmTarget,
+    plan: &ScenePlan,
+    known: &mut Vec<String>,
+    written: usize,
+) -> Result<(Vec<String>, bool), AppError> {
+    let mut found = Vec::new();
+    let mut going = true;
+    for part in &plan.parts {
+        match run.send_to(target, &AnalysisPrompt::build(&part.text, known, target)).await {
+            Sent::Text(text) => found.extend(AnalysisPrompt::accept(&text, &part.text)),
+            Sent::Skipped => {}
+            Sent::Stop => {
+                going = false;
+                break;
+            }
+        }
+        if !run.step(written) {
+            going = false;
+            break;
+        }
+    }
+    let merged = merge(found);
+    let added = if merged.is_empty() { Vec::new() } else { open.project.write(|tx| save_found(tx, &merged))? };
+    known.extend(added.iter().cloned());
+    Ok((added, going))
 }
 
 fn owner_of(target: &DescribeTarget) -> NoteOwner {
@@ -713,6 +790,40 @@ impl SceneWriter<'_> {
             }
         }
         Ok(Some(notes))
+    }
+
+    /// Персонажи и термины сцены без описания описываются с глубиной чтения проекта: так новые записи разбора
+    /// и старые пустые получают описание до описания сцены. Возвращает описанные и идёт ли запуск дальше.
+    async fn scene_entries(&self, run: &mut BatchRun<'_>, key: &ContainerKey, written: usize) -> Result<(Vec<DescribeTarget>, bool), AppError> {
+        let plans = self.open.project.read(|tx| {
+            let glossary = GlossaryData::load(tx)?;
+            let context = GlossaryContext::new(&glossary);
+            let samples = LineSampleRepo { conn: tx };
+            let (characters, terms) = scene_entries(&glossary, &samples.scene_lines(key)?);
+            if characters.is_empty() && terms.is_empty() {
+                return Ok(Vec::new());
+            }
+            let lines = samples.story_lines()?;
+            let choice = Choice::Depth(ReadingDepthRepo { conn: tx }.get()?);
+            let targets = characters.into_iter().map(DescribeTarget::Character).chain(terms.into_iter().map(DescribeTarget::Term));
+            let mut plans = Vec::new();
+            for target in targets {
+                plans.extend(plan_entry(tx, &context, &glossary, &lines, target, self.model, choice, Fill::Empty)?);
+            }
+            Ok(plans)
+        })?;
+        run.grow(plans.iter().map(EntryPlan::requests).sum());
+        let mut done = Vec::new();
+        for plan in plans {
+            let outcome = self.entry(run, &plan, written).await?;
+            if outcome.description.is_some() {
+                done.push(plan.target.clone());
+            }
+            if !outcome.going {
+                return Ok((done, false));
+            }
+        }
+        Ok((done, true))
     }
 
     /// Описание персонажа или термина по заметкам частей. Запуск заменяет описание, у персонажа и манеру речи.
@@ -1190,7 +1301,6 @@ pub(crate) enum Sent {
 /// Ход запуска предложений по пакетам: место запуска, прогресс, ошибка, которая обрывает запуск.
 struct BatchRun<'a> {
     run: LlmRun,
-    client: LlmClient,
     target: &'a LlmTarget,
     report: RunProgress,
     error: Option<String>,
@@ -1208,7 +1318,7 @@ impl<'a> BatchRun<'a> {
         let run = LlmRun::begin(state, Some(open.clone()), action, target, progress)?;
         let report = RunProgress { total: total as u32, ..RunProgress::default() };
         run.report(report.clone());
-        Ok(Self { run, client: LlmClient::for_kind(target.provider.kind()), target, report, error: None })
+        Ok(Self { run, target, report, error: None })
     }
 
     /// Пакет: запрос, разбор в `items`, отчёт. `false`: запуск остановлен или оборвался, дальше не спрашивать.
@@ -1229,10 +1339,16 @@ impl<'a> BatchRun<'a> {
 
     /// Запрос без отчёта. Ошибка запоминается и обрывает запуск.
     async fn send(&mut self, request: &ChatRequest) -> Sent {
+        let target = self.target;
+        self.send_to(target, request).await
+    }
+
+    /// Запрос к модели другого действия внутри этого запуска, например разбор сцены в запуске описаний.
+    async fn send_to(&mut self, target: &LlmTarget, request: &ChatRequest) -> Sent {
         if self.run.cancelled() || self.error.is_some() {
             return Sent::Stop;
         }
-        match ask(self.client, self.target, request, &self.run).await {
+        match ask(LlmClient::for_kind(target.provider.kind()), target, request, &self.run).await {
             Ok(Some(text)) => Sent::Text(text),
             Ok(None) => {
                 tracing::warn!("Модель отказалась отвечать на пакет, он пропущен");
@@ -1618,7 +1734,13 @@ mod tests {
     fn scenes_are_described_from_part_notes_and_named_once() {
         let (url, seen) = fake_model(|body| {
             let system = system_text(body);
-            let answer = if system.contains("name a scene") { "«Знакомство с Эйлин»." } else { "**Эйлин** здоровается с героем." };
+            let answer = if system.contains("proper names") {
+                "[]"
+            } else if system.contains("name a scene") {
+                "«Знакомство с Эйлин»."
+            } else {
+                "**Эйлин** здоровается с героем."
+            };
             completion(answer)
         });
         let dir = tempfile::tempdir().unwrap();
@@ -1629,13 +1751,14 @@ mod tests {
 
         let described =
             tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(start.clone()), usize::MAX, None, silent())).unwrap();
-        assert_eq!(described, Described { written: vec![DescribeTarget::Scene(start.clone())], error: None });
+        assert_eq!(described, Described { written: vec![DescribeTarget::Scene(start.clone())], added: Vec::new(), error: None });
         {
             let requests = seen.lock().unwrap();
-            assert_eq!(requests.len(), 2, "одна часть сразу становится описанием, потом название");
-            let part = user_text(&requests[0]);
+            assert_eq!(requests.len(), 3, "разбор, одна часть сразу становится описанием, потом название");
+            assert!(system_text(&requests[0]).contains("proper names"), "сначала разбор");
+            let part = user_text(&requests[1]);
             assert!(part.contains("Script:\n\nEileen: Hello.\nNarration.\nRadio Chatter: Static.\n"), "{part}");
-            assert!(system_text(&requests[1]).ends_with("This is the first scene of the game."));
+            assert!(system_text(&requests[2]).ends_with("This is the first scene of the game."));
         }
         let open = state.open_project(id).unwrap();
         let (scene, sources) = open
@@ -1658,10 +1781,10 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(described.written, [DescribeTarget::Scene(left.clone())], "заполненная сцена без новых частей пропущена");
-        assert_eq!(seen.lock().unwrap().len(), 4);
+        assert_eq!(seen.lock().unwrap().len(), 6, "пропущенная сцена не разбирается");
 
         tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(start.clone()), usize::MAX, None, silent())).unwrap();
-        assert_eq!(seen.lock().unwrap().len(), 4, "заметка готова, название есть: запросов нет");
+        assert_eq!(seen.lock().unwrap().len(), 7, "заметка готова, название есть: только разбор");
 
         let parts = service.scene_parts(id, &start).unwrap();
         assert_eq!(parts.len(), 1);
@@ -1669,6 +1792,51 @@ mod tests {
         assert!(parts[0].useful);
         assert_eq!(service.reset_notes(id, &DescribeTarget::Scene(start.clone())).unwrap(), 1);
         assert_eq!(service.scene_parts(id, &start).unwrap()[0].note, None);
+    }
+
+    #[test]
+    fn scene_analysis_adds_new_entries_and_describes_them_before_the_scene() {
+        let (url, seen) = fake_model(|body| {
+            let system = system_text(body);
+            let answer = if system.contains("proper names") {
+                r#"[{"kind": "location", "name": "Left side"}, {"kind": "character", "name": "Eileen", "gender": "female"}, {"kind": "character", "name": "Ghost"}]"#
+            } else if system.contains("notes about the term") {
+                "Сторона дороги."
+            } else if system.contains("name a scene") {
+                "Налево"
+            } else {
+                "Эйлин показывает дорогу."
+            };
+            completion(answer)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let service = DescribeService { state: &state };
+        let left = ContainerKey::new("label:left").unwrap();
+
+        let described = tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(left.clone()), usize::MAX, None, silent())).unwrap();
+        assert_eq!(described.added, ["Left side"], "подпись говорящего и выдуманное имя не добавлены");
+        assert_eq!(described.error, None);
+        let open = state.open_project(id).unwrap();
+        let terms = open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap();
+        assert_eq!(terms.len(), 1);
+        assert_eq!((terms[0].category(), terms[0].description()), (TermCategory::Location, Some("Сторона дороги.")));
+        let term = terms[0].id().unwrap();
+        assert_eq!(described.written, [DescribeTarget::Term(term), DescribeTarget::Scene(left.clone())], "сначала термин, потом сцена");
+        {
+            let requests = seen.lock().unwrap();
+            let systems: Vec<String> = requests.iter().map(system_text).collect();
+            assert_eq!(systems.len(), 4, "разбор, термин, часть сцены, название");
+            assert!(systems[0].contains("proper names") && systems[1].contains("notes about the term"));
+            assert_eq!(requests[0]["temperature"].as_f64(), Some(0.0), "разбор идёт с настройками своего действия");
+        }
+
+        let entries = GlossaryService { state: &state }.scene_entries(id, &left).unwrap();
+        assert_eq!((entries.0.len(), entries.1.len()), (0, 1), "у сцены один термин, персонажей в глоссарии нет");
+        tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(left.clone()), usize::MAX, None, silent())).unwrap();
+        let requests = seen.lock().unwrap();
+        assert!(user_text(&requests[4]).starts_with("Known names and terms: Left side, Eileen\n"), "{}", user_text(&requests[4]));
+        assert_eq!(requests.len(), 5, "описанный термин не описывается снова, заметка сцены готова");
     }
 
     #[test]
@@ -1705,7 +1873,7 @@ mod tests {
         let described =
             tauri::async_runtime::block_on(service.describe_many(id, vec![character.clone(), term.clone()], None, silent()))
                 .unwrap();
-        assert_eq!(described, Described { written: vec![character.clone(), term.clone()], error: None });
+        assert_eq!(described, Described { written: vec![character.clone(), term.clone()], added: Vec::new(), error: None });
         {
             let requests = seen.lock().unwrap();
             assert_eq!(requests.len(), 3, "часть и сборка персонажа, единственная часть термина");

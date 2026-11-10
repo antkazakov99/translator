@@ -47,9 +47,9 @@ impl GlossaryContext {
         }
         for term in &data.terms {
             let Some(translation) = term.translation() else { continue };
-            hints.terms.push((term.name().to_string(), translation.to_string(), term.is_guess()));
+            hints.terms.push((term.name().to_string(), translation.to_string()));
             for form in term.forms() {
-                hints.terms.push((form.text().to_string(), form.translation().unwrap_or(translation).to_string(), term.is_guess()));
+                hints.terms.push((form.text().to_string(), form.translation().unwrap_or(translation).to_string()));
             }
         }
         let mut values = HashMap::new();
@@ -192,7 +192,8 @@ mod tests {
         let mut entry = SpeakerEntry::new(key("label:Radio"), Timestamp::from_secs(0));
         entry.set_translation("Радио");
         entry.set_gender(Some(Gender::Male));
-        let term = Term::guess("Silver Key", "Серебряный ключ", TermCategory::Item).unwrap();
+        let mut term = Term::new("Silver Key", TermCategory::Item).unwrap();
+        term.set_translation("Серебряный ключ");
         let mut mother = Token::new("mom").unwrap();
         mother.set_value("mother");
         let mut hero = Token::new("mc").unwrap();
@@ -208,7 +209,7 @@ mod tests {
         let mut context = GlossaryContext::new(&data);
         assert!(context.hints.names.contains(&("Anna Lee".to_string(), "Анна Ли".to_string(), Some(Gender::Female))));
         assert!(context.hints.names.contains(&("Annie".to_string(), "Энни".to_string(), Some(Gender::Female))));
-        assert_eq!(context.hints.terms, [("Silver Key".to_string(), "Серебряный ключ".to_string(), true)]);
+        assert_eq!(context.hints.terms, [("Silver Key".to_string(), "Серебряный ключ".to_string())]);
         assert_eq!(context.hints.tokens, [("mc".to_string(), "имя героя".to_string())]);
 
         let mut lines = vec![line(1, "Hi, [mom]. I'm [mc].", ""), line(2, "Static.", "")];

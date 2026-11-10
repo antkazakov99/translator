@@ -65,7 +65,7 @@ impl SpeakerLabels {
         if !found.is_empty() {
             return found;
         }
-        let found: HashSet<String> = terms.iter().filter(|term| !term.is_guess()).filter_map(|term| term_translation(term, label)).collect();
+        let found: HashSet<String> = terms.iter().filter_map(|term| term_translation(term, label)).collect();
         if !found.is_empty() {
             return found;
         }
@@ -289,17 +289,15 @@ mod tests {
         let other = person(3, "Celia", None, ("Целия", None), Vec::new());
         let mut guard = Term::new("Guard", TermCategory::Title).unwrap();
         guard.set_translation("Стражник");
-        let guess = Term::guess("Ghost", "Призрак", TermCategory::General).unwrap();
         let mut entry = SpeakerEntry::new(SpeakerKey::new("label:Radio").unwrap(), Timestamp::from_secs(0));
         entry.set_translation("Радио");
         let characters = vec![lee.clone(), katy.clone()];
-        let terms = vec![guard, guess];
+        let terms = vec![guard];
         let labels = [
             source("Radio", Some(&entry), Vec::new()),
             source("Miss Lee", None, vec![&lee]),
             source("Katy", None, Vec::new()),
             source("guard", None, Vec::new()),
-            source("Ghost", None, Vec::new()),
             source("Celia & Katy", None, Vec::new()),
             source("[player]", None, Vec::new()),
             source("{b}Katy{/b}", None, Vec::new()),
@@ -314,7 +312,7 @@ mod tests {
                 ("Radio".to_string(), "Радио".to_string()),
                 ("guard".to_string(), "Стражник".to_string()),
             ],
-            "предположение модели и переменная не переводятся"
+            "переменная не переводится"
         );
 
         let ambiguous = SpeakerLabels::translate(&[source("Celia", None, Vec::new())], &[lee.clone(), other], &[]);

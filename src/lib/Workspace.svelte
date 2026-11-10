@@ -500,14 +500,23 @@
     view = "graph";
   }
 
-  function describedNotice(written: number, stopped: boolean) {
-    const text = `Описано сцен: ${written}`;
+  /** «Описано сцен: 1 · записей глоссария: 2 · новых: 1». В `written` идут и персонажи с терминами (`character:1`, `term:2`). */
+  function describedNotice(written: string[], added: string[], stopped: boolean) {
+    const entries = written.filter((key) => key.startsWith("character:") || key.startsWith("term:")).length;
+    let text = `Описано сцен: ${written.length - entries}`;
+    if (entries > 0) text += ` · записей глоссария: ${entries}`;
+    if (added.length > 0) text += ` · новых в глоссарии: ${added.length} (${added.join(", ")})`;
     return stopped ? `Остановлено. ${text}` : text;
   }
 
-  /** Описывает сцену по `parts` частям: сначала прочитанные, остальные равномерно по сцене. */
+  /** Разбирает сцену по `parts` частям (новые персонажи и термины сразу в глоссарий), описывает её записи без описания, потом саму сцену. */
   async function describeOne(key: string, parts: number) {
-    await describe.start((channel) => commands.describeScene(project.id, key, parts, null, channel), (message) => (error = message), describedNotice);
+    let result: { written: string[]; added: string[] } = { written: [], added: [] };
+    await describe.start(
+      async (channel) => (result = await commands.describeScene(project.id, key, parts, null, channel)),
+      (message) => (error = message),
+      (_, stopped) => describedNotice(result.written, result.added, stopped),
+    );
     await refresh();
   }
 

@@ -13,8 +13,6 @@ use crate::scan::SegmentId;
 pub const LINE_ANSWER_TOKENS: u32 = 4096;
 /// Предел подсказки терминов: в запрос идут термины, упомянутые в пакете.
 const MAX_TERM_HINT_CHARS: usize = 1500;
-/// Пометка термина, который предположила модель: она не должна считать его установленным.
-const UNCONFIRMED_MARK: &str = "(unconfirmed)";
 /// Сколько языков имён с правилами идёт в один запрос: правила длинные.
 const NAME_RULE_LANGUAGES: usize = 3;
 /// Подпись реплики без говорящего: повествование и мысли героя.
@@ -32,13 +30,11 @@ Rules:
 6. Translate every line, including short ones and interjections. "..." stays "...". Nonsense words, scat singing, onomatopoeia and deliberately garbled speech have no hidden meaning: render them as similar-sounding Russian nonsense, never replace them with words you guessed.
 7. A line starting with "Scene:" describes what happens. A line starting with "Speakers:" describes who talks. A line starting with "Tokens:" explains the variables. They are context: never translate or quote them.
 8. A line starting with "Russian names:" gives the exact spelling of names: always use it, declining the name as Russian grammar requires. A line starting with "Gender:" tells who is male or female. A line starting with "Name rules:" tells how to render names that are not listed.
-9. A line starting with "Known terms:" gives established translations: use them. A term marked (unconfirmed) is a guess: use it unless the text shows it is wrong.
-10. If a line contains the name of a place, organization, item, rank or event that recurs in the game and is not in "Known terms", add one object for it with the fields "term" (exact English spelling from the line), "translation", "category" (one of "general", "location", "organization", "title", "item", "event") and "note" (what it probably is, in Russian, one short sentence). Do not add personal names or ordinary words.
+9. A line starting with "Known terms:" gives established translations: use them.
 
 Respond ONLY with a valid JSON array of objects:
 [
-  {"id": "12", "text": "Где ты была всю ночь, [mc]?"},
-  {"term": "Silver Key", "translation": "Серебряный ключ", "category": "item", "note": "Похоже, ключ от подвала"}
+  {"id": "12", "text": "Где ты была всю ночь, [mc]?"}
 ]"#;
 
 const REVIEW_SYSTEM: &str = r#"You are the editor of a Russian translation of a visual novel. You receive a JSON array of lines in story order: each item with an "id" has the English "text" and its Russian "draft".
@@ -241,11 +237,8 @@ fn term_hint(text: &str, hints: &Hints) -> Option<String> {
     let pairs: Vec<String> = hints
         .terms
         .iter()
-        .filter(|(original, translated, _)| !translated.trim().is_empty() && mentions(&lower, &original.trim().to_lowercase()))
-        .map(|(original, translated, guess)| {
-            let pair = format!("{} = {}", original.trim(), translated.trim());
-            if *guess { format!("{pair} {UNCONFIRMED_MARK}") } else { pair }
-        })
+        .filter(|(original, translated)| !translated.trim().is_empty() && mentions(&lower, &original.trim().to_lowercase()))
+        .map(|(original, translated)| format!("{} = {}", original.trim(), translated.trim()))
         .take_while(|pair| {
             size += pair.chars().count() + 2;
             size <= MAX_TERM_HINT_CHARS
@@ -279,7 +272,7 @@ pub(crate) mod tests {
         };
         let hints = Hints {
             names: vec![("Anna".to_string(), "Анна".to_string(), Some(Gender::Female))],
-            terms: vec![("Silver Key".to_string(), "Серебряный ключ".to_string(), true)],
+            terms: vec![("Silver Key".to_string(), "Серебряный ключ".to_string())],
             ..Default::default()
         };
         let request = LinesPrompt::build(LinesMode::Translate, &scene, &batch, &hints, &target());

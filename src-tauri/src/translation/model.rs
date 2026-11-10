@@ -169,8 +169,8 @@ pub struct Draft {
 pub struct Hints {
     /// Оригинал, перевод и род.
     pub names: Vec<(String, String, Option<Gender>)>,
-    /// Оригинал, перевод и признак предположения (`unconfirmed`).
-    pub terms: Vec<(String, String, bool)>,
+    /// Оригинал и перевод термина или его формы.
+    pub terms: Vec<(String, String)>,
     /// Токен без значения и его пояснение: модель видит токен в тексте.
     pub tokens: Vec<(String, String)>,
     /// Имя, фамилия, полное имя или форма персонажа и коды языков их происхождения, у которых есть правила.

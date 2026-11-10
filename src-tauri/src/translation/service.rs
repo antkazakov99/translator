@@ -14,7 +14,7 @@ use super::{
 };
 use crate::common::{AppError, Timestamp};
 use crate::glossary::describe::{RunAsk, SceneReader};
-use crate::glossary::{CharacterRepo, GlossaryData, SceneDescriptionRepo, Term, TermRepo};
+use crate::glossary::{CharacterRepo, GlossaryData, SceneDescriptionRepo};
 use crate::name_rules::NameRuleService;
 use crate::llm::{Action, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunId, RunProgress, RunStatus};
 use crate::projects::ProjectId;
@@ -370,34 +370,6 @@ impl Job<'_> {
         };
         let drafts = answer.accept(self.mode, scene, batch);
         self.save(scene, &drafts)?;
-        if self.mode == LinesMode::Translate {
-            self.save_terms(answer.new_terms(scene, batch))?;
-        }
-        Ok(())
-    }
-
-    /// Новые термины ложатся в глоссарий предположениями и сразу идут в следующие запросы с пометкой:
-    /// иначе один термин расходился бы по пакетам. Название, уже известное глоссарию, не пишется.
-    fn save_terms(&mut self, terms: Vec<Term>) -> Result<(), AppError> {
-        if terms.is_empty() {
-            return Ok(());
-        }
-        let saved = self.open.project.write(|tx| {
-            let repo = TermRepo { conn: tx };
-            let mut saved = Vec::new();
-            for term in terms {
-                if !repo.is_known(term.name_key())? {
-                    repo.save(&term)?;
-                    saved.push(term);
-                }
-            }
-            Ok(saved)
-        })?;
-        for term in saved {
-            if let Some(translation) = term.translation() {
-                self.hints.terms.push((term.name().to_string(), translation.to_string(), true));
-            }
-        }
         Ok(())
     }
 
@@ -689,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn glossary_reaches_the_prompt_and_new_terms_become_guesses() {
+    fn glossary_reaches_the_prompt_and_terms_in_the_answer_are_ignored() {
         use crate::common::Gender;
         use crate::engines::SpeakerKey;
         use crate::glossary::{CharacterRepo, GlossaryService};
@@ -725,9 +697,9 @@ mod tests {
         assert!(first.contains("Speakers:\nEileen: female"), "{first}");
         assert!(first.contains("Russian names: Eileen = Эйлин"), "{first}");
 
-        let terms = glossary.overview(id).unwrap().data.terms;
-        assert_eq!(terms.len(), 1, "выдуманный термин без упоминания не сохраняется");
-        assert_eq!((terms[0].name(), terms[0].translation(), terms[0].is_guess()), ("Left Side", Some("Левая сторона"), true));
+        assert!(glossary.overview(id).unwrap().data.terms.is_empty(), "термины ищет разбор сцены, а не перевод");
+        let written: i64 = open.project.read(|tx| Ok(tx.query_row("SELECT count(*) FROM translations", [], |row| row.get(0))?)).unwrap();
+        assert!(written > 0, "реплики рядом с терминами в ответе записаны");
     }
 
     #[test]

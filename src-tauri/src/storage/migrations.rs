@@ -31,16 +31,16 @@ impl Migration {
 }
 
 /// Шаги app.db.
-pub const APP: &[Migration] = &[Migration {
-    version: 1,
-    name: "init",
-    sql: include_str!("schema/app/0001_init.sql"),
-}];
+pub const APP: &[Migration] = &[
+    Migration { version: 1, name: "init", sql: include_str!("schema/app/0001_init.sql") },
+    Migration { version: 2, name: "analysis_action", sql: include_str!("schema/app/0002_analysis_action.sql") },
+];
 
 /// Шаги project.db.
 pub const PROJECT: &[Migration] = &[
     Migration { version: 1, name: "init", sql: include_str!("schema/project/0001_init.sql") },
     Migration { version: 2, name: "reading_depth", sql: include_str!("schema/project/0002_reading_depth.sql") },
+    Migration { version: 3, name: "scene_analysis", sql: include_str!("schema/project/0003_scene_analysis.sql") },
 ];
 
 /// История шагов. Её создаёт механизм миграций, в самих шагах её нет.

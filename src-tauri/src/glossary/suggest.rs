@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn terms_prompt_numbers_items_and_gives_glossary_hints() {
-        let hints = Hints { terms: vec![("PPF".to_string(), "ППФ".to_string(), false)], ..Hints::default() };
+        let hints = Hints { terms: vec![("PPF".to_string(), "ППФ".to_string())], ..Hints::default() };
         let request = TermsPrompt::build(&[term(7, "PPF Headquarters", Some("База"))], &hints, &target());
         assert!(request.user.starts_with("Known terms: PPF = ППФ"));
         assert!(request.user.contains(r#"- id: 1, term: "PPF Headquarters", current_category: "general", about: "База", example: "We met at the PPF Headquarters.""#));

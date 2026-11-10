@@ -11,7 +11,7 @@ use super::entries::EntryLine;
 use super::{
     Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
     SpeakerSuggestion, Term,
-    TermCandidate, TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
+    TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
 };
 use crate::common::{AppError, Gender, Timestamp};
 use crate::engines::{ContainerKey, SpeakerKey};
@@ -132,8 +132,6 @@ pub struct TermDto {
     pub name: String,
     pub translation: Option<String>,
     pub category: TermCategory,
-    /// Предположение модели: идёт в запросы с пометкой, пока его не подтвердят.
-    pub guess: bool,
     pub description: Option<String>,
     pub forms: Vec<FormDto>,
 }
@@ -145,7 +143,6 @@ impl From<&Term> for TermDto {
             name: term.name().to_string(),
             translation: term.translation().map(str::to_string),
             category: term.category(),
-            guess: term.is_guess(),
             description: term.description().map(str::to_string),
             forms: term.forms().iter().map(FormDto::from).collect(),
         }
@@ -160,7 +157,6 @@ impl TermDto {
             &self.name,
             text(self.translation),
             self.category,
-            self.guess,
             text(self.description),
             Vec::new(),
         )?;
@@ -390,7 +386,7 @@ pub async fn take_term(app: AppHandle, project: String, name: String, category: 
     blocking(app, move |state| Ok(RowRef(GlossaryService { state }.take_term(self::project(&project)?, &name, category)?.get()))).await
 }
 
-/// Сохраняет термин целиком. Подтверждение предположения это `guess: false`.
+/// Сохраняет термин целиком.
 #[tauri::command]
 #[specta::specta]
 pub async fn save_term(app: AppHandle, project: String, term: TermDto) -> Result<(), String> {
@@ -428,31 +424,6 @@ pub async fn discard_term_name(app: AppHandle, project: String, name: String) ->
 #[specta::specta]
 pub async fn restore_term_name(app: AppHandle, project: String, key: String) -> Result<(), String> {
     blocking(app, move |state| GlossaryService { state }.restore_term_name(self::project(&project)?, &NameKey::from_stored(key))).await
-}
-
-/// Кандидат в термины из текста игры.
-#[derive(Debug, Clone, Serialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct TermCandidateDto {
-    pub text: String,
-    /// В скольких разных репликах встретилось.
-    pub occurrences: u32,
-    /// Кусок реплики вокруг названия.
-    pub example: String,
-}
-
-/// «Новые термины»: названия из текста игры, которых нет в глоссарии. Первый вызов после считывания их собирает.
-#[tauri::command]
-#[specta::specta]
-pub async fn new_terms(app: AppHandle, project: String) -> Result<Vec<TermCandidateDto>, String> {
-    blocking(app, move |state| {
-        let found = GlossaryService { state }.new_terms(self::project(&project)?)?;
-        Ok(found
-            .into_iter()
-            .map(|item: TermCandidate| TermCandidateDto { text: item.text, occurrences: item.occurrences, example: item.example })
-            .collect())
-    })
-    .await
 }
 
 /// Глубина чтения для описаний моделью: минимум и максимум частей и процент.
@@ -784,6 +755,8 @@ pub struct PartNoteDto {
 #[serde(rename_all = "camelCase")]
 pub struct DescribedDto {
     pub written: Vec<String>,
+    /// Персонажи и термины, которые разбор сцен добавил в глоссарий.
+    pub added: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -798,7 +771,7 @@ impl From<Described> for DescribedDto {
                 DescribeTarget::Term(id) => format!("term:{}", id.get()),
             })
             .collect();
-        Self { written, error: described.error }
+        Self { written, added: described.added, error: described.error }
     }
 }
 
@@ -1047,4 +1020,51 @@ pub async fn describe_scenes(
         .describe_many(self::project(&project)?, targets, self::profile(profile)?, progress)
         .await?;
     Ok(described.into())
+}
+
+/// Персонаж или термин сцены для карточки.
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneEntryDto {
+    pub id: RowRef,
+    pub name: String,
+    pub translation: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneEntriesDto {
+    pub characters: Vec<SceneEntryDto>,
+    pub terms: Vec<SceneEntryDto>,
+}
+
+/// Персонажи и термины сцены: кто говорит или упомянут в её репликах, какие термины названы.
+#[tauri::command]
+#[specta::specta]
+pub async fn scene_entries(app: AppHandle, project: String, key: String) -> Result<SceneEntriesDto, String> {
+    blocking(app, move |state| {
+        let (characters, terms) = GlossaryService { state }.scene_entries(self::project(&project)?, &scene_key(key)?)?;
+        Ok(SceneEntriesDto {
+            characters: characters
+                .iter()
+                .map(|character| SceneEntryDto {
+                    id: RowRef(character.id().map_or(0, CharacterId::get)),
+                    name: character.full_name().unwrap_or_default(),
+                    translation: character.translated_full_name(),
+                    description: character.description().map(str::to_string),
+                })
+                .collect(),
+            terms: terms
+                .iter()
+                .map(|term| SceneEntryDto {
+                    id: RowRef(term.id().map_or(0, TermId::get)),
+                    name: term.name().to_string(),
+                    translation: term.translation().map(str::to_string),
+                    description: term.description().map(str::to_string),
+                })
+                .collect(),
+        })
+    })
+    .await
 }

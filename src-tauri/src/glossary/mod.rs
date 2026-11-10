@@ -1,6 +1,6 @@
 //! Глоссарий: говорящие и их связи с персонажами, персонажи, термины, токены, описания сцен, заметки модели.
 
-pub mod candidates;
+pub mod analyze;
 pub mod characters;
 pub mod commands;
 pub mod describe;
@@ -18,6 +18,7 @@ pub mod suggest;
 pub mod terms;
 pub mod tokens;
 
+pub use analyze::{Finding, FoundKind};
 pub use characters::{Character, CharacterId, Form, NameField, NameOrigin};
 pub(crate) use describe::prune_notes;
 pub use describe::{DescribeService, DescribeTarget, Described, NamesService, ReadingDepth, Suggestions};
@@ -29,5 +30,5 @@ pub use suggest::{SpeakerSuggestion, TermSuggestion, TokenSuggestion};
 pub use scenes::{SceneDescription, SceneSource};
 pub use service::{ExcludeOwner, GlossaryData, GlossaryOverview, GlossaryService};
 pub use speakers::{Speaker, SpeakerEntry, SpeakerLink, speaker_gender};
-pub use terms::{DiscardReason, DiscardedTerm, Term, TermCandidate, TermCategory, TermId};
+pub use terms::{DiscardReason, DiscardedTerm, Term, TermCategory, TermId};
 pub use tokens::Token;

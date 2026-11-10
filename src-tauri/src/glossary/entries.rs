@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use super::parts::{ScenesPart, pack_scenes, script_line};
 use super::repo::StoryLine;
-use super::{Character, Term};
+use super::{Character, CharacterId, GlossaryData, Term, TermId};
 use crate::engines::{ContainerKey, SpeakerKey};
 use crate::translation::PlacedLine;
 use crate::translation::hints::GlossaryContext;
@@ -108,6 +108,29 @@ fn scenes_where(lines: &[StoryLine], excluded: &[ContainerKey], wanted: impl Fn(
         }
     }
     found
+}
+
+/// Персонажи и термины сцены по её репликам: персонаж говорит или упомянут, термин назван. Порядок глоссария.
+pub fn scene_entries(glossary: &GlossaryData, lines: &[StoryLine]) -> (Vec<CharacterId>, Vec<TermId>) {
+    let characters = glossary
+        .characters
+        .iter()
+        .filter_map(|character| {
+            let id = character.id()?;
+            let speakers: HashSet<SpeakerKey> = glossary.links.iter().filter(|link| link.character == id).map(|link| link.speaker.clone()).collect();
+            let names = character_names(character);
+            lines.iter().any(|line| character_use(line.speaker_key.as_ref(), &line.text, &speakers, &names).is_some()).then_some(id)
+        })
+        .collect();
+    let terms = glossary
+        .terms
+        .iter()
+        .filter_map(|term| {
+            let names = term_names(term);
+            lines.iter().any(|line| term_used(&line.text, &names)).then_some(term.id()?)
+        })
+        .collect();
+    (characters, terms)
 }
 
 /// Части из выбранных сцен: реплики строками «Говорящий: текст» с именами из глоссария и значениями токенов.
