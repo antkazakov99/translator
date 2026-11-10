@@ -58,27 +58,28 @@ pub enum DescribeTarget {
 }
 
 /// Глубина чтения в массовом обновлении: минимум и максимум частей и желаемый процент.
-/// Своя у проекта (`reading_depth`), без неё действует `default`.
+/// Одна на приложение (`reading_depth` в app.db), без неё действует `default`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadingDepth {
     min_parts: usize,
-    max_parts: usize,
+    /// `None`: без предела.
+    max_parts: Option<usize>,
     percent: u8,
 }
 
 impl Default for ReadingDepth {
     fn default() -> Self {
-        Self { min_parts: 5, max_parts: 50, percent: 30 }
+        Self { min_parts: 5, max_parts: Some(50), percent: 30 }
     }
 }
 
 impl ReadingDepth {
-    /// Минимум не меньше одной части, максимум не меньше минимума, процент от 1 до 100.
-    pub fn new(min_parts: usize, max_parts: usize, percent: u8) -> Result<Self, ValidationError> {
+    /// Минимум не меньше одной части, максимум (если есть) не меньше минимума, процент от 1 до 100.
+    pub fn new(min_parts: usize, max_parts: Option<usize>, percent: u8) -> Result<Self, ValidationError> {
         if min_parts == 0 {
             return Err(ValidationError::OutOfRange("минимум частей"));
         }
-        if max_parts < min_parts {
+        if max_parts.is_some_and(|max| max < min_parts) {
             return Err(ValidationError::OutOfRange("максимум частей меньше минимума"));
         }
         if !(1..=100).contains(&percent) {
@@ -91,7 +92,7 @@ impl ReadingDepth {
         self.min_parts
     }
 
-    pub fn max_parts(&self) -> usize {
+    pub fn max_parts(&self) -> Option<usize> {
         self.max_parts
     }
 
@@ -99,14 +100,23 @@ impl ReadingDepth {
         self.percent
     }
 
-    /// Процент от всех частей округляется вверх и ограничивается минимумом и максимумом.
-    /// У кого частей меньше минимума, тот читается целиком (`partsForDepth`).
+    /// Процент от всех частей округляется вверх и ограничивается минимумом и максимумом, если он есть.
+    /// У кого частей меньше минимума, тот читается целиком (`partsFor` в окне).
     pub fn parts_for(&self, total: usize) -> usize {
         if total <= self.min_parts {
             return total;
         }
-        let wanted = (total * usize::from(self.percent)).div_ceil(100);
-        wanted.clamp(self.min_parts, self.max_parts.max(self.min_parts)).min(total)
+        let wanted = (total * usize::from(self.percent)).div_ceil(100).max(self.min_parts);
+        let capped = match self.max_parts {
+            Some(max) => wanted.min(max.max(self.min_parts)),
+            None => wanted,
+        };
+        capped.min(total)
+    }
+
+    /// Глубина приложения: без строки в app.db значение по умолчанию.
+    pub fn load(state: &AppState) -> Result<Self, AppError> {
+        Ok(state.app.read(|tx| ReadingDepthRepo { conn: tx }.get())?)
     }
 }
 
@@ -247,7 +257,7 @@ impl DescribeService<'_> {
         self.run(project, vec![target], Choice::Count(parts), Fill::Replace, one_off, progress).await
     }
 
-    /// Группа по очереди с глубиной чтения проекта. Заполненная запись без новых частей в запуск не входит.
+    /// Группа по очереди с глубиной чтения приложения. Заполненная запись без новых частей в запуск не входит.
     pub async fn describe_many(
         &self,
         project: ProjectId,
@@ -255,7 +265,7 @@ impl DescribeService<'_> {
         one_off: Option<ProfileId>,
         progress: Channel<RunProgress>,
     ) -> Result<Described, AppError> {
-        let depth = self.state.open_project(project)?.project.read(|tx| ReadingDepthRepo { conn: tx }.get())?;
+        let depth = ReadingDepth::load(self.state)?;
         self.run(project, targets, Choice::Depth(depth), Fill::ReplaceUnlessRead, one_off, progress).await
     }
 
@@ -274,6 +284,7 @@ impl DescribeService<'_> {
             .target(Some(&open), Action::Descriptions, None)
             .ok()
             .map(|target| target.profile.model().to_string());
+        let depth = ReadingDepth::load(self.state)?;
         Ok(open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let context = GlossaryContext::new(&glossary);
@@ -285,7 +296,6 @@ impl DescribeService<'_> {
                 own.or_else(|| notes.iter().find(|note| note.part_hash == hash && model.is_none()))
             };
             let ready: Vec<bool> = selection.parts.iter().map(|part| note_of(&part.part.hash).is_some()).collect();
-            let depth = ReadingDepthRepo { conn: tx }.get()?;
             let picked = pick_parts(&ready, depth.parts_for(selection.parts.len()));
             let parts = selection
                 .parts
@@ -355,6 +365,7 @@ impl DescribeService<'_> {
         } else {
             None
         };
+        let depth = ReadingDepth::load(self.state)?;
         let (plans, hints, mut known) = open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let mut context = GlossaryContext::new(&glossary);
@@ -400,7 +411,7 @@ impl DescribeService<'_> {
                             }
                         }
                         if going {
-                            match writer.scene_entries(&mut run, &scene.key, done).await {
+                            match writer.scene_entries(&mut run, &scene.key, depth, done).await {
                                 Ok((written, still)) => {
                                     described.written.extend(written);
                                     going = still;
@@ -458,9 +469,9 @@ impl SceneReader {
     ) -> Result<Self, AppError> {
         let target = LlmTargetService { state }.target(Some(open), Action::Descriptions, one_off)?;
         let model = target.profile.model().to_string();
+        let choice = Choice::Depth(ReadingDepth::load(state)?);
         let plans = open.project.read(|tx| {
             let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
-            let choice = Choice::Depth(ReadingDepthRepo { conn: tx }.get()?);
             let mut plans = Vec::new();
             for key in keys {
                 if let Some(plan) = plan_scene(tx, context, key, &model, choice, Fill::Empty, first.as_ref())? {
@@ -792,9 +803,16 @@ impl SceneWriter<'_> {
         Ok(Some(notes))
     }
 
-    /// Персонажи и термины сцены без описания описываются с глубиной чтения проекта: так новые записи разбора
+    /// Персонажи и термины сцены без описания описываются с глубиной чтения приложения: так новые записи разбора
     /// и старые пустые получают описание до описания сцены. Возвращает описанные и идёт ли запуск дальше.
-    async fn scene_entries(&self, run: &mut BatchRun<'_>, key: &ContainerKey, written: usize) -> Result<(Vec<DescribeTarget>, bool), AppError> {
+    async fn scene_entries(
+        &self,
+        run: &mut BatchRun<'_>,
+        key: &ContainerKey,
+        depth: ReadingDepth,
+        written: usize,
+    ) -> Result<(Vec<DescribeTarget>, bool), AppError> {
+        let choice = Choice::Depth(depth);
         let plans = self.open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let context = GlossaryContext::new(&glossary);
@@ -804,7 +822,6 @@ impl SceneWriter<'_> {
                 return Ok(Vec::new());
             }
             let lines = samples.story_lines()?;
-            let choice = Choice::Depth(ReadingDepthRepo { conn: tx }.get()?);
             let targets = characters.into_iter().map(DescribeTarget::Character).chain(terms.into_iter().map(DescribeTarget::Term));
             let mut plans = Vec::new();
             for target in targets {
@@ -1965,24 +1982,35 @@ mod tests {
 
     #[test]
     fn depth_rejects_bad_bounds() {
-        assert!(ReadingDepth::new(0, 10, 30).is_err());
-        assert!(ReadingDepth::new(5, 4, 30).is_err());
-        assert!(ReadingDepth::new(1, 4, 0).is_err());
-        assert!(ReadingDepth::new(1, 4, 101).is_err());
-        let depth = ReadingDepth::new(2, 4, 100).unwrap();
+        assert!(ReadingDepth::new(0, Some(10), 30).is_err());
+        assert!(ReadingDepth::new(5, Some(4), 30).is_err());
+        assert!(ReadingDepth::new(1, Some(4), 0).is_err());
+        assert!(ReadingDepth::new(1, Some(4), 101).is_err());
+        let depth = ReadingDepth::new(2, Some(4), 100).unwrap();
         assert_eq!(depth.parts_for(10), 4);
         assert_eq!(depth.parts_for(2), 2);
     }
 
     #[test]
-    fn project_keeps_its_own_depth() {
+    fn depth_without_max_reads_by_percent_only() {
+        let depth = ReadingDepth::new(5, None, 30).unwrap();
+        assert_eq!(depth.parts_for(1000), 300);
+        assert_eq!(depth.parts_for(10), 5, "минимум держится");
+        assert_eq!(ReadingDepth::new(1, None, 100).unwrap().parts_for(400), 400);
+    }
+
+    #[test]
+    fn app_keeps_one_depth_for_all_projects() {
         let dir = tempfile::tempdir().unwrap();
-        let (state, id) = project(dir.path(), "http://127.0.0.1:9");
+        let (state, _) = project(dir.path(), "http://127.0.0.1:9");
         let glossary = super::super::GlossaryService { state: &state };
-        assert_eq!(glossary.reading_depth(id).unwrap(), ReadingDepth::default());
-        let depth = ReadingDepth::new(1, 3, 100).unwrap();
-        glossary.save_reading_depth(id, &depth).unwrap();
-        glossary.save_reading_depth(id, &depth).unwrap();
-        assert_eq!(glossary.reading_depth(id).unwrap(), depth);
+        assert_eq!(glossary.reading_depth().unwrap(), ReadingDepth::default());
+        let depth = ReadingDepth::new(1, Some(3), 100).unwrap();
+        glossary.save_reading_depth(&depth).unwrap();
+        glossary.save_reading_depth(&depth).unwrap();
+        assert_eq!(glossary.reading_depth().unwrap(), depth);
+        let unlimited = ReadingDepth::new(2, None, 40).unwrap();
+        glossary.save_reading_depth(&unlimited).unwrap();
+        assert_eq!(ReadingDepth::load(&state).unwrap(), unlimited, "пустой максимум читается как «без предела»");
     }
 }

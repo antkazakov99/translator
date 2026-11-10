@@ -598,24 +598,24 @@ impl TokenRepo<'_> {
     }
 }
 
-/// `reading_depth`: одна строка на проект.
+/// `reading_depth` в app.db: одна строка на приложение.
 pub struct ReadingDepthRepo<'c> {
     pub conn: &'c Connection,
 }
 
 impl ReadingDepthRepo<'_> {
-    /// Без строки действует глубина из кода.
+    /// Без строки действует глубина из кода. `max_parts` `NULL`: без предела.
     pub fn get(&self) -> Result<super::ReadingDepth, DbError> {
         let row = self
             .conn
             .query_row("SELECT min_parts, max_parts, percent FROM reading_depth WHERE id = 1", [], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, i64>(2)?))
             })
             .optional()?;
         let Some((min, max, percent)) = row else { return Ok(super::ReadingDepth::default()) };
         let bad = |field: &'static str| DbError::bad_value("reading_depth", field, ValidationError::OutOfRange(field));
         let min = usize::try_from(min).map_err(|_| bad("min_parts"))?;
-        let max = usize::try_from(max).map_err(|_| bad("max_parts"))?;
+        let max = max.map(usize::try_from).transpose().map_err(|_| bad("max_parts"))?;
         let percent = u8::try_from(percent).map_err(|_| bad("percent"))?;
         super::ReadingDepth::new(min, max, percent).map_err(|error| DbError::bad_value("reading_depth", "min_parts", error))
     }
@@ -625,7 +625,7 @@ impl ReadingDepthRepo<'_> {
         self.conn.execute(
             "INSERT INTO reading_depth (id, min_parts, max_parts, percent) VALUES (1, ?1, ?2, ?3)
              ON CONFLICT (id) DO UPDATE SET min_parts = excluded.min_parts, max_parts = excluded.max_parts, percent = excluded.percent",
-            params![to_sql(depth.min_parts()), to_sql(depth.max_parts()), i64::from(depth.percent())],
+            params![to_sql(depth.min_parts()), depth.max_parts().map(to_sql), i64::from(depth.percent())],
         )?;
         Ok(())
     }

@@ -1,11 +1,10 @@
 <script lang="ts">
   import DescribeParts from "./DescribeParts.svelte";
   import EntryLines from "./EntryLines.svelte";
-  import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, Undo2, UserRound, SlidersHorizontal } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
-  import ReadingDepthSettings from "./ReadingDepthSettings.svelte";
   import { commands, type EntryLineDto_Serialize as EntryLine, type TermCategory } from "./bindings";
   import {
     categories,
@@ -206,9 +205,6 @@
     selected = null;
     draft = null;
   }
-
-  /** Карточка глубины чтения под шапкой раздела. */
-  let depthOpen = $state(false);
 </script>
 
 <div class="toolbar">
@@ -216,10 +212,6 @@
     <strong>Термины</strong>
     <span>Места, организации, предметы и звания. Новые находит модель, когда описывает сцену</span>
   </div>
-  <button class="btn small" class:active={depthOpen} title="Сколько частей читает модель для описаний" onclick={() => (depthOpen = !depthOpen)}>
-    <SlidersHorizontal size={13} />
-    <span>Глубина чтения</span>
-  </button>
   <div class="segmented" role="tablist" aria-label="Какие термины">
     <button role="tab" aria-selected={filter === "all"} class:on={filter === "all"} onclick={() => (filter = "all")}>Все · {data.terms.length}</button>
     <button role="tab" aria-selected={filter === "trash"} class:on={filter === "trash"} onclick={() => (filter = "trash")}>
@@ -232,7 +224,6 @@
   </button>
 </div>
 
-{#if depthOpen}<ReadingDepthSettings {projectId} onClose={() => (depthOpen = false)} />{/if}
 <SuggestStatus {run} {onError} />
 {#if !draft}<SuggestStatus run={entriesRun} {onError} />{/if}
 

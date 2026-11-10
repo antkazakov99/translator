@@ -69,9 +69,9 @@ export const commands = {
 	restoreTermName: (project: string, key: string) => __TAURI_INVOKE<null>("restore_term_name", { project, key }),
 	/**  Значение или пояснение токена. Пустые оба удаляют запись. */
 	saveToken: (project: string, name: string, value: string, note: string) => __TAURI_INVOKE<null>("save_token", { project, name, value, note }),
-	/**  Глубина чтения проекта. Пока её не меняли, действует значение из кода. */
-	readingDepth: (project: string) => __TAURI_INVOKE<ReadingDepthDto>("reading_depth", { project }),
-	saveReadingDepth: (project: string, depth: ReadingDepthDto) => __TAURI_INVOKE<null>("save_reading_depth", { project, depth }),
+	/**  Глубина чтения приложения. Пока её не меняли, действует значение из кода. */
+	readingDepth: () => __TAURI_INVOKE<ReadingDepthDto_Serialize>("reading_depth"),
+	saveReadingDepth: (depth: ReadingDepthDto_Deserialize) => __TAURI_INVOKE<null>("save_reading_depth", { depth }),
 	/**  Перевод имён, фамилий и форм персонажей без перевода. Отмеченное окно записывает через `save_character`. */
 	suggestNames: (project: string, characters: RowRef[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<NameSuggestionsDto_Serialize>("suggest_names", { project, characters, profile, progress }),
 	/**  Языки имён проекта и библиотеки с правилами. */
@@ -919,9 +919,21 @@ export type ProviderKind =
 "compatible";
 
 /**  Глубина чтения для описаний моделью: минимум и максимум частей и процент. */
-export type ReadingDepthDto = {
+export type ReadingDepthDto = ReadingDepthDto_Serialize | ReadingDepthDto_Deserialize;
+
+/**  Глубина чтения для описаний моделью: минимум и максимум частей и процент. */
+export type ReadingDepthDto_Deserialize = {
 	min: number,
-	max: number,
+	/**  `null`: без предела. */
+	max?: number | null,
+	percent: number,
+};
+
+/**  Глубина чтения для описаний моделью: минимум и максимум частей и процент. */
+export type ReadingDepthDto_Serialize = {
+	min: number,
+	/**  `null`: без предела. */
+	max: number | null,
 	percent: number,
 };
 

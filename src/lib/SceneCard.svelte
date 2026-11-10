@@ -43,14 +43,14 @@
   let notes = $state<PartNote[] | null>(null);
   /** Персонажи и термины сцены. `null`: ещё не загружены. */
   let entries = $state<SceneEntries | null>(null);
-  /** Глубина чтения проекта: по ней ставится число частей, пока его не сдвинули. */
+  /** Глубина чтения приложения: по ней ставится число частей, пока его не сдвинули. */
   let depth = $state<ReadingDepth>(DEFAULT_READING_DEPTH);
   /** Сколько частей прочитает «Описать». `null`: по глубине чтения проекта. */
   let picked = $state<number | null>(null);
 
   onMount(async () => {
     try {
-      depth = await commands.readingDepth(projectId);
+      depth = await commands.readingDepth();
     } catch (e) {
       onError(String(e));
     }

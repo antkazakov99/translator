@@ -15,6 +15,7 @@
     X,
   } from "lucide-svelte";
   import ModelCombobox from "./ModelCombobox.svelte";
+  import ReadingDepthSettings from "./ReadingDepthSettings.svelte";
   import {
     commands,
     type ActionDto_Serialize as ActionDto,
@@ -723,6 +724,9 @@
             </div>
           {/each}
         </div>
+        <div class="depth-block">
+          <ReadingDepthSettings />
+        </div>
       {/if}
     </div>
 
@@ -918,6 +922,14 @@
   .actions {
     display: flex;
     flex-direction: column;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+  }
+
+  .depth-block {
+    margin-top: 16px;
+    padding: 12px;
     border: 1px solid var(--border);
     border-radius: 10px;
     background: var(--surface);

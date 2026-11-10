@@ -431,30 +431,31 @@ pub async fn restore_term_name(app: AppHandle, project: String, key: String) -> 
 #[serde(rename_all = "camelCase")]
 pub struct ReadingDepthDto {
     pub min: u32,
-    pub max: u32,
+    /// `null`: без предела.
+    pub max: Option<u32>,
     pub percent: u8,
 }
 
 impl From<ReadingDepth> for ReadingDepthDto {
     fn from(depth: ReadingDepth) -> Self {
         let count = |value: usize| u32::try_from(value).unwrap_or(u32::MAX);
-        Self { min: count(depth.min_parts()), max: count(depth.max_parts()), percent: depth.percent() }
+        Self { min: count(depth.min_parts()), max: depth.max_parts().map(count), percent: depth.percent() }
     }
 }
 
-/// Глубина чтения проекта. Пока её не меняли, действует значение из кода.
+/// Глубина чтения приложения. Пока её не меняли, действует значение из кода.
 #[tauri::command]
 #[specta::specta]
-pub async fn reading_depth(app: AppHandle, project: String) -> Result<ReadingDepthDto, String> {
-    blocking(app, move |state| Ok(GlossaryService { state }.reading_depth(self::project(&project)?)?.into())).await
+pub async fn reading_depth(app: AppHandle) -> Result<ReadingDepthDto, String> {
+    blocking(app, move |state| Ok(GlossaryService { state }.reading_depth()?.into())).await
 }
 
 #[tauri::command]
 #[specta::specta]
-pub async fn save_reading_depth(app: AppHandle, project: String, depth: ReadingDepthDto) -> Result<(), String> {
+pub async fn save_reading_depth(app: AppHandle, depth: ReadingDepthDto) -> Result<(), String> {
     blocking(app, move |state| {
-        let depth = ReadingDepth::new(depth.min as usize, depth.max as usize, depth.percent)?;
-        GlossaryService { state }.save_reading_depth(self::project(&project)?, &depth)
+        let depth = ReadingDepth::new(depth.min as usize, depth.max.map(|max| max as usize), depth.percent)?;
+        GlossaryService { state }.save_reading_depth(&depth)
     })
     .await
 }
