@@ -13,6 +13,11 @@ export function glossaryRuns(): GlossaryRuns {
   };
 }
 
+/** Счётчики хода и шаг, который модель делает сейчас (`RunProgress.message` из Rust). */
+function withStep(counts: string, message: string | null | undefined): string {
+  return message ? `${counts} · ${message}` : counts;
+}
+
 /** Предложение в отборе: отмеченные записываются в глоссарий. */
 export type Picked<T> = T & { selected: boolean };
 
@@ -99,9 +104,9 @@ export class SuggestRun<T> {
   get text() {
     if (!this.progress) return "";
     if (this.stopping) return `${this.label}: останавливается после текущего запроса`;
-    const { done, total, written } = this.progress;
+    const { done, total, written, message } = this.progress;
     if (total === 0) return `${this.label}: подготовка`;
-    return `${this.label}: пакет ${Math.min(done + 1, total)} из ${total} · предложений: ${written}`;
+    return withStep(`${this.label}: пакет ${Math.min(done + 1, total)} из ${total} · предложений: ${written}`, message);
   }
 }
 
@@ -164,8 +169,8 @@ export class WriteRun {
   get text() {
     if (!this.progress) return "";
     if (this.stopping) return `${this.label}: останавливается после текущего запроса`;
-    const { done, total, written } = this.progress;
+    const { done, total, written, message } = this.progress;
     if (total === 0) return `${this.label}: подготовка`;
-    return `${this.label}: запрос ${Math.min(done + 1, total)} из ${total} · записано: ${written}`;
+    return withStep(`${this.label}: запрос ${Math.min(done + 1, total)} из ${total} · записано: ${written}`, message);
   }
 }

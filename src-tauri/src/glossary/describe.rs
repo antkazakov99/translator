@@ -162,6 +162,8 @@ struct ScenePlan {
     need_title: bool,
     opening: bool,
     fill: Fill,
+    /// «Сцена «Утро»»: начало строки хода запуска. Без названия ключ сцены.
+    label: String,
 }
 
 impl ScenePlan {
@@ -192,6 +194,14 @@ impl EntryPlan {
             EntryKind::Term => self.parts.len() > 1,
         };
         unread + usize::from(assembly)
+    }
+
+    /// «Персонаж «Lis»» или «Термин «Rusty Anchor»»: начало строки хода запуска.
+    fn label(&self) -> String {
+        match self.kind {
+            EntryKind::Character => format!("Персонаж «{}»", self.name),
+            EntryKind::Term => format!("Термин «{}»", self.name),
+        }
     }
 }
 
@@ -527,7 +537,9 @@ async fn analyze_scene(
 ) -> Result<(Vec<String>, bool), AppError> {
     let mut found = Vec::new();
     let mut going = true;
-    for part in &plan.parts {
+    let total = plan.parts.len();
+    for (index, part) in plan.parts.iter().enumerate() {
+        run.note(format!("{}: поиск персонажей и терминов, часть {} из {total}", plan.label, index + 1));
         match run.send_to(target, &AnalysisPrompt::build(&part.text, known, target)).await {
             Sent::Text(text) => found.extend(AnalysisPrompt::accept(&text, &part.text)),
             Sent::Skipped => {}
@@ -543,6 +555,9 @@ async fn analyze_scene(
     }
     let merged = merge(found);
     let added = if merged.is_empty() { Vec::new() } else { open.project.write(|tx| save_found(tx, &merged))? };
+    if !added.is_empty() {
+        run.note(format!("{}: добавлено в глоссарий: {}", plan.label, added.join(", ")));
+    }
     known.extend(added.iter().cloned());
     Ok((added, going))
 }
@@ -611,7 +626,9 @@ fn plan_scene(
     let text = parts.iter().map(|part| part.text.as_str()).collect();
     let need_title = description.as_ref().is_none_or(|scene| scene.title().is_none());
     let opening = first == Some(&key);
-    Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening, fill }))
+    let name = description.as_ref().and_then(|scene| scene.title()).map_or_else(|| key.to_string(), str::to_string);
+    let label = format!("Сцена «{name}»");
+    Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening, fill, label }))
 }
 
 /// Сцены записи без исключённых и части из них.
@@ -759,9 +776,11 @@ struct SceneWriter<'a> {
 impl SceneWriter<'_> {
     /// Заметки выбранных частей: готовые из базы, новые спрашиваются и пишутся сразу. Исключённые, пустые
     /// и отказы в итог не входят. `None`: запуск остановлен.
+    #[allow(clippy::too_many_arguments)]
     async fn notes(
         &self,
         run: &mut impl Ask,
+        label: &str,
         owner: &NoteOwner,
         parts: &[Part],
         stored: &HashMap<String, Note>,
@@ -769,11 +788,12 @@ impl SceneWriter<'_> {
         request: impl Fn(&Part) -> ChatRequest,
     ) -> Result<Option<Vec<String>>, AppError> {
         let mut notes = Vec::new();
-        for part in parts {
+        for (index, part) in parts.iter().enumerate() {
             let note = match stored.get(&part.hash) {
                 Some(note) if note.excluded => continue,
                 Some(note) => note.text.clone(),
                 None => {
+                    run.note(format!("{label}: заметка к части {} из {}", index + 1, parts.len()));
                     let note = match run.send(&request(part)).await {
                         Sent::Text(text) => clean_note(&text),
                         Sent::Skipped => String::new(),
@@ -846,8 +866,11 @@ impl SceneWriter<'_> {
     /// Описание персонажа или термина по заметкам частей. Запуск заменяет описание, у персонажа и манеру речи.
     async fn entry(&self, run: &mut impl Ask, plan: &EntryPlan, written: usize) -> Result<Outcome, AppError> {
         let owner = owner_of(&plan.target);
+        let label = plan.label();
         let request = |part: &Part| EntryPartPrompt::build(plan.kind, &plan.name, &part.text, self.hints, self.target);
-        let Some(notes) = self.notes(run, &owner, &plan.parts, &plan.stored, written, request).await? else { return Ok(Outcome::STOPPED) };
+        let Some(notes) = self.notes(run, &label, &owner, &plan.parts, &plan.stored, written, request).await? else {
+            return Ok(Outcome::STOPPED);
+        };
         if notes.is_empty() {
             return Ok(Outcome::NOTHING);
         }
@@ -855,7 +878,8 @@ impl SceneWriter<'_> {
         let answer = if let (EntryKind::Term, [_], [note]) = (plan.kind, plan.parts.as_slice(), notes.as_slice()) {
             Some(CharacterAnswer { description: note.clone(), speech: None })
         } else {
-            let Some(notes) = self.condense(run, notes, written).await else { return Ok(Outcome::STOPPED) };
+            let Some(notes) = self.condense(run, &label, notes, written).await else { return Ok(Outcome::STOPPED) };
+            run.note(format!("{label}: сборка описания"));
             let request = match plan.kind {
                 EntryKind::Character => CharacterPrompt::build(&plan.name, &notes, &plan.text, self.hints, self.target),
                 EntryKind::Term => TermPrompt::build(&plan.name, &notes, &plan.text, self.hints, self.target),
@@ -897,7 +921,9 @@ impl SceneWriter<'_> {
     async fn scene(&self, run: &mut impl Ask, plan: &ScenePlan, written: usize) -> Result<Outcome, AppError> {
         let owner = NoteOwner::Container(plan.key.clone());
         let request = |part: &Part| PartPrompt::build(&part.text, self.hints, self.target);
-        let Some(notes) = self.notes(run, &owner, &plan.parts, &plan.stored, written, request).await? else { return Ok(Outcome::STOPPED) };
+        let Some(notes) = self.notes(run, &plan.label, &owner, &plan.parts, &plan.stored, written, request).await? else {
+            return Ok(Outcome::STOPPED);
+        };
         if notes.is_empty() {
             return Ok(Outcome::NOTHING);
         }
@@ -906,7 +932,8 @@ impl SceneWriter<'_> {
         let description = if let ([_], [note]) = (plan.parts.as_slice(), notes.as_slice()) {
             note.clone()
         } else {
-            let Some(notes) = self.condense(run, notes, written).await else { return Ok(Outcome::STOPPED) };
+            let Some(notes) = self.condense(run, &plan.label, notes, written).await else { return Ok(Outcome::STOPPED) };
+            run.note(format!("{}: сборка описания", plan.label));
             let description = match run.send(&ScenePrompt::build(&notes, &plan.text, self.hints, self.target)).await {
                 Sent::Text(text) => clean_note(&text),
                 Sent::Skipped => String::new(),
@@ -937,6 +964,7 @@ impl SceneWriter<'_> {
             return Ok(Outcome { description: Some(description), going });
         }
 
+        run.note(format!("{}: название", plan.label));
         let title = match run.send(&TitlePrompt::build(&description, plan.opening, self.target)).await {
             Sent::Text(text) => TitlePrompt::accept(&text),
             Sent::Skipped => None,
@@ -957,7 +985,7 @@ impl SceneWriter<'_> {
     }
 
     /// Сжимает заметки группами, пока они не поместятся в запрос сборки. `None`: запуск остановлен.
-    async fn condense(&self, run: &mut impl Ask, mut notes: Vec<String>, written: usize) -> Option<Vec<String>> {
+    async fn condense(&self, run: &mut impl Ask, label: &str, mut notes: Vec<String>, written: usize) -> Option<Vec<String>> {
         for _ in 0..CONDENSE_ROUNDS {
             if CondensePrompt::fits(&notes) {
                 break;
@@ -965,7 +993,9 @@ impl SceneWriter<'_> {
             let groups = CondensePrompt::groups(notes);
             run.grow(groups.len());
             let mut condensed = Vec::new();
-            for group in groups {
+            let count = groups.len();
+            for (index, group) in groups.into_iter().enumerate() {
+                run.note(format!("{label}: сжатие заметок, группа {} из {count}", index + 1));
                 match run.send(&CondensePrompt::build(&group, self.target)).await {
                     Sent::Text(text) => {
                         let text = clean_note(&text);
@@ -1030,7 +1060,9 @@ impl NamesService<'_> {
         let mut missing = Vec::new();
 
         let mut going = true;
-        for batch in origin_batches {
+        let origin_count = origin_batches.len();
+        for (index, batch) in origin_batches.into_iter().enumerate() {
+            run.note(format!("Происхождение имён: пакет {} из {origin_count}: {}", index + 1, item_names(batch.iter().map(|item| item.name.as_str()))));
             match run.send(&OriginsPrompt::build(batch, &cast, &target)).await {
                 Sent::Text(text) => {
                     let found = OriginsPrompt::accept(&text, batch);
@@ -1062,8 +1094,10 @@ impl NamesService<'_> {
             let rules = NameRuleService { state: self.state }.effective(project, &languages)?;
             missing = missing_rules(&names.iter().chain(&forms).cloned().collect::<Vec<_>>(), &rules);
             let spell = Spell { cast: &cast, hints: &context.hints, rules: &rules, target: &target };
-            for batch in chunks(names, &target) {
-                going = spell.batch(&mut run, &batch, &mut items).await;
+            let batches = chunks(names, &target);
+            let count = batches.len();
+            for (index, batch) in batches.iter().enumerate() {
+                going = spell.batch(&mut run, &format!("Написание имён: пакет {} из {count}", index + 1), batch, &mut items).await;
                 if !going {
                     break;
                 }
@@ -1071,8 +1105,10 @@ impl NamesService<'_> {
             if going {
                 let mut forms = form_items(&chosen, &items);
                 with_origins(&mut forms, known.iter().map(|(id, origin)| (*id, origin)));
-                for batch in chunks(forms, &target) {
-                    if !spell.batch(&mut run, &batch, &mut items).await {
+                let batches = chunks(forms, &target);
+                let count = batches.len();
+                for (index, batch) in batches.iter().enumerate() {
+                    if !spell.batch(&mut run, &format!("Написание форм: пакет {} из {count}", index + 1), batch, &mut items).await {
                         break;
                     }
                 }
@@ -1097,7 +1133,8 @@ impl NamesService<'_> {
         let open = self.state.open_project(project)?;
         let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Names, one_off)?;
         let request = RulesDraftPrompt::build(&from, existing.as_deref(), &target);
-        run_batches(self.state, &open, Action::Names, &target, progress, vec![request], |_, text| {
+        let note = format!("Черновик правил имён: {from}");
+        run_batches(self.state, &open, Action::Names, &target, progress, vec![(note, request)], |_, text| {
             RulesDraftPrompt::accept(text).into_iter().collect()
         })
         .await
@@ -1143,7 +1180,10 @@ impl NamesService<'_> {
             })
             .collect();
         let batches = chunks(items, &target);
-        let requests = batches.iter().map(|batch| TermsPrompt::build(batch, &context.hints, &target)).collect();
+        let requests = batches
+            .iter()
+            .map(|batch| (batch_note(batch.iter().map(|item| item.name.as_str())), TermsPrompt::build(batch, &context.hints, &target)))
+            .collect();
         run_batches(self.state, &open, Action::Terms, &target, progress, requests, |index, text| TermsPrompt::accept(text, &batches[index])).await
     }
 
@@ -1182,7 +1222,10 @@ impl NamesService<'_> {
             })
             .collect();
         let batches = chunks(items, &target);
-        let requests = batches.iter().map(|batch| TokensPrompt::build(batch, &context.hints, &target)).collect();
+        let requests = batches
+            .iter()
+            .map(|batch| (batch_note(batch.iter().map(|item| item.name.as_str())), TokensPrompt::build(batch, &context.hints, &target)))
+            .collect();
         run_batches(self.state, &open, Action::Tokens, &target, progress, requests, |index, text| TokensPrompt::accept(text, &batches[index])).await
     }
 
@@ -1217,7 +1260,10 @@ impl NamesService<'_> {
             })
             .collect();
         let batches = chunks(items, &target);
-        let requests = batches.iter().map(|batch| SpeakersPrompt::build(batch, &context.hints, &target)).collect();
+        let requests = batches
+            .iter()
+            .map(|batch| (batch_note(batch.iter().map(|item| item.label.as_str())), SpeakersPrompt::build(batch, &context.hints, &target)))
+            .collect();
         run_batches(self.state, &open, Action::Speakers, &target, progress, requests, |index, text| SpeakersPrompt::accept(text, &batches[index]))
             .await
     }
@@ -1238,14 +1284,14 @@ fn chunks<T: Clone>(items: Vec<T>, target: &LlmTarget) -> Vec<Vec<T>> {
 }
 
 /// Запуск предложений: место запуска, запросы по очереди, разбор, итог в `llm_runs`. Ответ модели ждётся вне транзакции,
-/// а в базу ничего не пишется. `accept` получает номер пакета и текст ответа.
+/// а в базу ничего не пишется. Запрос идёт со строкой хода: что в пакете. `accept` получает номер пакета и текст ответа.
 async fn run_batches<T>(
     state: &AppState,
     open: &Arc<OpenProject>,
     action: Action,
     target: &LlmTarget,
     progress: Channel<RunProgress>,
-    requests: Vec<ChatRequest>,
+    requests: Vec<(String, ChatRequest)>,
     accept: impl Fn(usize, &str) -> Vec<T>,
 ) -> Result<Suggestions<T>, AppError> {
     if requests.is_empty() {
@@ -1253,12 +1299,29 @@ async fn run_batches<T>(
     }
     let mut run = BatchRun::begin(state, open, action, target, progress, requests.len())?;
     let mut items = Vec::new();
-    for (index, request) in requests.iter().enumerate() {
+    for (index, (note, request)) in requests.iter().enumerate() {
+        run.note(note.clone());
         if !run.ask(request, &mut items, |text| accept(index, text)).await {
             break;
         }
     }
     run.finish(items)
+}
+
+/// Записи пакета для строки хода: первые пять через запятую, остальные числом.
+fn item_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    const SHOWN: usize = 5;
+    let names: Vec<&str> = names.collect();
+    let mut text = names.iter().take(SHOWN).copied().collect::<Vec<_>>().join(", ");
+    if names.len() > SHOWN {
+        text.push_str(&format!(" и ещё {}", names.len() - SHOWN));
+    }
+    text
+}
+
+/// «В пакете: Rusty Anchor, Old Lantern»: строка хода запуска предложений.
+fn batch_note<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    format!("в пакете: {}", item_names(names))
 }
 
 /// Итог перевода имён: написания и языки имён, для которых не нашлось правил.
@@ -1285,14 +1348,18 @@ struct Spell<'a> {
 impl Spell<'_> {
     /// Перевод и проверка: два шага прогресса. `false`: запуск остановлен или оборвался, написания пакета
     /// остаются непроверенными.
-    async fn batch(&self, run: &mut BatchRun<'_>, batch: &[NameItem], items: &mut Vec<NameSuggestion>) -> bool {
+    /// `label`: «Написание имён: пакет 1 из 3» для хода запуска.
+    async fn batch(&self, run: &mut BatchRun<'_>, label: &str, batch: &[NameItem], items: &mut Vec<NameSuggestion>) -> bool {
         let start = items.len();
+        let names = item_names(batch.iter().map(|item| item.name.as_str()));
+        run.note(format!("{label}: {names}"));
         let request = NamesPrompt::build(batch, self.cast, self.hints, self.rules, self.target);
         if !run.ask(&request, items, |text| NamesPrompt::accept(text, batch)).await {
             CheckPrompt::unchecked(&mut items[start..]);
             return false;
         }
         if let Some(request) = CheckPrompt::build(batch, &items[start..], self.hints, self.rules, self.target) {
+            run.note(format!("{label}: проверка написаний"));
             match run.send(&request).await {
                 Sent::Text(text) => CheckPrompt::apply(&text, batch, &mut items[start..]),
                 Sent::Skipped => CheckPrompt::unchecked(&mut items[start..]),
@@ -1384,6 +1451,12 @@ impl<'a> BatchRun<'a> {
         self.run.report(self.report.clone());
     }
 
+    /// Что модель делает сейчас: строка хода запуска для окна.
+    fn note(&mut self, message: String) {
+        self.report.message = Some(message);
+        self.run.report(self.report.clone());
+    }
+
     /// Пакет готов: отчёт с числом предложений. `false`: запуск остановлен.
     fn step(&mut self, written: usize) -> bool {
         self.report.done += 1;
@@ -1412,6 +1485,8 @@ pub(crate) trait Ask {
     fn step(&mut self, written: usize) -> bool;
     /// Запросов больше, чем было в плане.
     fn grow(&mut self, more: usize);
+    /// Что модель делает сейчас: строка хода запуска для окна.
+    fn note(&mut self, message: String);
 }
 
 impl Ask for BatchRun<'_> {
@@ -1425,6 +1500,10 @@ impl Ask for BatchRun<'_> {
 
     fn grow(&mut self, more: usize) {
         BatchRun::grow(self, more);
+    }
+
+    fn note(&mut self, message: String) {
+        BatchRun::note(self, message);
     }
 }
 
@@ -1459,6 +1538,11 @@ impl Ask for RunAsk<'_> {
 
     fn grow(&mut self, more: usize) {
         self.progress.total += more as u32;
+        self.run.report(self.progress.clone());
+    }
+
+    fn note(&mut self, message: String) {
+        self.progress.message = Some(message);
         self.run.report(self.progress.clone());
     }
 }
@@ -1509,6 +1593,25 @@ mod tests {
 
     fn silent() -> Channel<RunProgress> {
         Channel::new(|_| Ok(()))
+    }
+
+    /// Канал, который запоминает строки хода запуска без повторов подряд.
+    fn recorded() -> (Channel<RunProgress>, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = notes.clone();
+        let channel = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body
+                && let Ok(progress) = serde_json::from_str::<serde_json::Value>(&json)
+                && let Some(message) = progress["message"].as_str()
+            {
+                let mut notes = sink.lock().unwrap();
+                if notes.last().map(String::as_str) != Some(message) {
+                    notes.push(message.to_string());
+                }
+            }
+            Ok(())
+        });
+        (channel, notes)
     }
 
     #[test]
@@ -1831,8 +1934,20 @@ mod tests {
         let service = DescribeService { state: &state };
         let left = ContainerKey::new("label:left").unwrap();
 
-        let described = tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(left.clone()), usize::MAX, None, silent())).unwrap();
+        let (channel, notes) = recorded();
+        let described = tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(left.clone()), usize::MAX, None, channel)).unwrap();
         assert_eq!(described.added, ["Left side"], "подпись говорящего и выдуманное имя не добавлены");
+        assert_eq!(
+            *notes.lock().unwrap(),
+            [
+                "Сцена «label:left»: поиск персонажей и терминов, часть 1 из 1",
+                "Сцена «label:left»: добавлено в глоссарий: Left side",
+                "Термин «Left side»: заметка к части 1 из 1",
+                "Сцена «label:left»: заметка к части 1 из 1",
+                "Сцена «label:left»: название",
+            ],
+            "ход запуска говорит, что делает модель"
+        );
         assert_eq!(described.error, None);
         let open = state.open_project(id).unwrap();
         let terms = open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap();

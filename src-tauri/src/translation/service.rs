@@ -295,17 +295,20 @@ impl Job<'_> {
             if !batches.is_empty() {
                 self.read(scene, name.as_deref()).await?;
             }
-            for batch in batches {
+            let count = batches.len();
+            let place = name.as_deref().map_or_else(|| "Реплики вне сцен".to_string(), |name| format!("Сцена «{name}»"));
+            for (index, batch) in batches.into_iter().enumerate() {
                 if self.run.cancelled() {
                     return Ok(self.progress.written as usize);
                 }
-                self.report(name.clone());
+                let note = format!("{place}: пакет {} из {count}, реплик: {}", index + 1, batch.lines.len());
+                self.report(Some(note.clone()));
                 match self.mode {
                     LinesMode::Translate => self.translate(scene, &batch).await?,
                     LinesMode::Review => self.ask(scene, &batch).await?,
                 }
                 self.progress.done += 1;
-                self.report(name.clone());
+                self.report(Some(note));
             }
         }
         Ok(self.progress.written as usize)
