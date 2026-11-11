@@ -97,6 +97,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             game_overview,
             run_game,
             write_names,
+            reset_game,
             entry_parts,
             describe_entry,
             describe_entries,

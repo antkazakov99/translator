@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { Check, CircleDashed, CircleSlash, LoaderCircle, Play, RefreshCw, Square, TriangleAlert } from "lucide-svelte";
+  import { Check, CircleDashed, CircleSlash, LoaderCircle, Play, RefreshCw, RotateCcw, Square, Trash2, TriangleAlert } from "lucide-svelte";
   import NamePicks from "./NamePicks.svelte";
   import { commands, type GameStep, type NamesMode, type StepWorkDto } from "./bindings";
   import { defaultSteps, finishedText, formatCount, leftLabel, requestsLabel, stepOutcomes, stepTitles, stepsToRun, type StepOutcome } from "./game-run";
@@ -92,6 +92,24 @@
   }
 
   const onError = (message: string) => (error = message);
+
+  /** Подтверждение сброса всего прогресса. */
+  let confirmReset = $state(false);
+  let resetting = $state(false);
+
+  async function reset() {
+    resetting = true;
+    error = "";
+    try {
+      if (await game.reset(onError)) {
+        confirmReset = false;
+        chosen = null;
+        await load();
+      }
+    } finally {
+      resetting = false;
+    }
+  }
 </script>
 
 <div class="game-page">
@@ -155,7 +173,22 @@
           <span>Запустить · {toRun.length}</span>
         </button>
         {#if toRun.length > 0}<span class="faint">{requestsLabel(requests)} всего</span>{/if}
+        <button class="btn small danger reset" disabled={busy || resetting} title={busy ? "Модель уже работает" : "Вернуть проект к состоянию сразу после считывания игры"} onclick={() => (confirmReset = true)}>
+          <RotateCcw size={13} />
+          <span>Сбросить всё</span>
+        </button>
       </div>
+      {#if confirmReset}
+        <div class="banner error" role="alert">
+          <TriangleAlert size={14} />
+          <span>Удалятся переводы реплик с историей, описания сцен, заметки модели, весь глоссарий (персонажи, термины, подписи, токены) и запуски. Снимок игры и настройки останутся. Отменить нельзя</span>
+          <button class="btn small" disabled={resetting} onclick={() => (confirmReset = false)}>Отмена</button>
+          <button class="btn small danger" disabled={resetting || busy} onclick={reset}>
+            {#if resetting}<LoaderCircle size={13} class="spin" />{:else}<Trash2 size={13} />{/if}
+            <span>Удалить безвозвратно</span>
+          </button>
+        </div>
+      {/if}
     {:else if loading}
       <div class="faint loading"><LoaderCircle size={13} class="spin" /> Считаю, сколько осталось</div>
     {/if}
@@ -350,6 +383,11 @@
     flex-wrap: wrap;
     gap: 6px;
     align-items: center;
+  }
+
+  /* Сброс справа, подальше от запуска. */
+  .reset {
+    margin-left: auto;
   }
 
   .actions.end {

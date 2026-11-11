@@ -255,6 +255,11 @@ pub struct LlmRunRepo<'c> {
 }
 
 impl LlmRunRepo<'_> {
+    /// Сброс проекта: законченные запуски. Идущий остаётся.
+    pub fn clear_finished(&self) -> Result<usize, DbError> {
+        Ok(self.conn.execute("DELETE FROM llm_runs WHERE status <> 'running'", [])?)
+    }
+
     /// Имена провайдера и модели строкой: профиль могут удалить, а запись останется понятной.
     pub fn start(&self, action: Action, provider: &str, model: &str, now: Timestamp) -> Result<RunId, DbError> {
         self.conn.execute(

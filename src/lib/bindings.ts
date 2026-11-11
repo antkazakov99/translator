@@ -109,6 +109,8 @@ export const commands = {
 	runGame: (project: string, steps: GameStep[], names: NamesMode, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<GameRunDto_Serialize>("run_game", { project, steps, names, progress }),
 	/**  Написания из отбора имён в пустые поля персонажей. Возвращает число изменённых персонажей. */
 	writeNames: (project: string, names: NamePickDto[]) => __TAURI_INVOKE<number>("write_names", { project, names }),
+	/**  Сброс всего прогресса: переводы, описания, заметки, отметки, весь глоссарий и законченные запуски. */
+	resetGame: (project: string) => __TAURI_INVOKE<null>("reset_game", { project }),
 	/**  Части сцен персонажа или термина с заметками модели. */
 	entryParts: (project: string, owner: OwnerDto) => __TAURI_INVOKE<EntryPartsDto_Serialize>("entry_parts", { project, owner }),
 	/**  Описывает персонажа или термин по частям сцен с глубиной чтения проекта и заменяет описание. */

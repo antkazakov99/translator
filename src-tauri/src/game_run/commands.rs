@@ -111,6 +111,13 @@ pub async fn run_game(
     Ok(run.into())
 }
 
+/// Сброс всего прогресса: переводы, описания, заметки, отметки, весь глоссарий и законченные запуски.
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_game(app: AppHandle, project: String) -> Result<(), String> {
+    blocking(app, move |state| GameRunService { state }.reset(self::project(&project)?)).await
+}
+
 /// Написания из отбора имён в пустые поля персонажей. Возвращает число изменённых персонажей.
 #[tauri::command]
 #[specta::specta]

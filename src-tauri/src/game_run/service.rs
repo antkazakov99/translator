@@ -12,13 +12,14 @@ use crate::glossary::names::{ORIGIN_BATCH, form_items, name_items, with_origins}
 use crate::glossary::service::game_tokens;
 use crate::glossary::{
     Character, CharacterId, CharacterRepo, DescribeService, DescribeTarget, Described, GlossaryData, GlossaryService, NamePick, NamesFound,
-    NamesService, SpeakerRepo, TermId,
+    NamesService, NoteRepo, SceneDescriptionRepo, SpeakerRepo, TermId, TermRepo, TokenRepo,
 };
-use crate::llm::{Action, LlmTargetService, RunChain, RunProgress};
+use crate::llm::{Action, LlmRunRepo, LlmTargetService, RunChain, RunProgress};
 use crate::projects::ProjectId;
 use crate::state::{AppState, OpenProject};
 use crate::storage::DbError;
-use crate::translation::{LinesMode, TranslationScope, TranslationService};
+use crate::translation::{LinesMode, TranslationRepo, TranslationScope, TranslationService};
+use crate::glossary::repo::AnalyzedPartRepo;
 
 pub struct GameRunService<'a> {
     pub state: &'a AppState,
@@ -126,6 +127,28 @@ impl GameRunService<'_> {
             }
         }
         Ok(result)
+    }
+
+    /// Сброс всего прогресса одной транзакцией: проект как сразу после считывания игры. Уходят переводы реплик
+    /// с историей, отметки вычитки и разбора, заметки, описания сцен, весь глоссарий и законченные запуски.
+    /// Снимок игры, настройки моделей проекта, свои правила имён и замены шрифтов остаются.
+    pub fn reset(&self, project: ProjectId) -> Result<(), AppError> {
+        if self.state.llm_run.is_active() {
+            return Err(AppError::RunActive);
+        }
+        let open = self.state.open_project(project)?;
+        Ok(open.project.write(|tx| {
+            TranslationRepo { conn: tx }.clear()?;
+            AnalyzedPartRepo { conn: tx }.clear()?;
+            NoteRepo { conn: tx }.clear()?;
+            SceneDescriptionRepo { conn: tx }.clear()?;
+            SpeakerRepo { conn: tx }.clear()?;
+            CharacterRepo { conn: tx }.clear()?;
+            TermRepo { conn: tx }.clear()?;
+            TokenRepo { conn: tx }.clear()?;
+            LlmRunRepo { conn: tx }.clear_finished()?;
+            Ok(())
+        })?)
     }
 
     /// Написания имён из отбора в пустые поля персонажей. Возвращает число изменённых персонажей.
@@ -496,6 +519,31 @@ mod tests {
         assert!(result.finished.is_empty());
         assert_eq!(count(&state, id, "SELECT count(*) FROM llm_runs WHERE action_id = 'lines'"), 0);
         assert!(!state.llm_run.is_active());
+    }
+
+    #[test]
+    fn reset_returns_the_project_to_a_fresh_scan() {
+        let (url, _) = fake_model(reply);
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id, _) = project(dir.path(), &url);
+        let service = GameRunService { state: &state };
+        let segments = count(&state, id, "SELECT count(*) FROM segments");
+        tauri::async_runtime::block_on(service.run(id, &GameStep::ALL, NamesMode::Auto, silent())).unwrap();
+        assert!(count(&state, id, "SELECT count(*) FROM translations") > 0);
+
+        let held = RunChain::begin(&state, silent()).unwrap();
+        assert!(matches!(service.reset(id), Err(AppError::RunActive)), "во время запуска сброса нет");
+        drop(held);
+
+        service.reset(id).unwrap();
+        for table in [
+            "translations", "revisions", "reviewed_lines", "analyzed_parts", "notes", "scene_descriptions", "characters", "character_forms",
+            "speaker_characters", "speaker_entries", "discarded_speakers", "terms", "term_forms", "discarded_terms", "tokens", "llm_runs",
+        ] {
+            assert_eq!(count(&state, id, &format!("SELECT count(*) FROM {table}")), 0, "{table}");
+        }
+        assert_eq!(count(&state, id, "SELECT count(*) FROM segments"), segments, "снимок игры остался");
+        assert_eq!(empty_steps(&state, id), [GameStep::Glossary, GameStep::Entries, GameStep::Review], "глоссарий пуст: разбор, описания сцен и перевод снова доступны");
     }
 
     #[test]

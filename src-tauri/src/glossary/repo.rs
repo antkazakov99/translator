@@ -40,6 +40,12 @@ pub struct SpeakerRepo<'c> {
 }
 
 impl SpeakerRepo<'_> {
+    /// Сброс проекта: связи говорящих с персонажами, записи говорящих и корзина говорящих.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute_batch("DELETE FROM speaker_characters; DELETE FROM speaker_entries; DELETE FROM discarded_speakers;")?;
+        Ok(())
+    }
+
     /// Говорящие текущего снимка с числом реплик, в порядке подписи.
     pub fn current(&self) -> Result<Vec<SpeakerUse>, DbError> {
         let mut statement = self.conn.prepare(
@@ -216,6 +222,12 @@ const CHARACTER_SELECT: &str = "SELECT id, first_name, last_name, translated_fir
                                 FROM characters";
 
 impl CharacterRepo<'_> {
+    /// Сброс проекта: все персонажи, их формы, происхождение имён и исключённые сцены уходят каскадом.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM characters", [])?;
+        Ok(())
+    }
+
     pub fn get(&self, id: CharacterId) -> Result<Character, DbError> {
         let sql = format!("{CHARACTER_SELECT} WHERE id = ?1");
         let row = self.conn.query_row(&sql, [id.get()], CharacterRow::read).optional()?;
@@ -414,6 +426,12 @@ const TERM_SELECT: &str = "SELECT id, name, translation, category, description F
 type TermRow = (i64, String, Option<String>, String, Option<String>);
 
 impl TermRepo<'_> {
+    /// Сброс проекта: все термины с формами и исключёнными сценами и корзина терминов.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute_batch("DELETE FROM terms; DELETE FROM discarded_terms;")?;
+        Ok(())
+    }
+
     pub fn get(&self, id: TermId) -> Result<Term, DbError> {
         let sql = format!("{TERM_SELECT} WHERE id = ?1");
         let row = self.conn.query_row(&sql, [id.get()], Self::read).optional()?.ok_or(DbError::NotFound)?;
@@ -569,6 +587,12 @@ pub struct TokenRepo<'c> {
 }
 
 impl TokenRepo<'_> {
+    /// Сброс проекта: значения и пояснения всех токенов.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM tokens", [])?;
+        Ok(())
+    }
+
     pub fn list(&self) -> Result<Vec<Token>, DbError> {
         let mut statement = self.conn.prepare("SELECT name, value, note FROM tokens ORDER BY name")?;
         let rows = statement
@@ -637,6 +661,12 @@ pub struct SceneDescriptionRepo<'c> {
 }
 
 impl SceneDescriptionRepo<'_> {
+    /// Сброс проекта: названия и описания всех сцен.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM scene_descriptions", [])?;
+        Ok(())
+    }
+
     pub fn get(&self, key: &ContainerKey) -> Result<Option<SceneDescription>, DbError> {
         self.conn
             .query_row(
@@ -733,6 +763,12 @@ pub struct NoteRepo<'c> {
 }
 
 impl NoteRepo<'_> {
+    /// Сброс проекта: все заметки модели.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM notes", [])?;
+        Ok(())
+    }
+
     /// Заметки владельца от одной модели.
     pub fn of(&self, owner: &NoteOwner, model: &str) -> Result<Vec<Note>, DbError> {
         self.query(
@@ -954,6 +990,12 @@ pub struct AnalyzedPartRepo<'c> {
 }
 
 impl AnalyzedPartRepo<'_> {
+    /// Сброс проекта: разбор прочитает все части заново.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM analyzed_parts", [])?;
+        Ok(())
+    }
+
     /// Отпечатки прочитанных разбором частей сцены.
     pub fn of(&self, key: &ContainerKey) -> Result<std::collections::HashSet<String>, DbError> {
         let mut statement = self.conn.prepare("SELECT part_hash FROM analyzed_parts WHERE container_key = ?1")?;

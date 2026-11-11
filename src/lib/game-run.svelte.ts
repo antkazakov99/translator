@@ -109,6 +109,24 @@ export class GameRun {
     await this.continue(onError);
   }
 
+  /** Сброс всего прогресса проекта: итог и отбор прошлой цепочки тоже уходят. `true`: сброшено. */
+  async reset(onError: (message: string) => void) {
+    if (this.progress) return false;
+    try {
+      await commands.resetGame(this.project());
+    } catch (e) {
+      onError(String(e));
+      return false;
+    }
+    this.result = null;
+    this.names = null;
+    this.missingRules = [];
+    this.requested = [];
+    this.rest = [];
+    this.onChanged();
+    return true;
+  }
+
   /** Отбрасывает написания и продолжает цепочку. */
   async skipNames(onError: (message: string) => void) {
     if (!this.names) return;

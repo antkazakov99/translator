@@ -95,6 +95,12 @@ pub struct TranslationRepo<'c> {
 }
 
 impl TranslationRepo<'_> {
+    /// Сброс проекта: переводы реплик, их история и отметки вычитки. Снова действует перевод из игры.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute_batch("DELETE FROM revisions; DELETE FROM translations; DELETE FROM reviewed_lines;")?;
+        self.bump_search()
+    }
+
     /// Файлы текущего снимка с репликами и прогресс по ним.
     pub fn files(&self) -> Result<Vec<FileProgress>, DbError> {
         let mut statement = self.conn.prepare(
