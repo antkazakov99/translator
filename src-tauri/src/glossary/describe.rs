@@ -2313,6 +2313,44 @@ mod tests {
     }
 
     #[test]
+    fn a_titled_name_is_never_a_term() {
+        use super::super::analyze::{Finding, FoundKind};
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let open = state.open_project(id).unwrap();
+        let glossary = GlossaryService { state: &state };
+        let found = |name: &str, kind| Finding { name: name.to_string(), kind, gender: None, same_as: None, parts: None };
+        let save = |findings: &[Finding]| open.project.write(|tx| save_found(tx, findings)).unwrap();
+        let names = || {
+            open.project
+                .read(|tx| {
+                    let terms = TermRepo { conn: tx }.list()?.iter().map(|term| term.name().to_string()).collect::<Vec<_>>();
+                    let characters = CharacterRepo { conn: tx }.list()?.iter().filter_map(|character| character.first_name().map(str::to_string)).collect::<Vec<_>>();
+                    Ok((terms, characters))
+                })
+                .unwrap()
+        };
+
+        assert_eq!(save(&[found("General Store", FoundKind::Term(TermCategory::Location))]), ["General Store"], "место с «General» не делится");
+
+        // Термин, записанный до разделения должностей, превращается, когда разбор снова находит это имя.
+        glossary.take_term(id, "Princess Selena", TermCategory::General).unwrap();
+        assert_eq!(
+            save(&[found("Princess Selena", FoundKind::Character)]),
+            ["Princess Selena → Princess + Selena (разделено)", "Princess", "Selena"]
+        );
+        assert_eq!(names(), (vec!["General Store".to_string(), "Princess".to_string()], vec!["Selena".to_string()]));
+
+        // И когда имя после должности стало известным персонажем.
+        glossary.take_term(id, "Queen Mara", TermCategory::General).unwrap();
+        assert_eq!(save(&[found("Mara", FoundKind::Character)]), ["Mara", "Queen Mara → Queen + Mara (разделено)", "Queen"]);
+        let (terms, characters) = names();
+        assert!(!terms.contains(&"Queen Mara".to_string()) && terms.contains(&"Queen".to_string()));
+        assert_eq!(characters, ["Mara", "Selena"]);
+        assert!(save(&[found("Princess Selena", FoundKind::Term(TermCategory::General))]).is_empty(), "разделённое название в корзине");
+    }
+
+    #[test]
     fn short_names_find_their_full_name_and_the_scene_breaks_ties() {
         use super::super::analyze::{Finding, FoundKind, save_scene_found};
         let dir = tempfile::tempdir().unwrap();

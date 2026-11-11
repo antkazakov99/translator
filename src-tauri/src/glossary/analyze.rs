@@ -10,8 +10,8 @@ use super::repo::{CharacterRepo, LineSampleRepo, TermRepo};
 use super::entries::scene_entries;
 use super::service::{give_term, merge_characters, merge_terms};
 use crate::engines::ContainerKey;
-use super::{Character, CharacterId, Form, GlossaryData, NameKey, Term, TermCategory, TermId};
-use crate::common::Gender;
+use super::{Character, CharacterId, DiscardReason, DiscardedTerm, Form, GlossaryData, NameKey, NoteOwner, NoteRepo, Term, TermCategory, TermId};
+use crate::common::{Gender, Timestamp};
 use crate::llm::{ChatRequest, LlmTarget};
 use crate::storage::DbError;
 use crate::translation::answer::json_array;
@@ -475,7 +475,9 @@ impl Saver<'_> {
         let Some(key) = NameKey::new(&finding.name) else { return Ok(()) };
         // Личное имя с частями от модели должностью не считается.
         let personal = finding.parts.as_ref().is_some_and(|parts| parts.first.is_some());
-        if let (false, Some((title, name))) = (personal, title_and_name(&finding.name)) {
+        if let (false, Some((title, name))) = (personal, title_and_name(&finding.name))
+            && self.names_a_person(finding, &name)
+        {
             return self.save_titled(finding, &title, &name);
         }
         if self.is_known(&key)? {
@@ -498,8 +500,30 @@ impl Saver<'_> {
         Ok(())
     }
 
-    /// Должность пишется термином-должностью (обращения нет), имя после неё как отдельная находка.
+    /// Должность с именем это человек, а не название: находка-персонаж, находка-должность или остаток уже известен
+    /// как персонаж. «General Store» у места делиться не должен.
+    fn names_a_person(&self, finding: &Finding, name: &str) -> bool {
+        let known_person = NameKey::new(name).and_then(|key| self.owners.by_key.get(&key)).is_some_and(|owner| matches!(owner, Owner::Character(_)));
+        matches!(finding.kind, FoundKind::Character | FoundKind::Term(TermCategory::Title)) || known_person
+    }
+
+    /// Должность пишется термином-должностью (обращения нет), имя после неё как отдельная находка. Термин с тем же
+    /// написанием, записанный раньше («Princess Selena»), удаляется: его название уходит в корзину.
     fn save_titled(&mut self, finding: &Finding, title: &str, name: &str) -> Result<(), DbError> {
+        if let Some(Owner::Term(id)) = NameKey::new(&finding.name).and_then(|key| self.owners.by_key.get(&key)).copied() {
+            let terms = TermRepo { conn: self.tx };
+            let term = terms.get(id)?;
+            terms.delete(id)?;
+            NoteRepo { conn: self.tx }.delete_owner(&NoteOwner::Term(id))?;
+            terms.discard(&DiscardedTerm {
+                text: term.name().to_string(),
+                key: term.name_key().clone(),
+                reason: DiscardReason::Junk,
+                discarded_at: Timestamp::now(),
+            })?;
+            self.added.push(format!("{} → {title} + {name} (разделено)", term.name()));
+            self.reload()?;
+        }
         if !is_honorific(title)
             && let Some(key) = NameKey::new(title)
             && !self.is_known(&key)?
@@ -600,6 +624,20 @@ impl Saver<'_> {
         Ok(())
     }
 
+    /// Термины вида «должность + имя известного персонажа», записанные раньше («Princess Selena», когда Selena уже
+    /// персонаж), делятся на должность и персонажа.
+    fn split_titled_terms(&mut self) -> Result<(), DbError> {
+        let terms = TermRepo { conn: self.tx }.list()?;
+        for term in terms.iter().filter(|term| term.category() != TermCategory::Title) {
+            let Some((title, name)) = title_and_name(term.name()) else { continue };
+            let person = Finding { name: term.name().to_string(), kind: FoundKind::Term(term.category()), gender: None, same_as: None, parts: None };
+            if self.names_a_person(&person, &name) {
+                self.save_titled(&person, &title, &name)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Персонаж из одного слова сливается с единственным персонажем, у которого это слово фамилия или имя
     /// при фамилии («Karanovic» в «Vera Karanovic»), иначе с единственным, чьё имя это его полная или короткая
     /// форма («Dimi» и «Dimitria», при нескольких таких решает сцена). Главным остаётся полное имя.
@@ -661,6 +699,7 @@ pub fn save_scene_found(tx: &rusqlite::Connection, found: &[Finding], scene: Opt
     for finding in ordered(found) {
         saver.save(finding)?;
     }
+    saver.split_titled_terms()?;
     saver.merge_single_names()?;
     Ok(saver.added)
 }
