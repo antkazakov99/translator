@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 
 use super::repo::{CharacterRepo, LineSampleRepo, TermRepo};
+use super::service::{give_term, merge_characters, merge_terms};
 use super::{Character, CharacterId, Form, GlossaryData, NameKey, Term, TermCategory, TermId};
 use crate::common::Gender;
 use crate::llm::{ChatRequest, LlmTarget};
@@ -270,16 +271,48 @@ impl Owners {
     }
 
     /// Чья это форма: запись, которую назвала модель, иначе термин, который сокращает находка или который
-    /// сокращает её.
-    fn owner_of(&self, finding: &Finding) -> Option<Owner> {
-        if let Some(owner) = finding.same_as.as_deref().and_then(NameKey::new).and_then(|key| self.by_key.get(&key)) {
-            return Some(*owner);
+    /// сокращает её. `own`: запись самой находки, если она уже есть, на себя находка не ссылается.
+    fn owner_of(&self, finding: &Finding, own: Option<Owner>) -> Option<Owner> {
+        let named = finding.same_as.as_deref().and_then(NameKey::new).and_then(|key| self.by_key.get(&key)).copied();
+        if let Some(owner) = named.filter(|owner| Some(*owner) != own) {
+            return Some(owner);
         }
         self.term_names
             .iter()
+            .filter(|(_, id)| Some(Owner::Term(*id)) != own)
             .find(|(name, _)| abbreviates(&finding.name, name) || abbreviates(name, &finding.name))
             .map(|(_, id)| Owner::Term(*id))
     }
+}
+
+/// Две записи глоссария оказались одной: связь нашлась позже, в другой сцене. Главной у терминов становится
+/// полное название, термин уходит персонажу формой, персонаж `own` сливается в `other`. Персонаж в термин не
+/// сливается. Возвращает строку итога: «PPF → People's Police Force (объединено)».
+fn merge_entries(tx: &rusqlite::Connection, own: Owner, other: Owner) -> Result<Option<String>, DbError> {
+    let terms = TermRepo { conn: tx };
+    let characters = CharacterRepo { conn: tx };
+    let character_name = |id| -> Result<String, DbError> { Ok(characters.get(id)?.full_name().unwrap_or_default()) };
+    let text = match (own, other) {
+        (Owner::Term(a), Owner::Term(b)) => {
+            let (a_name, b_name) = (terms.get(a)?.name().to_string(), terms.get(b)?.name().to_string());
+            let (from, into, from_name, into_name) =
+                if acronym(&b_name).is_some() && acronym(&a_name).is_none() { (b, a, b_name, a_name) } else { (a, b, a_name, b_name) };
+            merge_terms(tx, from, into)?;
+            format!("{from_name} → {into_name} (объединено)")
+        }
+        (Owner::Term(a), Owner::Character(b)) => {
+            let name = terms.get(a)?.name().to_string();
+            give_term(tx, a, b)?;
+            format!("{name} → {} (объединено)", character_name(b)?)
+        }
+        (Owner::Character(a), Owner::Character(b)) => {
+            let name = character_name(a)?;
+            merge_characters(tx, a, b)?;
+            format!("{name} → {} (объединено)", character_name(b)?)
+        }
+        (Owner::Character(_), Owner::Term(_)) => return Ok(None),
+    };
+    Ok(Some(text))
 }
 
 /// Сначала находки без ссылки на другую находку: тогда запись, к которой ложится форма, уже есть.
@@ -301,18 +334,42 @@ pub fn save_found(tx: &rusqlite::Connection, found: &[Finding]) -> Result<Vec<St
     for finding in ordered(found) {
         let Some(key) = NameKey::new(&finding.name) else { continue };
         if known.contains(&key) || terms.is_known(&key)? {
+            // Известная запись оказалась другим именем другой записи: связь нашлась позже, записи сливаются.
+            if let Some(own) = owners.by_key.get(&key).copied()
+                && let Some(other) = owners.owner_of(finding, Some(own))
+                && let Some(text) = merge_entries(tx, own, other)?
+            {
+                added.push(text);
+                owners = Owners::load(&GlossaryData::load(tx)?);
+            }
             continue;
         }
-        match owners.owner_of(finding) {
+        match owners.owner_of(finding, None) {
             Some(Owner::Term(id)) => {
                 let mut term = terms.get(id)?;
-                let Ok(form) = Form::new(&finding.name, None) else { continue };
-                if term.add_form(form).is_err() {
-                    continue;
+                if acronym(term.name()).is_some() && acronym(&finding.name).is_none() {
+                    // Полное название к термину-аббревиатуре: оно становится названием, аббревиатура формой со своим
+                    // переводом, перевод полного названия даст шаг переводов глоссария.
+                    let (old, translation) = (term.name().to_string(), term.translation().map(str::to_string));
+                    if term.rename(&finding.name).is_err() {
+                        continue;
+                    }
+                    term.set_translation("");
+                    if let Ok(form) = Form::new(&old, translation.as_deref()) {
+                        let _ = term.add_form(form);
+                    }
+                    terms.save(&term)?;
+                    owners.add_term(&finding.name, id);
+                    added.push(format!("{old} → {}", finding.name));
+                } else {
+                    let Ok(form) = Form::new(&finding.name, None) else { continue };
+                    if term.add_form(form).is_err() {
+                        continue;
+                    }
+                    terms.save(&term)?;
+                    owners.add_term(&finding.name, id);
+                    added.push(format!("{} → {}", finding.name, term.name()));
                 }
-                terms.save(&term)?;
-                owners.add_term(&finding.name, id);
-                added.push(format!("{} → {}", finding.name, term.name()));
             }
             Some(Owner::Character(id)) => {
                 let mut character = characters.get(id)?;

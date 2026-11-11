@@ -2210,6 +2210,61 @@ mod tests {
     }
 
     #[test]
+    fn entries_linked_later_are_merged() {
+        use super::super::analyze::{Finding, FoundKind};
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let glossary = GlossaryService { state: &state };
+        let open = state.open_project(id).unwrap();
+        let org = FoundKind::Term(TermCategory::Organization);
+        let found = |name: &str, kind, same_as: Option<&str>| Finding { name: name.to_string(), kind, gender: None, same_as: same_as.map(str::to_string) };
+        let save = |findings: &[Finding]| open.project.write(|tx| save_found(tx, findings)).unwrap();
+        let terms = || open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap();
+        let forms = |term: &crate::glossary::Term| term.forms().iter().map(|form| (form.text().to_string(), form.translation().map(str::to_string))).collect::<Vec<_>>();
+
+        // Аббревиатура записана раньше полного названия: полное становится названием, аббревиатура формой со своим переводом.
+        let ppf = glossary.take_term(id, "PPF", TermCategory::Organization).unwrap();
+        let mut term = open.project.read(|tx| TermRepo { conn: tx }.get(ppf)).unwrap();
+        term.set_translation("НПС");
+        glossary.save_term(id, &term).unwrap();
+        assert_eq!(save(&[found("People's Police Force", org, None)]), ["PPF → People's Police Force"]);
+        let list = terms();
+        assert_eq!((list.len(), list[0].name(), list[0].translation()), (1, "People's Police Force", None));
+        assert_eq!(forms(&list[0]), [("PPF".to_string(), Some("НПС".to_string()))]);
+
+        // Два отдельных термина: связь нашлась позже, главным остаётся полное название в любую сторону ссылки.
+        let order = glossary.take_term(id, "Order of the Dawn", TermCategory::Organization).unwrap();
+        let od = glossary.take_term(id, "OD", TermCategory::Organization).unwrap();
+        assert_eq!(save(&[found("Order of the Dawn", org, Some("OD"))]), ["OD → Order of the Dawn (объединено)"]);
+        let list = terms();
+        assert!(list.iter().all(|term| term.id() != Some(od)), "аббревиатура слита");
+        assert_eq!(forms(list.iter().find(|term| term.id() == Some(order)).unwrap()), [("OD".to_string(), None)]);
+
+        // Персонаж под другим именем сливается в того, на кого указала модель: формы и связи говорящих переходят.
+        let eileen = glossary.create_character(id, "Eileen").unwrap();
+        let mut character = open.project.read(|tx| CharacterRepo { conn: tx }.get(eileen)).unwrap();
+        character.set_last_name("Lee");
+        glossary.save_character(id, &character).unwrap();
+        let mister = glossary.speaker_to_character(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
+        let mut character = open.project.read(|tx| CharacterRepo { conn: tx }.get(mister)).unwrap();
+        character.set_first_name("Mr. Lee");
+        character.set_description("Учитель.");
+        glossary.save_character(id, &character).unwrap();
+        assert_eq!(save(&[found("Mr. Lee", FoundKind::Character, Some("Eileen Lee"))]), ["Mr. Lee → Eileen Lee (объединено)"]);
+        let (characters, links) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.list()?, SpeakerRepo { conn: tx }.links_of(eileen)?))).unwrap();
+        assert_eq!(characters.len(), 1);
+        assert_eq!(characters[0].forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Mr. Lee"]);
+        assert_eq!(characters[0].description(), Some("Учитель."), "пустое описание заполнено");
+        assert_eq!(links.iter().map(|link| link.speaker.as_str()).collect::<Vec<_>>(), ["code:e"], "говорящий перешёл");
+
+        // Термин оказался именем персонажа: уходит ему формой.
+        glossary.take_term(id, "Leeway", TermCategory::General).unwrap();
+        assert_eq!(save(&[found("Leeway", FoundKind::Character, Some("Eileen Lee"))]), ["Leeway → Eileen Lee (объединено)"]);
+        assert!(terms().iter().all(|term| term.name() != "Leeway"));
+        assert_eq!(save(&[found("Leeway", FoundKind::Character, Some("Eileen Lee"))]), Vec::<String>::new(), "второй раз сливать нечего");
+    }
+
+    #[test]
     fn notes_of_parts_that_are_gone_are_pruned() {
         let (url, _) = fake_model(|body| {
             let system = system_text(body);

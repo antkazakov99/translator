@@ -190,19 +190,7 @@ impl GlossaryService<'_> {
     /// Одной транзакцией: термин удаляется, название уходит в корзину `given_to_character`,
     /// у персонажа появляется форма с переводом термина.
     pub fn give_term_to_character(&self, project: ProjectId, term: TermId, character: CharacterId) -> Result<(), AppError> {
-        self.write(project, |tx| {
-            let terms = TermRepo { conn: tx };
-            let term = terms.get(term)?;
-            add_form(tx, character, term.name(), term.translation())?;
-            terms.delete(term.id().ok_or(DbError::NotFound)?)?;
-            NoteRepo { conn: tx }.delete_owner(&NoteOwner::Term(term.id().ok_or(DbError::NotFound)?))?;
-            terms.discard(&DiscardedTerm {
-                text: term.name().to_string(),
-                key: term.name_key().clone(),
-                reason: DiscardReason::GivenToCharacter,
-                discarded_at: Timestamp::now(),
-            })
-        })
+        self.write(project, |tx| give_term(tx, term, character))
     }
 
     /// Название из корзины ещё одному персонажу: общая фамилия достаётся всем.
@@ -438,6 +426,92 @@ fn character_from_speaker(conn: &Connection, key: &SpeakerKey) -> Result<Charact
 }
 
 /// Форма персонажа. Совпадение с именем, фамилией или другой формой не ошибка: перевод заполнит пустое поле.
+/// Термин уходит персонажу формой с переводом термина: термин и его заметки удаляются, название уходит
+/// в корзину `given_to_character`.
+pub(crate) fn give_term(tx: &Connection, term: TermId, character: CharacterId) -> Result<(), DbError> {
+    let terms = TermRepo { conn: tx };
+    let term = terms.get(term)?;
+    let id = term.id().ok_or(DbError::NotFound)?;
+    add_form(tx, character, term.name(), term.translation())?;
+    terms.delete(id)?;
+    NoteRepo { conn: tx }.delete_owner(&NoteOwner::Term(id))?;
+    terms.discard(&DiscardedTerm {
+        text: term.name().to_string(),
+        key: term.name_key().clone(),
+        reason: DiscardReason::GivenToCharacter,
+        discarded_at: Timestamp::now(),
+    })
+}
+
+/// Термин `from` сливается в `into`: название и формы `from` становятся формами `into` со своими переводами,
+/// описание пишется в пустое, исключённые сцены объединяются, `from` и его заметки удаляются.
+pub(crate) fn merge_terms(tx: &Connection, from: TermId, into: TermId) -> Result<(), DbError> {
+    if from == into {
+        return Ok(());
+    }
+    let terms = TermRepo { conn: tx };
+    let (source, mut target) = (terms.get(from)?, terms.get(into)?);
+    let names = std::iter::once((source.name(), source.translation())).chain(source.forms().iter().map(|form| (form.text(), form.translation())));
+    for (text, translation) in names {
+        if let Ok(form) = Form::new(text, translation) {
+            let _ = target.add_form(form);
+        }
+    }
+    if let (None, Some(description)) = (target.description(), source.description()) {
+        target.set_description(description);
+    }
+    let excluded = terms.excluded_containers(from)?;
+    terms.delete(from)?;
+    NoteRepo { conn: tx }.delete_owner(&NoteOwner::Term(from))?;
+    terms.save(&target)?;
+    for container in excluded {
+        terms.set_excluded(into, &container, true)?;
+    }
+    Ok(())
+}
+
+/// Персонаж `from` сливается в `into`: полное имя `from` и его формы становятся формами `into` с переводами,
+/// связи говорящих переходят без основного кода, род, описание и манера речи пишутся в пустое, исключённые
+/// сцены объединяются, `from` и его заметки удаляются.
+pub(crate) fn merge_characters(tx: &Connection, from: CharacterId, into: CharacterId) -> Result<(), DbError> {
+    if from == into {
+        return Ok(());
+    }
+    let characters = CharacterRepo { conn: tx };
+    let speakers = SpeakerRepo { conn: tx };
+    let source = characters.get(from)?;
+    let links = speakers.links_of(from)?;
+    let excluded = characters.excluded_containers(from)?;
+    characters.delete(from)?;
+    NoteRepo { conn: tx }.delete_owner(&NoteOwner::Character(from))?;
+    let names = source
+        .full_name()
+        .map(|name| (name, source.translated_full_name()))
+        .into_iter()
+        .chain(source.forms().iter().map(|form| (form.text().to_string(), form.translation().map(str::to_string))));
+    for (text, translation) in names {
+        add_form(tx, into, &text, translation.as_deref())?;
+    }
+    let mut target = characters.get(into)?;
+    if target.gender().is_none() {
+        target.set_gender(source.gender());
+    }
+    if let (None, Some(description)) = (target.description(), source.description()) {
+        target.set_description(description);
+    }
+    if let (None, Some(speech)) = (target.speech(), source.speech()) {
+        target.set_speech(speech);
+    }
+    characters.save(&target)?;
+    for link in links {
+        speakers.link(&SpeakerLink { speaker: link.speaker, character: into, is_primary: false })?;
+    }
+    for container in excluded {
+        characters.set_excluded(into, &container, true)?;
+    }
+    Ok(())
+}
+
 fn add_form(conn: &Connection, character: CharacterId, text: &str, translation: Option<&str>) -> Result<(), DbError> {
     let repo = CharacterRepo { conn };
     let mut person = repo.get(character)?;
