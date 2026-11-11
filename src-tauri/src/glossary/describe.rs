@@ -1004,7 +1004,7 @@ impl SceneWriter<'_> {
         }
         let mut going = true;
         let answer = if let (EntryKind::Term, [_], [note]) = (plan.kind, plan.parts.as_slice(), notes.as_slice()) {
-            Some(CharacterAnswer { description: note.clone(), speech: None })
+            Some(CharacterAnswer { description: note.clone(), ..CharacterAnswer::default() })
         } else {
             let Some(notes) = self.condense(run, &label, notes, written).await else { return Ok(Outcome::STOPPED) };
             run.note(format!("{label}: сборка описания"));
@@ -1020,7 +1020,7 @@ impl SceneWriter<'_> {
             going = run.step(written);
             match plan.kind {
                 EntryKind::Character => CharacterPrompt::accept(&text),
-                EntryKind::Term => Some(clean_note(&text)).filter(|text| !text.is_empty()).map(|description| CharacterAnswer { description, speech: None }),
+                EntryKind::Term => Some(clean_note(&text)).filter(|text| !text.is_empty()).map(|description| CharacterAnswer { description, ..CharacterAnswer::default() }),
             }
         };
         let Some(answer) = answer else { return Ok(Outcome { description: None, going }) };
@@ -1031,6 +1031,9 @@ impl SceneWriter<'_> {
                 character.set_description(&answer.description);
                 if let Some(speech) = &answer.speech {
                     character.set_speech(speech);
+                }
+                if character.gender().is_none() {
+                    character.set_gender(answer.gender);
                 }
                 repo.save(&character).map(|_| ())
             }
@@ -2112,7 +2115,7 @@ mod tests {
             let system = system_text(body);
             // Сборка тоже говорит о заметках, поэтому проверяется первой.
             let answer = if system.contains("about one character") {
-                "```json\n{\"description\": \"Эйлин встречает героя.\", \"speech\": \"Говорит на «ты».\"}\n```"
+                "```json\n{\"description\": \"Эйлин встречает героя.\", \"speech\": \"Говорит на «ты».\", \"gender\": \"female\"}\n```"
             } else if system.contains("notes about the character") {
                 "Эйлин здоровается и показывает дорогу."
             } else if system.contains("notes about the term") {
@@ -2151,6 +2154,7 @@ mod tests {
         let open = state.open_project(id).unwrap();
         let (person, item) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.get(eileen)?, TermRepo { conn: tx }.get(side)?))).unwrap();
         assert_eq!((person.description(), person.speech()), (Some("Эйлин встречает героя."), Some("Говорит на «ты».")));
+        assert_eq!(person.gender(), Some(crate::common::Gender::Female), "пустой род заполнен по описанию");
         assert_eq!(item.description(), Some("Сторона, куда ведёт дорога."), "заметка единственной части сразу описание");
 
         let parts = service.entry_parts(id, &character).unwrap();
@@ -2442,6 +2446,13 @@ mod tests {
         assert!(open.project.read(|tx| known_for_prompt(tx)).unwrap().contains(&"Eileen".to_string()));
         assert!(open.project.write(|tx| save_found(tx, &[found("Eileen", FoundKind::Character)])).unwrap().is_empty());
         assert_eq!(links().len(), 1);
+
+        // Герой с подписью-токеном модели не виден: говорящий с репликами сам становится персонажем.
+        open.project.write(|tx| Ok(tx.execute("UPDATE segments SET speaker_key = 'code:mc' WHERE source_text = 'Narration.'", [])?)).unwrap();
+        assert_eq!(open.project.write(|tx| save_found(tx, &[])).unwrap(), ["[player] (говорящий, новый персонаж)"]);
+        let hero = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap().into_iter().find(|character| character.first_name() == Some("[player]")).unwrap();
+        assert!(links().contains(&SpeakerLink { speaker: SpeakerKey::new("code:mc").unwrap(), character: hero.id().unwrap(), is_primary: true }));
+        assert!(open.project.write(|tx| save_found(tx, &[])).unwrap().is_empty(), "второй раз не создаётся");
     }
 
     #[test]

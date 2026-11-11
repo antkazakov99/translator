@@ -458,6 +458,12 @@ pub fn title_and_name(name: &str) -> Option<(String, String)> {
     Some((words[..count].join(" "), words[count..].join(" ")))
 }
 
+/// Подпись из одного токена: «[mc]», «[player_name]». «[mc]'s mom» это роль, а не токен.
+pub fn is_token_label(label: &str) -> bool {
+    let label = label.trim();
+    label.len() > 2 && label.starts_with('[') && label.ends_with(']') && !label[1..label.len() - 1].contains(['[', ']'])
+}
+
 /// Одно обычное звание или обращение («King», «Princess», «Sister», «Mr.»): это обычное слово, а не термин игры.
 /// Его перевод очевиден, а одно написание на всю игру вредит: «Sister» бывает монахиней и сестрой. Составное
 /// звание («Detective-Colonel», «Grand Duke») термином остаётся.
@@ -690,17 +696,30 @@ impl Saver<'_> {
     /// Говорящие, которых пользователь ещё не разобрал, привязываются к персонажу по подписи: подпись это имя,
     /// фамилия, полное имя или форма персонажа, то же после должности («Detective-Colonel Karanovic») или короткая
     /// форма единственного имени («Dimi» у «Dimitria», при нескольких решает сцена). Связь становится основной, если
-    /// у персонажа основной ещё нет.
+    /// у персонажа основной ещё нет. Говорящий с подписью из одного токена («[mc]», «[player_name]»), обычно герой,
+    /// модели не виден: если у него есть реплики, он становится персонажем с этой подписью.
     fn link_speakers(&mut self) -> Result<(), DbError> {
         let repo = SpeakerRepo { conn: self.tx };
         let characters = CharacterRepo { conn: self.tx };
+        let speaking: HashSet<_> = repo.current()?.into_iter().filter(|used| used.lines > 0).map(|used| used.speaker.key).collect();
         for speaker in repo.new_speakers()? {
             let Some(label) = speaker.label.as_deref() else { continue };
             let owner = |name: &str| NameKey::new(name).and_then(|key| self.owners.by_key.get(&key).copied());
             let found = owner(label)
                 .or_else(|| title_and_name(label).and_then(|(_, name)| owner(&name)))
                 .or_else(|| (!label.contains(char::is_whitespace)).then(|| self.owners.short_form_owner(label, None).map(Owner::Character)).flatten());
-            let Some(Owner::Character(id)) = found else { continue };
+            let id = match found {
+                Some(Owner::Character(id)) => id,
+                Some(Owner::Term(_)) => continue,
+                None if is_token_label(label) && speaking.contains(&speaker.key) => {
+                    let id = characters.save(&Character::new(label))?;
+                    repo.link(&SpeakerLink { speaker: speaker.key.clone(), character: id, is_primary: true })?;
+                    self.owners.add(label, Owner::Character(id));
+                    self.added.push(format!("{label} (говорящий, новый персонаж)"));
+                    continue;
+                }
+                None => continue,
+            };
             let primary = !repo.links_of(id)?.iter().any(|link| link.is_primary);
             repo.link(&SpeakerLink { speaker: speaker.key.clone(), character: id, is_primary: primary })?;
             self.added.push(format!("{label} (говорящий) → {}", characters.get(id)?.full_name().unwrap_or_default()));
@@ -875,6 +894,8 @@ mod tests {
         assert_eq!(title_and_name("Vera Karanovic"), None);
         assert_eq!(title_and_name("Captain"), None, "без имени после должности делить нечего");
         assert!(is_common_title("Mr.") && is_common_title("Princess") && is_common_title(" sister "));
+        assert!(is_token_label("[mc]") && is_token_label(" [player_name] "));
+        assert!(!is_token_label("[mc]'s mom") && !is_token_label("[]") && !is_token_label("[a] [b]") && !is_token_label("Eileen"));
         assert!(!is_common_title("Detective-Colonel") && !is_common_title("Grand Duke") && !is_common_title("Selena"));
     }
 

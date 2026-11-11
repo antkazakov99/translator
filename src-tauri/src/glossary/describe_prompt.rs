@@ -6,6 +6,7 @@ use regex::Regex;
 
 use super::parts::MAX_PART_TEXT;
 use super::suggest::hints_block;
+use crate::common::Gender;
 use crate::llm::{ChatRequest, LlmTarget};
 use crate::translation::Hints;
 
@@ -171,10 +172,12 @@ A line starting with \"Known terms:\" gives established translations: use them. 
 Never copy these glossary hint lines into your answer. Write only the note text, without headings, labels or Markdown.";
 
 const CHARACTER_SYSTEM: &str = "You write a glossary entry about one character of a visual novel for its translator into Russian. \
-You receive notes about the character collected from the game. Answer with a JSON object with two string fields. \
+You receive notes about the character collected from the game. Answer with a JSON object with three string fields. \
 \"description\": 2 to 5 sentences in Russian: who the character is, occupation, relations with others, place in the story. \
 \"speech\": one short sentence in Russian on how the character speaks: tone, slang, \"ты\" or \"вы\" and to whom; \
 an empty string if the notes say nothing about it. \
+\"gender\": \"male\", \"female\" or \"unknown\", the grammatical gender the character uses about themself, \
+judging by the notes and the lines; \"unknown\" when they do not settle it. \
 Use only the notes and do not invent facts. \
 A line starting with \"Russian names:\" gives the exact spelling of names: always use it, declining the name as Russian grammar requires. \
 A line starting with \"Gender:\" tells who is male or female. \
@@ -223,6 +226,8 @@ pub struct CharacterPrompt;
 pub struct CharacterAnswer {
     pub description: String,
     pub speech: Option<String>,
+    /// Род по заметкам: пишется только персонажу без рода.
+    pub gender: Option<Gender>,
 }
 
 impl CharacterPrompt {
@@ -241,6 +246,7 @@ impl CharacterPrompt {
         struct Raw {
             description: Option<String>,
             speech: Option<String>,
+            gender: Option<String>,
         }
         let start = answer.find('{')?;
         let end = answer.rfind('}')?;
@@ -250,7 +256,8 @@ impl CharacterPrompt {
             return None;
         }
         let speech = raw.speech.map(|speech| clean_note(&speech)).filter(|speech| !speech.is_empty());
-        Some(CharacterAnswer { description, speech })
+        let gender = raw.gender.as_deref().and_then(|text| Gender::parse(text.trim().to_lowercase().as_str()).ok());
+        Some(CharacterAnswer { description, speech, gender })
     }
 }
 
@@ -339,7 +346,10 @@ mod tests {
     #[test]
     fn character_answer_is_read_from_json_even_in_markdown() {
         let answer = CharacterPrompt::accept("Вот:\n```json\n{\"description\": \"**Анна** учится.\", \"speech\": \" \"}\n```");
-        assert_eq!(answer, Some(CharacterAnswer { description: "Анна учится.".to_string(), speech: None }));
+        assert_eq!(answer, Some(CharacterAnswer { description: "Анна учится.".to_string(), speech: None, gender: None }));
+        let answer = CharacterPrompt::accept("{\"description\": \"Герой.\", \"speech\": \"\", \"gender\": \"Female\"}").unwrap();
+        assert_eq!(answer.gender, Some(Gender::Female));
+        assert_eq!(CharacterPrompt::accept("{\"description\": \"Герой.\", \"gender\": \"unknown\"}").unwrap().gender, None);
         assert_eq!(CharacterPrompt::accept("{\"description\": \"\"}"), None);
         assert_eq!(CharacterPrompt::accept("Не JSON"), None);
         let request = EntryPartPrompt::build(EntryKind::Term, "Old Key", "Anna: The old key.\n", &Hints::default(), &target());
