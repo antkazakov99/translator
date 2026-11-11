@@ -51,6 +51,8 @@ pub struct SceneLine {
     pub location: Option<String>,
     /// Перевод сделан для другого оригинала: игра изменила реплику после перевода.
     pub source_changed: bool,
+    /// Модель уже вычитала реплику с нынешним текстом. Ставит только вычитка «Вся игра»: такая реплика ей не нужна.
+    pub reviewed: bool,
 }
 
 impl LineState {

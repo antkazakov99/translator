@@ -102,6 +102,7 @@ pub(crate) mod tests {
             state: if text.is_empty() { LineState::Empty } else { LineState::Done },
             location: None,
             source_changed: false,
+            reviewed: false,
         }
     }
 

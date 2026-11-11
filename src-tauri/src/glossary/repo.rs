@@ -947,3 +947,43 @@ impl LineSampleRepo<'_> {
             .collect())
     }
 }
+
+/// `analyzed_parts`: части сцен, которые прочитал разбор.
+pub struct AnalyzedPartRepo<'c> {
+    pub conn: &'c Connection,
+}
+
+impl AnalyzedPartRepo<'_> {
+    /// Отпечатки прочитанных разбором частей сцены.
+    pub fn of(&self, key: &ContainerKey) -> Result<std::collections::HashSet<String>, DbError> {
+        let mut statement = self.conn.prepare("SELECT part_hash FROM analyzed_parts WHERE container_key = ?1")?;
+        let rows = statement.query_map([key.as_str()], |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark(&self, key: &ContainerKey, part_hash: &str, now: Timestamp) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO analyzed_parts (container_key, part_hash, analyzed_at) VALUES (?1, ?2, ?3)",
+            params![key.as_str(), part_hash, now.secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Сцены с отметками: по ним идёт уборка после считывания.
+    pub fn scenes(&self) -> Result<Vec<ContainerKey>, DbError> {
+        let mut statement = self.conn.prepare("SELECT DISTINCT container_key FROM analyzed_parts ORDER BY container_key")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(|key| ContainerKey::new(key).map_err(|error| DbError::bad_value("analyzed_parts", "container_key", error))).collect()
+    }
+
+    /// Удаляет отметки частей, которых больше нет у сцены. Возвращает число удалённых.
+    pub fn retain(&self, key: &ContainerKey, part_hashes: &[String]) -> Result<usize, DbError> {
+        let mut removed = 0;
+        for hash in self.of(key)?.iter().filter(|hash| !part_hashes.contains(hash)) {
+            removed += self
+                .conn
+                .execute("DELETE FROM analyzed_parts WHERE container_key = ?1 AND part_hash = ?2", params![key.as_str(), hash])?;
+        }
+        Ok(removed)
+    }
+}

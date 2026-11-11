@@ -103,6 +103,12 @@ export const commands = {
 	sceneEntries: (project: string, key: string) => __TAURI_INVOKE<SceneEntriesDto_Serialize>("scene_entries", { project, key }),
 	/**  Описывает сцены по очереди с глубиной чтения проекта. Описанные сцены без новых частей пропускаются. */
 	describeScenes: (project: string, keys: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scenes", { project, keys, profile, progress }),
+	/**  Сводка шагов «Вся игра»: сколько осталось и примерное число запросов. */
+	gameOverview: (project: string) => __TAURI_INVOKE<StepWorkDto[]>("game_overview", { project }),
+	/**  Отмеченные шаги по порядку одной цепочкой. Повторный запуск продолжает с того же места. */
+	runGame: (project: string, steps: GameStep[], names: NamesMode, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<GameRunDto_Serialize>("run_game", { project, steps, names, progress }),
+	/**  Написания из отбора имён в пустые поля персонажей. Возвращает число изменённых персонажей. */
+	writeNames: (project: string, names: NamePickDto[]) => __TAURI_INVOKE<number>("write_names", { project, names }),
 	/**  Части сцен персонажа или термина с заметками модели. */
 	entryParts: (project: string, owner: OwnerDto) => __TAURI_INVOKE<EntryPartsDto_Serialize>("entry_parts", { project, owner }),
 	/**  Описывает персонажа или термин по частям сцен с глубиной чтения проекта и заменяет описание. */
@@ -467,6 +473,42 @@ export type GameFontDto_Serialize = {
 	replacement: FontReplacementDto | null,
 };
 
+/**  Итог цепочки. `names`: ручной выбор имён, цепочка ждёт отбора и продолжится шагами `rest`. */
+export type GameRunDto = GameRunDto_Serialize | GameRunDto_Deserialize;
+
+/**  Итог цепочки. `names`: ручной выбор имён, цепочка ждёт отбора и продолжится шагами `rest`. */
+export type GameRunDto_Deserialize = {
+	finished: StepResultDto[],
+	stopped: boolean,
+	error?: string | null,
+	names?: NameSuggestionsDto_Deserialize | null,
+	rest: GameStep[],
+};
+
+/**  Итог цепочки. `names`: ручной выбор имён, цепочка ждёт отбора и продолжится шагами `rest`. */
+export type GameRunDto_Serialize = {
+	finished: StepResultDto[],
+	stopped: boolean,
+	error: string | null,
+	names: NameSuggestionsDto_Serialize | null,
+	rest: GameStep[],
+};
+
+/**  Шаг цепочки. Порядок вариантов это порядок выполнения. */
+export type GameStep = 
+/**  Разбор сцен: новые персонажи и термины. */
+"analysis" | 
+/**  Переводы глоссария: термины, подписи говорящих, значения токенов, имена. */
+"glossary" | 
+/**  Описания персонажей и терминов. */
+"entries" | 
+/**  Описания сцен. */
+"scenes" | 
+/**  Перевод реплик. */
+"lines" | 
+/**  Вычитка. */
+"review";
+
 /**  Род: с ним согласуются глаголы в переводе. `None` в полях значит «неизвестен». */
 export type Gender = "male" | "female";
 
@@ -693,6 +735,14 @@ export type ModResultDto = {
 /**  Поле имени, происхождение которого определила модель. */
 export type NameField = "first" | "last" | "form";
 
+/**  Написание поля персонажа из отбора. */
+export type NamePickDto = {
+	character: RowRef,
+	field: NameField,
+	source: string,
+	translation: string,
+};
+
 /**  Написания одного поля персонажа. */
 export type NameSuggestionDto = NameSuggestionDto_Serialize | NameSuggestionDto_Deserialize;
 
@@ -753,6 +803,13 @@ export type NameVariantDto_Serialize = {
 	translation: string,
 	description: string | null,
 };
+
+/**  Как цепочка выбирает написание имени. */
+export type NamesMode = 
+/**  Первый вариант модели: промпт ставит первым самое устоявшееся написание. */
+"auto" | 
+/**  Цепочка останавливается на отборе имён, окно продолжает её после записи. */
+"manual";
 
 /**  Персонаж или термин, которого описывает модель. */
 export type OwnerDto = { kind: "character"; id: RowRef } | { kind: "term"; id: RowRef };
@@ -995,6 +1052,8 @@ export type RunProgress_Deserialize = {
 	/**  Реплик записано за запуск. */
 	written: number,
 	message?: string | null,
+	/**  Шаг цепочки «Вся игра»: есть только у запуска внутри цепочки. */
+	stage?: RunStage | null,
 };
 
 /**
@@ -1007,6 +1066,15 @@ export type RunProgress_Serialize = {
 	/**  Реплик записано за запуск. */
 	written: number,
 	message: string | null,
+	/**  Шаг цепочки «Вся игра»: есть только у запуска внутри цепочки. */
+	stage?: RunStage,
+};
+
+/**  Шаг цепочки в ходе запуска: «Шаг 2 из 4 · Перевод терминов». */
+export type RunStage = {
+	index: number,
+	count: number,
+	title: string,
 };
 
 export type RunStatus = "running" | "done" | "cancelled" | "failed";
@@ -1224,6 +1292,22 @@ export type SpeakerSuggestionsDto_Serialize = {
 	error: string | null,
 };
 
+export type StepResultDto = {
+	step: GameStep,
+	written: number,
+};
+
+/**  Сводка шага для карточки. */
+export type StepWorkDto = {
+	step: GameStep,
+	title: string,
+	left: WorkCountDto[],
+	/**  Примерное число запросов к модели. */
+	requests: number,
+	/**  Делать нечего: шаг недоступен. */
+	empty: boolean,
+};
+
 export type TermCategory = "general" | "location" | "organization" | "title" | "item" | "event";
 
 export type TermDto = TermDto_Serialize | TermDto_Deserialize;
@@ -1331,5 +1415,11 @@ export type TokenSuggestionsDto_Deserialize = {
 export type TokenSuggestionsDto_Serialize = {
 	items: TokenSuggestionDto_Serialize[],
 	error: string | null,
+};
+
+/**  Что осталось: «сцен без описания: 140». */
+export type WorkCountDto = {
+	label: string,
+	count: number,
 };
 

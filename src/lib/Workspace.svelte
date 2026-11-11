@@ -19,6 +19,7 @@
     Waypoints,
     X,
   } from "lucide-svelte";
+  import GamePage from "./GamePage.svelte";
   import Glossary from "./Glossary.svelte";
   import ModPanel from "./ModPanel.svelte";
   import ScanPanel from "./ScanPanel.svelte";
@@ -29,6 +30,7 @@
   import SuggestStatus from "./SuggestStatus.svelte";
   import { trackRun, type RunSource } from "./run-status.svelte";
   import { WriteRun } from "./suggest-run.svelte";
+  import { GameRun } from "./game-run.svelte";
   import { progressLabel, progressPercent } from "./progress";
   import { fileName, filterScenes, hitMap, lineMatches, pickId, sceneItemName, sceneList, type ScenePick } from "./scene-tree";
   import { sceneLabel, type GraphScene } from "$lib/scene-graph";
@@ -66,7 +68,7 @@
   let filter = $state<Filter>("all");
   let editing = $state<{ id: number; text: string } | null>(null);
   let saving = $state(false);
-  let view = $state<"table" | "graph" | "glossary">("table");
+  let view = $state<"table" | "graph" | "glossary" | "game">("table");
   /** Карточка мода под шапкой. */
   let modOpen = $state(false);
   /** Карточка версии игры: считывание, смена папки, «Пропавшие». */
@@ -103,6 +105,8 @@
   });
   /** Описание открытой сцены моделью. */
   const describe = new WriteRun("Описания");
+  /** Цепочка «Вся игра»: живёт здесь, чтобы переход между видами не терял запуск, отбор имён и итог. */
+  const game = new GameRun(() => project.id, () => refresh());
 
   type RunMode = "translate" | "review";
   /** Запуск перевода или редактуры из этого окна. */
@@ -118,7 +122,7 @@
   let working = $state(false);
 
   /** Модель занята: перевод, редактура или описание. Второй запуск Rust всё равно не даст. */
-  const busy = $derived(run !== null || describe.active);
+  const busy = $derived(run !== null || describe.active || game.active);
   const group = $derived.by(() => {
     const pick = selected;
     if (!pick) return null;
@@ -568,6 +572,7 @@
       <button role="tab" aria-selected={view === "table"} class:on={view === "table"} onclick={() => (view = "table")}>Таблица</button>
       <button role="tab" aria-selected={view === "graph"} class:on={view === "graph"} onclick={() => (view = "graph")}>Граф</button>
       <button role="tab" aria-selected={view === "glossary"} class:on={view === "glossary"} onclick={() => (view = "glossary")}>Глоссарий</button>
+      <button role="tab" aria-selected={view === "game"} class:on={view === "game"} onclick={() => (view = "game")}>Вся игра</button>
     </div>
     <button class="btn small" class:active={scanOpen} onclick={() => (scanOpen = !scanOpen)} title="Считать новую версию игры, сменить папку, пропавшие реплики">
       <RefreshCw size={15} />
@@ -599,6 +604,10 @@
   {:else if view === "glossary"}
     <div class="body">
       <Glossary projectId={project.id} onOpenLine={openLine} />
+    </div>
+  {:else if view === "game"}
+    <div class="body">
+      <GamePage projectId={project.id} {game} />
     </div>
   {:else}
   <div class="body">

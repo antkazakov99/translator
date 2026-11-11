@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tauri::ipc::Channel;
 
 use super::batcher::LINE_CONTEXT;
 use super::hints::GlossaryContext;
@@ -14,9 +13,9 @@ use super::{
 };
 use crate::common::{AppError, Timestamp};
 use crate::glossary::describe::{RunAsk, SceneReader};
-use crate::glossary::{CharacterRepo, GlossaryData, SceneDescriptionRepo};
+use crate::glossary::{CharacterRepo, GlossaryData, Pending, SceneDescriptionRepo};
 use crate::name_rules::NameRuleService;
-use crate::llm::{Action, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunId, RunProgress, RunStatus};
+use crate::llm::{Action, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunHost, RunId, RunProgress, RunStatus};
 use crate::projects::ProjectId;
 use crate::scan::{FileId, SegmentId};
 use crate::state::{AppState, OpenProject};
@@ -36,9 +35,9 @@ impl TranslationService<'_> {
         project: ProjectId,
         scope: TranslationScope,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<LinesRun, AppError> {
-        self.run(project, LinesMode::Translate, scope, one_off, progress).await
+        self.run(project, LinesMode::Translate, scope, one_off, host, false).await
     }
 
     /// Вычитывает готовые реплики, исправления становятся черновиками. Возвращает запуск и число исправленных.
@@ -47,19 +46,60 @@ impl TranslationService<'_> {
         project: ProjectId,
         scope: TranslationScope,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<LinesRun, AppError> {
-        self.run(project, LinesMode::Review, scope, one_off, progress).await
+        self.run(project, LinesMode::Review, scope, one_off, host, false).await
+    }
+
+    /// Вычитка «Вся игра»: только реплики, которые модель не вычитывала с нынешним текстом. Остановленная
+    /// вычитка продолжается со следующей невычитанной.
+    pub async fn review_unreviewed(
+        &self,
+        project: ProjectId,
+        scope: TranslationScope,
+        one_off: Option<ProfileId>,
+        host: impl Into<RunHost>,
+    ) -> Result<LinesRun, AppError> {
+        self.run(project, LinesMode::Review, scope, one_off, host, true).await
+    }
+
+    /// Сколько работы у перевода или вычитки всей игры: нужные режиму реплики и пакеты. `skip_reviewed`:
+    /// как у `review_unreviewed`. Чтение сцен без описания перед переводом не считается.
+    pub fn pending(&self, project: ProjectId, mode: LinesMode, skip_reviewed: bool) -> Result<Pending, AppError> {
+        let open = self.state.open_project(project)?;
+        let action = match mode {
+            LinesMode::Translate => Action::Lines,
+            LinesMode::Review => Action::Review,
+        };
+        let size = LlmTargetService { state: self.state }
+            .target(Some(&open), action, None)
+            .map_or_else(|_| action.default_batch_size(), |target| target.settings.batch_size);
+        let (mut scenes, reviewed) = open.project.read(|tx| {
+            let repo = TranslationRepo { conn: tx };
+            let reviewed = if skip_reviewed { repo.reviewed()? } else { HashMap::new() };
+            Ok((load_scenes(&repo, &TranslationScope::Project)?, reviewed))
+        })?;
+        let mut pending = Pending::default();
+        for scene in &mut scenes {
+            for line in &mut scene.lines {
+                line.reviewed = reviewed.get(&line.id).is_some_and(|text| *text == line.text);
+            }
+            pending.items += scene.lines.iter().filter(|line| mode.wants(line)).count();
+            pending.requests += Batcher::split(scene, mode, size).len();
+        }
+        Ok(pending)
     }
 
     /// Запуск: цель, сцены, место запуска, пакеты, итог в `llm_runs`. Остановка не ошибка: готовое остаётся.
+    /// `skip_reviewed`: вычитанные с нынешним текстом реплики остаются контекстом.
     async fn run(
         &self,
         project: ProjectId,
         mode: LinesMode,
         scope: TranslationScope,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
+        skip_reviewed: bool,
     ) -> Result<LinesRun, AppError> {
         let open = self.state.open_project(project)?;
         let action = match mode {
@@ -67,9 +107,14 @@ impl TranslationService<'_> {
             LinesMode::Review => Action::Review,
         };
         let target = LlmTargetService { state: self.state }.target(Some(&open), action, one_off)?;
-        let (mut scenes, glossary, origins) = open.project.read(|tx| {
-            Ok((load_scenes(&TranslationRepo { conn: tx }, &scope)?, GlossaryData::load(tx)?, CharacterRepo { conn: tx }.all_origins()?))
+        let (mut scenes, glossary, origins, reviewed) = open.project.read(|tx| {
+            let repo = TranslationRepo { conn: tx };
+            let reviewed = if skip_reviewed { repo.reviewed()? } else { HashMap::new() };
+            Ok((load_scenes(&repo, &scope)?, GlossaryData::load(tx)?, CharacterRepo { conn: tx }.all_origins()?, reviewed))
         })?;
+        for line in scenes.iter_mut().flat_map(|scene| &mut scene.lines) {
+            line.reviewed = reviewed.get(&line.id).is_some_and(|text| *text == line.text);
+        }
         let rules = NameRuleService { state: self.state }.effective(project, &GlossaryContext::name_languages(&glossary, &origins))?;
         let only = match scope {
             TranslationScope::Line(line) => Some(line),
@@ -94,7 +139,7 @@ impl TranslationService<'_> {
             (LinesMode::Translate, None) if !unread.is_empty() => Some(SceneReader::prepare(self.state, &open, unread, &mut glossary, one_off)?),
             _ => None,
         };
-        let run = LlmRun::begin(self.state, Some(open.clone()), action, &target, progress)?;
+        let run = LlmRun::begin(self.state, Some(open.clone()), action, &target, host)?;
         let result = match run.id() {
             Some(id) => {
                 let mut job =
@@ -159,25 +204,19 @@ impl TranslationService<'_> {
     /// с текстом сцены в снимке.
     pub fn scene_tree(&self, project: ProjectId) -> Result<Vec<FileScenes>, AppError> {
         let open = self.state.open_project(project)?;
-        let (files, mut scenes, sources, described) = open.project.read(|tx| {
-            let repo = TranslationRepo { conn: tx };
-            let descriptions = SceneDescriptionRepo { conn: tx };
-            Ok((repo.files()?, repo.scene_progress()?, descriptions.sources()?, descriptions.list()?))
-        })?;
-        let hashes: HashMap<_, _> = sources.into_iter().map(|source| (source.key, source.text_hash)).collect();
-        let described: HashMap<_, _> = described.into_iter().map(|scene| (scene.key().clone(), scene)).collect();
-        for scene in &mut scenes {
-            let Some(key) = &scene.key else { continue };
-            scene.stale = match (described.get(key), hashes.get(key)) {
-                (Some(description), Some(hash)) => description.is_stale(hash),
-                _ => false,
-            };
-        }
+        let (files, scenes) = open.project.read(|tx| Ok((TranslationRepo { conn: tx }.files()?, story_scenes(tx)?)))?;
         let mut by_file: HashMap<FileId, Vec<SceneProgress>> = HashMap::new();
         for scene in scenes {
             by_file.entry(scene.file).or_default().push(scene);
         }
         Ok(files.into_iter().map(|file| FileScenes { scenes: by_file.remove(&file.id).unwrap_or_default(), file }).collect())
+    }
+
+    /// Сцены по сюжету с прогрессом, реплики вне сцен по файлам последними. «Устарело» сверяет отпечаток
+    /// описания с текстом сцены в снимке.
+    pub fn story_scenes(&self, project: ProjectId) -> Result<Vec<SceneProgress>, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| story_scenes(tx))?)
     }
 
     /// Сцены, где в оригинале или действующем переводе реплик есть `query`, и число таких реплик.
@@ -239,6 +278,22 @@ pub struct LinesRun {
     pub run: RunId,
     /// Записанные реплики.
     pub written: usize,
+}
+
+/// Сцены с прогрессом по сюжету и признаком устаревшего описания.
+fn story_scenes(tx: &rusqlite::Connection) -> Result<Vec<SceneProgress>, crate::storage::DbError> {
+    let descriptions = SceneDescriptionRepo { conn: tx };
+    let (mut scenes, sources, described) = (TranslationRepo { conn: tx }.scene_progress()?, descriptions.sources()?, descriptions.list()?);
+    let hashes: HashMap<_, _> = sources.into_iter().map(|source| (source.key, source.text_hash)).collect();
+    let described: HashMap<_, _> = described.into_iter().map(|scene| (scene.key().clone(), scene)).collect();
+    for scene in &mut scenes {
+        let Some(key) = &scene.key else { continue };
+        scene.stale = match (described.get(key), hashes.get(key)) {
+            (Some(description), Some(hash)) => description.is_stale(hash),
+            _ => false,
+        };
+    }
+    Ok(scenes)
 }
 
 /// Сцены запуска. Проект берёт файлы по порядку.
@@ -373,6 +428,12 @@ impl Job<'_> {
         };
         let drafts = answer.accept(self.mode, scene, batch);
         self.save(scene, &drafts)?;
+        if self.mode == LinesMode::Review {
+            // Вычитанное отмечается текстом из базы: правка пользователя или откат вернут реплику в вычитку.
+            let marks: Vec<(SegmentId, String)> =
+                batch.lines.iter().filter_map(|line| Some((*line, self.sent.get(line)?.text.clone()))).collect();
+            self.open.project.write(|tx| TranslationRepo { conn: tx }.mark_reviewed(&marks, Timestamp::now()))?;
+        }
         Ok(())
     }
 
@@ -442,6 +503,7 @@ fn single(scene: &Scene, mode: LinesMode, line: SegmentId) -> Option<Batch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauri::ipc::Channel;
     use crate::projects::ProjectService;
     use crate::state::tests::memory_secrets;
     use crate::engines::ContainerKey;

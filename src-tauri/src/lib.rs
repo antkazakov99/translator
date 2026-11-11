@@ -8,6 +8,7 @@ pub mod engines;
 pub mod export;
 pub mod files;
 pub mod fonts;
+pub mod game_run;
 pub mod glossary;
 pub mod graph;
 pub mod llm;
@@ -33,6 +34,7 @@ const BINDINGS: &str = "../src/lib/bindings.ts";
 fn commands() -> tauri_specta::Builder<tauri::Wry> {
     use export::commands::*;
     use fonts::commands::*;
+    use game_run::commands::*;
     use glossary::commands::*;
     use graph::commands::*;
     use llm::commands::*;
@@ -92,6 +94,9 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             describe_scene,
             scene_entries,
             describe_scenes,
+            game_overview,
+            run_game,
+            write_names,
             entry_parts,
             describe_entry,
             describe_entries,

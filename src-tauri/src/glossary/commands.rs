@@ -9,7 +9,7 @@ use tauri::{AppHandle, State};
 use super::describe::{EntryPart, PartNote};
 use super::entries::EntryLine;
 use super::{
-    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesService, SpeakerEntry,
+    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesFound, NamesService, SpeakerEntry,
     SpeakerSuggestion, Term,
     TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
 };
@@ -591,28 +591,34 @@ pub async fn suggest_names(
 ) -> Result<NameSuggestionsDto, String> {
     let characters = characters.iter().map(|id| CharacterId::from_row(id.0)).collect();
     let found = NamesService { state: &state }.translate_names(self::project(&project)?, characters, self::profile(profile)?, progress).await?;
-    Ok(NameSuggestionsDto {
-        items: found
-            .suggestions
-            .items
-            .into_iter()
-            .map(|item: NameSuggestion| NameSuggestionDto {
-                character: RowRef(item.character.get()),
-                field: item.field,
-                source: item.source,
-                languages: item.languages.iter().map(ToString::to_string).collect(),
-                translation: item.variants.first().map(|variant| variant.translation.clone()).unwrap_or_default(),
-                variants: item
-                    .variants
-                    .into_iter()
-                    .map(|variant: NameVariant| NameVariantDto { translation: variant.translation, description: variant.description })
-                    .collect(),
-                issues: item.issues,
-            })
-            .collect(),
-        error: found.suggestions.error,
-        missing_rules: found.missing_rules.iter().map(ToString::to_string).collect(),
-    })
+    Ok(found.into())
+}
+
+impl From<NamesFound> for NameSuggestionsDto {
+    fn from(found: NamesFound) -> Self {
+        Self {
+            items: found
+                .suggestions
+                .items
+                .into_iter()
+                .map(|item: NameSuggestion| NameSuggestionDto {
+                    character: RowRef(item.character.get()),
+                    field: item.field,
+                    source: item.source,
+                    languages: item.languages.iter().map(ToString::to_string).collect(),
+                    translation: item.variants.first().map(|variant| variant.translation.clone()).unwrap_or_default(),
+                    variants: item
+                        .variants
+                        .into_iter()
+                        .map(|variant: NameVariant| NameVariantDto { translation: variant.translation, description: variant.description })
+                        .collect(),
+                    issues: item.issues,
+                })
+                .collect(),
+            error: found.suggestions.error,
+            missing_rules: found.missing_rules.iter().map(ToString::to_string).collect(),
+        }
+    }
 }
 
 fn language(code: &str) -> Result<LanguageTag, AppError> {

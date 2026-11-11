@@ -13,6 +13,6 @@ pub use action::{Action, ActionSettings, BatchSize, ResolvedSettings, Temperatur
 pub use client::{LlmClient, LlmError};
 pub use model::{Params, Profile, ProfileId, Provider, ProviderId, ProviderKind};
 pub use repo::{ActionRepo, ProfileRepo, ProviderRepo};
-pub use run::{LlmRun, LlmRunRepo, RunId, RunProgress, RunSlot, RunStatus};
+pub use run::{LlmRun, LlmRunRepo, RunChain, RunHost, RunId, RunProgress, RunSlot, RunStage, RunStatus};
 pub use service::LlmSettingsService;
 pub use target::{ApiKey, ChatRequest, LlmTarget, LlmTargetService, ProfileChoice};

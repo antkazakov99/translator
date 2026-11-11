@@ -58,6 +58,7 @@ fn read_line(row: &Row) -> rusqlite::Result<LineRow> {
             state,
             location: row.get(8)?,
             source_changed,
+            reviewed: false,
         },
     })
 }
@@ -289,6 +290,27 @@ impl TranslationRepo<'_> {
     /// Исправления редактуры: заменяют и заполненные реплики, если текст и `source_hash` те же, что ушли модели.
     pub fn replace_with_drafts(&self, drafts: &[Draft], run: RunId, now: Timestamp) -> Result<usize, DbError> {
         self.write_drafts(drafts, run, now, false)
+    }
+
+    /// Отмечает реплики вычитанными с их текстом после вычитки.
+    pub fn mark_reviewed(&self, lines: &[(SegmentId, String)], now: Timestamp) -> Result<(), DbError> {
+        for (line, text) in lines {
+            self.conn.execute(
+                "INSERT INTO reviewed_lines (segment_id, text, reviewed_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (segment_id) DO UPDATE SET text = excluded.text, reviewed_at = excluded.reviewed_at",
+                params![line.get(), text, now.secs()],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Текст каждой вычитанной реплики на момент вычитки.
+    pub fn reviewed(&self) -> Result<std::collections::HashMap<SegmentId, String>, DbError> {
+        let mut statement = self.conn.prepare("SELECT segment_id, text FROM reviewed_lines")?;
+        let rows = statement
+            .query_map([], |row| Ok((SegmentId::from_row(row.get(0)?), row.get::<_, String>(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
     }
 
     /// Пишет черновик, если реплика осталась такой, какой ушла модели: пользователь мог поправить её

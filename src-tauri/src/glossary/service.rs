@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use rusqlite::Connection;
+use super::{NameField, SpeakerSuggestion, TermSuggestion, TokenSuggestion};
 
 use super::entries::{EntryLine, character_lines, character_names, scene_entries, term_lines, term_names};
 use super::{
@@ -297,10 +298,132 @@ impl GlossaryService<'_> {
         Ok(self.state.app.write(|tx| super::ReadingDepthRepo { conn: tx }.save(depth))?)
     }
 
+    /// Переводы терминов от модели без отбора: только термину без перевода. Категория меняется на названную
+    /// моделью, описание пишется в пустое. Возвращает число записанных.
+    pub fn accept_terms(&self, project: ProjectId, items: &[TermSuggestion]) -> Result<usize, AppError> {
+        self.write(project, |tx| {
+            let repo = TermRepo { conn: tx };
+            let mut written = 0;
+            for item in items {
+                let mut term = match repo.get(item.id) {
+                    Ok(term) => term,
+                    Err(DbError::NotFound) => continue,
+                    Err(error) => return Err(error),
+                };
+                if term.translation().is_some() || item.translation.trim().is_empty() {
+                    continue;
+                }
+                term.set_translation(&item.translation);
+                if let Some(category) = item.category {
+                    term.set_category(category);
+                }
+                if let (None, Some(description)) = (term.description(), &item.description) {
+                    term.set_description(description);
+                }
+                repo.save(&term)?;
+                written += 1;
+            }
+            Ok(written)
+        })
+    }
+
+    /// Переводы подписей от модели без отбора: только записи говорящего без перевода, род в пустое поле.
+    pub fn accept_speakers(&self, project: ProjectId, items: &[SpeakerSuggestion]) -> Result<usize, AppError> {
+        self.write(project, |tx| {
+            let repo = SpeakerRepo { conn: tx };
+            let entries = repo.entries()?;
+            let mut written = 0;
+            for item in items {
+                let Some(entry) = entries.iter().find(|entry| entry.key() == &item.key) else { continue };
+                if entry.translation().is_some() || item.translation.trim().is_empty() {
+                    continue;
+                }
+                let mut entry = entry.clone();
+                entry.set_translation(&item.translation);
+                if entry.gender().is_none() {
+                    entry.set_gender(item.gender);
+                }
+                repo.save_entry(&entry)?;
+                written += 1;
+            }
+            Ok(written)
+        })
+    }
+
+    /// Значения и пояснения токенов от модели без отбора: только в пустые поля.
+    pub fn accept_tokens(&self, project: ProjectId, items: &[TokenSuggestion]) -> Result<usize, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.write(|tx| {
+            let repo = TokenRepo { conn: tx };
+            let tokens = repo.list()?;
+            let mut written = 0;
+            for item in items {
+                let mut token = match tokens.iter().find(|token| token.name() == item.name) {
+                    Some(token) => token.clone(),
+                    None => match Token::new(&item.name) {
+                        Ok(token) => token,
+                        Err(_) => continue,
+                    },
+                };
+                let mut changed = false;
+                if let (None, Some(value)) = (token.value(), item.value.as_deref().filter(|value| !value.trim().is_empty())) {
+                    token.set_value(value);
+                    changed = true;
+                }
+                if let (None, Some(note)) = (token.note(), item.note.as_deref().filter(|note| !note.trim().is_empty())) {
+                    token.set_note(note);
+                    changed = true;
+                }
+                if changed {
+                    repo.save(&token)?;
+                    written += 1;
+                }
+            }
+            Ok(written)
+        })?)
+    }
+
+    /// Написания имён в пустые поля персонажей: выбор окна или первый вариант модели. Возвращает число
+    /// изменённых персонажей.
+    pub fn fill_names(&self, project: ProjectId, picks: &[NamePick]) -> Result<usize, AppError> {
+        self.write(project, |tx| {
+            let repo = CharacterRepo { conn: tx };
+            let mut ids: Vec<CharacterId> = picks.iter().map(|pick| pick.character).collect();
+            ids.dedup();
+            let mut written = 0;
+            for id in ids {
+                let mut character = match repo.get(id) {
+                    Ok(character) => character,
+                    Err(DbError::NotFound) => continue,
+                    Err(error) => return Err(error),
+                };
+                let mut changed = false;
+                for pick in picks.iter().filter(|pick| pick.character == id) {
+                    changed |= character.fill_spelling(pick.field, &pick.source, &pick.translation);
+                }
+                if changed {
+                    repo.save(&character)?;
+                    written += 1;
+                }
+            }
+            Ok(written)
+        })
+    }
+
     fn write<T>(&self, project: ProjectId, work: impl FnOnce(&rusqlite::Transaction) -> Result<T, DbError>) -> Result<T, AppError> {
         let open = self.state.open_project(project)?;
         Ok(open.project.write(work)?)
     }
+}
+
+/// Написание одного поля персонажа для записи.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamePick {
+    pub character: CharacterId,
+    pub field: NameField,
+    /// Написание в игре: у формы по нему находится сама форма.
+    pub source: String,
+    pub translation: String,
 }
 
 /// Персонаж по подписи говорящего: имя это подпись, у говорящего без подписи хвост ключа.
@@ -344,7 +467,7 @@ fn add_form(conn: &Connection, character: CharacterId, text: &str, translation: 
 }
 
 /// Токены в репликах текущего снимка и число реплик с каждым.
-fn game_tokens(conn: &Connection) -> Result<BTreeMap<String, usize>, DbError> {
+pub(crate) fn game_tokens(conn: &Connection) -> Result<BTreeMap<String, usize>, DbError> {
     let mut statement = conn.prepare("SELECT source_text FROM segments WHERE missing = 0 AND instr(source_text, '[') > 0")?;
     let texts = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
     let mut tokens: BTreeMap<String, usize> = BTreeMap::new();

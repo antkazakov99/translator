@@ -68,7 +68,7 @@ impl LinesMode {
         let blank = line.is_blank();
         let wanted = match self {
             Self::Translate => blank,
-            Self::Review => !blank,
+            Self::Review => !blank && !line.reviewed,
         };
         wanted && !is_wordless(&line.source_text)
     }

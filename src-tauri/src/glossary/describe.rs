@@ -1,9 +1,8 @@
 //! Запуски модели по глоссарию: описания по частям сцен, имена, токены, подписи говорящих, термины.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tauri::ipc::Channel;
 
 use super::analyze::{AnalysisPrompt, known_for_prompt, merge, save_found};
 use super::describe_prompt::{
@@ -12,7 +11,7 @@ use super::describe_prompt::{
 };
 use super::entries::{character_names, character_scenes, entry_parts, scene_entries, term_names, term_scenes};
 use super::parts::{MAX_PART_TEXT, Part, ScenesPart, pick_parts, scene_hash, script_line, split_lines};
-use super::repo::{LineSampleRepo, NoteRepo, ReadingDepthRepo, SampleLine, SceneDescriptionRepo, StoryLine, TermRepo};
+use super::repo::{AnalyzedPartRepo, LineSampleRepo, NoteRepo, ReadingDepthRepo, SampleLine, SceneDescriptionRepo, StoryLine, TermRepo};
 use super::{Note, NoteOwner, SceneDescription};
 use crate::common::Timestamp;
 use crate::storage::DbError;
@@ -30,7 +29,7 @@ use crate::name_rules::{LanguageTag, NameRule, NameRuleService, RulesDraftPrompt
 use crate::translation::Hints;
 use crate::common::AppError;
 use crate::engines::{ContainerKey, SpeakerKey};
-use crate::llm::{Action, ChatRequest, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunProgress, RunStatus};
+use crate::llm::{Action, ChatRequest, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunHost, RunProgress, RunStatus};
 use crate::projects::ProjectId;
 use crate::state::{AppState, OpenProject};
 use crate::translation::hints::GlossaryContext;
@@ -132,6 +131,13 @@ pub struct Described {
     pub error: Option<String>,
 }
 
+/// Сколько работы у запуска: записи и примерное число запросов.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pending {
+    pub items: usize,
+    pub requests: usize,
+}
+
 /// Как писать описание.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fill {
@@ -164,6 +170,8 @@ struct ScenePlan {
     fill: Fill,
     /// «Сцена «Утро»»: начало строки хода запуска. Без названия ключ сцены.
     label: String,
+    /// Отпечатки частей сцены, которые уже прочитал разбор.
+    analyzed: HashSet<String>,
 }
 
 impl ScenePlan {
@@ -171,6 +179,11 @@ impl ScenePlan {
     fn requests(&self) -> usize {
         let unread = self.parts.iter().filter(|part| !self.stored.contains_key(&part.hash)).count();
         unread + usize::from(self.parts.len() > 1) + usize::from(self.need_title)
+    }
+
+    /// Выбранные части, которые разбор ещё не читал.
+    fn unanalyzed(&self) -> Vec<&Part> {
+        self.parts.iter().filter(|part| !self.analyzed.contains(&part.hash)).collect()
     }
 }
 
@@ -262,9 +275,9 @@ impl DescribeService<'_> {
         target: DescribeTarget,
         parts: usize,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<Described, AppError> {
-        self.run(project, vec![target], Choice::Count(parts), Fill::Replace, one_off, progress).await
+        self.run(project, vec![target], Choice::Count(parts), Fill::Replace, one_off, host).await
     }
 
     /// Группа по очереди с глубиной чтения приложения. Заполненная запись без новых частей в запуск не входит.
@@ -273,10 +286,92 @@ impl DescribeService<'_> {
         project: ProjectId,
         targets: Vec<DescribeTarget>,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<Described, AppError> {
         let depth = ReadingDepth::load(self.state)?;
-        self.run(project, targets, Choice::Depth(depth), Fill::ReplaceUnlessRead, one_off, progress).await
+        self.run(project, targets, Choice::Depth(depth), Fill::ReplaceUnlessRead, one_off, host).await
+    }
+
+    /// Сколько работы у группы `describe_many`: записи, которые войдут в запуск, и запросы без сжатия,
+    /// разбора сцен и описания записей сцены.
+    pub fn pending(&self, project: ProjectId, targets: Vec<DescribeTarget>) -> Result<Pending, AppError> {
+        let open = self.state.open_project(project)?;
+        let model = self.notes_model(&open, Action::Descriptions);
+        let choice = Choice::Depth(ReadingDepth::load(self.state)?);
+        let plans = open.project.read(|tx| {
+            let glossary = GlossaryData::load(tx)?;
+            let mut context = GlossaryContext::new(&glossary);
+            plan_all(tx, &mut context, &glossary, targets, &model, choice, Fill::ReplaceUnlessRead)
+        })?;
+        Ok(Pending { items: plans.len(), requests: plans.iter().map(Plan::requests).sum() })
+    }
+
+    /// Сколько работы у разбора `analyze`: сцены с непрочитанными разбором частями и число таких частей.
+    pub fn pending_analysis(&self, project: ProjectId, keys: Vec<ContainerKey>) -> Result<Pending, AppError> {
+        let open = self.state.open_project(project)?;
+        let plans = self.analysis_plans(&open, keys)?;
+        Ok(Pending { items: plans.len(), requests: plans.iter().map(|plan| plan.unanalyzed().len()).sum() })
+    }
+
+    /// Разбор сцен без описания: части, которые прочитало бы описание с глубиной чтения приложения, ищутся
+    /// новые персонажи и термины и сразу пишутся в глоссарий. Прочитанные разбором части пропускаются.
+    pub async fn analyze(
+        &self,
+        project: ProjectId,
+        keys: Vec<ContainerKey>,
+        one_off: Option<ProfileId>,
+        host: impl Into<RunHost>,
+    ) -> Result<Described, AppError> {
+        let open = self.state.open_project(project)?;
+        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Analysis, one_off)?;
+        let plans = self.analysis_plans(&open, keys)?;
+        if plans.is_empty() {
+            return Ok(Described::default());
+        }
+        let mut known = open.project.read(|tx| known_for_prompt(tx))?;
+        let total = plans.iter().map(|plan| plan.unanalyzed().len()).sum();
+        let mut run = BatchRun::begin(self.state, &open, Action::Analysis, &target, host, total)?;
+        let mut added = Vec::new();
+        for plan in &plans {
+            match analyze_scene(&open, &mut run, &target, plan, &mut known, added.len()).await {
+                Ok((found, going)) => {
+                    added.extend(found);
+                    if !going {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    run.error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        let result = run.finish(Vec::<()>::new())?;
+        Ok(Described { written: Vec::new(), added, error: result.error })
+    }
+
+    /// Сцены с непрочитанными разбором частями: части те же, что выбрало бы описание группы.
+    fn analysis_plans(&self, open: &Arc<OpenProject>, keys: Vec<ContainerKey>) -> Result<Vec<ScenePlan>, AppError> {
+        let model = self.notes_model(open, Action::Descriptions);
+        let choice = Choice::Depth(ReadingDepth::load(self.state)?);
+        Ok(open.project.read(|tx| {
+            let glossary = GlossaryData::load(tx)?;
+            let mut context = GlossaryContext::new(&glossary);
+            let mut plans = Vec::new();
+            for key in keys {
+                if let Some(plan) = plan_scene(tx, &mut context, key, &model, choice, Fill::Replace, None)?
+                    && !plan.unanalyzed().is_empty()
+                {
+                    plans.push(plan);
+                }
+            }
+            Ok(plans)
+        })?)
+    }
+
+    /// Модель заметок действия. Без настроенной модели пусто: выборка частей идёт без прочитанных заметок.
+    fn notes_model(&self, open: &Arc<OpenProject>, action: Action) -> String {
+        LlmTargetService { state: self.state }.target(Some(open), action, None).map(|target| target.profile.model().to_string()).unwrap_or_default()
     }
 
     /// Сбрасывает заметки владельца всех моделей: следующий запуск прочитает части заново.
@@ -363,7 +458,7 @@ impl DescribeService<'_> {
         choice: Choice,
         fill: Fill,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<Described, AppError> {
         let open = self.state.open_project(project)?;
         let service = LlmTargetService { state: self.state };
@@ -379,17 +474,7 @@ impl DescribeService<'_> {
         let (plans, hints, mut known) = open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let mut context = GlossaryContext::new(&glossary);
-            let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
-            let entries = targets.iter().any(|target| !matches!(target, DescribeTarget::Scene(_)));
-            let lines = if entries { LineSampleRepo { conn: tx }.story_lines()? } else { Vec::new() };
-            let mut plans = Vec::new();
-            for target in targets {
-                let plan = match target {
-                    DescribeTarget::Scene(key) => plan_scene(tx, &mut context, key, &model, choice, fill, first.as_ref())?.map(Plan::Scene),
-                    other => plan_entry(tx, &context, &glossary, &lines, other, &model, choice, fill)?.map(Plan::Entry),
-                };
-                plans.extend(plan);
-            }
+            let plans = plan_all(tx, &mut context, &glossary, targets, &model, choice, fill)?;
             let known = if analysis.is_some() { known_for_prompt(tx)? } else { Vec::new() };
             Ok((plans, context.hints, known))
         })?;
@@ -398,11 +483,11 @@ impl DescribeService<'_> {
             return Ok(described);
         }
         let analyses: usize = match analysis {
-            Some(_) => plans.iter().map(|plan| if let Plan::Scene(scene) = plan { scene.parts.len() } else { 0 }).sum(),
+            Some(_) => plans.iter().map(|plan| if let Plan::Scene(scene) = plan { scene.unanalyzed().len() } else { 0 }).sum(),
             None => 0,
         };
         let total = plans.iter().map(Plan::requests).sum::<usize>() + analyses;
-        let mut run = BatchRun::begin(self.state, &open, Action::Descriptions, &target, progress, total)?;
+        let mut run = BatchRun::begin(self.state, &open, Action::Descriptions, &target, host, total)?;
         let writer = SceneWriter { open: &open, hints: &hints, target: &target, model: &model };
         for plan in plans {
             let done = described.written.len();
@@ -537,8 +622,10 @@ async fn analyze_scene(
 ) -> Result<(Vec<String>, bool), AppError> {
     let mut found = Vec::new();
     let mut going = true;
-    let total = plan.parts.len();
-    for (index, part) in plan.parts.iter().enumerate() {
+    let parts = plan.unanalyzed();
+    let total = parts.len();
+    let mut read = Vec::new();
+    for (index, part) in parts.into_iter().enumerate() {
         run.note(format!("{}: поиск персонажей и терминов, часть {} из {total}", plan.label, index + 1));
         match run.send_to(target, &AnalysisPrompt::build(&part.text, known, target)).await {
             Sent::Text(text) => found.extend(AnalysisPrompt::accept(&text, &part.text)),
@@ -548,18 +635,51 @@ async fn analyze_scene(
                 break;
             }
         }
+        read.push(part.hash.as_str());
         if !run.step(written) {
             going = false;
             break;
         }
     }
     let merged = merge(found);
-    let added = if merged.is_empty() { Vec::new() } else { open.project.write(|tx| save_found(tx, &merged))? };
+    // Находки и отметки прочитанных частей одной транзакцией: повторный разбор не пропустит часть без её находок.
+    let added = open.project.write(|tx| {
+        let marks = AnalyzedPartRepo { conn: tx };
+        let now = Timestamp::now();
+        for hash in &read {
+            marks.mark(&plan.key, hash, now)?;
+        }
+        if merged.is_empty() { Ok(Vec::new()) } else { save_found(tx, &merged) }
+    })?;
     if !added.is_empty() {
         run.note(format!("{}: добавлено в глоссарий: {}", plan.label, added.join(", ")));
     }
     known.extend(added.iter().cloned());
     Ok((added, going))
+}
+
+/// Планы записей запуска описаний по порядку. Пропущенные записи (нечего читать, заполнены) в план не входят.
+fn plan_all(
+    tx: &rusqlite::Connection,
+    context: &mut GlossaryContext,
+    glossary: &GlossaryData,
+    targets: Vec<DescribeTarget>,
+    model: &str,
+    choice: Choice,
+    fill: Fill,
+) -> Result<Vec<Plan>, DbError> {
+    let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
+    let entries = targets.iter().any(|target| !matches!(target, DescribeTarget::Scene(_)));
+    let lines = if entries { LineSampleRepo { conn: tx }.story_lines()? } else { Vec::new() };
+    let mut plans = Vec::new();
+    for target in targets {
+        let plan = match target {
+            DescribeTarget::Scene(key) => plan_scene(tx, context, key, model, choice, fill, first.as_ref())?.map(Plan::Scene),
+            other => plan_entry(tx, context, glossary, &lines, other, model, choice, fill)?.map(Plan::Entry),
+        };
+        plans.extend(plan);
+    }
+    Ok(plans)
 }
 
 fn owner_of(target: &DescribeTarget) -> NoteOwner {
@@ -628,7 +748,8 @@ fn plan_scene(
     let opening = first == Some(&key);
     let name = description.as_ref().and_then(|scene| scene.title()).map_or_else(|| key.to_string(), str::to_string);
     let label = format!("Сцена «{name}»");
-    Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening, fill, label }))
+    let analyzed = AnalyzedPartRepo { conn: tx }.of(&key)?;
+    Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening, fill, label, analyzed }))
 }
 
 /// Сцены записи без исключённых и части из них.
@@ -679,7 +800,7 @@ fn select_entry(
 pub(crate) fn prune_notes(tx: &rusqlite::Connection) -> Result<usize, DbError> {
     let notes = NoteRepo { conn: tx };
     let owners = notes.owners()?;
-    if owners.is_empty() {
+    if owners.is_empty() && (AnalyzedPartRepo { conn: tx }).scenes()?.is_empty() {
         return Ok(0);
     }
     let glossary = GlossaryData::load(tx)?;
@@ -695,6 +816,13 @@ pub(crate) fn prune_notes(tx: &rusqlite::Connection) -> Result<usize, DbError> {
             NoteOwner::Term(id) => entry_hashes(tx, &context, &glossary, &lines, &DescribeTarget::Term(*id))?,
         };
         removed += notes.retain_parts(&owner, &hashes)?;
+    }
+    // Отметки разбора уходят вместе с частями: изменённая часть сцены разбирается заново.
+    let marks = AnalyzedPartRepo { conn: tx };
+    for key in marks.scenes()? {
+        let hashes: Vec<String> =
+            scene_text(tx, &mut context, &key)?.map(|(parts, _)| parts.into_iter().map(|part| part.hash).collect()).unwrap_or_default();
+        marks.retain(&key, &hashes)?;
     }
     Ok(removed)
 }
@@ -1033,7 +1161,7 @@ impl NamesService<'_> {
         project: ProjectId,
         characters: Vec<CharacterId>,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<NamesFound, AppError> {
         let open = self.state.open_project(project)?;
         let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Names, one_off)?;
@@ -1055,7 +1183,7 @@ impl NamesService<'_> {
         let origin_batches: Vec<&[NameItem]> = unknown.chunks(ORIGIN_BATCH).collect();
         let size = target.settings.batch_size.get();
         let total = origin_batches.len() + 2 * (names.len().div_ceil(size) + forms.len().div_ceil(size));
-        let mut run = BatchRun::begin(self.state, &open, Action::Names, &target, progress, total)?;
+        let mut run = BatchRun::begin(self.state, &open, Action::Names, &target, host, total)?;
         let mut items: Vec<NameSuggestion> = Vec::new();
         let mut missing = Vec::new();
 
@@ -1125,7 +1253,7 @@ impl NamesService<'_> {
         from: LanguageTag,
         existing: Option<String>,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<Suggestions<String>, AppError> {
         if !crate::name_rules::has_rules(&from) {
             return Err(ValidationError::BadLanguage(from.to_string()).into());
@@ -1134,7 +1262,7 @@ impl NamesService<'_> {
         let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Names, one_off)?;
         let request = RulesDraftPrompt::build(&from, existing.as_deref(), &target);
         let note = format!("Черновик правил имён: {from}");
-        run_batches(self.state, &open, Action::Names, &target, progress, vec![(note, request)], |_, text| {
+        run_batches(self.state, &open, Action::Names, &target, host, vec![(note, request)], |_, text| {
             RulesDraftPrompt::accept(text).into_iter().collect()
         })
         .await
@@ -1146,7 +1274,7 @@ impl NamesService<'_> {
         project: ProjectId,
         terms: Vec<TermId>,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<Suggestions<TermSuggestion>, AppError> {
         let open = self.state.open_project(project)?;
         let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Terms, one_off)?;
@@ -1184,7 +1312,7 @@ impl NamesService<'_> {
             .iter()
             .map(|batch| (batch_note(batch.iter().map(|item| item.name.as_str())), TermsPrompt::build(batch, &context.hints, &target)))
             .collect();
-        run_batches(self.state, &open, Action::Terms, &target, progress, requests, |index, text| TermsPrompt::accept(text, &batches[index])).await
+        run_batches(self.state, &open, Action::Terms, &target, host, requests, |index, text| TermsPrompt::accept(text, &batches[index])).await
     }
 
     /// Пояснения и значения токенов по репликам с `[___]` вместо токена. Токен без реплик пропускается: судить не о чем.
@@ -1193,7 +1321,7 @@ impl NamesService<'_> {
         project: ProjectId,
         tokens: Vec<String>,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<Suggestions<TokenSuggestion>, AppError> {
         let open = self.state.open_project(project)?;
         let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Tokens, one_off)?;
@@ -1226,7 +1354,7 @@ impl NamesService<'_> {
             .iter()
             .map(|batch| (batch_note(batch.iter().map(|item| item.name.as_str())), TokensPrompt::build(batch, &context.hints, &target)))
             .collect();
-        run_batches(self.state, &open, Action::Tokens, &target, progress, requests, |index, text| TokensPrompt::accept(text, &batches[index])).await
+        run_batches(self.state, &open, Action::Tokens, &target, host, requests, |index, text| TokensPrompt::accept(text, &batches[index])).await
     }
 
     /// Перевод подписи и род говорящих по нескольким их репликам.
@@ -1235,7 +1363,7 @@ impl NamesService<'_> {
         project: ProjectId,
         speakers: Vec<SpeakerKey>,
         one_off: Option<ProfileId>,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
     ) -> Result<Suggestions<SpeakerSuggestion>, AppError> {
         let open = self.state.open_project(project)?;
         let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Speakers, one_off)?;
@@ -1264,7 +1392,7 @@ impl NamesService<'_> {
             .iter()
             .map(|batch| (batch_note(batch.iter().map(|item| item.label.as_str())), SpeakersPrompt::build(batch, &context.hints, &target)))
             .collect();
-        run_batches(self.state, &open, Action::Speakers, &target, progress, requests, |index, text| SpeakersPrompt::accept(text, &batches[index]))
+        run_batches(self.state, &open, Action::Speakers, &target, host, requests, |index, text| SpeakersPrompt::accept(text, &batches[index]))
             .await
     }
 }
@@ -1290,14 +1418,14 @@ async fn run_batches<T>(
     open: &Arc<OpenProject>,
     action: Action,
     target: &LlmTarget,
-    progress: Channel<RunProgress>,
+    host: impl Into<RunHost>,
     requests: Vec<(String, ChatRequest)>,
     accept: impl Fn(usize, &str) -> Vec<T>,
 ) -> Result<Suggestions<T>, AppError> {
     if requests.is_empty() {
         return Ok(Suggestions { items: Vec::new(), error: None });
     }
-    let mut run = BatchRun::begin(state, open, action, target, progress, requests.len())?;
+    let mut run = BatchRun::begin(state, open, action, target, host, requests.len())?;
     let mut items = Vec::new();
     for (index, (note, request)) in requests.iter().enumerate() {
         run.note(note.clone());
@@ -1396,10 +1524,10 @@ impl<'a> BatchRun<'a> {
         open: &Arc<OpenProject>,
         action: Action,
         target: &'a LlmTarget,
-        progress: Channel<RunProgress>,
+        host: impl Into<RunHost>,
         total: usize,
     ) -> Result<Self, AppError> {
-        let run = LlmRun::begin(state, Some(open.clone()), action, target, progress)?;
+        let run = LlmRun::begin(state, Some(open.clone()), action, target, host)?;
         let report = RunProgress { total: total as u32, ..RunProgress::default() };
         run.report(report.clone());
         Ok(Self { run, target, report, error: None })
@@ -1566,6 +1694,7 @@ async fn ask(client: LlmClient, target: &LlmTarget, request: &ChatRequest, run: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tauri::ipc::Channel;
     use crate::glossary::{GlossaryService, NameField, TermCategory};
 
     use crate::llm::client::tests::{completion, fake_model};
@@ -1904,7 +2033,7 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 6, "пропущенная сцена не разбирается");
 
         tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(start.clone()), usize::MAX, None, silent())).unwrap();
-        assert_eq!(seen.lock().unwrap().len(), 7, "заметка готова, название есть: только разбор");
+        assert_eq!(seen.lock().unwrap().len(), 6, "заметка готова, название есть, часть разобрана: запросов нет");
 
         let parts = service.scene_parts(id, &start).unwrap();
         assert_eq!(parts.len(), 1);
@@ -1966,9 +2095,13 @@ mod tests {
         let entries = GlossaryService { state: &state }.scene_entries(id, &left).unwrap();
         assert_eq!((entries.0.len(), entries.1.len()), (0, 1), "у сцены один термин, персонажей в глоссарии нет");
         tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(left.clone()), usize::MAX, None, silent())).unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 4, "разобранная часть не разбирается снова, термин описан, заметка сцены готова");
+
+        open.project.write(|tx| Ok(tx.execute("DELETE FROM analyzed_parts", [])?)).unwrap();
+        tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(left.clone()), usize::MAX, None, silent())).unwrap();
         let requests = seen.lock().unwrap();
         assert!(user_text(&requests[4]).starts_with("Known names and terms: Left side, Eileen\n"), "{}", user_text(&requests[4]));
-        assert_eq!(requests.len(), 5, "описанный термин не описывается снова, заметка сцены готова");
+        assert_eq!(requests.len(), 5, "без отметки часть разбирается снова, описанный термин не описывается снова");
     }
 
     #[test]

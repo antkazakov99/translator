@@ -3,6 +3,7 @@
   import DescribeParts from "./DescribeParts.svelte";
   import EntryLines from "./EntryLines.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
+  import NamePicks from "./NamePicks.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
   import { commands, type EntryLineDto_Serialize as EntryLine } from "./bindings";
   import {
@@ -11,7 +12,6 @@
     genders,
     languageList,
     matches,
-    nameFieldLabels,
     runsBusy,
     speakerName,
     untranslatedNames,
@@ -239,34 +239,7 @@
   {/if}
   <div class="list">
     <p class="pick-head">Написания от модели. Отмеченные запишутся в пустые поля персонажей, написание можно выбрать из вариантов или поправить</p>
-    {#each run.review as item, index (index)}
-      {@const variant = item.variants.find((variant) => variant.translation === item.translation.trim())}
-      <div class="pick-row names" class:off={!item.selected}>
-        <input type="checkbox" bind:checked={item.selected} aria-label="Записать написание «{item.source}»" />
-        <div class="name">
-          <strong>{item.source}</strong>
-          <span>{nameFieldLabels[item.field]} · {owner(item.character)}{item.languages.length ? ` · ${languageList(item.languages)}` : ""}</span>
-          {#each item.issues as issue, issueIndex (issueIndex)}<span class="issue">{issue}</span>{/each}
-        </div>
-        <input class="input" bind:value={item.translation} aria-label="Написание «{item.source}»" />
-        <div class="variants">
-          {#if item.variants.length > 1}
-            <div class="segmented" role="radiogroup" aria-label="Варианты написания «{item.source}»">
-              {#each item.variants as variant (variant.translation)}
-                <button
-                  role="radio"
-                  aria-checked={item.translation.trim() === variant.translation}
-                  class:on={item.translation.trim() === variant.translation}
-                  title={variant.description ?? ""}
-                  onclick={() => (item.translation = variant.translation)}>{variant.translation}</button
-                >
-              {/each}
-            </div>
-          {/if}
-          <span class="faint">{variant ? (variant.description ?? "") : item.translation.trim() ? "Своё написание" : ""}</span>
-        </div>
-      </div>
-    {/each}
+    <NamePicks items={run.review} {owner} />
   </div>
   <div class="pick-actions">
     <button class="btn small" disabled={writing} onclick={() => run.discard()}>Отбросить</button>
@@ -398,22 +371,5 @@
   .marked-item .item {
     flex: 1;
     min-width: 0;
-  }
-
-  .variants {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    align-items: flex-start;
-    min-width: 0;
-  }
-
-  .variants .segmented {
-    flex-wrap: wrap;
-  }
-
-  .name .issue {
-    color: var(--warning);
-    white-space: normal;
   }
 </style>

@@ -1,6 +1,6 @@
 //! Персонаж: имя и фамилия с переводами, другие формы, род, описание.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::NameKey;
 use crate::common::{Gender, ValidationError, non_empty, row_id};
@@ -118,6 +118,33 @@ impl Character {
     pub fn set_translated_names(&mut self, first: &str, last: &str) {
         self.translated_first_name = non_empty(first);
         self.translated_last_name = non_empty(last);
+    }
+
+    /// Написание модели в пустое поле: имя, фамилию или форму с написанием `source`. Заполненное не трогается.
+    /// Возвращает, записано ли.
+    pub fn fill_spelling(&mut self, field: NameField, source: &str, translation: &str) -> bool {
+        let Some(translation) = non_empty(translation) else { return false };
+        match field {
+            NameField::First if self.translated_first_name.is_none() && self.first_name.is_some() => {
+                self.translated_first_name = Some(translation);
+                true
+            }
+            NameField::Last if self.translated_last_name.is_none() && self.last_name.is_some() => {
+                self.translated_last_name = Some(translation);
+                true
+            }
+            NameField::Form => {
+                let key = NameKey::new(source);
+                match self.forms.iter_mut().find(|form| Some(form.key()) == key.as_ref() && form.translation.is_none()) {
+                    Some(form) => {
+                        form.translation = Some(translation);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     pub fn set_gender(&mut self, gender: Option<Gender>) {
@@ -243,7 +270,7 @@ impl Character {
 }
 
 /// Поле имени, происхождение которого определила модель.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, specta::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum NameField {
     First,
