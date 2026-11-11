@@ -1,7 +1,7 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chainText, defaultSteps, finishedText, leftLabel, plural, requestsLabel, stepOutcomes, stepsToRun } from '../src/lib/game-run.ts';
+import { availableSteps, chainText, defaultSteps, fedBy, finishedText, leftLabel, plural, requestsLabel, stepOutcomes, stepsToRun } from '../src/lib/game-run.ts';
 
 const work = (step, counts, requests = 0) => ({
   step,
@@ -26,8 +26,28 @@ test('left work shows only what is there', () => {
 
 test('steps without work are neither default nor run', () => {
   const all = [work('review', [['реплик не вычитано', 3]]), work('analysis', [['сцен', 2]]), work('lines', [['реплик', 0]])];
-  assert.deepEqual(defaultSteps(all), ['review', 'analysis']);
+  assert.deepEqual(defaultSteps(all), ['analysis', 'review']);
   assert.deepEqual(stepsToRun(['review', 'lines', 'analysis'], all), ['analysis', 'review'], 'порядок цепочки, пустой шаг выпал');
+});
+
+test('a step gets work from a chosen earlier step', () => {
+  const all = [
+    work('analysis', [['сцен', 140]]),
+    work('glossary', [['терминов', 0]]),
+    work('entries', [['без описания', 0]]),
+    work('scenes', [['сцен без описания', 140]]),
+    work('lines', [['реплик', 12300]]),
+    work('review', [['не вычитано', 0]]),
+  ];
+  assert.deepEqual(defaultSteps(all), ['analysis', 'glossary', 'entries', 'scenes', 'lines', 'review'], 'разбор найдёт записи, перевод даст вычитку');
+  assert.equal(fedBy('entries', defaultSteps(all), all), 'analysis');
+  assert.equal(fedBy('review', defaultSteps(all), all), 'lines');
+  assert.equal(fedBy('lines', defaultSteps(all), all), null, 'у перевода работа есть сейчас');
+
+  const withoutAnalysis = ['glossary', 'entries', 'scenes', 'lines', 'review'];
+  assert.deepEqual([...availableSteps(withoutAnalysis, all)], ['analysis', 'scenes', 'lines', 'review'], 'без разбора описывать некого, сам разбор отметить можно');
+  assert.deepEqual(stepsToRun(withoutAnalysis, all), ['scenes', 'lines', 'review']);
+  assert.deepEqual(stepsToRun(['review'], all), [], 'вычитке без перевода нечего читать');
 });
 
 test('run bar shows the step of the chain', () => {

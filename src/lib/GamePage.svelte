@@ -3,7 +3,7 @@
   import { Check, CircleDashed, CircleSlash, LoaderCircle, Play, RefreshCw, RotateCcw, Square, Trash2, TriangleAlert } from "lucide-svelte";
   import NamePicks from "./NamePicks.svelte";
   import { commands, type GameStep, type NamesMode, type StepWorkDto } from "./bindings";
-  import { defaultSteps, finishedText, formatCount, leftLabel, requestsLabel, stepOutcomes, stepTitles, stepsToRun, type StepOutcome } from "./game-run";
+  import { availableSteps, defaultSteps, fedBy, finishedText, formatCount, leftLabel, requestsLabel, stepOutcomes, stepTitles, stepsToRun, type StepOutcome } from "./game-run";
   import type { GameRun } from "./game-run.svelte";
   import { characterName, languageList, type Character } from "./glossary";
   import { activeRun } from "./run-status.svelte";
@@ -21,6 +21,9 @@
 
   const picked = $derived(chosen ?? (work ? defaultSteps(work) : []));
   const toRun = $derived(work ? stepsToRun(picked, work) : []);
+  /** Отмечены шаги, работа которых появится только по ходу цепочки: их запросы пока не сосчитать. */
+  const later = $derived(work?.some((item) => item.empty && toRun.includes(item.step)) ?? false);
+  const available = $derived(work ? availableSteps(picked, work) : new Set<GameStep>());
   const requests = $derived(work?.filter((item) => toRun.includes(item.step)).reduce((sum, item) => sum + item.requests, 0) ?? 0);
   /** Модель занята этой цепочкой или другим запуском. */
   const busy = $derived(activeRun.current !== null || game.active);
@@ -127,18 +130,20 @@
     {#if work}
       <ol class="steps">
         {#each work as item, index (item.step)}
-          <li class:off={item.empty}>
+          {@const ready = available.has(item.step)}
+          {@const feeder = work ? fedBy(item.step, picked, work) : null}
+          <li class:off={!ready}>
             <input
               type="checkbox"
-              checked={!item.empty && picked.includes(item.step)}
-              disabled={item.empty || busy || game.names !== null}
+              checked={ready && picked.includes(item.step)}
+              disabled={!ready || busy || game.names !== null}
               onchange={(event) => toggle(item.step, event.currentTarget.checked)}
               aria-label="Шаг «{item.title}»"
             />
             <span class="number">{index + 1}</span>
             <div class="step">
               <strong>{item.title}</strong>
-              <span>{leftLabel(item)}</span>
+              <span>{feeder ? `Сейчас делать нечего: работа появится после шага «${stepTitles[feeder]}»` : leftLabel(item)}</span>
             </div>
             <span class="requests">{item.empty ? "" : requestsLabel(item.requests)}</span>
           </li>
@@ -172,7 +177,7 @@
           {#if game.active}<LoaderCircle size={13} class="spin" />{:else}<Play size={13} />{/if}
           <span>Запустить · {toRun.length}</span>
         </button>
-        {#if toRun.length > 0}<span class="faint">{requestsLabel(requests)} всего</span>{/if}
+        {#if toRun.length > 0}<span class="faint">{requestsLabel(requests)} всего{later ? " сейчас: шаги, где работа появится по ходу, добавят ещё" : ""}</span>{/if}
         <button class="btn small danger reset" disabled={busy || resetting} title={busy ? "Модель уже работает" : "Вернуть проект к состоянию сразу после считывания игры"} onclick={() => (confirmReset = true)}>
           <RotateCcw size={13} />
           <span>Сбросить всё</span>

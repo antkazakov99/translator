@@ -41,14 +41,43 @@ export function leftLabel(work: StepWorkDto) {
   return shown.map((item) => `${item.label}: ${formatCount(item.count)}`).join(" · ");
 }
 
-/** Отмеченные по умолчанию: шаги, где есть что делать. */
-export function defaultSteps(work: StepWorkDto[]): GameStep[] {
-  return work.filter((item) => !item.empty).map((item) => item.step);
+/**
+ * Шаги, которые дают работу шагу позже в очереди: разбор находит персонажей и термины для переводов глоссария
+ * и описаний, перевод даёт реплики вычитке. Шаг без работы сейчас доступен, если отмечен такой шаг раньше.
+ */
+export const feeders: Partial<Record<GameStep, GameStep[]>> = {
+  glossary: ["analysis"],
+  entries: ["analysis"],
+  review: ["lines"],
+};
+
+/** Отмеченный раньше шаг, после которого у шага появится работа. `null`: работа есть сейчас или взяться ей неоткуда. */
+export function fedBy(step: GameStep, chosen: GameStep[], work: StepWorkDto[]): GameStep | null {
+  if (work.some((item) => item.step === step && !item.empty)) return null;
+  const ready = availableSteps(chosen, work);
+  return (feeders[step] ?? []).find((feeder) => chosen.includes(feeder) && ready.has(feeder)) ?? null;
 }
 
-/** Шаги к запуску: отмеченные, где есть что делать, в порядке выполнения. */
+/** Шаги, которые можно отметить: есть работа сейчас или её даст отмеченный раньше доступный шаг. */
+export function availableSteps(chosen: GameStep[], work: StepWorkDto[]): Set<GameStep> {
+  const ready = new Set<GameStep>();
+  for (const step of gameSteps) {
+    const item = work.find((known) => known.step === step);
+    if (!item) continue;
+    const later = (feeders[step] ?? []).some((feeder) => chosen.includes(feeder) && ready.has(feeder));
+    if (!item.empty || later) ready.add(step);
+  }
+  return ready;
+}
+
+/** Отмеченные по умолчанию: шаги, где есть что делать сейчас или после шагов раньше. */
+export function defaultSteps(work: StepWorkDto[]): GameStep[] {
+  return [...availableSteps(gameSteps, work)];
+}
+
+/** Шаги к запуску: отмеченные и доступные, в порядке выполнения. */
 export function stepsToRun(chosen: GameStep[], work: StepWorkDto[]): GameStep[] {
-  const ready = new Set(defaultSteps(work));
+  const ready = availableSteps(chosen, work);
   return gameSteps.filter((step) => chosen.includes(step) && ready.has(step));
 }
 
