@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 
-use super::analyze::{AnalysisPrompt, known_for_prompt, merge, save_found};
+use super::analyze::{AnalysisPrompt, known_for_prompt, merge, save_scene_found};
 use super::describe_prompt::{
     CharacterAnswer, CharacterPrompt, CondensePrompt, EntryKind, EntryPartPrompt, PartPrompt, ScenePrompt, TermPrompt, TitlePrompt, clean_note,
     is_useful,
@@ -649,7 +649,7 @@ async fn analyze_scene(
         for hash in &read {
             marks.mark(&plan.key, hash, now)?;
         }
-        if merged.is_empty() { Ok(Vec::new()) } else { save_found(tx, &merged) }
+        save_scene_found(tx, &merged, Some(&plan.key))
     })?;
     if !added.is_empty() {
         run.note(format!("{}: добавлено в глоссарий: {}", plan.label, added.join(", ")));
@@ -1695,6 +1695,7 @@ async fn ask(client: LlmClient, target: &LlmTarget, request: &ChatRequest, run: 
 mod tests {
     use super::*;
     use tauri::ipc::Channel;
+    use super::super::analyze::save_found;
     use crate::glossary::{GlossaryService, NameField, TermCategory};
 
     use crate::llm::client::tests::{completion, fake_model};
@@ -2179,7 +2180,7 @@ mod tests {
         glossary.save_character(id, &character).unwrap();
 
         let org = FoundKind::Term(TermCategory::Organization);
-        let found = |name: &str, kind, same_as: Option<&str>| Finding { name: name.to_string(), kind, gender: None, same_as: same_as.map(str::to_string) };
+        let found = |name: &str, kind, same_as: Option<&str>| Finding { name: name.to_string(), kind, gender: None, same_as: same_as.map(str::to_string), parts: None };
         let added = open
             .project
             .write(|tx| {
@@ -2195,12 +2196,12 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(added, ["PPF → People's Police Force", "Mr. Lee → Eileen Lee", "Order of the Dawn", "Ghost", "the Order → Order of the Dawn"]);
+        assert_eq!(added, ["PPF → People's Police Force", "Order of the Dawn", "Ghost", "the Order → Order of the Dawn"], "обращение с фамилией не форма");
 
         let (terms, character) = open.project.read(|tx| Ok((TermRepo { conn: tx }.list()?, CharacterRepo { conn: tx }.get(eileen)?))).unwrap();
         let police = terms.iter().find(|term| term.id() == Some(police)).unwrap();
         assert_eq!(police.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["PPF"], "аббревиатура легла формой без подсказки модели");
-        assert_eq!(character.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Mr. Lee"]);
+        assert!(character.forms().is_empty(), "«Mr. Lee» не стал формой");
         let order = terms.iter().find(|term| term.name() == "Order of the Dawn").unwrap();
         assert_eq!(order.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["the Order"], "ссылка на находку того же ответа");
         assert_eq!(terms.len(), 2, "PPF и the Order не стали отдельными терминами");
@@ -2217,7 +2218,7 @@ mod tests {
         let glossary = GlossaryService { state: &state };
         let open = state.open_project(id).unwrap();
         let org = FoundKind::Term(TermCategory::Organization);
-        let found = |name: &str, kind, same_as: Option<&str>| Finding { name: name.to_string(), kind, gender: None, same_as: same_as.map(str::to_string) };
+        let found = |name: &str, kind, same_as: Option<&str>| Finding { name: name.to_string(), kind, gender: None, same_as: same_as.map(str::to_string), parts: None };
         let save = |findings: &[Finding]| open.project.write(|tx| save_found(tx, findings)).unwrap();
         let terms = || open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap();
         let forms = |term: &crate::glossary::Term| term.forms().iter().map(|form| (form.text().to_string(), form.translation().map(str::to_string))).collect::<Vec<_>>();
@@ -2245,16 +2246,20 @@ mod tests {
         let mut character = open.project.read(|tx| CharacterRepo { conn: tx }.get(eileen)).unwrap();
         character.set_last_name("Lee");
         glossary.save_character(id, &character).unwrap();
-        let mister = glossary.speaker_to_character(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
-        let mut character = open.project.read(|tx| CharacterRepo { conn: tx }.get(mister)).unwrap();
-        character.set_first_name("Mr. Lee");
+        let stu = glossary.speaker_to_character(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
+        let mut character = open.project.read(|tx| CharacterRepo { conn: tx }.get(stu)).unwrap();
+        character.set_first_name("Stu");
+        character.set_translated_names("Стю", "");
         character.set_description("Учитель.");
         glossary.save_character(id, &character).unwrap();
-        assert_eq!(save(&[found("Mr. Lee", FoundKind::Character, Some("Eileen Lee"))]), ["Mr. Lee → Eileen Lee (объединено)"]);
-        let (characters, links) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.list()?, SpeakerRepo { conn: tx }.links_of(eileen)?))).unwrap();
-        assert_eq!(characters.len(), 1);
-        assert_eq!(characters[0].forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Mr. Lee"]);
-        assert_eq!(characters[0].description(), Some("Учитель."), "пустое описание заполнено");
+        let stuart = glossary.create_character(id, "Stuart").unwrap();
+        assert_eq!(save(&[found("Stuart", FoundKind::Character, Some("Stu"))]), ["Stu → Stuart (объединено)"], "главным осталось полное имя");
+        let (characters, links) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.list()?, SpeakerRepo { conn: tx }.links_of(stuart)?))).unwrap();
+        assert_eq!(characters.len(), 2, "Eileen Lee и Stuart");
+        let merged = characters.iter().find(|character| character.id() == Some(stuart)).unwrap();
+        let forms_of = |character: &crate::glossary::Character| character.forms().iter().map(|form| (form.text().to_string(), form.translation().map(str::to_string))).collect::<Vec<_>>();
+        assert_eq!(forms_of(merged), [("Stu".to_string(), Some("Стю".to_string()))], "уменьшительное стало формой со своим переводом");
+        assert_eq!(merged.description(), Some("Учитель."), "пустое описание заполнено");
         assert_eq!(links.iter().map(|link| link.speaker.as_str()).collect::<Vec<_>>(), ["code:e"], "говорящий перешёл");
 
         // Термин оказался именем персонажа: уходит ему формой.
@@ -2262,6 +2267,87 @@ mod tests {
         assert_eq!(save(&[found("Leeway", FoundKind::Character, Some("Eileen Lee"))]), ["Leeway → Eileen Lee (объединено)"]);
         assert!(terms().iter().all(|term| term.name() != "Leeway"));
         assert_eq!(save(&[found("Leeway", FoundKind::Character, Some("Eileen Lee"))]), Vec::<String>::new(), "второй раз сливать нечего");
+    }
+
+    #[test]
+    fn names_titles_and_short_forms_from_a_real_game() {
+        use super::super::analyze::{Finding, FoundKind, NameParts};
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let glossary = GlossaryService { state: &state };
+        let open = state.open_project(id).unwrap();
+        let karanovic = glossary.create_character(id, "Karanovic").unwrap();
+        let stu = glossary.create_character(id, "Stu").unwrap();
+        let person = |name: &str, first: Option<&str>, last: Option<&str>, same_as: Option<&str>| Finding {
+            name: name.to_string(),
+            kind: FoundKind::Character,
+            gender: None,
+            same_as: same_as.map(str::to_string),
+            parts: NameParts::check(name, first, last),
+        };
+
+        let added = open
+            .project
+            .write(|tx| {
+                save_found(
+                    tx,
+                    &[
+                        person("Vera Karanovic", Some("Vera"), Some("Karanovic"), None),
+                        person("Detective-Colonel Karanovic", None, None, None),
+                        person("Stuart", None, None, Some("Stu")),
+                    ],
+                )
+            })
+            .unwrap();
+        assert_eq!(added, ["Vera Karanovic", "Detective-Colonel", "Stu → Stuart", "Karanovic → Vera Karanovic (объединено)"]);
+
+        let (characters, terms) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.list()?, TermRepo { conn: tx }.list()?))).unwrap();
+        let vera = characters.iter().find(|character| character.first_name() == Some("Vera")).unwrap();
+        assert_eq!(vera.last_name(), Some("Karanovic"), "имя и фамилия по отдельности");
+        assert!(vera.forms().is_empty(), "должность с фамилией не форма");
+        assert!(characters.iter().all(|character| character.id() != Some(karanovic)), "одиночная фамилия слита с Vera Karanovic");
+        let stuart = characters.iter().find(|character| character.id() == Some(stu)).unwrap();
+        assert_eq!(stuart.first_name(), Some("Stuart"), "полное имя стало основным");
+        assert_eq!(stuart.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Stu"]);
+        assert_eq!(terms.iter().map(|term| (term.name(), term.category())).collect::<Vec<_>>(), [("Detective-Colonel", TermCategory::Title)]);
+    }
+
+    #[test]
+    fn short_names_find_their_full_name_and_the_scene_breaks_ties() {
+        use super::super::analyze::{Finding, FoundKind, save_scene_found};
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let glossary = GlossaryService { state: &state };
+        let open = state.open_project(id).unwrap();
+        let person = |name: &str| Finding { name: name.to_string(), kind: FoundKind::Character, gender: None, same_as: None, parts: None };
+        let forms = |id: CharacterId| {
+            open.project.read(|tx| CharacterRepo { conn: tx }.get(id)).unwrap().forms().iter().map(|form| form.text().to_string()).collect::<Vec<_>>()
+        };
+
+        // Новая короткая форма без подсказки модели ложится к единственному полному имени.
+        let dimitria = glossary.create_character(id, "Dimitria").unwrap();
+        assert_eq!(open.project.write(|tx| save_found(tx, &[person("Dimi")])).unwrap(), ["Dimi → Dimitria"]);
+        assert_eq!(forms(dimitria), ["Dimi"]);
+
+        // Оба уже записаны отдельно: сливаются, главным остаётся полное имя.
+        let anya = glossary.create_character(id, "Anya").unwrap();
+        let anastasia = glossary.create_character(id, "Anastasia").unwrap();
+        let _ = anya;
+        let ana = glossary.create_character(id, "Ana").unwrap();
+        let added = open.project.write(|tx| save_found(tx, &[])).unwrap();
+        assert_eq!(added, ["Ana → Anastasia (объединено)"], "Anya не короткая форма Anastasia, Ana короткая: у неё один кандидат");
+        assert!(open.project.read(|tx| CharacterRepo { conn: tx }.get(ana)).is_err());
+        assert_eq!(forms(anastasia), ["Ana"]);
+
+        // Несколько полных имён: выбирается тот, кто говорит в разобранной сцене.
+        let eileen = glossary.speaker_to_character(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
+        glossary.create_character(id, "Eileenor").unwrap();
+        let start = ContainerKey::new("label:start").unwrap();
+        assert_eq!(open.project.write(|tx| save_found(tx, &[person("Eile")])).unwrap(), ["Eile"], "без сцены двух кандидатов не различить");
+        let eile = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap().into_iter().find(|character| character.first_name() == Some("Eile")).unwrap();
+        glossary.delete_character(id, eile.id().unwrap()).unwrap();
+        assert_eq!(open.project.write(|tx| save_scene_found(tx, &[person("Eile")], Some(&start))).unwrap(), ["Eile → Eileen"]);
+        assert_eq!(forms(eileen), ["Eile"]);
     }
 
     #[test]
