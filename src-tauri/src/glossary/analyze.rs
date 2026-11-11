@@ -28,7 +28,8 @@ const SYSTEM: &str = "You read a part of a visual novel script and list the prop
 that a translator into Russian must keep consistent across the game. \
 The text has the form \"Speaker: text\", and \"you\" usually means the protagonist. \
 List characters (people and creatures with a name, including those who are only mentioned) and terms: \
-places, organizations, items, titles and ranks, events and other named concepts of this game. \
+places, organizations, items, titles and ranks specific to this game, events and other named concepts of this game. \
+An ordinary title or rank on its own (\"King\", \"Princess\", \"Sister\", \"Captain\") is a common noun, not a term. \
 Skip everything under \"Known names and terms\", ordinary words, common nouns, interjections, \
 and anything inside [square brackets] or {curly brackets}. \
 A new spelling of a known or listed name is not skipped: an abbreviation, a short or full form, a nickname \
@@ -457,9 +458,14 @@ pub fn title_and_name(name: &str) -> Option<(String, String)> {
     Some((words[..count].join(" "), words[count..].join(" ")))
 }
 
-/// Только обращения («Mr.», «Mrs.»): термином-должностью не становятся.
-fn is_honorific(title: &str) -> bool {
-    title.split_whitespace().all(|word| HONORIFICS.contains(&word.trim_matches('.').to_lowercase().as_str()))
+/// Одно обычное звание или обращение («King», «Princess», «Sister», «Mr.»): это обычное слово, а не термин игры.
+/// Его перевод очевиден, а одно написание на всю игру вредит: «Sister» бывает монахиней и сестрой. Составное
+/// звание («Detective-Colonel», «Grand Duke») термином остаётся.
+pub fn is_common_title(name: &str) -> bool {
+    let word = name.trim().trim_matches('.').to_lowercase();
+    !word.is_empty()
+        && !word.contains(|c: char| c.is_whitespace() || c == '-')
+        && (RANKS.contains(&word.as_str()) || HONORIFICS.contains(&word.as_str()))
 }
 
 /// Запись находок одного разбора: что уже известно, чьи это написания, что добавлено.
@@ -495,8 +501,8 @@ impl Saver<'_> {
         {
             return self.save_titled(finding, &title, &name);
         }
-        // Подпись говорящего («Waitress») переводится шагом подписей, а не термином.
-        if matches!(finding.kind, FoundKind::Term(_)) && self.new_labels.contains(&key) {
+        // Подпись говорящего («Waitress») переводится шагом подписей, а не термином, обычное звание тоже не термин.
+        if matches!(finding.kind, FoundKind::Term(_)) && (self.new_labels.contains(&key) || is_common_title(&finding.name)) {
             return Ok(());
         }
         if self.is_known(&key)? {
@@ -530,20 +536,12 @@ impl Saver<'_> {
     /// написанием, записанный раньше («Princess Selena»), удаляется: его название уходит в корзину.
     fn save_titled(&mut self, finding: &Finding, title: &str, name: &str) -> Result<(), DbError> {
         if let Some(Owner::Term(id)) = NameKey::new(&finding.name).and_then(|key| self.owners.by_key.get(&key)).copied() {
-            let terms = TermRepo { conn: self.tx };
-            let term = terms.get(id)?;
-            terms.delete(id)?;
-            NoteRepo { conn: self.tx }.delete_owner(&NoteOwner::Term(id))?;
-            terms.discard(&DiscardedTerm {
-                text: term.name().to_string(),
-                key: term.name_key().clone(),
-                reason: DiscardReason::Junk,
-                discarded_at: Timestamp::now(),
-            })?;
-            self.added.push(format!("{} → {title} + {name} (разделено)", term.name()));
+            let old = self.discard_term(id)?;
+            let parts = if is_common_title(title) { name.to_string() } else { format!("{title} + {name}") };
+            self.added.push(format!("{old} → {parts} (разделено)"));
             self.reload()?;
         }
-        if !is_honorific(title)
+        if !is_common_title(title)
             && let Some(key) = NameKey::new(title)
             && !self.is_known(&key)?
             && let Ok(term) = Term::new(title, TermCategory::Title)
@@ -556,6 +554,38 @@ impl Saver<'_> {
         let parts = finding.parts.as_ref().and_then(|parts| NameParts::check(name, parts.first.as_deref(), parts.last.as_deref()));
         let rest = Finding { name: name.to_string(), kind: FoundKind::Character, gender: finding.gender, same_as: None, parts };
         if title_and_name(name).is_some() { Ok(()) } else { self.save(&rest) }
+    }
+
+    /// Термин удаляется вместе с заметками, его название уходит в корзину как мусор: разбор его больше не предложит.
+    fn discard_term(&mut self, id: TermId) -> Result<String, DbError> {
+        let terms = TermRepo { conn: self.tx };
+        let term = terms.get(id)?;
+        terms.delete(id)?;
+        NoteRepo { conn: self.tx }.delete_owner(&NoteOwner::Term(id))?;
+        terms.discard(&DiscardedTerm {
+            text: term.name().to_string(),
+            key: term.name_key().clone(),
+            reason: DiscardReason::Junk,
+            discarded_at: Timestamp::now(),
+        })?;
+        Ok(term.name().to_string())
+    }
+
+    /// Обычные звания, записанные терминами раньше («Princess», «Sister»), уходят в корзину. Термин, которому
+    /// дали перевод, остаётся: его оставили намеренно.
+    fn drop_common_titles(&mut self) -> Result<(), DbError> {
+        let terms = TermRepo { conn: self.tx }.list()?;
+        let mut dropped = false;
+        for term in terms.iter().filter(|term| term.translation().is_none() && is_common_title(term.name())) {
+            let Some(id) = term.id() else { continue };
+            let name = self.discard_term(id)?;
+            self.added.push(format!("{name} (обычное слово, убрано)"));
+            dropped = true;
+        }
+        if dropped {
+            self.reload()?;
+        }
+        Ok(())
     }
 
     fn term_form(&mut self, finding: &Finding, id: TermId) -> Result<(), DbError> {
@@ -743,6 +773,7 @@ pub fn save_scene_found(tx: &rusqlite::Connection, found: &[Finding], scene: Opt
         saver.save(finding)?;
     }
     saver.split_titled_terms()?;
+    saver.drop_common_titles()?;
     saver.merge_single_names()?;
     saver.link_speakers()?;
     Ok(saver.added)
@@ -843,7 +874,8 @@ mod tests {
         assert_eq!(title_and_name("Captain Jack Morgan"), Some(("Captain".to_string(), "Jack Morgan".to_string())));
         assert_eq!(title_and_name("Vera Karanovic"), None);
         assert_eq!(title_and_name("Captain"), None, "без имени после должности делить нечего");
-        assert!(is_honorific("Mr.") && !is_honorific("Detective-Colonel"));
+        assert!(is_common_title("Mr.") && is_common_title("Princess") && is_common_title(" sister "));
+        assert!(!is_common_title("Detective-Colonel") && !is_common_title("Grand Duke") && !is_common_title("Selena"));
     }
 
     #[test]

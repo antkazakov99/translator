@@ -2340,19 +2340,36 @@ mod tests {
 
         // Термин, записанный до разделения должностей, превращается, когда разбор снова находит это имя.
         glossary.take_term(id, "Princess Selena", TermCategory::General).unwrap();
-        assert_eq!(
-            save(&[found("Princess Selena", FoundKind::Character)]),
-            ["Princess Selena → Princess + Selena (разделено)", "Princess", "Selena"]
-        );
-        assert_eq!(names(), (vec!["General Store".to_string(), "Princess".to_string()], vec!["Selena".to_string()]));
+        assert_eq!(save(&[found("Princess Selena", FoundKind::Character)]), ["Princess Selena → Selena (разделено)", "Selena"], "обычное звание не термин");
+        assert_eq!(names(), (vec!["General Store".to_string()], vec!["Selena".to_string()]));
 
         // И когда имя после должности стало известным персонажем.
         glossary.take_term(id, "Queen Mara", TermCategory::General).unwrap();
-        assert_eq!(save(&[found("Mara", FoundKind::Character)]), ["Mara", "Queen Mara → Queen + Mara (разделено)", "Queen"]);
+        assert_eq!(save(&[found("Mara", FoundKind::Character)]), ["Mara", "Queen Mara → Mara (разделено)"]);
         let (terms, characters) = names();
-        assert!(!terms.contains(&"Queen Mara".to_string()) && terms.contains(&"Queen".to_string()));
+        assert_eq!(terms, ["General Store"]);
         assert_eq!(characters, ["Mara", "Selena"]);
         assert!(save(&[found("Princess Selena", FoundKind::Term(TermCategory::General))]).is_empty(), "разделённое название в корзине");
+
+        // Составное звание остаётся термином, одиночное от модели не записывается.
+        let added = save(&[found("Detective-Colonel Orin", FoundKind::Character), found("Princess", FoundKind::Term(TermCategory::Title))]);
+        assert_eq!(added, ["Detective-Colonel", "Orin"]);
+
+        // Обычные звания, записанные раньше, уходят в корзину, кроме переведённых.
+        let sister = glossary.take_term(id, "Sister", TermCategory::Title).unwrap();
+        let king = glossary.take_term(id, "King", TermCategory::Title).unwrap();
+        open.project
+            .write(|tx| {
+                let repo = TermRepo { conn: tx };
+                let mut term = repo.get(king)?;
+                term.set_translation("Государь");
+                repo.save(&term)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(save(&[]), ["Sister (обычное слово, убрано)"]);
+        assert!(open.project.read(|tx| TermRepo { conn: tx }.get(sister)).is_err());
+        assert_eq!(names().0, ["Detective-Colonel", "General Store", "King"]);
     }
 
     #[test]
