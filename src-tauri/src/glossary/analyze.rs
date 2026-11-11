@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 
 use super::repo::{CharacterRepo, LineSampleRepo, TermRepo};
-use super::{Character, GlossaryData, NameKey, Term, TermCategory};
+use super::{Character, CharacterId, Form, GlossaryData, NameKey, Term, TermCategory, TermId};
 use crate::common::Gender;
 use crate::llm::{ChatRequest, LlmTarget};
 use crate::storage::DbError;
@@ -25,11 +25,17 @@ List characters (people and creatures with a name, including those who are only 
 places, organizations, items, titles and ranks, events and other named concepts of this game. \
 Skip everything under \"Known names and terms\", ordinary words, common nouns, interjections, \
 and anything inside [square brackets] or {curly brackets}. \
+A new spelling of a known or listed name is not skipped: an abbreviation, a short or full form, a nickname, \
+a title with a surname (\"PPF\" for \"People's Police Force\", \"Mr. Lee\" for \"Eileen Lee\"). List it with \"same_as\". \
 Answer with a JSON array, or [] if there is nothing new. Each object has the fields: \
 \"kind\": one of \"character\", \"location\", \"organization\", \"title\", \"item\", \"event\", \"general\"; \
 \"name\": the exact spelling from the text; \
-\"gender\": \"male\", \"female\" or \"unknown\", only for a character. \
+\"gender\": \"male\", \"female\" or \"unknown\", only for a character; \
+\"same_as\": only when this is another name of a known name or of another name in your answer, its exact spelling. \
 Respond with the JSON array only.";
+
+/// Служебные слова, которые аббревиатура пропускает: «People's Police Force» это PPF, «Order of the Dawn» это OD.
+const MINOR_WORDS: [&str; 10] = ["of", "the", "and", "for", "a", "an", "in", "on", "at", "to"];
 
 /// Что нашла модель: персонаж или термин своей категории.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,6 +62,8 @@ pub struct Finding {
     /// У сведённой вид, который модель называла чаще.
     pub kind: FoundKind,
     pub gender: Option<Gender>,
+    /// Чьё это другое имя по словам модели: написание известной записи или другой находки.
+    pub same_as: Option<String>,
 }
 
 /// Запись ответа. Поля под разными именами: модели пишут их по привычке.
@@ -66,6 +74,8 @@ struct AnswerItem {
     #[serde(alias = "term", alias = "text")]
     name: Option<String>,
     gender: Option<String>,
+    #[serde(alias = "alias_of", alias = "form_of", alias = "sameAs")]
+    same_as: Option<String>,
 }
 
 /// Запрос разбора одной части.
@@ -116,7 +126,12 @@ impl AnalysisPrompt {
                     FoundKind::Character => gender(item.gender.as_deref()),
                     FoundKind::Term(_) => None,
                 };
-                Some(Finding { name, kind, gender })
+                let same_as = item
+                    .same_as
+                    .as_deref()
+                    .map(|text| text.trim().trim_matches(|c: char| "\"'«»“”".contains(c)).trim().to_string())
+                    .filter(|text| !text.is_empty() && NameKey::new(text) != NameKey::new(&name));
+                Some(Finding { name, kind, gender, same_as })
             })
             .collect()
     }
@@ -139,7 +154,7 @@ pub fn merge(found: Vec<Finding>) -> Vec<Finding> {
         let Some(key) = NameKey::new(&finding.name) else { continue };
         let (merged, kinds) = entries.entry(key.clone()).or_insert_with(|| {
             order.push(key);
-            (Finding { name: finding.name.clone(), kind: finding.kind, gender: None }, Vec::new())
+            (Finding { name: finding.name.clone(), kind: finding.kind, gender: None, same_as: None }, Vec::new())
         });
         match kinds.iter_mut().find(|(kind, _)| *kind == finding.kind) {
             Some((_, count)) => *count += 1,
@@ -147,6 +162,9 @@ pub fn merge(found: Vec<Finding>) -> Vec<Finding> {
         }
         if merged.gender.is_none() {
             merged.gender = finding.gender;
+        }
+        if merged.same_as.is_none() {
+            merged.same_as = finding.same_as;
         }
     }
     order
@@ -168,31 +186,161 @@ pub fn merge(found: Vec<Finding>) -> Vec<Finding> {
         .collect()
 }
 
-/// Новые записи разбора в глоссарий: персонаж с родом, термин с категорией. Известное глоссарию, корзине
-/// терминов и подписям говорящих пропускается. Возвращает написания добавленных.
+/// Аббревиатура: 2–8 заглавных букв или цифр, хотя бы две буквы, точки между ними допускаются («P.P.F.»).
+/// Возвращает её без точек.
+pub fn acronym(text: &str) -> Option<String> {
+    let bare: String = text.trim().chars().filter(|c| *c != '.').collect();
+    let letters = bare.chars().filter(|c| c.is_alphabetic()).count();
+    let fits = (2..=8).contains(&bare.chars().count())
+        && letters >= 2
+        && bare.chars().all(|c| c.is_alphanumeric() && !c.is_lowercase());
+    fits.then_some(bare)
+}
+
+/// Первые буквы значимых слов названия из нескольких слов: «People's Police Force» это «PPF».
+/// `None`: слово одно, сокращать нечего.
+pub fn initials(name: &str) -> Option<String> {
+    let words: Vec<&str> = name
+        .split(|c: char| c.is_whitespace() || c == '-')
+        .filter(|word| !word.is_empty() && !MINOR_WORDS.contains(&word.to_lowercase().as_str()))
+        .collect();
+    if words.len() < 2 {
+        return None;
+    }
+    words.iter().map(|word| word.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string())).collect()
+}
+
+/// Одно название сокращает другое: аббревиатура совпала с первыми буквами полного названия.
+pub fn abbreviates(short: &str, long: &str) -> bool {
+    match (acronym(short), initials(long)) {
+        (Some(short), Some(long)) => short.to_uppercase() == long,
+        _ => false,
+    }
+}
+
+/// Запись глоссария, к которой ложится форма.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Character(CharacterId),
+    Term(TermId),
+}
+
+/// Написания записей глоссария и их владельцы: термины по названию и формам, персонажи по полному имени,
+/// имени, фамилии и формам. Растёт по мере записи находок.
+struct Owners {
+    by_key: HashMap<NameKey, Owner>,
+    /// Названия и формы терминов: по ним ищется аббревиатура.
+    term_names: Vec<(String, TermId)>,
+}
+
+impl Owners {
+    fn load(glossary: &GlossaryData) -> Self {
+        let mut owners = Self { by_key: HashMap::new(), term_names: Vec::new() };
+        for term in &glossary.terms {
+            let Some(id) = term.id() else { continue };
+            owners.add_term(term.name(), id);
+            for form in term.forms() {
+                owners.add_term(form.text(), id);
+            }
+        }
+        for character in &glossary.characters {
+            let Some(id) = character.id() else { continue };
+            let names = character
+                .full_name()
+                .into_iter()
+                .chain(character.first_name().map(str::to_string))
+                .chain(character.last_name().map(str::to_string))
+                .chain(character.forms().iter().map(|form| form.text().to_string()));
+            for name in names {
+                owners.add(&name, Owner::Character(id));
+            }
+        }
+        owners
+    }
+
+    fn add(&mut self, name: &str, owner: Owner) {
+        if let Some(key) = NameKey::new(name) {
+            self.by_key.entry(key).or_insert(owner);
+        }
+    }
+
+    fn add_term(&mut self, name: &str, id: TermId) {
+        self.add(name, Owner::Term(id));
+        self.term_names.push((name.to_string(), id));
+    }
+
+    /// Чья это форма: запись, которую назвала модель, иначе термин, который сокращает находка или который
+    /// сокращает её.
+    fn owner_of(&self, finding: &Finding) -> Option<Owner> {
+        if let Some(owner) = finding.same_as.as_deref().and_then(NameKey::new).and_then(|key| self.by_key.get(&key)) {
+            return Some(*owner);
+        }
+        self.term_names
+            .iter()
+            .find(|(name, _)| abbreviates(&finding.name, name) || abbreviates(name, &finding.name))
+            .map(|(_, id)| Owner::Term(*id))
+    }
+}
+
+/// Сначала находки без ссылки на другую находку: тогда запись, к которой ложится форма, уже есть.
+fn ordered(found: &[Finding]) -> Vec<&Finding> {
+    let keys: HashSet<NameKey> = found.iter().filter_map(|finding| NameKey::new(&finding.name)).collect();
+    let linked = |finding: &Finding| finding.same_as.as_deref().and_then(NameKey::new).is_some_and(|key| keys.contains(&key));
+    found.iter().filter(|finding| !linked(finding)).chain(found.iter().filter(|finding| linked(finding))).collect()
+}
+
+/// Новые записи разбора в глоссарий: персонаж с родом, термин с категорией. Другое имя известной записи или
+/// другой находки становится формой той записи. Известное глоссарию, корзине терминов и подписям говорящих
+/// пропускается. Возвращает написания добавленных, форму как «PPF → People's Police Force».
 pub fn save_found(tx: &rusqlite::Connection, found: &[Finding]) -> Result<Vec<String>, DbError> {
     let mut known: HashSet<NameKey> = known_for_prompt(tx)?.iter().filter_map(|name| NameKey::new(name)).collect();
+    let mut owners = Owners::load(&GlossaryData::load(tx)?);
     let terms = TermRepo { conn: tx };
     let characters = CharacterRepo { conn: tx };
     let mut added = Vec::new();
-    for finding in found {
+    for finding in ordered(found) {
         let Some(key) = NameKey::new(&finding.name) else { continue };
         if known.contains(&key) || terms.is_known(&key)? {
             continue;
         }
-        match finding.kind {
-            FoundKind::Character => {
-                let mut character = Character::new(&finding.name);
-                character.set_gender(finding.gender);
-                characters.save(&character)?;
-            }
-            FoundKind::Term(category) => {
-                let Ok(term) = Term::new(&finding.name, category) else { continue };
+        match owners.owner_of(finding) {
+            Some(Owner::Term(id)) => {
+                let mut term = terms.get(id)?;
+                let Ok(form) = Form::new(&finding.name, None) else { continue };
+                if term.add_form(form).is_err() {
+                    continue;
+                }
                 terms.save(&term)?;
+                owners.add_term(&finding.name, id);
+                added.push(format!("{} → {}", finding.name, term.name()));
             }
+            Some(Owner::Character(id)) => {
+                let mut character = characters.get(id)?;
+                let Ok(form) = Form::new(&finding.name, None) else { continue };
+                if character.add_form(form).is_err() {
+                    continue;
+                }
+                characters.save(&character)?;
+                owners.add(&finding.name, Owner::Character(id));
+                added.push(format!("{} → {}", finding.name, character.full_name().unwrap_or_default()));
+            }
+            None => match finding.kind {
+                FoundKind::Character => {
+                    let mut character = Character::new(&finding.name);
+                    character.set_gender(finding.gender);
+                    let id = characters.save(&character)?;
+                    owners.add(&finding.name, Owner::Character(id));
+                    added.push(finding.name.clone());
+                }
+                FoundKind::Term(category) => {
+                    let Ok(term) = Term::new(&finding.name, category) else { continue };
+                    let id = terms.save(&term)?;
+                    owners.add_term(&finding.name, id);
+                    added.push(finding.name.clone());
+                }
+            },
         }
         known.insert(key);
-        added.push(finding.name.clone());
     }
     Ok(added)
 }
@@ -218,7 +366,7 @@ mod tests {
     use super::*;
 
     fn finding(name: &str, kind: FoundKind) -> Finding {
-        Finding { name: name.to_string(), kind, gender: None }
+        Finding { name: name.to_string(), kind, gender: None, same_as: None }
     }
 
     #[test]
@@ -262,5 +410,36 @@ mod tests {
         let lis = Finding { gender: Some(Gender::Female), ..finding("Lis", FoundKind::Character) };
         let merged = merge(vec![finding("Rusty Anchor", location), lis.clone(), finding("rusty anchor", FoundKind::Character), finding("RUSTY ANCHOR", location)]);
         assert_eq!(merged, [finding("Rusty Anchor", location), lis]);
+
+        let ppf = Finding { same_as: Some("People's Police Force".to_string()), ..finding("PPF", location) };
+        assert_eq!(merge(vec![finding("PPF", location), ppf.clone()]), [ppf], "ссылка берётся у любой части");
+    }
+
+    #[test]
+    fn acronyms_match_initials_of_significant_words() {
+        assert_eq!(acronym("P.P.F."), Some("PPF".to_string()));
+        assert_eq!(acronym("Ppf"), None, "строчные буквы это не аббревиатура");
+        assert_eq!(acronym("A"), None);
+        assert_eq!(initials("People's Police Force"), Some("PPF".to_string()));
+        assert_eq!(initials("the Order of the Dawn"), Some("OD".to_string()), "служебные слова пропущены");
+        assert_eq!(initials("Rusty"), None);
+        assert!(abbreviates("PPF", "People's Police Force"));
+        assert!(abbreviates("ppf".to_uppercase().as_str(), "people's police force"));
+        assert!(!abbreviates("PPF", "Police Force"));
+        assert!(!abbreviates("People's Police Force", "PPF"), "порядок важен: короткое первым");
+    }
+
+    #[test]
+    fn answer_keeps_the_name_it_belongs_to() {
+        let part = "Eileen: The PPF is here.\n";
+        let answer = r#"[{"kind": "organization", "name": "PPF", "same_as": "People's Police Force"}, {"kind": "character", "name": "Eileen", "alias_of": "eileen"}]"#;
+        assert_eq!(
+            AnalysisPrompt::accept(answer, part),
+            [
+                Finding { same_as: Some("People's Police Force".to_string()), ..finding("PPF", FoundKind::Term(TermCategory::Organization)) },
+                finding("Eileen", FoundKind::Character),
+            ],
+            "ссылка на само имя отброшена"
+        );
     }
 }

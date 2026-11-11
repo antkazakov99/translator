@@ -2166,6 +2166,50 @@ mod tests {
     }
 
     #[test]
+    fn findings_that_name_a_known_entry_become_its_forms() {
+        use super::super::analyze::{Finding, FoundKind};
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let glossary = GlossaryService { state: &state };
+        let police = glossary.take_term(id, "People's Police Force", TermCategory::Organization).unwrap();
+        let eileen = glossary.create_character(id, "Eileen").unwrap();
+        let open = state.open_project(id).unwrap();
+        let mut character = open.project.read(|tx| CharacterRepo { conn: tx }.get(eileen)).unwrap();
+        character.set_last_name("Lee");
+        glossary.save_character(id, &character).unwrap();
+
+        let org = FoundKind::Term(TermCategory::Organization);
+        let found = |name: &str, kind, same_as: Option<&str>| Finding { name: name.to_string(), kind, gender: None, same_as: same_as.map(str::to_string) };
+        let added = open
+            .project
+            .write(|tx| {
+                save_found(
+                    tx,
+                    &[
+                        found("PPF", org, None),
+                        found("Mr. Lee", FoundKind::Character, Some("Eileen Lee")),
+                        found("the Order", org, Some("Order of the Dawn")),
+                        found("Order of the Dawn", org, None),
+                        found("Ghost", FoundKind::Character, Some("Nobody")),
+                    ],
+                )
+            })
+            .unwrap();
+        assert_eq!(added, ["PPF → People's Police Force", "Mr. Lee → Eileen Lee", "Order of the Dawn", "Ghost", "the Order → Order of the Dawn"]);
+
+        let (terms, character) = open.project.read(|tx| Ok((TermRepo { conn: tx }.list()?, CharacterRepo { conn: tx }.get(eileen)?))).unwrap();
+        let police = terms.iter().find(|term| term.id() == Some(police)).unwrap();
+        assert_eq!(police.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["PPF"], "аббревиатура легла формой без подсказки модели");
+        assert_eq!(character.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Mr. Lee"]);
+        let order = terms.iter().find(|term| term.name() == "Order of the Dawn").unwrap();
+        assert_eq!(order.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["the Order"], "ссылка на находку того же ответа");
+        assert_eq!(terms.len(), 2, "PPF и the Order не стали отдельными терминами");
+
+        let again = open.project.write(|tx| save_found(tx, &[found("P.P.F.", org, None), found("PPF", org, None)])).unwrap();
+        assert_eq!(again, ["P.P.F. → People's Police Force"], "известная форма пропущена");
+    }
+
+    #[test]
     fn notes_of_parts_that_are_gone_are_pruned() {
         let (url, _) = fake_model(|body| {
             let system = system_text(body);
