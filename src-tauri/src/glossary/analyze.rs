@@ -27,13 +27,18 @@ const MAX_KNOWN_CHARS: usize = 2000;
 const SYSTEM: &str = "You read a part of a visual novel script and list the proper names and game-specific terms \
 that a translator into Russian must keep consistent across the game. \
 The text has the form \"Speaker: text\", and \"you\" usually means the protagonist. \
-List characters (people and creatures with a name, including those who are only mentioned) and terms: \
+List characters (people and creatures with a name, including those who are only mentioned). \
+A character is someone who acts, speaks or is spoken about. A title used as the name of one person \
+(\"The Fairy Queen\") is a character: list it without the article. \
+A word for an act, an object or a menu choice is never a character, even when it stands alone on a line. \
+Also list terms: \
 places, organizations, items, titles and ranks specific to this game, events and other named concepts of this game. \
 An ordinary title or rank on its own (\"King\", \"Princess\", \"Sister\", \"Captain\") is a common noun, not a term. \
 Skip everything under \"Known names and terms\", ordinary words, common nouns, interjections, \
 and anything inside [square brackets] or {curly brackets}. \
-A new spelling of a known or listed name is not skipped: an abbreviation, a short or full form, a nickname \
-(\"PPF\" for \"People's Police Force\", \"Stuart\" for \"Stu\"). List it with \"same_as\". \
+A new spelling of a known or listed name is not skipped: an abbreviation, a short or full form, a nickname, \
+a synonym (\"PPF\" for \"People's Police Force\", \"Stuart\" for \"Stu\", \"Fey Court\" for \"Fairy Court\"). \
+List it with \"same_as\". \
 A rank, title or form of address before a name is not part of the name: for \"Detective-Colonel Karanovic\" \
 list the title \"Detective-Colonel\" and the name \"Karanovic\" separately, and skip \"Mr.\", \"Mrs.\" and similar. \
 Answer with a JSON array, or [] if there is nothing new. Each object has the fields: \
@@ -354,9 +359,16 @@ impl Owners {
     }
 
     fn add(&mut self, name: &str, owner: Owner) {
-        if let Some(key) = NameKey::new(name) {
-            self.by_key.entry(key).or_insert(owner);
+        for name in [name, without_article(name)] {
+            if let Some(key) = NameKey::new(name) {
+                self.by_key.entry(key).or_insert(owner);
+            }
         }
+    }
+
+    /// Владелец написания, с артиклем или без: «The Fairy King» находит «Fairy King».
+    fn find(&self, name: &str) -> Option<Owner> {
+        [name, without_article(name)].iter().find_map(|name| NameKey::new(name).and_then(|key| self.by_key.get(&key).copied()))
     }
 
     fn add_term(&mut self, name: &str, id: TermId) {
@@ -367,7 +379,7 @@ impl Owners {
     /// Чья это форма: запись, которую назвала модель, иначе термин, который сокращает находка или который
     /// сокращает её. `own`: запись самой находки, если она уже есть, на себя находка не ссылается.
     fn owner_of(&self, finding: &Finding, own: Option<Owner>) -> Option<Owner> {
-        let named = finding.same_as.as_deref().and_then(NameKey::new).and_then(|key| self.by_key.get(&key)).copied();
+        let named = finding.same_as.as_deref().and_then(|name| self.find(name));
         if let Some(owner) = named.filter(|owner| Some(*owner) != own) {
             return Some(owner);
         }
@@ -375,7 +387,10 @@ impl Owners {
             .term_names
             .iter()
             .filter(|(_, id)| Some(Owner::Term(*id)) != own)
-            .find(|(name, _)| abbreviates(&finding.name, name) || abbreviates(name, &finding.name))
+            .find(|(name, _)| {
+                let plural = matches!(finding.kind, FoundKind::Term(_)) && (plural_of(&finding.name, name) || plural_of(name, &finding.name));
+                plural || abbreviates(&finding.name, name) || abbreviates(name, &finding.name)
+            })
             .map(|(_, id)| Owner::Term(*id));
         if abbreviated.is_some() || finding.kind != FoundKind::Character || finding.name.contains(char::is_whitespace) {
             return abbreviated;
@@ -398,8 +413,9 @@ fn merge_entries(tx: &rusqlite::Connection, own: Owner, other: Owner) -> Result<
     let text = match (own, other) {
         (Owner::Term(a), Owner::Term(b)) => {
             let (a_name, b_name) = (terms.get(a)?.name().to_string(), terms.get(b)?.name().to_string());
-            let (from, into, from_name, into_name) =
-                if acronym(&b_name).is_some() && acronym(&a_name).is_none() { (b, a, b_name, a_name) } else { (a, b, a_name, b_name) };
+            // Главным остаётся полное название и единственное число.
+            let swap = (acronym(&b_name).is_some() && acronym(&a_name).is_none()) || plural_of(&b_name, &a_name);
+            let (from, into, from_name, into_name) = if swap { (b, a, b_name, a_name) } else { (a, b, a_name, b_name) };
             merge_terms(tx, from, into)?;
             format!("{from_name} → {into_name} (объединено)")
         }
@@ -458,6 +474,60 @@ pub fn title_and_name(name: &str) -> Option<(String, String)> {
     Some((words[..count].join(" "), words[count..].join(" ")))
 }
 
+/// Имя без артикля впереди: «Fairy Queen» у «The Fairy Queen».
+pub fn without_article(name: &str) -> &str {
+    let name = name.trim();
+    for article in ["the ", "a ", "an "] {
+        if name.len() > article.len() && name.is_char_boundary(article.len()) && name[..article.len()].eq_ignore_ascii_case(article) {
+            let rest = name[article.len()..].trim_start();
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    name
+}
+
+/// Титул как имя одного лица: несколько слов, последнее из них звание («Fairy Queen», «The Fairy King»).
+/// «Order of the King» с предлогом это название, а не лицо.
+pub fn is_person_title(name: &str) -> bool {
+    let words: Vec<String> = without_article(name).split_whitespace().map(str::to_lowercase).collect();
+    words.len() >= 2 && words.last().is_some_and(|last| RANKS.contains(&last.as_str())) && !words.iter().any(|word| MINOR_WORDS.contains(&word.as_str()))
+}
+
+/// Одно название множественное число другого: «pixies» у «pixie», «truthsayers» у «truthsayer».
+pub fn plural_of(plural: &str, single: &str) -> bool {
+    let (plural, single) = (plural.trim().to_lowercase(), single.trim().to_lowercase());
+    single.chars().count() >= 3 && (plural == format!("{single}s") || plural == format!("{single}es"))
+}
+
+/// Имя из одного слова это обычное слово, а не имя: в репликах игры оно есть со строчной буквы и ни разу
+/// с заглавной посреди фразы («Boobjob» строкой выбора в меню и «a boobjob» в репликах). Имя, которое модель
+/// сама написала строчными, тоже обычное слово.
+pub fn is_common_word(name: &str, lines: &[String]) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name.contains(char::is_whitespace) || !name.chars().any(char::is_alphabetic) {
+        return false;
+    }
+    let lower = name.to_lowercase();
+    if lower == name {
+        return true;
+    }
+    let mut lowercase = false;
+    for line in lines {
+        for (start, _) in line.match_indices(name) {
+            let after = line[start + name.len()..].chars().next();
+            let before = line[..start].trim_end().chars().next_back();
+            let whole = !line[..start].chars().next_back().is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric);
+            if whole && before.is_some_and(|c| c.is_alphanumeric() || c == ',') {
+                return false;
+            }
+        }
+        lowercase |= mentions(line, &lower);
+    }
+    lowercase
+}
+
 /// Подпись из одного токена: «[mc]», «[player_name]». «[mc]'s mom» это роль, а не токен.
 pub fn is_token_label(label: &str) -> bool {
     let label = label.trim();
@@ -498,7 +568,29 @@ impl Saver<'_> {
         Ok(())
     }
 
+    /// Титул как имя лица («Fairy Queen») это персонаж, а не термин, имя персонажа пишется без артикля.
+    fn normalized(finding: &Finding) -> Finding {
+        let mut finding = finding.clone();
+        if matches!(finding.kind, FoundKind::Term(TermCategory::General | TermCategory::Title)) && is_person_title(&finding.name) {
+            finding.kind = FoundKind::Character;
+        }
+        if finding.kind == FoundKind::Character {
+            finding.name = without_article(&finding.name).to_string();
+        }
+        finding
+    }
+
+    /// Все реплики игры, где есть name: по ним видно, имя это или обычное слово.
+    fn is_common_word(&self, name: &str) -> Result<bool, DbError> {
+        if name.contains(char::is_whitespace) {
+            return Ok(false);
+        }
+        let lines: Vec<String> = LineSampleRepo { conn: self.tx }.containing(name, None)?.into_iter().map(|line| line.text).collect();
+        Ok(is_common_word(name, &lines))
+    }
+
     fn save(&mut self, finding: &Finding) -> Result<(), DbError> {
+        let finding = &Self::normalized(finding);
         let Some(key) = NameKey::new(&finding.name) else { return Ok(()) };
         // Личное имя с частями от модели должностью не считается.
         let personal = finding.parts.as_ref().is_some_and(|parts| parts.first.is_some());
@@ -525,6 +617,8 @@ impl Saver<'_> {
         match self.owners.owner_of(finding, None) {
             Some(Owner::Term(id)) => self.term_form(finding, id)?,
             Some(Owner::Character(id)) => self.character_form(finding, id)?,
+            // Обычное слово персонажем не становится. Подпись говорящего не проверяется: он говорит.
+            None if finding.kind == FoundKind::Character && !self.new_labels.contains(&key) && self.is_common_word(&finding.name)? => return Ok(()),
             None => self.create(finding)?,
         }
         self.known.insert(key);
@@ -589,6 +683,63 @@ impl Saver<'_> {
             dropped = true;
         }
         if dropped {
+            self.reload()?;
+        }
+        Ok(())
+    }
+
+    /// Термины-титулы лиц, записанные раньше («Fairy Queen»), становятся персонажами: имя без артикля, перевод
+    /// термина и его формы переходят персонажу, название уходит в корзину как переданное персонажу.
+    fn titled_terms_to_characters(&mut self) -> Result<(), DbError> {
+        let terms = TermRepo { conn: self.tx };
+        let mut changed = false;
+        for term in terms.list()? {
+            let Some(id) = term.id() else { continue };
+            if !matches!(term.category(), TermCategory::General | TermCategory::Title) || !is_person_title(term.name()) {
+                continue;
+            }
+            let mut character = Character::new(without_article(term.name()));
+            character.set_translated_names(term.translation().unwrap_or_default(), "");
+            for form in term.forms() {
+                let _ = character.add_form(form.clone());
+            }
+            CharacterRepo { conn: self.tx }.save(&character)?;
+            terms.delete(id)?;
+            NoteRepo { conn: self.tx }.delete_owner(&NoteOwner::Term(id))?;
+            terms.discard(&DiscardedTerm {
+                text: term.name().to_string(),
+                key: term.name_key().clone(),
+                reason: DiscardReason::GivenToCharacter,
+                discarded_at: Timestamp::now(),
+            })?;
+            self.added.push(format!("{} (термин → персонаж)", term.name()));
+            changed = true;
+        }
+        if changed {
+            self.reload()?;
+        }
+        Ok(())
+    }
+
+    /// Персонажи из одного обычного слова, записанные раньше («Boobjob»), удаляются: без фамилии, без говорящего,
+    /// слово в игре есть только строчными. Слово уходит в корзину терминов, разбор его больше не предложит.
+    fn drop_common_characters(&mut self) -> Result<(), DbError> {
+        let characters = CharacterRepo { conn: self.tx };
+        let speakers = SpeakerRepo { conn: self.tx };
+        let mut changed = false;
+        for character in characters.list()? {
+            let (Some(id), Some(name), None) = (character.id(), character.first_name(), character.last_name()) else { continue };
+            let Some(key) = NameKey::new(name) else { continue };
+            if !speakers.links_of(id)?.is_empty() || !self.is_common_word(name)? {
+                continue;
+            }
+            characters.delete(id)?;
+            NoteRepo { conn: self.tx }.delete_owner(&NoteOwner::Character(id))?;
+            TermRepo { conn: self.tx }.discard(&DiscardedTerm { text: name.to_string(), key, reason: DiscardReason::Junk, discarded_at: Timestamp::now() })?;
+            self.added.push(format!("{name} (обычное слово, убрано)"));
+            changed = true;
+        }
+        if changed {
             self.reload()?;
         }
         Ok(())
@@ -704,7 +855,7 @@ impl Saver<'_> {
         let speaking: HashSet<_> = repo.current()?.into_iter().filter(|used| used.lines > 0).map(|used| used.speaker.key).collect();
         for speaker in repo.new_speakers()? {
             let Some(label) = speaker.label.as_deref() else { continue };
-            let owner = |name: &str| NameKey::new(name).and_then(|key| self.owners.by_key.get(&key).copied());
+            let owner = |name: &str| self.owners.find(name);
             let found = owner(label)
                 .or_else(|| title_and_name(label).and_then(|(_, name)| owner(&name)))
                 .or_else(|| (!label.contains(char::is_whitespace)).then(|| self.owners.short_form_owner(label, None).map(Owner::Character)).flatten());
@@ -768,6 +919,39 @@ impl Saver<'_> {
     }
 }
 
+/// Термины-дубли сливаются: множественное число с единственным («pixies» и «pixie») и термины одной категории
+/// с одинаковым переводом («Fey Court» и «Fairy Court», оба «Двор фей»). Главным остаётся единственное число,
+/// иначе записанный раньше; второй ложится формой со своим переводом. Возвращает строки итога.
+pub fn merge_duplicate_terms(tx: &rusqlite::Connection) -> Result<Vec<String>, DbError> {
+    let mut terms = TermRepo { conn: tx }.list()?;
+    terms.sort_by_key(|term| term.id().map(TermId::get));
+    let translation = |term: &Term| term.translation().and_then(NameKey::new);
+    let mut gone: HashSet<TermId> = HashSet::new();
+    let mut merged = Vec::new();
+    for (index, first) in terms.iter().enumerate() {
+        let Some(a) = first.id() else { continue };
+        for second in &terms[index + 1..] {
+            let Some(b) = second.id() else { continue };
+            if gone.contains(&a) {
+                break;
+            }
+            if gone.contains(&b) {
+                continue;
+            }
+            let plural = plural_of(first.name(), second.name()) || plural_of(second.name(), first.name());
+            let same = first.category() == second.category() && translation(first).is_some() && translation(first) == translation(second);
+            if !plural && !same {
+                continue;
+            }
+            if let Some(text) = merge_entries(tx, Owner::Term(b), Owner::Term(a))? {
+                gone.insert(if (TermRepo { conn: tx }).get(a).is_ok() { b } else { a });
+                merged.push(text);
+            }
+        }
+    }
+    Ok(merged)
+}
+
 /// Новые записи разбора в глоссарий: персонаж с именем, фамилией и родом, термин с категорией. Другое имя
 /// известной записи или другой находки становится формой той записи, должность перед именем термином, персонаж
 /// из одного слова сливается с единственным полным, неразобранный говорящий привязывается к персонажу по подписи.
@@ -782,7 +966,13 @@ pub fn save_scene_found(tx: &rusqlite::Connection, found: &[Finding], scene: Opt
     let known: HashSet<NameKey> = known_for_prompt(tx)?.iter().filter_map(|name| NameKey::new(name)).collect();
     let glossary = GlossaryData::load(tx)?;
     let speakers: Vec<Speaker> = SpeakerRepo { conn: tx }.current()?.into_iter().map(|used| used.speaker).collect();
-    let new_labels = SpeakerRepo { conn: tx }.new_speakers()?.iter().filter_map(Speaker::label_key).collect();
+    let new_labels = SpeakerRepo { conn: tx }
+        .new_speakers()?
+        .iter()
+        .filter_map(|speaker| speaker.label.as_deref())
+        .flat_map(|label| [NameKey::new(label), NameKey::new(without_article(label))])
+        .flatten()
+        .collect();
     let mut owners = Owners::load(&glossary, &speakers);
     if let Some(key) = scene {
         owners.present = scene_entries(&glossary, &LineSampleRepo { conn: tx }.scene_lines(key)?).0;
@@ -793,6 +983,13 @@ pub fn save_scene_found(tx: &rusqlite::Connection, found: &[Finding], scene: Opt
     }
     saver.split_titled_terms()?;
     saver.drop_common_titles()?;
+    saver.titled_terms_to_characters()?;
+    saver.drop_common_characters()?;
+    let merged = merge_duplicate_terms(tx)?;
+    if !merged.is_empty() {
+        saver.added.extend(merged);
+        saver.reload()?;
+    }
     saver.merge_single_names()?;
     saver.link_speakers()?;
     Ok(saver.added)
@@ -897,6 +1094,22 @@ mod tests {
         assert!(is_token_label("[mc]") && is_token_label(" [player_name] "));
         assert!(!is_token_label("[mc]'s mom") && !is_token_label("[]") && !is_token_label("[a] [b]") && !is_token_label("Eileen"));
         assert!(!is_common_title("Detective-Colonel") && !is_common_title("Grand Duke") && !is_common_title("Selena"));
+    }
+
+    #[test]
+    fn common_words_articles_titles_and_plurals() {
+        let lines = |texts: &[&str]| texts.iter().map(|text| text.to_string()).collect::<Vec<_>>();
+        let game = lines(&["Boobjob", "Give him a... boobjob.", "Are you ready for your b-boobjob?", "Merek", "I saw Merek today.", "Crone! Ask the crone, Crone knows."]);
+        assert!(is_common_word("Boobjob", &game), "только строчными и строкой меню");
+        assert!(!is_common_word("Merek", &game) && !is_common_word("Crone", &game), "с заглавной посреди фразы это имя");
+        assert!(!is_common_word("Kastia", &game), "строчными не встречается");
+        assert!(is_common_word("boobjob", &game) && !is_common_word("Fairy Queen", &game));
+
+        assert_eq!(without_article("The Fairy Queen"), "Fairy Queen");
+        assert_eq!((without_article("the Order"), without_article("Theodore"), without_article("The")), ("Order", "Theodore", "The"));
+        assert!(is_person_title("Fairy Queen") && is_person_title("The Fairy King"));
+        assert!(!is_person_title("Queen") && !is_person_title("Order of the King") && !is_person_title("Ancient Forest"));
+        assert!(plural_of("pixies", "pixie") && plural_of("Witches", "witch") && !plural_of("pixie", "pixies") && !plural_of("as", "a"));
     }
 
     #[test]

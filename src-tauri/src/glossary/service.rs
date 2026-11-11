@@ -305,12 +305,13 @@ impl GlossaryService<'_> {
                 if let Some(category) = item.category {
                     term.set_category(category);
                 }
-                if let (None, Some(description)) = (term.description(), &item.description) {
-                    term.set_description(description);
-                }
+                // Пояснение модели к переводу («Название локации») описанием не пишется: оно повторяет категорию
+                // и закрыло бы термин от описания по сценам.
                 repo.save(&term)?;
                 written += 1;
             }
+            // Одинаковый перевод у двух терминов одной категории: это одно и то же («Fey Court» и «Fairy Court»).
+            super::analyze::merge_duplicate_terms(tx)?;
             Ok(written)
         })
     }

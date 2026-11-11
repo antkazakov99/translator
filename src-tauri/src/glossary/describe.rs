@@ -2377,6 +2377,75 @@ mod tests {
     }
 
     #[test]
+    fn junk_names_titled_people_and_duplicate_terms_from_a_real_game() {
+        use super::super::analyze::{Finding, FoundKind};
+        use crate::glossary::TermSuggestion;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let open = state.open_project(id).unwrap();
+        let glossary = GlossaryService { state: &state };
+        let found = |name: &str, kind| Finding { name: name.to_string(), kind, gender: None, same_as: None, parts: None };
+        let save = |findings: &[Finding]| open.project.write(|tx| save_found(tx, findings)).unwrap();
+        let general = FoundKind::Term(TermCategory::General);
+        let characters = || {
+            open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap().iter().filter_map(|character| character.first_name().map(str::to_string)).collect::<Vec<_>>()
+        };
+        let terms = || open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap();
+        open.project
+            .write(|tx| {
+                tx.execute("UPDATE segments SET source_text = 'Give him a... boobjob.' WHERE source_text = 'Static.'", [])?;
+                tx.execute("UPDATE segments SET source_text = 'Boobjob' WHERE source_text = 'Who?'", [])?;
+                tx.execute("UPDATE segments SET source_text = 'I saw Merek today.' WHERE source_text = 'Left side.'", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Слово из меню не персонаж, имя посреди фразы персонаж.
+        assert_eq!(save(&[found("Boobjob", FoundKind::Character), found("Merek", FoundKind::Character)]), ["Merek"]);
+        // Записанный раньше мусор убирается и больше не предлагается.
+        let junk = glossary.create_character(id, "Boobjob").unwrap();
+        assert_eq!(save(&[]), ["Boobjob (обычное слово, убрано)"]);
+        assert!(open.project.read(|tx| CharacterRepo { conn: tx }.get(junk)).is_err());
+        assert!(save(&[found("Boobjob", general)]).is_empty(), "слово в корзине");
+
+        // Титул как имя лица это персонаж без артикля, а записанный термином превращается в персонажа с переводом.
+        assert_eq!(save(&[found("The Fairy Queen", general)]), ["Fairy Queen"]);
+        let king = glossary.take_term(id, "Fairy King", TermCategory::Title).unwrap();
+        glossary.accept_terms(id, &[TermSuggestion { id: king, translation: "Король фей".to_string(), category: None, description: None }]).unwrap();
+        assert_eq!(save(&[]), ["Fairy King (термин → персонаж)"]);
+        assert_eq!(characters(), ["Fairy King", "Fairy Queen", "Merek"]);
+        let saved = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap();
+        assert_eq!(saved.iter().find(|character| character.first_name() == Some("Fairy King")).unwrap().translated_first_name(), Some("Король фей"));
+        assert!(terms().is_empty());
+
+        // Множественное число ложится формой единственного.
+        glossary.take_term(id, "pixie", TermCategory::General).unwrap();
+        assert_eq!(save(&[found("pixies", general)]), ["pixies → pixie"]);
+
+        // Пояснение модели к переводу описанием не пишется, одинаковый перевод одной категории сливает термины.
+        let fey = glossary.take_term(id, "Fey Court", TermCategory::Location).unwrap();
+        let fairy = glossary.take_term(id, "Fairy Court", TermCategory::Location).unwrap();
+        let forest = glossary.take_term(id, "Ancient Forest", TermCategory::Location).unwrap();
+        let suggestion = |id, translation: &str, note: &str| TermSuggestion { id, translation: translation.to_string(), category: None, description: Some(note.to_string()) };
+        let written = glossary
+            .accept_terms(id, &[suggestion(fey, "Двор фей", "Место обитания фей"), suggestion(fairy, "Двор фей", "Резиденция фей"), suggestion(forest, "Древний лес", "Название локации")])
+            .unwrap();
+        assert_eq!(written, 3);
+        let names: Vec<(String, Vec<String>, Option<String>)> = terms()
+            .iter()
+            .map(|term| (term.name().to_string(), term.forms().iter().map(|form| form.text().to_string()).collect(), term.description().map(str::to_string)))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Ancient Forest".to_string(), vec![], None),
+                ("Fey Court".to_string(), vec!["Fairy Court".to_string()], None),
+                ("pixie".to_string(), vec!["pixies".to_string()], None),
+            ]
+        );
+    }
+
+    #[test]
     fn short_names_find_their_full_name_and_the_scene_breaks_ties() {
         use super::super::analyze::{Finding, FoundKind, save_scene_found};
         let dir = tempfile::tempdir().unwrap();
