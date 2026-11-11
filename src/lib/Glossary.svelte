@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
+  import { activeRun } from "./run-status.svelte";
   import { Braces, BookText, LoaderCircle, MessagesSquare, SpellCheck, TriangleAlert, Users, X } from "lucide-svelte";
   import GlossaryCharacters from "./GlossaryCharacters.svelte";
   import GlossaryNameRules from "./GlossaryNameRules.svelte";
@@ -54,6 +55,35 @@
     } catch {
       // Без хранилища выбор просто не запомнится.
     }
+  });
+
+  /**
+   * Запуск модели (разбор сцен, «Вся игра», описания) пишет в глоссарий по ходу: пока он идёт, список
+   * перечитывается не чаще раза в `REFRESH_MS` и ещё раз после конца. Открытая карточка держит свой черновик.
+   */
+  const REFRESH_MS = 1500;
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let wasRunning = false;
+
+  function refreshSoon() {
+    if (refreshTimer) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      load();
+    }, REFRESH_MS);
+  }
+
+  $effect(() => {
+    const run = activeRun.current;
+    // Строка хода меняется с каждым запросом: по ней видно, что запуск продвинулся.
+    if (run && run.text) refreshSoon();
+    const running = run !== null;
+    if (wasRunning && !running) load();
+    wasRunning = running;
+  });
+
+  onDestroy(() => {
+    if (refreshTimer) clearTimeout(refreshTimer);
   });
 
   function open(next: Section) {
