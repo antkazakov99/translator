@@ -949,15 +949,6 @@ impl LineSampleRepo<'_> {
             .collect()
     }
 
-    /// Подписи говорящих текущего снимка: разбор сцены их не предлагает.
-    pub fn speaker_labels(&self) -> Result<Vec<String>, DbError> {
-        let mut statement = self.conn.prepare(
-            "SELECT label FROM speakers WHERE label IS NOT NULL AND last_seen_scan = (SELECT max(id) FROM scans)",
-        )?;
-        let labels = statement.query_map([], |row| row.get(0))?.collect::<Result<Vec<String>, _>>()?;
-        Ok(labels)
-    }
-
     /// Все реплики говорящего.
     pub fn of_speaker(&self, key: &SpeakerKey) -> Result<Vec<SampleLine>, DbError> {
         self.query(&format!("{} AND s.speaker_key = ?1 {}", Self::SELECT, Self::ORDER), key.as_str())

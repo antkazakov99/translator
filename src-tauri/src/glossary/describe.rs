@@ -2063,10 +2063,11 @@ mod tests {
         let (state, id) = project(dir.path(), &url);
         let service = DescribeService { state: &state };
         let left = ContainerKey::new("label:left").unwrap();
+        GlossaryService { state: &state }.keep_as_speaker(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
 
         let (channel, notes) = recorded();
         let described = tauri::async_runtime::block_on(service.describe(id, DescribeTarget::Scene(left.clone()), usize::MAX, None, channel)).unwrap();
-        assert_eq!(described.added, ["Left side"], "подпись говорящего и выдуманное имя не добавлены");
+        assert_eq!(described.added, ["Left side"], "подпись разобранного говорящего и выдуманное имя не добавлены");
         assert_eq!(
             *notes.lock().unwrap(),
             [
@@ -2196,7 +2197,11 @@ mod tests {
                 )
             })
             .unwrap();
-        assert_eq!(added, ["PPF → People's Police Force", "Order of the Dawn", "Ghost", "the Order → Order of the Dawn"], "обращение с фамилией не форма");
+        assert_eq!(
+            added,
+            ["PPF → People's Police Force", "Order of the Dawn", "Ghost", "the Order → Order of the Dawn", "Eileen (говорящий) → Eileen Lee"],
+            "обращение с фамилией не форма, говорящий привязан по имени"
+        );
 
         let (terms, character) = open.project.read(|tx| Ok((TermRepo { conn: tx }.list()?, CharacterRepo { conn: tx }.get(eileen)?))).unwrap();
         let police = terms.iter().find(|term| term.id() == Some(police)).unwrap();
@@ -2386,6 +2391,40 @@ mod tests {
         glossary.delete_character(id, eile.id().unwrap()).unwrap();
         assert_eq!(open.project.write(|tx| save_scene_found(tx, &[person("Eile")], Some(&start))).unwrap(), ["Eile → Eileen"]);
         assert_eq!(forms(eileen), ["Eile"]);
+    }
+
+    #[test]
+    fn speakers_without_a_character_are_linked_to_found_characters() {
+        use super::super::analyze::{Finding, FoundKind, NameParts, known_for_prompt};
+        use crate::common::Gender;
+        use crate::glossary::SpeakerLink;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let open = state.open_project(id).unwrap();
+        let found = |name: &str, kind| Finding { name: name.to_string(), kind, gender: None, same_as: None, parts: None };
+        let links = || open.project.read(|tx| SpeakerRepo { conn: tx }.links()).unwrap();
+
+        // Неразобранный говорящий моделью не скрыт: она назовёт его персонажем.
+        let known = open.project.read(|tx| known_for_prompt(tx)).unwrap();
+        assert!(!known.contains(&"Eileen".to_string()) && !known.contains(&"Radio Chatter".to_string()));
+
+        // Персонаж с подписью говорящего привязывает говорящего, подпись-роль термином не становится.
+        let eileen = Finding {
+            gender: Some(Gender::Female),
+            parts: NameParts::check("Eileen Grant", Some("Eileen"), Some("Grant")),
+            ..found("Eileen Grant", FoundKind::Character)
+        };
+        let added = open.project.write(|tx| save_found(tx, &[eileen, found("Radio Chatter", FoundKind::Term(TermCategory::General))])).unwrap();
+        assert_eq!(added, ["Eileen Grant", "Eileen (говорящий) → Eileen Grant"]);
+        let characters = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap();
+        let [character] = characters.as_slice() else { panic!("один персонаж: {characters:?}") };
+        assert_eq!(links(), [SpeakerLink { speaker: SpeakerKey::new("code:e").unwrap(), character: character.id().unwrap(), is_primary: true }]);
+        assert!(open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap().is_empty());
+
+        // Привязанный говорящий снова известен, повтор ничего не меняет.
+        assert!(open.project.read(|tx| known_for_prompt(tx)).unwrap().contains(&"Eileen".to_string()));
+        assert!(open.project.write(|tx| save_found(tx, &[found("Eileen", FoundKind::Character)])).unwrap().is_empty());
+        assert_eq!(links().len(), 1);
     }
 
     #[test]

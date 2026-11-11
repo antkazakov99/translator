@@ -1,16 +1,19 @@
 //! Разбор сцены моделью перед её описанием: новые персонажи и термины по частям сцены. Находки сводятся
-//! по `NameKey`, известное глоссарию, корзине терминов и подписям говорящих отсеивается, остальное сразу
+//! по `NameKey`, известное глоссарию, корзине терминов и подписям разобранных говорящих отсеивается, остальное сразу
 //! пишется в глоссарий. Описывает новые записи потом общий путь описаний.
 
 use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 
-use super::repo::{CharacterRepo, LineSampleRepo, TermRepo};
+use super::repo::{CharacterRepo, LineSampleRepo, SpeakerRepo, TermRepo};
 use super::entries::scene_entries;
 use super::service::{give_term, merge_characters, merge_terms};
 use crate::engines::ContainerKey;
-use super::{Character, CharacterId, DiscardReason, DiscardedTerm, Form, GlossaryData, NameKey, NoteOwner, NoteRepo, Term, TermCategory, TermId};
+use super::{
+    Character, CharacterId, DiscardReason, DiscardedTerm, Form, GlossaryData, NameKey, NoteOwner, NoteRepo, Speaker, SpeakerLink, Term, TermCategory,
+    TermId,
+};
 use crate::common::{Gender, Timestamp};
 use crate::llm::{ChatRequest, LlmTarget};
 use crate::storage::DbError;
@@ -312,7 +315,8 @@ impl Owners {
         }
     }
 
-    fn load(glossary: &GlossaryData) -> Self {
+    /// `speakers`: говорящие снимка. Подпись говорящего с одним персонажем ведёт к этому персонажу.
+    fn load(glossary: &GlossaryData, speakers: &[Speaker]) -> Self {
         let mut owners = Self { by_key: HashMap::new(), term_names: Vec::new(), first_names: Vec::new(), present: Vec::new() };
         for character in &glossary.characters {
             if let (Some(id), Some(first)) = (character.id(), character.first_name()) {
@@ -336,6 +340,13 @@ impl Owners {
                 .chain(character.forms().iter().map(|form| form.text().to_string()));
             for name in names {
                 owners.add(&name, Owner::Character(id));
+            }
+        }
+        for speaker in speakers {
+            let Some(label) = &speaker.label else { continue };
+            let linked: Vec<CharacterId> = glossary.links.iter().filter(|link| link.speaker == speaker.key).map(|link| link.character).collect();
+            if let [only] = linked.as_slice() {
+                owners.add(label, Owner::Character(*only));
             }
         }
         owners
@@ -455,6 +466,10 @@ fn is_honorific(title: &str) -> bool {
 struct Saver<'c> {
     tx: &'c rusqlite::Connection,
     known: HashSet<NameKey>,
+    /// Говорящие снимка: по подписям связанных находится персонаж.
+    speakers: Vec<Speaker>,
+    /// Подписи говорящих, которых пользователь ещё не разобрал: термином такая находка не становится.
+    new_labels: HashSet<NameKey>,
     owners: Owners,
     added: Vec<String>,
 }
@@ -466,7 +481,7 @@ impl Saver<'_> {
 
     fn reload(&mut self) -> Result<(), DbError> {
         let present = std::mem::take(&mut self.owners.present);
-        self.owners = Owners::load(&GlossaryData::load(self.tx)?);
+        self.owners = Owners::load(&GlossaryData::load(self.tx)?, &self.speakers);
         self.owners.present = present;
         Ok(())
     }
@@ -479,6 +494,10 @@ impl Saver<'_> {
             && self.names_a_person(finding, &name)
         {
             return self.save_titled(finding, &title, &name);
+        }
+        // Подпись говорящего («Waitress») переводится шагом подписей, а не термином.
+        if matches!(finding.kind, FoundKind::Term(_)) && self.new_labels.contains(&key) {
+            return Ok(());
         }
         if self.is_known(&key)? {
             // Известная запись оказалась другим именем другой записи: связь нашлась позже, записи сливаются.
@@ -638,6 +657,27 @@ impl Saver<'_> {
         Ok(())
     }
 
+    /// Говорящие, которых пользователь ещё не разобрал, привязываются к персонажу по подписи: подпись это имя,
+    /// фамилия, полное имя или форма персонажа, то же после должности («Detective-Colonel Karanovic») или короткая
+    /// форма единственного имени («Dimi» у «Dimitria», при нескольких решает сцена). Связь становится основной, если
+    /// у персонажа основной ещё нет.
+    fn link_speakers(&mut self) -> Result<(), DbError> {
+        let repo = SpeakerRepo { conn: self.tx };
+        let characters = CharacterRepo { conn: self.tx };
+        for speaker in repo.new_speakers()? {
+            let Some(label) = speaker.label.as_deref() else { continue };
+            let owner = |name: &str| NameKey::new(name).and_then(|key| self.owners.by_key.get(&key).copied());
+            let found = owner(label)
+                .or_else(|| title_and_name(label).and_then(|(_, name)| owner(&name)))
+                .or_else(|| (!label.contains(char::is_whitespace)).then(|| self.owners.short_form_owner(label, None).map(Owner::Character)).flatten());
+            let Some(Owner::Character(id)) = found else { continue };
+            let primary = !repo.links_of(id)?.iter().any(|link| link.is_primary);
+            repo.link(&SpeakerLink { speaker: speaker.key.clone(), character: id, is_primary: primary })?;
+            self.added.push(format!("{label} (говорящий) → {}", characters.get(id)?.full_name().unwrap_or_default()));
+        }
+        Ok(())
+    }
+
     /// Персонаж из одного слова сливается с единственным персонажем, у которого это слово фамилия или имя
     /// при фамилии («Karanovic» в «Vera Karanovic»), иначе с единственным, чьё имя это его полная или короткая
     /// форма («Dimi» и «Dimitria», при нескольких таких решает сцена). Главным остаётся полное имя.
@@ -681,7 +721,8 @@ impl Saver<'_> {
 
 /// Новые записи разбора в глоссарий: персонаж с именем, фамилией и родом, термин с категорией. Другое имя
 /// известной записи или другой находки становится формой той записи, должность перед именем термином, персонаж
-/// из одного слова сливается с единственным полным. Известное глоссарию, корзине терминов и подписям говорящих
+/// из одного слова сливается с единственным полным, неразобранный говорящий привязывается к персонажу по подписи.
+/// Известное глоссарию, корзине терминов и подписям разобранных говорящих
 /// пропускается. Возвращает написания добавленных, форму как «PPF → People's Police Force».
 pub fn save_found(tx: &rusqlite::Connection, found: &[Finding]) -> Result<Vec<String>, DbError> {
     save_scene_found(tx, found, None)
@@ -691,23 +732,30 @@ pub fn save_found(tx: &rusqlite::Connection, found: &[Finding]) -> Result<Vec<St
 pub fn save_scene_found(tx: &rusqlite::Connection, found: &[Finding], scene: Option<&ContainerKey>) -> Result<Vec<String>, DbError> {
     let known: HashSet<NameKey> = known_for_prompt(tx)?.iter().filter_map(|name| NameKey::new(name)).collect();
     let glossary = GlossaryData::load(tx)?;
-    let mut owners = Owners::load(&glossary);
+    let speakers: Vec<Speaker> = SpeakerRepo { conn: tx }.current()?.into_iter().map(|used| used.speaker).collect();
+    let new_labels = SpeakerRepo { conn: tx }.new_speakers()?.iter().filter_map(Speaker::label_key).collect();
+    let mut owners = Owners::load(&glossary, &speakers);
     if let Some(key) = scene {
         owners.present = scene_entries(&glossary, &LineSampleRepo { conn: tx }.scene_lines(key)?).0;
     }
-    let mut saver = Saver { tx, known, owners, added: Vec::new() };
+    let mut saver = Saver { tx, known, speakers, new_labels, owners, added: Vec::new() };
     for finding in ordered(found) {
         saver.save(finding)?;
     }
     saver.split_titled_terms()?;
     saver.merge_single_names()?;
+    saver.link_speakers()?;
     Ok(saver.added)
 }
 
-/// Имена, фамилии, полные имена и формы персонажей, термины и их формы и подписи говорящих текущего снимка.
+/// Имена, фамилии, полные имена и формы персонажей, термины и их формы и подписи разобранных говорящих текущего
+/// снимка. Подписи говорящих, которых пользователь ещё не разобрал, известными не считаются: модель называет их
+/// персонажами, и говорящий привязывается к найденному персонажу.
 pub fn known_for_prompt(tx: &rusqlite::Connection) -> Result<Vec<String>, DbError> {
     let glossary = GlossaryData::load(tx)?;
-    let labels = LineSampleRepo { conn: tx }.speaker_labels()?;
+    let speakers = SpeakerRepo { conn: tx };
+    let new: HashSet<_> = speakers.new_speakers()?.into_iter().map(|speaker| speaker.key).collect();
+    let labels = speakers.current()?.into_iter().filter(|used| !new.contains(&used.speaker.key)).filter_map(|used| used.speaker.label);
     let characters = glossary.characters.iter().flat_map(|character| {
         character
             .full_name()
