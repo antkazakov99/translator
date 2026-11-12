@@ -215,15 +215,15 @@ fn speaker_key(line: &DialogueData) -> Option<(SpeakerKey, bool)> {
 }
 
 /// Скрипт в тексте: `.rpy` как есть, `.rpyc` после декомпиляции.
-struct ScriptText<'a> {
-    file: &'a SnapshotFile,
-    text: String,
+pub(super) struct ScriptText<'a> {
+    pub(super) file: &'a SnapshotFile,
+    pub(super) text: String,
 }
 
 /// Собирает снимок из файлов в `FileStore`. Папка игры здесь уже не нужна.
 /// Тексты скриптов оригинала в порядке файлов: `.rpy` как есть, `.rpyc` декомпилированный.
 /// С `originals` заодно собирает реплики оригинала из `.rpyc`: по ним восстанавливается перевод в `.rpyc`.
-fn script_texts<'a>(
+pub(super) fn script_texts<'a>(
     files: &'a [SnapshotFile],
     store: &FileStore,
     mut originals: Option<&mut HashMap<String, String>>,

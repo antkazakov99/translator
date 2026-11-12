@@ -19,14 +19,15 @@ use super::same_entry::{self, SameEntryPrompt};
 use super::service::{GlossaryService, NamePick, game_tokens};
 use super::suggest::{
     SPEAKER_SAMPLES, SpeakerItem, SpeakerSuggestion, SpeakersPrompt, TERM_SAMPLES, TOKEN_SAMPLES, TermItem, TermSuggestion, TermsPrompt, TokenItem,
-    TokenSuggestion, TokensPrompt, sample_line, spread, token_line,
+    TokenSuggestion, TokensPrompt, player_input_note, sample_line, spread, token_line,
 };
 use super::{Character, CharacterId, CharacterRepo, GlossaryData, NameKey, NameOrigin, SpeakerRepo, TermId};
 use crate::common::{AppError, Timestamp, ValidationError};
-use crate::engines::SpeakerKey;
+use crate::engines::{SpeakerKey, VariableSource};
 use crate::llm::{Action, ChatRequest, LlmTarget, LlmTargetService, ProfileId, RunHost};
 use crate::name_rules::{LanguageTag, NameRule, NameRuleService, RulesDraftPrompt};
 use crate::projects::ProjectId;
+use crate::scan::ScanService;
 use crate::storage::DbError;
 use crate::state::{AppState, OpenProject};
 use crate::translation::Hints;
@@ -341,7 +342,7 @@ impl SuggestService<'_> {
             Ok((items, data))
         })?;
         items.sort_by_key(|item| item.name.split_whitespace().count());
-        self.offer::<TermsPrompt>(project, &open, &glossary, items, one_off, host.into(), taking).await
+        self.offer::<TermsPrompt>(project, &open, GlossaryContext::new(&glossary).hints, items, one_off, host.into(), taking).await
     }
 
     /// Вопросы «одно ли это» о терминах с одинаковым переводом («Fey Court» и «Fairy Court», оба «Двор фей»):
@@ -385,6 +386,11 @@ impl SuggestService<'_> {
     }
 
     /// Пояснения и значения токенов по репликам с `[___]` вместо токена. Токен без реплик пропускается: судить не о чем.
+    ///
+    /// Что скрипты игры говорят о переменной, отдаёт движок (`ScanService::text_variables`). Токен, значение
+    /// которого вводит игрок, модели не отправляется: он сразу получает пояснение без значения, тем же путём,
+    /// что ответ модели (цепочка пишет, окно получает в отбор). Константа идёт в запрос со значением из скрипта,
+    /// у меняющейся переменной значение из ответа не берётся (`TokenItem::takes_value`).
     pub async fn suggest_tokens(
         &self,
         project: ProjectId,
@@ -407,17 +413,45 @@ impl SuggestService<'_> {
             }
             Ok((lines, GlossaryData::load(tx)?))
         })?;
+        let lines: Vec<(String, Vec<SampleLine>)> = lines.into_iter().filter(|(_, found)| !found.is_empty()).collect();
+        if lines.is_empty() {
+            return Ok(Suggestions::default());
+        }
+        // Движок читает все скрипты снимка: долго, поэтому вне потоков запросов.
+        let names: Vec<String> = lines.iter().map(|(name, _)| name.clone()).collect();
+        let reader = open.clone();
+        let variables = tauri::async_runtime::spawn_blocking(move || ScanService::text_variables(&reader, &names))
+            .await
+            .map_err(|_| AppError::Cancelled)??;
+        let mut sources: HashMap<String, VariableSource> = variables.into_iter().map(|variable| (variable.name, variable.source)).collect();
+
         let values = token_values(&glossary);
-        let items: Vec<TokenItem> = lines
-            .into_iter()
-            .filter(|(_, found)| !found.is_empty())
-            .map(|(name, found)| {
-                let lines =
-                    spread(&found, TOKEN_SAMPLES).iter().map(|line| token_line(line.speaker.as_deref(), &line.text, &name, &values)).collect();
-                TokenItem { name, lines }
-            })
-            .collect();
-        self.offer::<TokensPrompt>(project, &open, &glossary, items, one_off, host.into(), taking).await
+        let mut hints = GlossaryContext::new(&glossary).hints;
+        let mut typed: Vec<TokenSuggestion> = Vec::new();
+        let mut items: Vec<TokenItem> = Vec::new();
+        for (name, found) in lines {
+            match sources.remove(&name).unwrap_or_default() {
+                VariableSource::PlayerInput { prompt } => {
+                    let note = player_input_note(prompt.as_deref());
+                    // В репликах остальных токенов этот остаётся токеном: пояснение идёт в их подсказки.
+                    hints.tokens.push((name.clone(), note.clone()));
+                    typed.push(TokenSuggestion { name, value: None, note: Some(note) });
+                }
+                source => {
+                    let lines =
+                        spread(&found, TOKEN_SAMPLES).iter().map(|line| token_line(line.speaker.as_deref(), &line.text, &name, &values)).collect();
+                    items.push(TokenItem { name, lines, source });
+                }
+            }
+        }
+        let written = match taking {
+            Taking::Write => GlossaryService { state: self.state }.accept_tokens(project, &typed)?,
+            Taking::Offer => 0,
+        };
+        let mut found = self.offer::<TokensPrompt>(project, &open, hints, items, one_off, host.into(), taking).await?;
+        found.written += written;
+        found.items.splice(0..0, typed);
+        Ok(found)
     }
 
     /// Перевод подписи и род говорящих по нескольким их репликам.
@@ -449,29 +483,33 @@ impl SuggestService<'_> {
                 SpeakerItem { key, label, lines }
             })
             .collect();
-        self.offer::<SpeakersPrompt>(project, &open, &glossary, items, one_off, host.into(), taking).await
+        self.offer::<SpeakersPrompt>(project, &open, GlossaryContext::new(&glossary).hints, items, one_off, host.into(), taking).await
     }
 
     /// Запуск предложений пакетами: запрос, разбор, итог в `llm_runs`. Ответ модели ждётся вне транзакции.
-    /// Ответ пакета идёт в подсказки следующих: знание растёт внутри запуска. `Taking::Write` пишет годное
-    /// после каждого пакета и запоминает записи, на которые годного ответа нет.
+    /// `hints`: подсказки глоссария на начало запуска. Ответ пакета идёт в подсказки следующих: знание растёт
+    /// внутри запуска. `Taking::Write` пишет годное после каждого пакета и запоминает записи, на которые годного
+    /// ответа нет.
     #[allow(clippy::too_many_arguments)]
     async fn offer<O: Offer>(
         &self,
         project: ProjectId,
         open: &Arc<OpenProject>,
-        glossary: &GlossaryData,
+        mut hints: Hints,
         items: Vec<O::Item>,
         one_off: Option<ProfileId>,
         host: RunHost,
         taking: Taking,
     ) -> Result<Suggestions<O::Found>, AppError> {
+        // Без записей модель не нужна: запуск проходит и там, где она не настроена.
+        if items.is_empty() {
+            return Ok(Suggestions::default());
+        }
         let target = LlmTargetService { state: self.state }.target(Some(open), O::ACTION, one_off)?;
         let batches = chunks(items, &target);
         if batches.is_empty() {
             return Ok(Suggestions::default());
         }
-        let mut hints = GlossaryContext::new(glossary).hints;
         let mut run = BatchRun::begin(self.state, open, O::ACTION, &target, host, batches.len())?;
         let mut found: Vec<O::Found> = Vec::new();
         let mut written = 0;
@@ -810,7 +848,7 @@ impl Spelling<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glossary::describe::tests::{project, silent, system_text, user_text};
+    use crate::glossary::describe::tests::{project, project_with, silent, system_text, user_text};
     use crate::glossary::{NameField, TermCategory, TermRepo};
     use crate::llm::client::tests::{completion, fake_model};
 
@@ -1189,6 +1227,133 @@ mod tests {
         let found = tauri::async_runtime::block_on(SuggestService { state: &state }.suggest_tokens(id, vec!["mc".to_string()], None, silent(), Taking::Write));
         assert_eq!(found.unwrap(), Suggestions::default());
         assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// Скрипт с переменными: ввод игрока, константа, переменная с двумя значениями, незаданная и константа без слов.
+    const TOKENS_SCRIPT: &str = r#"define mom = _("Mom")
+default title = "Mr."
+define config.version = "1.0"
+
+label names:
+    $ hero = renpy.input("{i}What is your name?{/i}", length=12).strip()
+    if hero == "Ann":
+        $ title = "Ms."
+    e "Hi, [hero]! Ask [mom]."
+    e "Good day, [title] [hero!c]."
+    e "Take [thing] with you."
+    e "Version [config.version]."
+    return
+"#;
+
+    const HERO_NOTE: &str = "Значение вводит игрок. Вопрос игры: «What is your name?»";
+
+    fn token_names_of(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// Токены проекта: имя, значение, пояснение.
+    fn stored_tokens(state: &AppState, project: ProjectId) -> Vec<(String, Option<String>, Option<String>)> {
+        let open = state.open_project(project).unwrap();
+        let tokens = open.project.read(|tx| crate::glossary::TokenRepo { conn: tx }.list()).unwrap();
+        let mut shown: Vec<_> =
+            tokens.iter().map(|token| (token.name().to_string(), token.value().map(str::to_string), token.note().map(str::to_string))).collect();
+        shown.sort();
+        shown
+    }
+
+    #[test]
+    fn chain_takes_token_facts_from_the_scripts_of_the_game() {
+        let (url, seen) = fake_model(|_| {
+            completion(
+                r#"[{"id": 1, "note": "Как герой зовёт мать", "value": "Мама"}, {"id": 2, "note": "Обращение к герою", "value": "господин"},
+                    {"id": 3, "note": "", "value": ""}, {"id": 4, "note": "Версия игры", "value": "1.0"}]"#,
+            )
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project_with(dir.path(), &url, &[("tokens.rpy", TOKENS_SCRIPT)]);
+        let service = SuggestService { state: &state };
+        let tokens = token_names_of(&["hero", "mom", "title", "thing", "config.version", "nobody"]);
+        let found = tauri::async_runtime::block_on(service.suggest_tokens(id, tokens.clone(), None, silent(), Taking::Write)).unwrap();
+        assert_eq!((found.written, found.error), (4, None));
+
+        let requests: Vec<String> = seen.lock().unwrap().iter().map(user_text).collect();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.starts_with(&format!("Tokens: [hero] = {HERO_NOTE}\n\n")), "пояснение вводимого токена в подсказках: {request}");
+        assert!(request.contains("\nid: 1\nScript value: \"Mom\"\nLines:\nEileen: Hi, [hero]! Ask [___].\n"), "{request}");
+        assert!(request.contains("\nid: 2\nChanges during the game. Script values: \"Mr.\", \"Ms.\"\nLines:\nEileen: Good day, [___] [hero!c].\n"), "{request}");
+        assert!(request.contains("\nid: 3\nLines:\nEileen: Take [___] with you.\n"), "{request}");
+        assert!(request.contains("\nid: 4\nScript value: \"1.0\"\nLines:\n"), "{request}");
+        assert!(!request.contains("\nid: 5\n"), "токен, который вводит игрок, и токен без реплик в запрос не идут: {request}");
+
+        let token = |name: &str, value: Option<&str>, note: Option<&str>| (name.to_string(), value.map(str::to_string), note.map(str::to_string));
+        assert_eq!(
+            stored_tokens(&state, id),
+            [
+                token("config.version", None, Some("Версия игры")),
+                token("hero", None, Some(HERO_NOTE)),
+                token("mom", Some("Мама"), Some("Как герой зовёт мать")),
+                token("title", None, Some("Обращение к герою")),
+            ],
+            "значение записано только константе со словами, вводимый токен получил пояснение без модели"
+        );
+        assert_eq!(asked(&state, id, AskKind::Token), ["thing"], "токен без годного ответа запомнен");
+
+        // Записанное цепочке больше не работа. «nobody» в репликах нет: его нет и в работе.
+        let open = state.open_project(id).unwrap();
+        assert!(open.project.read(|tx| glossary_work(tx, true)).unwrap().tokens.is_empty());
+    }
+
+    #[test]
+    fn typed_in_token_comes_to_the_window_without_the_model_and_fills_only_an_empty_note() {
+        let dir = tempfile::tempdir().unwrap();
+        // Модели по этому адресу нет: запрос оборвал бы запуск.
+        let (state, id) = project_with(dir.path(), "http://127.0.0.1:9/v1", &[("tokens.rpy", TOKENS_SCRIPT)]);
+        let service = SuggestService { state: &state };
+        let run = |taking| tauri::async_runtime::block_on(service.suggest_tokens(id, token_names_of(&["hero"]), None, silent(), taking)).unwrap();
+
+        let offered = run(Taking::Offer);
+        let suggestion = TokenSuggestion { name: "hero".to_string(), value: None, note: Some(HERO_NOTE.to_string()) };
+        assert_eq!(offered, Suggestions { items: vec![suggestion.clone()], error: None, written: 0 });
+        assert!(stored_tokens(&state, id).is_empty(), "окно само не пишет");
+        let runs: i64 =
+            state.open_project(id).unwrap().project.read(|tx| Ok(tx.query_row("SELECT count(*) FROM llm_runs", [], |row| row.get(0))?)).unwrap();
+        assert_eq!(runs, 0, "запуска модели не было");
+
+        // Своё пояснение остаётся: запись идёт только в пустое поле.
+        let glossary = GlossaryService { state: &state };
+        let own = TokenSuggestion { name: "hero".to_string(), value: None, note: Some("Имя героя".to_string()) };
+        assert_eq!(glossary.accept_tokens(id, &[own]).unwrap(), 1);
+        let written = run(Taking::Write);
+        assert_eq!((written.written, written.items), (0, vec![suggestion]));
+        assert_eq!(stored_tokens(&state, id), [("hero".to_string(), None, Some("Имя героя".to_string()))]);
+    }
+
+    /// Шаг токенов на настоящей игре из `TRANSLATOR_TEST_VARIABLES_GAME` (папка `game`): печатает токены, которые
+    /// получили пояснение без модели, и первый запрос к модели. Модель поддельная и отвечает пустым списком.
+    #[test]
+    #[ignore = "Читает настоящую игру: TRANSLATOR_TEST_VARIABLES_GAME"]
+    fn token_step_reads_a_real_game() {
+        use crate::glossary::describe::tests::project_of;
+
+        let Some(game) = crate::engines::renpy::local_test_game("TRANSLATOR_TEST_VARIABLES_GAME") else { return };
+        let (url, seen) = fake_model(|_| completion("[]"));
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::projects::GameRoot::new(std::path::Path::new(&game).parent().unwrap()).unwrap();
+        let (state, id) = project_of(dir.path(), &url, root);
+        let tokens = state.open_project(id).unwrap().project.read(|tx| glossary_work(tx, true)).unwrap().tokens;
+        let started = std::time::Instant::now();
+        let found = tauri::async_runtime::block_on(SuggestService { state: &state }.suggest_tokens(id, tokens.clone(), None, silent(), Taking::Offer)).unwrap();
+        let requests = seen.lock().unwrap();
+        println!("{game}: токенов {}, без модели {}, запросов {}, шаг {:?}", tokens.len(), found.items.len(), requests.len(), started.elapsed());
+        for item in &found.items {
+            println!("[{}] {}", item.name, item.note.as_deref().unwrap_or_default());
+        }
+        if let Some(first) = requests.first() {
+            println!("{}", user_text(first));
+        }
+        assert_eq!(found.error, None);
+        assert!(found.items.iter().all(|item| item.value.is_none()), "без модели значение не пишется");
     }
 
     #[test]

@@ -316,7 +316,7 @@ fn script_texts(trimmed: &str, hidden: bool) -> Vec<(Option<&str>, String)> {
 }
 
 /// Значение строки Python. Пробелы, в отличие от строк сценария, не схлопываются.
-fn unescape_python_string(s: &str) -> String {
+pub(super) fn unescape_python_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

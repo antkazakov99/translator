@@ -10,6 +10,7 @@ pub mod rpyc_writer;
 pub mod scenes;
 pub mod script;
 pub mod snapshot;
+pub mod variables;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,7 @@ use regex::Regex;
 
 use super::{
     EngineError, EngineFont, EngineId, FileKind, GameEngine, GameInfo, GameSnapshot, GameSource, ModArchive, ModInput,
-    SnapshotEdge, SnapshotFile, SourceText,
+    SnapshotEdge, SnapshotFile, SourceText, TextVariable,
 };
 use crate::files::FileStore;
 use crate::projects::GameRoot;
@@ -30,7 +31,9 @@ pub struct RenpyEngine;
 
 /// Версия разбора: заменяет `CACHE_VERSION` из `rpa.rs`. Выросла: снимок пересобирается из `files/`.
 /// 2: строка `old` в строковом переводе получает свой номер строки, а не номер из комментария над ней.
-const PARSER_VERSION: u32 = 2;
+/// 3: декомпилятор пишет хранилище в `define gui.x`, отступы кода Python после `$` и строки экранов,
+/// которые пишут в переменные.
+const PARSER_VERSION: u32 = 3;
 
 /// Версия сборки переходов между метками (`scenes::scene_edges`). Выросла: таблица `edges` пересобирается.
 const EDGES_VERSION: u32 = 1;
@@ -108,6 +111,11 @@ impl GameEngine for RenpyEngine {
 
     fn fonts(&self, files: &[SnapshotFile], store: &FileStore) -> Result<Vec<EngineFont>, EngineError> {
         fonts::game_fonts(files, store)
+    }
+
+    /// Присваивания переменной в скриптах оригинала: `define`, `default`, код Python, поля ввода экранов.
+    fn text_variables(&self, names: &[String], files: &[SnapshotFile], store: &FileStore) -> Result<Vec<TextVariable>, EngineError> {
+        variables::text_variables(names, files, store)
     }
 
     /// `ru_lang.rpa`: переводы `tl/<язык>`, строковые переводы, подписи говорящих, включение языка, шрифты.

@@ -221,6 +221,27 @@ pub struct EngineFont {
     pub locked: Option<String>,
 }
 
+/// Что скрипты игры говорят о значении текстовой переменной.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum VariableSource {
+    /// Одна строка на всю игру, как она записана в скрипте.
+    Constant(String),
+    /// Значение вводит игрок. `prompt`: вопрос, который задаёт игра, одной строкой и без разметки движка.
+    PlayerInput { prompt: Option<String> },
+    /// Значений несколько или значение считает код. `values`: строки, которые скрипты записывают в переменную.
+    Varies { values: Vec<String> },
+    /// Скрипты переменную не задают, или движок такого не разбирает.
+    #[default]
+    Unknown,
+}
+
+/// Текстовая переменная игры: имя, как оно стоит в реплике, без скобок.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextVariable {
+    pub name: String,
+    pub source: VariableSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FontSwap {
     pub target_path: String,
@@ -283,6 +304,10 @@ pub trait GameEngine: Sync {
 
     /// Шрифты игры по файлам снимка: упоминания в скриптах и то, что помешает замене.
     fn fonts(&self, files: &[SnapshotFile], store: &FileStore) -> Result<Vec<EngineFont>, EngineError>;
+
+    /// Что скрипты снимка говорят о переменных `names`: по записи на имя, в том же порядке. Имя это токен
+    /// реплики без скобок. Считается по файлам снимка при каждом вызове, в базе не хранится.
+    fn text_variables(&self, names: &[String], files: &[SnapshotFile], store: &FileStore) -> Result<Vec<TextVariable>, EngineError>;
 
     /// Собирает мод без папки игры: всё нужное лежит в `input` и `files`.
     fn build_mod(&self, input: &ModInput, files: &FileStore, out_dir: &std::path::Path) -> Result<ModArchive, EngineError>;

@@ -2,7 +2,7 @@
 
 use super::{EdgeRepo, FileId, MatchSegment, Matcher, MissingSegment, ScanReport, ScanRepo, SegmentId};
 use crate::common::{AppError, ValidationError};
-use crate::engines::{self, GameEngine, GameSnapshot, GameSource, SourceText};
+use crate::engines::{self, GameEngine, GameSnapshot, GameSource, SourceText, TextVariable};
 use crate::projects::{GameRoot, ProjectId, ProjectInfoRepo, ProjectRepo};
 use crate::state::{AppState, OpenProject};
 use crate::storage::DbError;
@@ -44,6 +44,16 @@ impl ScanService<'_> {
         let engine = engines::by_id(info.engine).ok_or(AppError::UnsupportedEngine(info.engine))?;
         // Долго для .rpyc перевода: декомпилируются все скрипты. Вне транзакции.
         Ok((path, engine.source_text(current, &files, &open.files)?))
+    }
+
+    /// Что скрипты текущего снимка говорят о переменных игры `names`: запись на имя, в том же порядке. Папка
+    /// игры не нужна. Считается при каждом вызове и долго: читаются все скрипты, `.rpyc` декомпилируются.
+    /// Принимает открытый проект, а не `self`: шаг токенов зовёт это из потока для блокирующей работы.
+    pub fn text_variables(open: &OpenProject, names: &[String]) -> Result<Vec<TextVariable>, AppError> {
+        let _lock = open.snapshot_lock.lock();
+        let (info, files) = open.project.read(|tx| Ok((ProjectInfoRepo { conn: tx }.get()?, ScanRepo { conn: tx }.current_files()?)))?;
+        let engine = engines::by_id(info.engine).ok_or(AppError::UnsupportedEngine(info.engine))?;
+        Ok(engine.text_variables(names, &files, &open.files)?)
     }
 
     /// Пересобирает снимок из `files/` последнего считывания, без папки игры. `GameInfo` берётся из того же считывания.

@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use super::{TermCategory, TermId};
 use crate::common::Gender;
-use crate::engines::SpeakerKey;
+use crate::engines::{SpeakerKey, VariableSource};
 use crate::llm::{ChatRequest, LlmTarget};
 use crate::translation::Hints;
 use crate::translation::answer::json_array;
@@ -68,14 +68,18 @@ Respond ONLY with a valid JSON array, without markdown fences or explanations:
 const TOKENS_SYSTEM: &str = r#"You study text variables of a visual novel that is being translated into Russian.
 The game replaces each variable with a string at run time. In the lines below the variable is shown as [___].
 
-Work out from the lines what each variable stands for. Rely only on the lines. If the lines do not show what it means, leave the field empty instead of guessing.
+Work out from the lines what each variable stands for. Rely only on the lines and on what the game script says about the variable. If they do not show what it means, leave the field empty instead of guessing.
+
+A variable may come with a fact from the game script. It is true: trust it over the lines.
+- "Script value": the variable holds this one English string for the whole game. "value" is its Russian translation, with the capitalization of the English string.
+- "Changes during the game": the script gives the variable different strings, "Script values" lists the ones it names. Leave "value" empty and say in "note" what the variable chooses between.
 
 For each variable output:
 1. "id": EXACT id as given.
 2. "note": One short sentence in Russian for a translator: what the variable stands for and who it refers to.
-3. "value": A Russian word or phrase in the nominative case that reads correctly in place of [___]. Empty string if the player types it in, if it changes during the game, or if the lines do not settle it.
+3. "value": A Russian word or phrase in the nominative case that reads correctly in place of [___]. Empty string if the player types it in, if it changes during the game, or if neither the script nor the lines settle it.
 
-A line starting with "Russian names:" gives the exact spelling of names. A line starting with "Known terms:" gives established translations.
+A line starting with "Russian names:" gives the exact spelling of names. A line starting with "Known terms:" gives established translations. A line starting with "Tokens:" explains other variables of the lines.
 
 Respond ONLY with a valid JSON array, without markdown fences or explanations:
 [
@@ -108,6 +112,60 @@ pub struct SpeakerItem {
 pub struct TokenItem {
     pub name: String,
     pub lines: Vec<String>,
+    /// Что о значении говорят скрипты игры: от этого зависит, что модель видит и что из ответа берётся.
+    pub source: VariableSource,
+}
+
+impl TokenItem {
+    /// Строка запроса со сведениями из скриптов. О токене, про который скрипты молчат, строки нет.
+    fn script_fact(&self) -> Option<String> {
+        match &self.source {
+            VariableSource::Constant(value) => Some(format!("Script value: {}", quoted(value))),
+            VariableSource::Varies { values } if values.is_empty() => Some("Changes during the game.".to_string()),
+            VariableSource::Varies { values } => {
+                let values: Vec<String> = values.iter().map(|value| quoted(value)).collect();
+                Some(format!("Changes during the game. Script values: {}", values.join(", ")))
+            }
+            VariableSource::PlayerInput { .. } => Some("Typed in by the player.".to_string()),
+            VariableSource::Unknown => None,
+        }
+    }
+
+    /// Берётся ли значение из ответа. Значение токена подставляется в реплики до перевода, поэтому оно
+    /// принимается, только когда скрипты ему не противоречат: о переменной ничего не известно или она
+    /// константа со словами. Константа без букв («0.37») и с разметкой остаётся токеном: её подставит игра.
+    fn takes_value(&self) -> bool {
+        match &self.source {
+            VariableSource::Unknown => true,
+            VariableSource::Constant(value) => markers(value).is_empty() && value.chars().any(char::is_alphabetic),
+            VariableSource::PlayerInput { .. } | VariableSource::Varies { .. } => false,
+        }
+    }
+
+    /// Строки скрипта, по которым ищутся подсказки глоссария: имя в значении получает своё написание.
+    fn script_texts(&self) -> &[String] {
+        match &self.source {
+            VariableSource::Constant(value) => std::slice::from_ref(value),
+            VariableSource::Varies { values } => values,
+            VariableSource::PlayerInput { .. } | VariableSource::Unknown => &[],
+        }
+    }
+}
+
+/// Сколько знаков вопроса игры идёт в пояснение токена.
+const PLAYER_PROMPT_CHARS: usize = 160;
+
+/// Пояснение токена, значение которого вводит игрок: это видно из скриптов, модель о нём не спрашивают.
+/// `prompt`: вопрос, который игра задаёт игроку.
+pub fn player_input_note(prompt: Option<&str>) -> String {
+    match prompt.map(str::trim).filter(|prompt| !prompt.is_empty()) {
+        Some(prompt) => {
+            let shown: String = prompt.chars().take(PLAYER_PROMPT_CHARS).collect();
+            let cut = if shown.len() < prompt.len() { "…" } else { "" };
+            format!("Значение вводит игрок. Вопрос игры: «{shown}{cut}»")
+        }
+        None => "Значение вводит игрок.".to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,10 +404,15 @@ pub struct TokensPrompt;
 
 impl TokensPrompt {
     pub fn build(batch: &[TokenItem], hints: &Hints, target: &LlmTarget) -> ChatRequest {
-        let text: String = batch.iter().flat_map(|token| &token.lines).map(|line| format!("{line}\n")).collect();
+        let text: String =
+            batch.iter().flat_map(|token| token.lines.iter().chain(token.script_texts())).map(|line| format!("{line}\n")).collect();
         let mut list = String::new();
         for (index, token) in batch.iter().enumerate() {
-            list.push_str(&format!("\nid: {}\nLines:\n", index + 1));
+            list.push_str(&format!("\nid: {}\n", index + 1));
+            if let Some(fact) = token.script_fact() {
+                list.push_str(&format!("{fact}\n"));
+            }
+            list.push_str("Lines:\n");
             for line in &token.lines {
                 list.push_str(&format!("{line}\n"));
             }
@@ -362,12 +425,13 @@ impl TokensPrompt {
         }
     }
 
-    /// Значение или пояснение, хотя бы одно. Значение с `[___]` модель списала из реплики.
+    /// Значение или пояснение, хотя бы одно. Значение с `[___]` модель списала из реплики. Значение токена,
+    /// который по скриптам меняется или вводится игроком, не берётся (`TokenItem::takes_value`).
     pub fn accept(text: &str, batch: &[TokenItem]) -> Vec<TokenSuggestion> {
         by_number(text, batch)
             .into_iter()
             .filter_map(|(token, item)| {
-                let value = field(item.value.as_deref()).filter(|text| !text.contains(TOKEN_GAP));
+                let value = field(item.value.as_deref()).filter(|text| token.takes_value() && !text.contains(TOKEN_GAP));
                 let note = field(item.note.as_deref());
                 (value.is_some() || note.is_some()).then(|| TokenSuggestion { name: token.name.clone(), value, note })
             })
@@ -456,12 +520,64 @@ mod tests {
         let line = token_line(Some("Celia"), "Hi, [mc!c].\nI'm [mom].", "mc", &values);
         assert_eq!(line, "Celia: Hi, [___]. I'm мама.");
 
-        let batch = [TokenItem { name: "mc".to_string(), lines: vec![line] }, TokenItem { name: "pet".to_string(), lines: Vec::new() }];
+        let batch = [token("mc", vec![line], VariableSource::Unknown), token("pet", Vec::new(), VariableSource::Unknown)];
         let answer = r#"[{"id": 1, "value": "", "note": "Имя героя"}, {"id": 2, "value": "[___]", "note": ""}]"#;
+        assert_eq!(TokensPrompt::accept(answer, &batch), [suggestion("mc", None, Some("Имя героя"))]);
+    }
+
+    fn token(name: &str, lines: Vec<String>, source: VariableSource) -> TokenItem {
+        TokenItem { name: name.to_string(), lines, source }
+    }
+
+    fn suggestion(name: &str, value: Option<&str>, note: Option<&str>) -> TokenSuggestion {
+        TokenSuggestion { name: name.to_string(), value: value.map(str::to_string), note: note.map(str::to_string) }
+    }
+
+    #[test]
+    fn tokens_prompt_gives_script_facts_and_the_answer_keeps_a_value_the_script_allows() {
+        let constant = |value: &str| VariableSource::Constant(value.to_string());
+        let varies = |values: &[&str]| VariableSource::Varies { values: values.iter().map(|value| value.to_string()).collect() };
+        let line = |text: &str| vec![text.to_string()];
+        let batch = [
+            token("mom", line("Ask [___]."), constant("Joyce")),
+            token("title", line("Good day, [___]."), varies(&["Mr.", "Ms."])),
+            token("score", line("Score: [___]"), varies(&[])),
+            token("thing", line("Take [___]."), VariableSource::Unknown),
+            token("config.version", line("Version [___]"), constant("0.37")),
+            token("heart", line("I [___] you"), constant("{b}love{/b}")),
+            token("mc", line("Hi, [___]!"), VariableSource::PlayerInput { prompt: None }),
+        ];
+        let hints = Hints { names: vec![("Joyce".to_string(), "Джойс".to_string(), None)], ..Hints::default() };
+        let request = TokensPrompt::build(&batch, &hints, &target());
+        assert!(request.user.starts_with("Russian names: Joyce = Джойс"), "имя из значения скрипта получает написание: {}", request.user);
+        assert!(request.user.contains("\nid: 1\nScript value: \"Joyce\"\nLines:\nAsk [___].\n"), "{}", request.user);
+        assert!(request.user.contains("\nid: 2\nChanges during the game. Script values: \"Mr.\", \"Ms.\"\nLines:\n"), "{}", request.user);
+        assert!(request.user.contains("\nid: 3\nChanges during the game.\nLines:\n"), "{}", request.user);
+        assert!(request.user.contains("\nid: 4\nLines:\nTake [___].\n"), "о токене без сведений строки нет: {}", request.user);
+
+        let answer = r#"[{"id": 1, "value": "Джойс", "note": "Имя матери"}, {"id": 2, "value": "господин", "note": "Обращение к герою"},
+            {"id": 3, "value": "10", "note": ""}, {"id": 4, "value": "ключ", "note": "Что герой берёт"},
+            {"id": 5, "value": "0.37", "note": "Версия игры"}, {"id": 6, "value": "люблю", "note": ""}, {"id": 7, "value": "Макс", "note": "Имя героя"}]"#;
         assert_eq!(
             TokensPrompt::accept(answer, &batch),
-            [TokenSuggestion { name: "mc".to_string(), value: None, note: Some("Имя героя".to_string()) }]
+            [
+                suggestion("mom", Some("Джойс"), Some("Имя матери")),
+                suggestion("title", None, Some("Обращение к герою")),
+                suggestion("thing", Some("ключ"), Some("Что герой берёт")),
+                suggestion("config.version", None, Some("Версия игры")),
+                suggestion("mc", None, Some("Имя героя")),
+            ],
+            "значение берётся у константы со словами и у токена без сведений; у меняющегося и вводимого только пояснение"
         );
+    }
+
+    #[test]
+    fn player_input_note_quotes_the_question_of_the_game() {
+        assert_eq!(player_input_note(None), "Значение вводит игрок.");
+        assert_eq!(player_input_note(Some("  ")), "Значение вводит игрок.");
+        assert_eq!(player_input_note(Some("What's your name?")), "Значение вводит игрок. Вопрос игры: «What's your name?»");
+        let long = player_input_note(Some(&"я".repeat(400)));
+        assert!(long.ends_with("я…»") && long.chars().count() < 220, "{long}");
     }
 
     #[test]

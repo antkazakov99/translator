@@ -1258,8 +1258,21 @@ pub(crate) mod tests {
 
     /// Открытый проект по синтетической игре с моделью на `url`.
     pub(crate) fn project(dir: &std::path::Path, url: &str) -> (AppState, ProjectId) {
-        let state = AppState::start(dir.join("data"), memory_secrets()).unwrap();
+        project_with(dir, url, &[])
+    }
+
+    /// То же с дополнительными скриптами игры: имя файла в папке `game` и его текст.
+    pub(crate) fn project_with(dir: &std::path::Path, url: &str, scripts: &[(&str, &str)]) -> (AppState, ProjectId) {
         let root = crate::engines::renpy::snapshot::tests::sample_game(&dir.join("game"));
+        for (name, text) in scripts {
+            std::fs::write(dir.join("game").join("game").join(name), text).unwrap();
+        }
+        project_of(dir, url, root)
+    }
+
+    /// Открытый проект по игре `root` с моделью на `url`. Данные приложения лежат в `dir`.
+    pub(crate) fn project_of(dir: &std::path::Path, url: &str, root: crate::projects::GameRoot) -> (AppState, ProjectId) {
+        let state = AppState::start(dir.join("data"), memory_secrets()).unwrap();
         let service = ProjectService { state: &state };
         let id = service.create(root).unwrap().id();
         service.open(id).unwrap();

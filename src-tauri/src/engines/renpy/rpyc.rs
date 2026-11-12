@@ -34,6 +34,10 @@ const MAX_RPYC_BYTES: u64 = 128 * 1024 * 1024;
 const TREE_WALK_STACK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_AST_BYTES: usize = 256 * 1024 * 1024;
 
+/// Вызовы в коде экрана, ради которых его строка остаётся в декомпилированном тексте: переходы, показ
+/// других экранов и запись в переменные игры (`variables.rs`).
+const SCREEN_LINK_CALLS: &[&str] = &["Jump(", "Call(", "Show(", "ToggleScreen(", "InputValue(", "SetVariable(", "ToggleVariable("];
+
 impl RpycParser {
     /// Считывает таблицу слотов из .rpyc файла
     pub fn read_slots(data: &[u8]) -> Result<Vec<RpycSlot>, String> {
@@ -562,7 +566,7 @@ impl RpycParser {
                         if !varname.is_empty() {
                             stmts.push(RpycStatement {
                                 kind: "define".to_string(),
-                                scene_name: varname.clone(),
+                                scene_name: Self::stored_name(state.as_deref(), &varname),
                                 speaker: Some(varname),
                                 text: code_str,
                                 line_number,
@@ -581,7 +585,7 @@ impl RpycParser {
                         if !varname.is_empty() {
                             stmts.push(RpycStatement {
                                 kind: "default".to_string(),
-                                scene_name: varname.clone(),
+                                scene_name: Self::stored_name(state.as_deref(), &varname),
                                 speaker: None,
                                 text: code_str,
                                 line_number,
@@ -668,12 +672,12 @@ impl RpycParser {
         }
     }
 
-    /// Собирает из узлов экрана строки с действиями кнопок и вложенные экраны.
-    /// Узлы экранов различаются между версиями Ren'Py, поэтому обход не зависит от их полей.
+    /// Собирает из узлов экрана строки с действиями кнопок, вложенные экраны и строки, которые пишут
+    /// в переменные игры. Узлы экранов различаются между версиями Ren'Py, поэтому обход не зависит от их полей.
     fn collect_screen_links(val: &PickleValue, links: &mut Vec<String>) {
         match val {
             PickleValue::String(text) => {
-                if text.contains("Jump(") || text.contains("Call(") || text.contains("Show(") || text.contains("ToggleScreen(") {
+                if SCREEN_LINK_CALLS.iter().any(|call| text.contains(call)) {
                     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
                     if !links.contains(&line) {
                         links.push(line);
@@ -704,6 +708,16 @@ impl RpycParser {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Имя переменной `define` и `default` вместе с хранилищем: `gui.text_size`, `persistent.name`.
+    /// Без него `define config.name` читался бы как переменная `name`.
+    fn stored_name(state: Option<&PickleValue>, varname: &str) -> String {
+        let store = Self::get_field_val(state, "store").and_then(PickleValue::as_str).unwrap_or("store");
+        match store.strip_prefix("store.") {
+            Some(inner) if !inner.is_empty() => format!("{inner}.{varname}"),
+            _ => varname.to_string(),
         }
     }
 
@@ -874,11 +888,13 @@ impl RpycParser {
                     out.push_str(&format!("{}default {} = {}\n", top, stmt.scene_name, stmt.text));
                 }
                 "python" => {
-                    for line in stmt.text.lines() {
-                        let trimmed = line.trim();
-                        if !trimmed.is_empty() {
-                            out.push_str(&format!("{}$ {}\n", top, trimmed));
-                        }
+                    // Отступ внутри блока остаётся после `$`: по нему видно тело функции и класса.
+                    let indent_of = |line: &str| line.len() - line.trim_start().len();
+                    let lines = || stmt.text.lines().filter(|line| !line.trim().is_empty());
+                    let base = lines().map(indent_of).min().unwrap_or(0);
+                    for line in lines() {
+                        let line = line.trim_end();
+                        out.push_str(&format!("{}$ {}\n", top, line.get(base..).unwrap_or(line.trim_start())));
                     }
                 }
                 _ => {}
