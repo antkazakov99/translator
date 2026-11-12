@@ -12,7 +12,8 @@ use super::{
     TranslationRepo, TranslationScope, scene_hits,
 };
 use crate::common::{AppError, Timestamp};
-use crate::glossary::describe::{RunAsk, SceneReader};
+use crate::glossary::describe::SceneReader;
+use crate::glossary::run::RunAsk;
 use crate::glossary::{CharacterRepo, GlossaryData, Pending, SceneDescriptionRepo};
 use crate::name_rules::NameRuleService;
 use crate::llm::{Action, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunHost, RunId, RunProgress, RunStatus};
@@ -51,7 +52,7 @@ impl TranslationService<'_> {
         self.run(project, LinesMode::Review, scope, one_off, host, false).await
     }
 
-    /// Вычитка «Вся игра»: только реплики, которые модель не вычитывала с нынешним текстом. Остановленная
+    /// Вычитка автоперевода: только реплики, которые модель не вычитывала с нынешним текстом. Остановленная
     /// вычитка продолжается со следующей невычитанной.
     pub async fn review_unreviewed(
         &self,

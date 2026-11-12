@@ -172,6 +172,15 @@ impl DiscardReason {
     }
 }
 
+/// Поля термина, который пользователь убрал в корзину: с ними он возвращается.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KeptTerm {
+    pub translation: Option<String>,
+    pub category: TermCategory,
+    pub description: Option<String>,
+    pub forms: Vec<Form>,
+}
+
 /// Название в корзине: разбор сцены его не предлагает.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscardedTerm {
@@ -179,4 +188,70 @@ pub struct DiscardedTerm {
     pub key: NameKey,
     pub reason: DiscardReason,
     pub discarded_at: Timestamp,
+    /// Поля удалённого термина. `None`: в корзине только название (мусор от разбора, название, переданное персонажу).
+    pub kept: Option<KeptTerm>,
+}
+
+impl DiscardedTerm {
+    /// Только название: мусор от разбора сцены или название, переданное персонажу.
+    pub fn name(text: &str, key: NameKey, reason: DiscardReason, now: Timestamp) -> Self {
+        Self { text: text.trim().to_string(), key, reason, discarded_at: now, kept: None }
+    }
+
+    /// Термин, который пользователь убрал в корзину: поля остаются для возврата.
+    pub fn trashed(term: &Term, now: Timestamp) -> Self {
+        Self {
+            text: term.name.clone(),
+            key: term.name_key.clone(),
+            reason: DiscardReason::Junk,
+            discarded_at: now,
+            kept: Some(KeptTerm {
+                translation: term.translation.clone(),
+                category: term.category,
+                description: term.description.clone(),
+                forms: term.forms.clone(),
+            }),
+        }
+    }
+
+    /// Термин для возврата из корзины: с сохранёнными полями, без них категории `general`. Форма, которая
+    /// повторяет название или другую форму, пропускается.
+    pub fn into_term(self) -> Result<Term, ValidationError> {
+        let Some(kept) = self.kept else {
+            return Term::new(&self.text, TermCategory::General);
+        };
+        let mut term = Term::new(&self.text, kept.category)?;
+        term.translation = kept.translation;
+        term.description = kept.description;
+        for form in kept.forms {
+            let _ = term.add_form(form);
+        }
+        Ok(term)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trashed_term_returns_with_its_fields() {
+        let mut term = Term::new("People's Police Force", TermCategory::Organization).unwrap();
+        term.set_translation("Народная полиция");
+        term.set_description("Полиция города.");
+        term.add_form(Form::new("PPF", Some("НП")).unwrap()).unwrap();
+
+        let discarded = DiscardedTerm::trashed(&term, Timestamp::from_secs(1));
+        assert_eq!(discarded.reason, DiscardReason::Junk);
+        assert_eq!(discarded.key, *term.name_key());
+        assert_eq!(discarded.into_term().unwrap(), term);
+    }
+
+    #[test]
+    fn name_without_fields_returns_as_general_term() {
+        let key = NameKey::new("Silver Key").unwrap();
+        let discarded = DiscardedTerm::name(" Silver Key ", key, DiscardReason::GivenToCharacter, Timestamp::from_secs(1));
+        let term = discarded.into_term().unwrap();
+        assert_eq!((term.name(), term.category(), term.translation()), ("Silver Key", TermCategory::General, None));
+    }
 }

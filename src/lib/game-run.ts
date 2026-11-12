@@ -1,16 +1,33 @@
 import type { GameStep, RunProgress_Deserialize as RunProgress, StepResultDto, StepWorkDto } from "./bindings";
 
-/** Шаги «Вся игра» в порядке выполнения: тот же порядок держит Rust (`GameStep::ALL`). */
-export const gameSteps: GameStep[] = ["analysis", "glossary", "entries", "scenes", "lines", "review"];
+/** Шаги автоперевода в порядке выполнения: тот же порядок держит Rust (`GameStep::ALL`). */
+export const gameSteps: GameStep[] = ["analysis", "names", "glossary", "entries", "scenes", "lines", "review"];
 
 export const stepTitles: Record<GameStep, string> = {
   analysis: "Разбор сцен",
+  names: "Перевод имён",
   glossary: "Переводы глоссария",
   entries: "Описания персонажей и терминов",
   scenes: "Описания сцен",
   lines: "Перевод реплик",
   review: "Вычитка",
 };
+
+/** Что делает шаг: подпись в панели, пока не посчитано, сколько ему осталось. */
+export const stepHints: Record<GameStep, string> = {
+  analysis: "Модель находит в сценах персонажей и термины и пишет их в глоссарий",
+  names: "Написание имён и фамилий персонажей, потом форм. Раньше остальных переводов: термины и подписи с именем берут готовое написание",
+  glossary: "Перевод терминов, подписей говорящих и значения токенов",
+  entries: "Описания персонажей и терминов по их сценам",
+  scenes: "Названия и описания сцен",
+  lines: "Перевод пустых реплик",
+  review: "Вычитка переведённых реплик, которые модель ещё не вычитывала",
+};
+
+/** Отмеченные шаги в порядке выполнения. */
+export function orderedSteps(chosen: GameStep[]): GameStep[] {
+  return gameSteps.filter((step) => chosen.includes(step));
+}
 
 const numbers = new Intl.NumberFormat("ru-RU");
 
@@ -41,51 +58,11 @@ export function leftLabel(work: StepWorkDto) {
   return shown.map((item) => `${item.label}: ${formatCount(item.count)}`).join(" · ");
 }
 
-/**
- * Шаги, которые дают работу шагу позже в очереди: разбор находит персонажей и термины для переводов глоссария
- * и описаний, перевод даёт реплики вычитке. Шаг без работы сейчас доступен, если отмечен такой шаг раньше.
- */
-export const feeders: Partial<Record<GameStep, GameStep[]>> = {
-  glossary: ["analysis"],
-  entries: ["analysis"],
-  review: ["lines"],
-};
-
-/** Отмеченный раньше шаг, после которого у шага появится работа. `null`: работа есть сейчас или взяться ей неоткуда. */
-export function fedBy(step: GameStep, chosen: GameStep[], work: StepWorkDto[]): GameStep | null {
-  if (work.some((item) => item.step === step && !item.empty)) return null;
-  const ready = availableSteps(chosen, work);
-  return (feeders[step] ?? []).find((feeder) => chosen.includes(feeder) && ready.has(feeder)) ?? null;
-}
-
-/** Шаги, которые можно отметить: есть работа сейчас или её даст отмеченный раньше доступный шаг. */
-export function availableSteps(chosen: GameStep[], work: StepWorkDto[]): Set<GameStep> {
-  const ready = new Set<GameStep>();
-  for (const step of gameSteps) {
-    const item = work.find((known) => known.step === step);
-    if (!item) continue;
-    const later = (feeders[step] ?? []).some((feeder) => chosen.includes(feeder) && ready.has(feeder));
-    if (!item.empty || later) ready.add(step);
-  }
-  return ready;
-}
-
-/** Отмеченные по умолчанию: шаги, где есть что делать сейчас или после шагов раньше. */
-export function defaultSteps(work: StepWorkDto[]): GameStep[] {
-  return [...availableSteps(gameSteps, work)];
-}
-
-/** Шаги к запуску: отмеченные и доступные, в порядке выполнения. */
-export function stepsToRun(chosen: GameStep[], work: StepWorkDto[]): GameStep[] {
-  const ready = availableSteps(chosen, work);
-  return gameSteps.filter((step) => chosen.includes(step) && ready.has(step));
-}
-
 /** Строка общей полосы: «Шаг 2 из 4 · Перевод терминов: запрос 3 из 5 · записано: 2 · в пакете: Rusty Anchor». */
 export function chainText(progress: RunProgress, stopping: boolean) {
-  if (stopping) return "Вся игра: останавливается после текущего запроса";
+  if (stopping) return "Автоперевод: останавливается после текущего запроса";
   const stage = progress.stage;
-  const head = stage ? `Шаг ${stage.index} из ${stage.count} · ${stage.title}` : "Вся игра";
+  const head = stage ? `Шаг ${stage.index} из ${stage.count} · ${stage.title}` : "Автоперевод";
   if (progress.total === 0) return `${head}: подготовка`;
   const counts = `${head}: запрос ${Math.min(progress.done + 1, progress.total)} из ${progress.total} · записано: ${progress.written}`;
   return progress.message ? `${counts} · ${progress.message}` : counts;
@@ -124,6 +101,20 @@ export function stepOutcomes(
     } else outcomes[step] = { kind: "waiting" };
   }
   return outcomes;
+}
+
+/**
+ * Шаги до отбора имён и после него одним списком. Шаг имён проходит дважды, до отбора и после него:
+ * записанное складывается.
+ */
+export function mergeFinished(earlier: StepResultDto[], later: StepResultDto[]): StepResultDto[] {
+  const merged = earlier.map((item) => ({ ...item }));
+  for (const item of later) {
+    const known = merged.find((done) => done.step === item.step);
+    if (known) known.written += item.written;
+    else merged.push({ ...item });
+  }
+  return merged;
 }
 
 /** Итог: «Готово: Разбор сцен · 3, Перевод реплик · 120». */

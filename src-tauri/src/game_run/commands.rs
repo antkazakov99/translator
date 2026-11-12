@@ -1,4 +1,4 @@
-//! Команды карточки «Вся игра».
+//! Команды панели «Автоперевод».
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -90,7 +90,7 @@ pub struct NamePickDto {
     pub translation: String,
 }
 
-/// Сводка шагов «Вся игра»: сколько осталось и примерное число запросов.
+/// Сводка шагов автоперевода: сколько осталось и примерное число запросов.
 #[tauri::command]
 #[specta::specta]
 pub async fn game_overview(app: AppHandle, project: String) -> Result<Vec<StepWorkDto>, String> {

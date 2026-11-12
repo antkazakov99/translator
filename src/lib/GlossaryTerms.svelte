@@ -1,7 +1,7 @@
 <script lang="ts">
   import DescribeParts from "./DescribeParts.svelte";
   import EntryLines from "./EntryLines.svelte";
-  import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
@@ -46,7 +46,7 @@
   function runTitle() {
     if (untranslated.length === 0) return "У всех терминов есть перевод";
     if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
-    return "Модель предложит перевод, категорию и описание терминам без перевода";
+    return "Модель предложит перевод терминам без перевода, а термину общей категории и категорию";
   }
 
   function startRun() {
@@ -54,22 +54,15 @@
     run.start((channel) => commands.suggestTerms(projectId, ids, null, channel), onError);
   }
 
-  /** Отмеченное записывается целиком через `save_term`: термин подтверждается, своё описание остаётся. */
+  /** Отмеченное пишет `accept_terms`, та же запись, что у автоперевода: перевод ложится только в пустое поле. */
   async function writeChosen() {
-    const chosen = run.chosen.filter((item) => item.translation.trim());
+    const chosen = run.chosen
+      .filter((item) => item.translation.trim())
+      .map((item) => ({ id: item.id, translation: item.translation.trim(), category: item.category }));
     writing = true;
     try {
-      for (const item of chosen) {
-        const term = data.terms.find((known) => known.id === item.id);
-        if (!term) continue;
-        await commands.saveTerm(projectId, {
-          ...$state.snapshot(term),
-          translation: item.translation.trim(),
-          category: item.category ?? term.category,
-          description: term.description ?? (item.description?.trim() || null),
-        });
-      }
-      run.finish(`Записано терминов: ${chosen.length}`);
+      const written = await commands.acceptTerms(projectId, chosen);
+      run.finish(`Записано терминов: ${written}`);
       await reload();
     } catch (e) {
       onError(String(e));
@@ -83,47 +76,16 @@
 
   let query = $state("");
   let newName = $state("");
-  let newCategory = $state<TermCategory>("general");
   let creating = $state(false);
   let saving = $state(false);
   let fieldError = $state("");
-  let confirmDelete = $state(false);
+  /** Название в корзине, про которое открыт вопрос об окончательном удалении. */
+  let confirmForget = $state<string | null>(null);
+  /** Открыт вопрос о сбросе заметок модели: остальные действия шапки на это время скрыты. */
+  let resetting = $state(false);
   let giving = $state(false);
   let giveText = $state("");
   let draft = $state<Term | null>(null);
-
-  /** Отмеченные для описания моделью. По умолчанию ничего: чтение сцен дорого. */
-  let marked = $state<number[]>([]);
-  const entriesRun = $derived(runs.entries);
-
-  function toggleMark(id: number, on: boolean) {
-    marked = on ? [...marked, id] : marked.filter((item) => item !== id);
-  }
-
-  function markShown() {
-    marked = [...new Set([...marked, ...shown.map((item) => item.id)])];
-  }
-
-  function describeTitle() {
-    if (marked.length === 0) return "Отметьте термины в списке";
-    if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
-    return "Модель прочитает части сцен каждого термина и напишет описание. Описанные без новых частей пропускаются";
-  }
-
-  async function describeMarked() {
-    const owners = marked.map((id) => ({ kind: "term" as const, id }));
-    const written = await entriesRun.start(
-      (channel) => commands.describeEntries(projectId, owners, null, channel),
-      onError,
-      (count, stopped) => {
-        const text = `Описано: ${count}`;
-        return stopped ? `Остановлено. ${text}` : text;
-      },
-    );
-    const done = new Set(written);
-    marked = marked.filter((id) => !done.has(`term:${id}`));
-    if (written.length > 0) await reload();
-  }
 
   const shown = $derived(
     data.terms
@@ -142,7 +104,6 @@
     const found = data.terms.find((term) => term.id === id);
     draft = found ? structuredClone($state.snapshot(found)) : null;
     fieldError = "";
-    confirmDelete = false;
     giving = false;
   });
 
@@ -184,7 +145,7 @@
     if (!name) return;
     creating = true;
     try {
-      const id = await commands.takeTerm(projectId, name, newCategory);
+      const id = await commands.takeTerm(projectId, name, "general");
       newName = "";
       filter = "all";
       await reload();
@@ -204,6 +165,13 @@
   function forget() {
     selected = null;
     draft = null;
+  }
+
+  /** Единственное удаление записи: термин уходит в корзину вместе с полями. Окончательно его удаляют уже там. */
+  function toTrash() {
+    const term = draft;
+    if (!term) return;
+    act(() => commands.trashTerm(projectId, term.id), forget);
   }
 </script>
 
@@ -225,11 +193,11 @@
 </div>
 
 <SuggestStatus {run} {onError} />
-{#if !draft}<SuggestStatus run={entriesRun} {onError} />{/if}
+<SuggestStatus run={runs.entries} {onError} />
 
 {#if run.review}
   <div class="list">
-    <p class="pick-head">Предложения модели. Отмеченные запишутся в глоссарий, перевод и описание можно поправить</p>
+    <p class="pick-head">Предложения модели. Отмеченные запишутся в глоссарий, перевод и категорию можно поправить</p>
     {#each run.review as item (item.id)}
       {@const term = data.terms.find((known) => known.id === item.id)}
       <div class="pick-row terms" class:off={!item.selected}>
@@ -247,11 +215,6 @@
         >
           {#each categories as category (category.value)}<option value={category.value}>{category.label}</option>{/each}
         </select>
-        {#if term?.description}
-          <span class="faint" title={term.description}>Своё описание остаётся</span>
-        {:else}
-          <input class="input" bind:value={item.description} placeholder="Описание" aria-label="Описание «{term?.name}»" />
-        {/if}
       </div>
     {/each}
   </div>
@@ -268,17 +231,33 @@
       <div class="row">
         <div class="name">
           <strong>{item.text}</strong>
-          <span>{item.givenToCharacter ? "Передано персонажу" : "Не термин"}</span>
+          <span>{item.givenToCharacter ? "Передано персонажу" : (item.translation ?? "Нет перевода")}</span>
         </div>
-        <button class="btn small" onclick={() => act(() => commands.restoreTermName(projectId, item.key))}>
-          <Undo2 size={13} />
-          <span>Вернуть</span>
-        </button>
+        <div class="row-tools">
+          {#if confirmForget === item.key}
+            <span class="confirm-text">Удалить окончательно?</span>
+            <button class="btn small danger" onclick={() => act(() => commands.forgetTermName(projectId, item.key), () => (confirmForget = null))}>Да</button>
+            <button class="btn small" onclick={() => (confirmForget = null)}>Нет</button>
+          {:else}
+            <button
+              class="icon-button"
+              aria-label="Вернуть в термины"
+              title="Вернуть в термины с переводом, категорией, описанием и формами"
+              onclick={() => act(() => commands.restoreTerm(projectId, item.key))}><Undo2 size={14} /></button
+            >
+            <button
+              class="icon-button danger"
+              aria-label="Удалить окончательно"
+              title="Удалить окончательно: название забудется, модель может найти его снова"
+              onclick={() => (confirmForget = item.key)}><Trash2 size={14} /></button
+            >
+          {/if}
+        </div>
       </div>
     {:else}
       <div class="empty">
         <strong>Корзина пуста</strong>
-        <span>Сюда уходят названия, которые не термины: модель не предложит их снова</span>
+        <span>Сюда уходят удалённые термины: модель не предложит их снова</span>
       </div>
     {/each}
   </div>
@@ -286,58 +265,67 @@
   <div class="master with-lines">
     <div class="list-side">
       <input class="input" placeholder="Поиск по названию и переводу" bind:value={query} aria-label="Поиск терминов" />
-      <div class="marks">
-        <button class="btn small" disabled={shown.length === 0} onclick={markShown}>Отметить показанные</button>
-        <button class="btn small" disabled={marked.length === 0} onclick={() => (marked = [])}>Снять</button>
-        <button class="btn small primary" disabled={marked.length === 0 || runsBusy(runs)} title={describeTitle()} onclick={describeMarked}>
-          {#if entriesRun.active}<LoaderCircle size={12} class="spin" />{:else}<Sparkles size={12} />{/if}
-          <span>Описать · {marked.length}</span>
-        </button>
-      </div>
       <div class="items">
         {#each shown as term (term.id)}
-          <div class="marked-item">
-            <input
-              type="checkbox"
-              checked={marked.includes(term.id)}
-              onchange={(event) => toggleMark(term.id, event.currentTarget.checked)}
-              aria-label="Отметить {term.name}"
-            />
-            <button class="item" class:active={term.id === draft?.id} onclick={() => (selected = term.id)}>
-              <strong>{term.name}</strong>
-              <span>{term.translation ?? "Нет перевода"} · {categoryLabel(term.category)}</span>
-            </button>
-          </div>
+          <button class="item" class:active={term.id === draft?.id} onclick={() => (selected = term.id)}>
+            <strong>{term.name}</strong>
+            <span>{term.translation ?? "Нет перевода"} · {categoryLabel(term.category)}</span>
+          </button>
         {:else}
           <p class="faint">{data.terms.length ? "Ничего не нашлось" : "Терминов пока нет: модель найдёт их, когда описывает сцену, или добавьте ниже"}</p>
         {/each}
       </div>
-      <form class="add stacked" onsubmit={(event) => (event.preventDefault(), create())}>
-        <input class="input name" placeholder="Название нового термина" bind:value={newName} aria-label="Название нового термина" />
-        <select class="input category" bind:value={newCategory} aria-label="Категория нового термина">
-          {#each categories as item (item.value)}<option value={item.value}>{item.label}</option>{/each}
-        </select>
-        <button class="btn small" type="submit" disabled={creating || !newName.trim()}>
-          {#if creating}<LoaderCircle size={12} class="spin" />{:else}<Plus size={12} />{/if}
-          <span>Добавить</span>
+      <form class="add" onsubmit={(event) => (event.preventDefault(), create())}>
+        <input class="input" placeholder="Новый термин" bind:value={newName} aria-label="Название нового термина" />
+        <button
+          class="icon-button"
+          type="submit"
+          disabled={creating || !newName.trim()}
+          aria-label="Добавить термин"
+          title="Добавить термин. Категория выбирается в записи"
+        >
+          {#if creating}<LoaderCircle size={14} class="spin" />{:else}<Plus size={14} />{/if}
         </button>
       </form>
     </div>
 
     {#if draft}
-      <div class="card editor" class:saving>
-        <div class="card-head">
-          <strong>{draft.name}</strong>
-          {#if confirmDelete}
-            <span class="confirm-text">Удалить?</span>
-            <button class="btn small danger" onclick={() => draft && act(() => commands.deleteTerm(projectId, draft!.id), forget)}>Да</button>
-            <button class="btn small" onclick={() => (confirmDelete = false)}>Нет</button>
-          {:else}
-            <button class="icon-button danger" aria-label="Удалить термин" title="Удалить термин" onclick={() => (confirmDelete = true)}>
-              <Trash2 size={14} />
-            </button>
-          {/if}
+      <div class="editor" class:saving>
+        <div class="editor-head">
+          <strong title={draft.name}>{draft.name}</strong>
+          <div class="editor-tools">
+            <DescribeParts {projectId} owner={{ kind: "term", id: draft.id }} {runs} bind:confirming={resetting} onDescribed={described} {onError} />
+            {#if !resetting}
+              <button
+                class="icon-button"
+                class:active={giving}
+                disabled={data.characters.length === 0}
+                aria-label="Это персонаж"
+                aria-pressed={giving}
+                title="Это персонаж: имя или фамилия, название станет формой персонажа"
+                onclick={() => (giving = !giving)}><UserRound size={14} /></button
+              >
+              <button
+                class="icon-button danger"
+                aria-label="В корзину"
+                title="В корзину: модель не предложит термин снова, из корзины его можно вернуть"
+                onclick={toTrash}><Trash2 size={14} /></button
+              >
+            {/if}
+          </div>
         </div>
+
+        {#if giving && !resetting}
+          <Combobox
+            text={giveText}
+            options={characterOptions}
+            label="Персонаж"
+            placeholder="Кому отдать название"
+            empty="Персонажей нет"
+            oninput={(text) => (giveText = text)}
+            onpick={(id) => draft && act(() => commands.giveTermToCharacter(projectId, draft!.id, Number(id)), forget)}
+          />
+        {/if}
 
         <div class="grid">
           <label class="field">Название в игре<input class="input" bind:value={draft.name} onchange={() => save()} /></label>
@@ -351,50 +339,18 @@
         </div>
 
         <GlossaryForms forms={draft.forms} hint="Сокращения и короткие формы" onchange={(forms: NameForm[]) => save({ forms })} />
-        <label class="field">Описание<textarea class="input" rows="4" bind:value={draft.description} onchange={() => save()}></textarea></label>
-        <DescribeParts {projectId} owner={{ kind: "term", id: draft.id }} {runs} onDescribed={described} {onError} />
-
-        <div class="card-actions">
-          {#if giving}
-            <div class="picker">
-              <Combobox
-                text={giveText}
-                options={characterOptions}
-                label="Персонаж"
-                placeholder="Кому отдать название"
-                empty="Персонажей нет"
-                oninput={(text) => (giveText = text)}
-                onpick={(id) => draft && act(() => commands.giveTermToCharacter(projectId, draft!.id, Number(id)), forget)}
-              />
-            </div>
-          {/if}
-          <button
-            class="btn small"
-            disabled={data.characters.length === 0}
-            title="Это имя или фамилия: название станет формой персонажа"
-            onclick={() => (giving = !giving)}
-          >
-            <UserRound size={13} />
-            <span>Это персонаж</span>
-          </button>
-          <button
-            class="btn small"
-            title="Не термин: убрать и не предлагать снова"
-            onclick={() =>
-              draft &&
-              act(async () => {
-                await commands.deleteTerm(projectId, draft!.id);
-                await commands.discardTermName(projectId, draft!.name);
-              }, forget)}
-          >
-            <Trash2 size={13} />
-            <span>Не термин</span>
-          </button>
-        </div>
+        <label class="field">Описание<textarea class="input" rows="6" bind:value={draft.description} onchange={() => save()}></textarea></label>
 
         {#if fieldError}<p class="error-text">{fieldError}</p>{/if}
       </div>
-      <EntryLines {projectId} owner={{ kind: "term", id: draft.id }} revision={linesRevision} {onOpenLine} {onError} />
+      <EntryLines
+        subject={`term:${draft.id}`}
+        load={() => commands.entryLines(projectId, { kind: "term", id: draft?.id ?? 0 })}
+        empty="Название и формы в тексте не встречаются"
+        revision={linesRevision}
+        {onOpenLine}
+        {onError}
+      />
     {:else}
       <div class="empty">
         <strong>Термин не выбран</strong>
@@ -403,23 +359,3 @@
     {/if}
   </div>
 {/if}
-
-<style>
-  .marks {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-
-  .marked-item {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-  }
-
-  .marked-item .item {
-    flex: 1;
-    min-width: 0;
-  }
-
-</style>

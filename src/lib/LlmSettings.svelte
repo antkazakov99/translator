@@ -748,9 +748,9 @@
     inset: 0;
     z-index: 100;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
-    padding: 24px;
+    padding: 10vh 24px 24px;
     background: var(--backdrop);
   }
 

@@ -1,5 +1,6 @@
-//! Цепочка «Вся игра»: сводка того, что осталось, и шаги по очереди. Шаги вызывают сервисы действий как есть,
+//! Цепочка автоперевода: сводка того, что осталось, и шаги по очереди. Шаги вызывают сервисы действий как есть,
 //! внутри одной `RunChain`: место запуска занято на всю цепочку, у каждого вызова своя строка `llm_runs`.
+//! Что осталось шагу, считает сервис действия: цепочка своей логики действий не держит.
 
 use std::sync::Arc;
 
@@ -7,32 +8,21 @@ use tauri::ipc::Channel;
 
 use super::{GameRun, GameStep, NamesMode, StepResult, StepWork, WorkCount, ordered};
 use crate::common::AppError;
-use crate::engines::{ContainerKey, SpeakerKey};
-use crate::glossary::names::{ORIGIN_BATCH, form_items, name_items, with_origins};
-use crate::glossary::service::game_tokens;
+use crate::engines::ContainerKey;
+use crate::glossary::same_entry::translation_pairs;
+use crate::glossary::suggest_service::{glossary_work, names_work};
 use crate::glossary::{
-    Character, CharacterId, CharacterRepo, DescribeService, DescribeTarget, Described, GlossaryData, GlossaryService, NamePick, NamesFound,
-    NamesService, NoteRepo, SceneDescriptionRepo, SpeakerRepo, TermId, TermRepo, TokenRepo,
+    CharacterRepo, DescribeService, DescribeTarget, Described, GlossaryData, GlossaryService, NamePick, NameTaking, NamesFound, NoteRepo,
+    SceneDescriptionRepo, SpeakerRepo, SuggestService, Taking, TermRepo, TokenRepo,
 };
 use crate::llm::{Action, LlmRunRepo, LlmTargetService, RunChain, RunProgress};
 use crate::projects::ProjectId;
 use crate::state::{AppState, OpenProject};
-use crate::storage::DbError;
 use crate::translation::{LinesMode, TranslationRepo, TranslationScope, TranslationService};
-use crate::glossary::repo::AnalyzedPartRepo;
+use crate::glossary::repo::{AnalyzedPartRepo, AskRepo, MentionCheckRepo, PairCheckRepo};
 
 pub struct GameRunService<'a> {
     pub state: &'a AppState,
-}
-
-/// Записи глоссария без перевода: работа шага `glossary`.
-#[derive(Debug, Default)]
-struct GlossaryWork {
-    terms: Vec<TermId>,
-    speakers: Vec<SpeakerKey>,
-    tokens: Vec<String>,
-    /// Персонажи с именем, фамилией или формой без перевода.
-    characters: Vec<CharacterId>,
 }
 
 /// Чем кончился шаг.
@@ -61,8 +51,11 @@ impl GameRunService<'_> {
         let lines = TranslationService { state: self.state };
 
         let analysis = describe.pending_analysis(project, all)?;
-        let (glossary, entries) = open.project.read(|tx| Ok((glossary_work(tx)?, entry_targets(&GlossaryData::load(tx)?))))?;
-        let glossary_requests = self.glossary_requests(&open, &glossary)?;
+        let analyzed = analysis.items == 0;
+        let names_batch = self.batch_size(&open, Action::Names);
+        let (names, glossary, entries) =
+            open.project.read(|tx| Ok((names_work(tx, names_batch)?, glossary_work(tx, analyzed)?, entry_targets(&GlossaryData::load(tx)?))))?;
+        let glossary_requests = glossary.requests(|action| self.batch_size(&open, action));
         let entries = describe.pending(project, entries)?;
         let scenes = describe.pending(project, unread.into_iter().map(DescribeTarget::Scene).collect())?;
         let translate = lines.pending(project, LinesMode::Translate, false)?;
@@ -76,12 +69,17 @@ impl GameRunService<'_> {
         Ok(vec![
             work(GameStep::Analysis, vec![("сцен с непрочитанными частями", analysis.items)], analysis.requests),
             work(
+                GameStep::Names,
+                vec![("имён и фамилий без перевода", names.names), ("форм без перевода", names.forms)],
+                names.requests,
+            ),
+            work(
                 GameStep::Glossary,
                 vec![
                     ("терминов без перевода", glossary.terms.len()),
+                    ("пар терминов с одним переводом", glossary.pairs),
                     ("подписей без перевода", glossary.speakers.len()),
                     ("токенов без значения", glossary.tokens.len()),
-                    ("персонажей с именами без перевода", glossary.characters.len()),
                 ],
                 glossary_requests,
             ),
@@ -93,7 +91,8 @@ impl GameRunService<'_> {
     }
 
     /// Отмеченные шаги по порядку одной цепочкой. Остановка и ошибка обрывают цепочку после текущего запроса,
-    /// готовое остаётся. Ручной выбор имён останавливает цепочку на отборе: окно продолжает её с `rest`.
+    /// готовое остаётся. Отбор имён останавливает цепочку: окно продолжает её с `rest`, и первым в них стоит
+    /// сам шаг имён. Заход шага после отбора спрашивает только то, о чём ещё не спрашивал: формы.
     pub async fn run(&self, project: ProjectId, steps: &[GameStep], names: NamesMode, progress: Channel<RunProgress>) -> Result<GameRun, AppError> {
         let steps = ordered(steps);
         let chain = RunChain::begin(self.state, progress)?;
@@ -122,7 +121,7 @@ impl GameRunService<'_> {
             result.finished.push(StepResult { step, written: outcome.written });
             if outcome.names.is_some() {
                 result.names = outcome.names;
-                result.rest = steps[index + 1..].to_vec();
+                result.rest = steps[index..].to_vec();
                 break;
             }
         }
@@ -140,6 +139,9 @@ impl GameRunService<'_> {
         Ok(open.project.write(|tx| {
             TranslationRepo { conn: tx }.clear()?;
             AnalyzedPartRepo { conn: tx }.clear()?;
+            PairCheckRepo { conn: tx }.clear()?;
+            MentionCheckRepo { conn: tx }.clear()?;
+            AskRepo { conn: tx }.clear()?;
             NoteRepo { conn: tx }.clear()?;
             SceneDescriptionRepo { conn: tx }.clear()?;
             SpeakerRepo { conn: tx }.clear()?;
@@ -172,7 +174,8 @@ impl GameRunService<'_> {
                 let keys = self.scene_keys(project, |_| true)?;
                 Ok(StepOutcome::from_described(describe.analyze(project, keys, None, chain).await?))
             }
-            GameStep::Glossary => self.glossary(project, names, chain, index, count).await,
+            GameStep::Names => self.names(project, names, chain).await,
+            GameStep::Glossary => self.glossary(project, chain, index, count).await,
             GameStep::Entries => {
                 let open = self.state.open_project(project)?;
                 let targets = open.project.read(|tx| Ok(entry_targets(&GlossaryData::load(tx)?)))?;
@@ -194,19 +197,52 @@ impl GameRunService<'_> {
         }
     }
 
-    /// Термины, подписи и токены принимаются без отбора, имена по `names`. Каждая часть своим запуском.
-    async fn glossary(&self, project: ProjectId, names: NamesMode, chain: &RunChain, index: usize, count: usize) -> Result<StepOutcome, AppError> {
+    /// Имена, о которых цепочка ещё не спрашивала. «Авто» пишет написания, на которых перевод и проверка
+    /// сошлись, спорные идут в отбор; ручной режим отдаёт в отбор все. Отбор останавливает цепочку.
+    async fn names(&self, project: ProjectId, mode: NamesMode, chain: &RunChain) -> Result<StepOutcome, AppError> {
         let open = self.state.open_project(project)?;
-        let work = open.project.read(|tx| glossary_work(tx))?;
-        let suggest = NamesService { state: self.state };
-        let write = GlossaryService { state: self.state };
+        let work = open.project.read(|tx| names_work(tx, 1))?;
+        if work.characters.is_empty() {
+            return Ok(StepOutcome::default());
+        }
+        let taking = match mode {
+            NamesMode::Auto => NameTaking::Agreed,
+            NamesMode::Manual => NameTaking::Picks,
+        };
+        let found = SuggestService { state: self.state }.translate_names(project, work.characters, None, chain, taking).await?;
+        let mut outcome = StepOutcome { written: found.suggestions.written, error: found.suggestions.error.clone(), names: None };
+        if !found.suggestions.items.is_empty() {
+            outcome.names = Some(found);
+        }
+        Ok(outcome)
+    }
+
+    /// Термины, подписи и токены принимаются без отбора: годное пишется после каждого пакета. После терминов
+    /// модель отвечает, одно ли это термины с одинаковым переводом. Каждая часть своим запуском.
+    async fn glossary(&self, project: ProjectId, chain: &RunChain, index: usize, count: usize) -> Result<StepOutcome, AppError> {
+        let open = self.state.open_project(project)?;
+        let scenes = TranslationService { state: self.state }.story_scenes(project)?;
+        let all = scenes.iter().filter_map(|scene| scene.key.clone()).collect();
+        let analyzed = DescribeService { state: self.state }.pending_analysis(project, all)?.items == 0;
+        let work = open.project.read(|tx| glossary_work(tx, analyzed))?;
+        let suggest = SuggestService { state: self.state };
         let mut outcome = StepOutcome::default();
         let stop = |error: &Option<String>| error.is_some() || chain.cancelled();
 
         if !work.terms.is_empty() {
             chain.stage(index, count, "Перевод терминов");
-            let found = suggest.translate_terms(project, work.terms, None, chain).await?;
-            outcome.written += write.accept_terms(project, &found.items)?;
+            let found = suggest.translate_terms(project, work.terms, None, chain, Taking::Write).await?;
+            outcome.written += found.written;
+            outcome.error = found.error;
+            if stop(&outcome.error) {
+                return Ok(outcome);
+            }
+        }
+        // Пары считаются заново: одинаковый перевод мог дать перевод терминов этого же захода.
+        if open.project.read(|tx| Ok(!translation_pairs(tx, &GlossaryData::load(tx)?)?.is_empty()))? {
+            chain.stage(index, count, "Термины с одним переводом");
+            let found = suggest.settle_same_translations(project, None, chain).await?;
+            outcome.written += found.written;
             outcome.error = found.error;
             if stop(&outcome.error) {
                 return Ok(outcome);
@@ -214,8 +250,8 @@ impl GameRunService<'_> {
         }
         if !work.speakers.is_empty() {
             chain.stage(index, count, "Перевод подписей");
-            let found = suggest.suggest_speakers(project, work.speakers, None, chain).await?;
-            outcome.written += write.accept_speakers(project, &found.items)?;
+            let found = suggest.suggest_speakers(project, work.speakers, None, chain, Taking::Write).await?;
+            outcome.written += found.written;
             outcome.error = found.error;
             if stop(&outcome.error) {
                 return Ok(outcome);
@@ -223,22 +259,9 @@ impl GameRunService<'_> {
         }
         if !work.tokens.is_empty() {
             chain.stage(index, count, "Значения токенов");
-            let found = suggest.suggest_tokens(project, work.tokens, None, chain).await?;
-            outcome.written += write.accept_tokens(project, &found.items)?;
+            let found = suggest.suggest_tokens(project, work.tokens, None, chain, Taking::Write).await?;
+            outcome.written += found.written;
             outcome.error = found.error;
-            if stop(&outcome.error) {
-                return Ok(outcome);
-            }
-        }
-        if !work.characters.is_empty() {
-            chain.stage(index, count, "Перевод имён");
-            let found = suggest.translate_names(project, work.characters, None, chain).await?;
-            outcome.error = found.suggestions.error.clone();
-            match names {
-                NamesMode::Auto => outcome.written += write.fill_names(project, &first_variants(&found))?,
-                NamesMode::Manual if !found.suggestions.items.is_empty() => outcome.names = Some(found),
-                NamesMode::Manual => {}
-            }
         }
         Ok(outcome)
     }
@@ -249,26 +272,6 @@ impl GameRunService<'_> {
         Ok(scenes.iter().filter(|scene| wanted(scene)).filter_map(|scene| scene.key.clone()).collect())
     }
 
-    /// Запросы шага `glossary` по размерам пакетов действий: термины, подписи, токены, потом имена
-    /// (разбор происхождения, написание и проверка имён и форм).
-    fn glossary_requests(&self, open: &Arc<OpenProject>, work: &GlossaryWork) -> Result<usize, AppError> {
-        let batches = |action: Action, items: usize| items.div_ceil(self.batch_size(open, action));
-        let (glossary, origins) = open.project.read(|tx| Ok((GlossaryData::load(tx)?, CharacterRepo { conn: tx }.all_origins()?)))?;
-        let chosen: Vec<&Character> =
-            glossary.characters.iter().filter(|character| character.id().is_some_and(|id| work.characters.contains(&id))).collect();
-        let known: Vec<_> = origins.iter().flat_map(|(id, list)| list.iter().map(move |origin| (*id, origin))).collect();
-        let mut names = name_items(&chosen);
-        let mut forms = form_items(&chosen, &[]);
-        with_origins(&mut names, known.iter().copied());
-        with_origins(&mut forms, known.iter().copied());
-        let unknown = names.iter().chain(&forms).filter(|item| item.languages.is_empty()).count();
-        Ok(batches(Action::Terms, work.terms.len())
-            + batches(Action::Speakers, work.speakers.len())
-            + batches(Action::Tokens, work.tokens.len())
-            + unknown.div_ceil(ORIGIN_BATCH)
-            + 2 * (batches(Action::Names, names.len()) + batches(Action::Names, forms.len())))
-    }
-
     /// Размер пакета действия. Без настроенной модели значение из кода.
     fn batch_size(&self, open: &Arc<OpenProject>, action: Action) -> usize {
         LlmTargetService { state: self.state }
@@ -276,19 +279,6 @@ impl GameRunService<'_> {
             .map_or_else(|_| action.default_batch_size(), |target| target.settings.batch_size)
             .get()
     }
-}
-
-/// Первое написание каждого имени: промпт ставит первым самое устоявшееся.
-fn first_variants(found: &NamesFound) -> Vec<NamePick> {
-    found
-        .suggestions
-        .items
-        .iter()
-        .filter_map(|item| {
-            let variant = item.variants.first()?;
-            Some(NamePick { character: item.character, field: item.field, source: item.source.clone(), translation: variant.translation.clone() })
-        })
-        .collect()
 }
 
 /// Персонажи с именем и термины без описания: работа шага `entries`.
@@ -302,39 +292,11 @@ fn entry_targets(glossary: &GlossaryData) -> Vec<DescribeTarget> {
     characters.chain(terms).collect()
 }
 
-/// Записи глоссария без перевода, как их видят разделы глоссария: термины, записи говорящих текущего снимка,
-/// токены из текста игры без значения и пояснения, персонажи с непереведённым именем, фамилией или формой.
-fn glossary_work(tx: &rusqlite::Connection) -> Result<GlossaryWork, DbError> {
-    let glossary = GlossaryData::load(tx)?;
-    let current = SpeakerRepo { conn: tx }.current()?;
-    let terms = glossary.terms.iter().filter(|term| term.translation().is_none()).filter_map(|term| term.id()).collect();
-    let speakers = current
-        .iter()
-        .map(|item| &item.speaker.key)
-        .filter(|key| glossary.entries.iter().any(|entry| entry.key() == *key && entry.translation().is_none()))
-        .cloned()
-        .collect();
-    let tokens = game_tokens(tx)?
-        .into_keys()
-        .filter(|name| glossary.tokens.iter().find(|token| token.name() == name).is_none_or(|token| token.value().is_none() && token.note().is_none()))
-        .collect();
-    let characters = glossary
-        .characters
-        .iter()
-        .filter(|character| {
-            (character.first_name().is_some() && character.translated_first_name().is_none())
-                || (character.last_name().is_some() && character.translated_last_name().is_none())
-                || character.forms().iter().any(|form| form.translation().is_none())
-        })
-        .filter_map(Character::id)
-        .collect();
-    Ok(GlossaryWork { terms, speakers, tokens, characters })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::glossary::{NameField, TermCategory, TermRepo};
+    use crate::engines::SpeakerKey;
+    use crate::glossary::{CharacterId, NameField, TermCategory, TermRepo};
     use crate::llm::client::tests::{completion, fake_model};
     use crate::llm::{LlmSettingsService, Profile, Provider, ProviderKind};
     use crate::projects::ProjectService;
@@ -415,7 +377,7 @@ mod tests {
 
     #[test]
     fn whole_game_runs_every_step_in_one_slot_and_leaves_nothing() {
-        let (url, _) = fake_model(reply);
+        let (url, seen) = fake_model(reply);
         let dir = tempfile::tempdir().unwrap();
         let (state, id, eileen) = project(dir.path(), &url);
         let service = GameRunService { state: &state };
@@ -444,8 +406,20 @@ mod tests {
         );
         assert_eq!(count(&state, id, "SELECT count(*) FROM llm_runs WHERE status <> 'done'"), 0);
         let actions = count(&state, id, "SELECT count(DISTINCT action_id) FROM llm_runs");
-        assert_eq!(actions, 7, "у каждого вызова своя строка: analysis, terms, speakers, names, descriptions, lines, review");
+        assert_eq!(actions, 7, "у каждого вызова своя строка: analysis, names, terms, speakers, descriptions, lines, review");
+        {
+            let requests = seen.lock().unwrap();
+            let at = |part: &str| requests.iter().position(|body| text(body, 0).contains(part)).unwrap();
+            assert!(at("personal names") < at("terms of a visual novel"), "имена переводятся раньше терминов и подписей");
+        }
         assert_eq!(empty_steps(&state, id), GameStep::ALL, "повторять нечего");
+
+        // Окно запускает отмеченные шаги без сводки: шаг без работы проходит без запросов к модели.
+        let asked = seen.lock().unwrap().len();
+        let again = tauri::async_runtime::block_on(service.run(id, &GameStep::ALL, NamesMode::Auto, silent())).unwrap();
+        assert_eq!((again.error.as_deref(), again.stopped), (None, false));
+        assert_eq!(steps(&again), GameStep::ALL);
+        assert_eq!(seen.lock().unwrap().len(), asked, "делать нечего: к модели запросов нет");
     }
 
     #[test]
@@ -455,9 +429,9 @@ mod tests {
         let (state, id, eileen) = project(dir.path(), &url);
         let service = GameRunService { state: &state };
 
-        let result = tauri::async_runtime::block_on(service.run(id, &[GameStep::Lines, GameStep::Glossary], NamesMode::Manual, silent())).unwrap();
-        assert_eq!(steps(&result), [GameStep::Glossary]);
-        assert_eq!(result.rest, [GameStep::Lines], "перевод реплик ждёт отбора имён");
+        let result = tauri::async_runtime::block_on(service.run(id, &[GameStep::Lines, GameStep::Names], NamesMode::Manual, silent())).unwrap();
+        assert_eq!(steps(&result), [GameStep::Names]);
+        assert_eq!(result.rest, [GameStep::Names, GameStep::Lines], "перевод реплик ждёт отбора, шаг имён после него спросит формы");
         let names = result.names.clone().unwrap();
         let item = &names.suggestions.items[0];
         assert_eq!((item.character, item.field), (eileen, NameField::First));
@@ -474,8 +448,42 @@ mod tests {
         assert_eq!(service.write_names(id, &[NamePick { translation: "Эйлин".to_string(), ..pick }]).unwrap(), 0, "заполненное не перезаписывается");
 
         let rest = tauri::async_runtime::block_on(service.run(id, &result.rest, NamesMode::Manual, silent())).unwrap();
-        assert_eq!(steps(&rest), [GameStep::Lines]);
+        assert_eq!(steps(&rest), [GameStep::Names, GameStep::Lines], "второй заход имён прошёл без отбора");
+        assert!(rest.names.is_none());
         assert!(count(&state, id, "SELECT count(*) FROM translations WHERE run_id IS NOT NULL") > 0);
+    }
+
+    #[test]
+    fn auto_names_stop_only_on_disputed_spellings_and_ask_them_once() {
+        // Проверка ставит первым другое написание: перевод и проверка разошлись.
+        let (url, seen) = fake_model(|body| {
+            if text(body, 0).contains("review proposed") {
+                completion(r#"[{"id": 1, "variants": [{"source": "Eileen", "translated": "Айлин"}, {"source": "Eileen", "translated": "Эйлин"}]}]"#)
+            } else {
+                reply(body)
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id, eileen) = project(dir.path(), &url);
+        let service = GameRunService { state: &state };
+        let spelled = || seen.lock().unwrap().iter().filter(|body| text(body, 0).contains("expert in personal names")).count();
+        let open = state.open_project(id).unwrap();
+        let first = || open.project.read(|tx| CharacterRepo { conn: tx }.get(eileen)).unwrap().translated_first_name().map(str::to_string);
+
+        let result = tauri::async_runtime::block_on(service.run(id, &[GameStep::Names, GameStep::Lines], NamesMode::Auto, silent())).unwrap();
+        assert_eq!((steps(&result), result.rest.clone()), (vec![GameStep::Names], vec![GameStep::Names, GameStep::Lines]));
+        let names = result.names.unwrap();
+        assert_eq!(names.suggestions.items[0].variants[0].translation, "Айлин");
+        assert_eq!(first(), None, "спорное написание без отбора не пишется");
+        assert_eq!(spelled(), 1);
+
+        // Отбор отброшен: цепочка идёт дальше и имя второй раз не спрашивает, шаг становится пустым.
+        let rest = tauri::async_runtime::block_on(service.run(id, &result.rest, NamesMode::Auto, silent())).unwrap();
+        assert_eq!(steps(&rest), [GameStep::Names, GameStep::Lines]);
+        assert!(rest.names.is_none());
+        assert_eq!(spelled(), 1);
+        assert!(empty_steps(&state, id).contains(&GameStep::Names));
+        assert_eq!(count(&state, id, "SELECT count(*) FROM glossary_asks WHERE kind = 'name'"), 1);
     }
 
     #[test]
@@ -539,11 +547,16 @@ mod tests {
         for table in [
             "translations", "revisions", "reviewed_lines", "analyzed_parts", "notes", "scene_descriptions", "characters", "character_forms",
             "speaker_characters", "speaker_entries", "discarded_speakers", "terms", "term_forms", "discarded_terms", "tokens", "llm_runs",
+            "character_mention_checks", "term_mention_checks", "glossary_asks",
         ] {
             assert_eq!(count(&state, id, &format!("SELECT count(*) FROM {table}")), 0, "{table}");
         }
         assert_eq!(count(&state, id, "SELECT count(*) FROM segments"), segments, "снимок игры остался");
-        assert_eq!(empty_steps(&state, id), [GameStep::Glossary, GameStep::Entries, GameStep::Review], "глоссарий пуст: разбор, описания сцен и перевод снова доступны");
+        assert_eq!(
+            empty_steps(&state, id),
+            [GameStep::Names, GameStep::Glossary, GameStep::Entries, GameStep::Review],
+            "глоссарий пуст: разбор, описания сцен и перевод снова доступны"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use super::parts::scene_hash;
 use super::scenes::SceneSource;
 use super::{
-    Character, CharacterId, DiscardReason, DiscardedTerm, Form, NameField, NameKey, NameOrigin, Note, NoteOwner, SceneDescription, Speaker,
+    Character, CharacterId, DiscardReason, DiscardedTerm, Form, KeptTerm, NameField, NameKey, NameOrigin, Note, NoteOwner, SceneDescription, Speaker,
     SpeakerEntry, SpeakerLink, Term, TermCategory, TermId, Token,
 };
 use crate::common::{Gender, Timestamp, ValidationError};
@@ -425,6 +425,16 @@ const TERM_SELECT: &str = "SELECT id, name, translation, category, description F
 
 type TermRow = (i64, String, Option<String>, String, Option<String>);
 
+/// Поля удалённого термина в `discarded_terms`: категория, перевод, описание, формы в JSON.
+type KeptRow = (Option<String>, Option<String>, Option<String>, Option<String>);
+
+/// Форма термина в колонке `discarded_terms.forms`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredForm {
+    text: String,
+    translation: Option<String>,
+}
+
 impl TermRepo<'_> {
     /// Сброс проекта: все термины с формами и исключёнными сценами и корзина терминов.
     pub fn clear(&self) -> Result<(), DbError> {
@@ -534,28 +544,76 @@ impl TermRepo<'_> {
     }
 
     pub fn discarded(&self) -> Result<Vec<DiscardedTerm>, DbError> {
-        let mut statement =
-            self.conn.prepare("SELECT text_key, text, reason, discarded_at FROM discarded_terms ORDER BY discarded_at DESC, text_key")?;
+        let mut statement = self.conn.prepare(
+            "SELECT text_key, text, reason, discarded_at, category, translation, description, forms
+             FROM discarded_terms ORDER BY discarded_at DESC, text_key",
+        )?;
         let rows = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?)))?
+            .query_map([], |row| {
+                let kept: KeptRow = (row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?);
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, kept))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(key, text, reason, at)| {
+            .map(|(key, text, reason, at, kept)| {
                 Ok(DiscardedTerm {
                     text,
                     key: NameKey::from_stored(key),
                     reason: DiscardReason::parse(&reason).map_err(|error| DbError::bad_value("discarded_terms", "reason", error))?,
                     discarded_at: Timestamp::from_secs(at),
+                    kept: Self::kept(kept)?,
                 })
             })
             .collect()
     }
 
+    /// Поля удалённого термина. Без категории в корзине только название.
+    fn kept((category, translation, description, forms): KeptRow) -> Result<Option<KeptTerm>, DbError> {
+        let Some(category) = category else { return Ok(None) };
+        let category = TermCategory::parse(&category).map_err(|error| DbError::bad_value("discarded_terms", "category", error))?;
+        let stored: Vec<StoredForm> = match forms {
+            Some(json) => serde_json::from_str(&json).map_err(|_| {
+                DbError::bad_value("discarded_terms", "forms", ValidationError::UnknownValue { field: "discarded_terms.forms", value: json.clone() })
+            })?,
+            None => Vec::new(),
+        };
+        let forms = stored
+            .iter()
+            .map(|item| form("discarded_terms", &item.text, item.translation.as_deref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(KeptTerm { translation, category, description, forms }))
+    }
+
+    /// Название в корзину. Повторная запись заменяет строку целиком, вместе с полями термина.
     pub fn discard(&self, term: &DiscardedTerm) -> Result<(), DbError> {
+        let kept = term.kept.as_ref();
+        let forms = kept
+            .filter(|kept| !kept.forms.is_empty())
+            .map(|kept| {
+                let stored: Vec<StoredForm> = kept
+                    .forms
+                    .iter()
+                    .map(|form| StoredForm { text: form.text().to_string(), translation: form.translation().map(str::to_string) })
+                    .collect();
+                serde_json::to_string(&stored).map_err(|error| DbError::Corrupt(error.to_string()))
+            })
+            .transpose()?;
         self.conn.execute(
-            "INSERT INTO discarded_terms (text_key, text, reason, discarded_at) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (text_key) DO UPDATE SET text = excluded.text, reason = excluded.reason, discarded_at = excluded.discarded_at",
-            params![term.key.as_str(), term.text, term.reason.as_str(), term.discarded_at.secs()],
+            "INSERT INTO discarded_terms (text_key, text, reason, discarded_at, category, translation, description, forms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (text_key) DO UPDATE SET
+               text = excluded.text, reason = excluded.reason, discarded_at = excluded.discarded_at, category = excluded.category,
+               translation = excluded.translation, description = excluded.description, forms = excluded.forms",
+            params![
+                term.key.as_str(),
+                term.text,
+                term.reason.as_str(),
+                term.discarded_at.secs(),
+                kept.map(|kept| kept.category.as_str()),
+                kept.and_then(|kept| kept.translation.as_deref()),
+                kept.and_then(|kept| kept.description.as_deref()),
+                forms
+            ],
         )?;
         Ok(())
     }
@@ -888,6 +946,8 @@ pub struct SampleLine {
     /// Подпись говорящего, у говорящего без подписи хвост ключа.
     pub speaker: Option<String>,
     pub text: String,
+    /// Отпечаток оригинала: по нему берётся ответ модели, упомянута ли в реплике запись.
+    pub source_hash: String,
 }
 
 /// Реплика сцены текущего снимка для описаний персонажей и терминов.
@@ -898,6 +958,8 @@ pub struct StoryLine {
     /// Подпись говорящего из игры.
     pub label: Option<String>,
     pub text: String,
+    /// Отпечаток оригинала: по нему берётся ответ модели, упомянута ли в реплике запись.
+    pub source_hash: String,
 }
 
 /// Реплики текущего снимка в порядке сюжета: образцы для предложений модели.
@@ -906,7 +968,7 @@ pub struct LineSampleRepo<'c> {
 }
 
 impl LineSampleRepo<'_> {
-    const SELECT: &'static str = "SELECT sp.label, s.speaker_key, s.source_text
+    const SELECT: &'static str = "SELECT sp.label, s.speaker_key, s.source_text, s.source_hash
          FROM segments s
          LEFT JOIN containers c ON c.id = s.container_id
          LEFT JOIN speakers sp ON sp.key = s.speaker_key
@@ -925,7 +987,7 @@ impl LineSampleRepo<'_> {
 
     fn lines_of(&self, scene: Option<&ContainerKey>) -> Result<Vec<StoryLine>, DbError> {
         let mut statement = self.conn.prepare(&format!(
-            "SELECT c.key, s.speaker_key, sp.label, s.source_text
+            "SELECT c.key, s.speaker_key, sp.label, s.source_text, s.source_hash
              FROM segments s
              JOIN containers c ON c.id = s.container_id AND c.kind = 'scene'
              LEFT JOIN speakers sp ON sp.key = s.speaker_key
@@ -934,44 +996,168 @@ impl LineSampleRepo<'_> {
         ))?;
         let rows = statement
             .query_map([scene.map(ContainerKey::as_str)], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.into_iter()
-            .map(|(scene, speaker, label, text)| {
+            .map(|(scene, speaker, label, text, source_hash)| {
                 Ok(StoryLine {
                     scene: ContainerKey::new(scene).map_err(|error| DbError::bad_value("containers", "key", error))?,
                     speaker_key: speaker.map(|key| speaker_key("segments", key)).transpose()?,
                     label,
                     text,
+                    source_hash,
                 })
             })
             .collect()
     }
 
+    /// Все реплики текущего снимка по сюжету: среди них ищутся примеры для терминов.
+    pub fn all(&self) -> Result<Vec<SampleLine>, DbError> {
+        self.query(&format!("{} {}", Self::SELECT, Self::ORDER), [])
+    }
+
     /// Все реплики говорящего.
     pub fn of_speaker(&self, key: &SpeakerKey) -> Result<Vec<SampleLine>, DbError> {
-        self.query(&format!("{} AND s.speaker_key = ?1 {}", Self::SELECT, Self::ORDER), key.as_str())
+        self.query(&format!("{} AND s.speaker_key = ?1 {}", Self::SELECT, Self::ORDER), [key.as_str()])
     }
 
     /// Реплики, где есть `text`, без учёта регистра латиницы. Границы слов проверяет сервис. `None`: все.
     pub fn containing(&self, text: &str, limit: Option<usize>) -> Result<Vec<SampleLine>, DbError> {
         let limit = limit.map(|limit| format!(" LIMIT {limit}")).unwrap_or_default();
-        self.query(&format!("{} AND instr(lower(s.source_text), lower(?1)) > 0 {}{limit}", Self::SELECT, Self::ORDER), text)
+        self.query(&format!("{} AND instr(lower(s.source_text), lower(?1)) > 0 {}{limit}", Self::SELECT, Self::ORDER), [text])
     }
 
-    fn query(&self, sql: &str, value: &str) -> Result<Vec<SampleLine>, DbError> {
+    fn query(&self, sql: &str, values: impl rusqlite::Params) -> Result<Vec<SampleLine>, DbError> {
         let mut statement = self.conn.prepare(sql)?;
         let rows = statement
-            .query_map([value], |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?)))?
+            .query_map(values, |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows
             .into_iter()
-            .map(|(label, key, text)| SampleLine {
+            .map(|(label, key, text, source_hash)| SampleLine {
                 speaker: label.or_else(|| key.map(|key| key.split_once(':').map_or(key.as_str(), |(_, tail)| tail).to_string())),
                 text,
+                source_hash,
             })
             .collect())
+    }
+}
+
+/// `character_pair_checks`, `term_pair_checks` и `term_character_checks`: пары записей, про которые модель уже
+/// ответила, одно ли это.
+pub struct PairCheckRepo<'c> {
+    pub conn: &'c Connection,
+}
+
+impl PairCheckRepo<'_> {
+    /// Таблица пары, её колонки и номера записей в порядке колонок. `None`: запись в паре с собой.
+    fn place(a: super::ExcludeOwner, b: super::ExcludeOwner) -> Option<(&'static str, &'static str, &'static str, i64, i64)> {
+        use super::ExcludeOwner::{Character, Term};
+        let ordered = |a: i64, b: i64| (a != b).then_some((a.min(b), a.max(b)));
+        match (a, b) {
+            (Character(a), Character(b)) => ordered(a.get(), b.get()).map(|(first, second)| ("character_pair_checks", "first_id", "second_id", first, second)),
+            (Term(a), Term(b)) => ordered(a.get(), b.get()).map(|(first, second)| ("term_pair_checks", "first_id", "second_id", first, second)),
+            (Term(term), Character(character)) | (Character(character), Term(term)) => {
+                Some(("term_character_checks", "term_id", "character_id", term.get(), character.get()))
+            }
+        }
+    }
+
+    /// Сброс проекта.
+    pub fn clear(&self) -> Result<(), DbError> {
+        for table in ["character_pair_checks", "term_pair_checks", "term_character_checks"] {
+            self.conn.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        Ok(())
+    }
+
+    pub fn checked(&self, a: super::ExcludeOwner, b: super::ExcludeOwner) -> Result<bool, DbError> {
+        let Some((table, first_column, second_column, first, second)) = Self::place(a, b) else { return Ok(true) };
+        let found = self
+            .conn
+            .query_row(&format!("SELECT 1 FROM {table} WHERE {first_column} = ?1 AND {second_column} = ?2"), params![first, second], |_| Ok(()))
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Ответ о паре. Пара, из которой запись успели удалить, ответа не получает.
+    pub fn mark(&self, a: super::ExcludeOwner, b: super::ExcludeOwner, same: bool, now: Timestamp) -> Result<(), DbError> {
+        use super::ExcludeOwner::{Character, Term};
+        let Some((table, first_column, second_column, first, second)) = Self::place(a, b) else { return Ok(()) };
+        let (first_owner, second_owner) = match (a, b) {
+            (Character(_), Character(_)) => ("characters", "characters"),
+            (Term(_), Term(_)) => ("terms", "terms"),
+            _ => ("terms", "characters"),
+        };
+        self.conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {table} ({first_column}, {second_column}, same, checked_at)
+                 SELECT ?1, ?2, ?3, ?4
+                 WHERE EXISTS (SELECT 1 FROM {first_owner} WHERE id = ?1) AND EXISTS (SELECT 1 FROM {second_owner} WHERE id = ?2)"
+            ),
+            params![first, second, same, now.secs()],
+        )?;
+        Ok(())
+    }
+}
+
+/// Что спрашивали у модели: вид записи в `glossary_asks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskKind {
+    /// Ключ: ключ названия термина. Переименованный термин спросится снова.
+    Term,
+    /// Ключ: ключ говорящего.
+    Speaker,
+    /// Ключ: имя токена.
+    Token,
+    /// Ключ: `names::ask_key`, персонаж, поле и написание.
+    Name,
+}
+
+impl AskKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Term => "term",
+            Self::Speaker => "speaker",
+            Self::Token => "token",
+            Self::Name => "name",
+        }
+    }
+}
+
+/// `glossary_asks`: записи, о которых цепочка автоперевода спросила модель и не получила годного ответа.
+pub struct AskRepo<'c> {
+    pub conn: &'c Connection,
+}
+
+impl AskRepo<'_> {
+    /// Сброс проекта: цепочка спросит обо всём заново.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM glossary_asks", [])?;
+        Ok(())
+    }
+
+    pub fn asked(&self, kind: AskKind) -> Result<std::collections::HashSet<String>, DbError> {
+        let mut statement = self.conn.prepare("SELECT key FROM glossary_asks WHERE kind = ?1")?;
+        let rows = statement.query_map([kind.as_str()], |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark(&self, kind: AskKind, key: &str, now: Timestamp) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO glossary_asks (kind, key, asked_at) VALUES (?1, ?2, ?3)",
+            params![kind.as_str(), key, now.secs()],
+        )?;
+        Ok(())
     }
 }
 
@@ -1018,5 +1204,82 @@ impl AnalyzedPartRepo<'_> {
                 .execute("DELETE FROM analyzed_parts WHERE container_key = ?1 AND part_hash = ?2", params![key.as_str(), hash])?;
         }
         Ok(removed)
+    }
+}
+
+/// `character_mention_checks` и `term_mention_checks`: ответы модели, упомянута ли запись в реплике.
+pub struct MentionCheckRepo<'c> {
+    pub conn: &'c Connection,
+}
+
+impl MentionCheckRepo<'_> {
+    fn table(owner: super::ExcludeOwner) -> (&'static str, &'static str, i64) {
+        match owner {
+            super::ExcludeOwner::Character(id) => ("character_mention_checks", "character_id", id.get()),
+            super::ExcludeOwner::Term(id) => ("term_mention_checks", "term_id", id.get()),
+        }
+    }
+
+    /// Ответы по персонажам.
+    pub fn characters(&self) -> Result<HashMap<CharacterId, super::mentions::Checks>, DbError> {
+        let rows = self.rows("character_mention_checks", "character_id")?;
+        Ok(rows.into_iter().map(|(id, checks)| (CharacterId::from_row(id), checks)).collect())
+    }
+
+    /// Ответы по терминам.
+    pub fn terms(&self) -> Result<HashMap<TermId, super::mentions::Checks>, DbError> {
+        let rows = self.rows("term_mention_checks", "term_id")?;
+        Ok(rows.into_iter().map(|(id, checks)| (TermId::from_row(id), checks)).collect())
+    }
+
+    fn rows(&self, table: &str, column: &str) -> Result<HashMap<i64, super::mentions::Checks>, DbError> {
+        let mut statement = self.conn.prepare(&format!("SELECT {column}, text_hash, used FROM {table}"))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut all: HashMap<i64, super::mentions::Checks> = HashMap::new();
+        for (id, hash, used) in rows {
+            all.entry(id).or_default().insert(hash, used);
+        }
+        Ok(all)
+    }
+
+    /// Ответ по реплике. Запись, которую успели удалить, ответа не получает.
+    pub fn mark(&self, owner: super::ExcludeOwner, text_hash: &str, used: bool, now: Timestamp) -> Result<(), DbError> {
+        let (table, column, id) = Self::table(owner);
+        let owners = match owner {
+            super::ExcludeOwner::Character(_) => "characters",
+            super::ExcludeOwner::Term(_) => "terms",
+        };
+        self.conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {table} ({column}, text_hash, used, checked_at)
+                 SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM {owners} WHERE id = ?1)"
+            ),
+            params![id, text_hash, used, now.secs()],
+        )?;
+        Ok(())
+    }
+
+    /// Ответы `from` переходят к `into` при слиянии: ответ `into` по той же реплике важнее. Строки `from`
+    /// удаляются вместе с записью.
+    pub fn copy(&self, from: super::ExcludeOwner, into: super::ExcludeOwner) -> Result<(), DbError> {
+        let (source, source_column, source_id) = Self::table(from);
+        let (target, target_column, target_id) = Self::table(into);
+        self.conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO {target} ({target_column}, text_hash, used, checked_at)
+                 SELECT ?2, text_hash, used, checked_at FROM {source} WHERE {source_column} = ?1"
+            ),
+            params![source_id, target_id],
+        )?;
+        Ok(())
+    }
+
+    /// Сброс проекта.
+    pub fn clear(&self) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM character_mention_checks", [])?;
+        self.conn.execute("DELETE FROM term_mention_checks", [])?;
+        Ok(())
     }
 }

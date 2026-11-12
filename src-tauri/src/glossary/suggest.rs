@@ -1,6 +1,6 @@
 //! Предложения модели по записям глоссария: перевод терминов, перевод подписей говорящих, значения токенов.
-//! Промпты, разбор ответа и проверка. Ответ модели в базу сам не пишется: отмеченное в отборе записывает окно.
-//! Разбор ответа общий с именами (`names.rs`).
+//! Промпты, разбор ответа и проверка. Годное пишет `GlossaryService::accept_*`: цепочка после пакета, окно после
+//! отбора. Разбор ответа общий с именами (`names.rs`).
 
 use std::collections::HashMap;
 
@@ -17,14 +17,20 @@ use crate::translation::text::{fill_tokens, markers};
 
 /// Сколько реплик говорящего видит модель.
 pub const SPEAKER_SAMPLES: usize = 4;
+/// Сколько реплик с термином видит модель.
+pub const TERM_SAMPLES: usize = 3;
 /// Сколько реплик с токеном видит модель.
 pub const TOKEN_SAMPLES: usize = 8;
 /// Чем заменён разбираемый токен: имени токена модель верит больше, чем репликам.
 pub const TOKEN_GAP: &str = "[___]";
 
+/// Лимит ответа: не меньше этого и не меньше `*_ITEM_TOKENS` на запись пакета (`answer_tokens`).
 const TERM_ANSWER_TOKENS: u32 = 2048;
+const TERM_ITEM_TOKENS: u32 = 128;
 const SPEAKER_ANSWER_TOKENS: u32 = 1536;
+const SPEAKER_ITEM_TOKENS: u32 = 128;
 const TOKEN_ANSWER_TOKENS: u32 = 1536;
+const TOKEN_ITEM_TOKENS: u32 = 192;
 
 const TERMS_SYSTEM: &str = r#"You are an expert game localization specialist translating English terms of a visual novel into Russian.
 Translate in-game terms, locations, factions, artifacts, ranks, items and events into authentic Russian.
@@ -34,14 +40,13 @@ For each term output:
 2. "translation": Accurate, authentic Russian translation in the nominative case.
    Examples: "Demon Hunter" -> "Охотник на демонов", "PPF Headquarters" -> "Штаб ППФ", "Ancient Rune" -> "Древняя руна", "Silver Key" -> "Серебряный ключ".
 3. "category": One of "general", "location", "organization", "title", "item", "event". Use "organization" for companies, factions, agencies, gangs, schools as institutions and other groups of people. Use "event" for wars, battles, disasters, holidays, tournaments and other things that happen at a particular time.
-4. "note": What the term is, in Russian, one short sentence, or an empty string.
 
-"example" is a line of the game where the term appears: use it to understand what the term means. Text in [square brackets] is an in-game variable: keep it unchanged.
-A line starting with "Russian names:" gives the exact spelling of names. A line starting with "Known terms:" gives established translations: keep translations consistent with them.
+"examples" are lines of the game where the term appears: use them to understand what the term means. "about" is what is already known about the term. Text in [square brackets] is an in-game variable: keep it unchanged.
+A line starting with "Russian names:" gives the exact spelling of names: a term that contains a name uses that spelling. A line starting with "Known terms:" gives established translations: keep translations consistent with them, a term that contains a known term uses its translation.
 
 Respond ONLY with a valid JSON array, without markdown fences or explanations:
 [
-  {"id": 1, "translation": "Штаб ППФ", "category": "location", "note": "Главная база ППФ"}
+  {"id": 1, "translation": "Штаб ППФ", "category": "location"}
 ]"#;
 
 const SPEAKERS_SYSTEM: &str = r#"You translate speaker labels of a visual novel from English into Russian.
@@ -86,8 +91,8 @@ pub struct TermItem {
     pub category: TermCategory,
     /// Своё описание: модель его не заменяет, а читает.
     pub description: Option<String>,
-    /// Реплика с термином, первая по сюжету.
-    pub example: Option<String>,
+    /// Реплики с термином вразброс по игре: упоминание решает `mentions::mentioned`.
+    pub examples: Vec<String>,
 }
 
 /// Говорящий в запросе.
@@ -109,10 +114,9 @@ pub struct TokenItem {
 pub struct TermSuggestion {
     pub id: TermId,
     pub translation: String,
-    /// `None`: модель не назвала категорию из списка, остаётся прежняя.
+    /// Только у термина категории `general`: категорию разбора и пользователя перевод не меняет.
+    /// `None`: остаётся прежняя.
     pub category: Option<TermCategory>,
-    /// Только у термина без своего описания.
-    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,14 +153,21 @@ pub(super) struct AnswerItem {
     pub(super) reason: Option<String>,
 }
 
+/// Лимит ответа пакета: не меньше `base` и не меньше `per_item` на запись. Размер пакета задаётся в настройках
+/// действия, и постоянный лимит обрезал бы ответ на большой пакет.
+pub(super) fn answer_tokens(base: u32, per_item: u32, items: usize) -> u32 {
+    base.max(per_item.saturating_mul(u32::try_from(items).unwrap_or(u32::MAX)))
+}
+
 /// Записи ответа с номером пакета. Номер принимается числом и строкой, в том числе с буквой вроде `t3`.
 /// Одну запись локальная модель иногда возвращает объектом вместо массива. Тогда первым массивом в тексте
-/// оказывается вложенный, у его записей нет `id`.
+/// оказывается вложенный, у его записей нет `id`. Обрезанный массив целиком не читается: из него берутся
+/// готовые записи.
 fn answer_items(text: &str) -> Vec<(usize, AnswerItem)> {
     let values = serde_json::from_str::<Vec<serde_json::Value>>(json_array(text))
         .ok()
         .filter(|values| values.is_empty() || values.iter().any(|value| value.get("id").is_some()))
-        .unwrap_or_else(|| single_object(text).into_iter().collect());
+        .unwrap_or_else(|| objects(text));
     values
         .into_iter()
         .filter_map(|value| serde_json::from_value::<AnswerItem>(value).ok())
@@ -171,12 +182,23 @@ fn answer_items(text: &str) -> Vec<(usize, AnswerItem)> {
         .collect()
 }
 
-/// Первый объект с полем `id` в тексте.
-fn single_object(text: &str) -> Option<serde_json::Value> {
-    text.match_indices('{').find_map(|(start, _)| {
-        let value = serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>().next()?.ok()?;
-        value.get("id").is_some().then_some(value)
-    })
+/// Объекты с полем `id` в тексте по порядку: одна запись объектом вместо массива и записи массива, который
+/// модель не дописала. Оборванная запись и вложенные в неё объекты пропускаются.
+fn objects(text: &str) -> Vec<serde_json::Value> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find('{') {
+        let start = from + offset;
+        let mut stream = serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(value)) if value.get("id").is_some() => {
+                found.push(value);
+                from = start + stream.byte_offset();
+            }
+            _ => from = start + 1,
+        }
+    }
+    found
 }
 
 /// Записи ответа по записям пакета: номер с 1, первая запись на номер побеждает.
@@ -218,7 +240,8 @@ pub(super) fn quoted(text: &str) -> String {
 
 /// Подсказки глоссария по тексту пакета, абзацами перед списком.
 pub(super) fn hints_block(text: &str, hints: &Hints) -> String {
-    glossary_hints(text, hints).iter().map(|hint| format!("{hint}\n\n")).collect()
+    let lines: Vec<(&str, &str)> = text.lines().map(|line| (line, "")).collect();
+    glossary_hints(&lines, hints).iter().map(|hint| format!("{hint}\n\n")).collect()
 }
 
 /// `count` записей равномерно по всему списку, по порядку.
@@ -247,16 +270,16 @@ pub struct TermsPrompt;
 
 impl TermsPrompt {
     pub fn build(batch: &[TermItem], hints: &Hints, target: &LlmTarget) -> ChatRequest {
-        let text: String =
-            batch.iter().flat_map(|term| [Some(term.name.as_str()), term.example.as_deref()]).flatten().map(|line| format!("{line}\n")).collect();
+        let text: String = batch.iter().flat_map(|term| std::iter::once(&term.name).chain(&term.examples)).map(|line| format!("{line}\n")).collect();
         let mut list = String::new();
         for (index, term) in batch.iter().enumerate() {
             list.push_str(&format!("- id: {}, term: {}, current_category: {}", index + 1, quoted(&term.name), quoted(term.category.as_str())));
             if let Some(description) = &term.description {
                 list.push_str(&format!(", about: {}", quoted(description)));
             }
-            if let Some(example) = &term.example {
-                list.push_str(&format!(", example: {}", quoted(example)));
+            if !term.examples.is_empty() {
+                let examples: Vec<String> = term.examples.iter().map(|example| quoted(example)).collect();
+                list.push_str(&format!(", examples: [{}]", examples.join(", ")));
             }
             list.push('\n');
         }
@@ -264,19 +287,23 @@ impl TermsPrompt {
             system: TERMS_SYSTEM.to_string(),
             user: format!("{}Terms to translate into Russian:\n{list}\nProvide JSON array now:", hints_block(&text, hints)),
             temperature: target.settings.temperature,
-            max_tokens: TERM_ANSWER_TOKENS,
+            max_tokens: answer_tokens(TERM_ANSWER_TOKENS, TERM_ITEM_TOKENS, batch.len()),
         }
     }
 
-    /// Перевод одной строкой с токенами оригинала. Категория только из списка, описание только термину без своего.
+    /// Перевод одной строкой с токенами оригинала. Категория только из списка и только термину категории `general`.
     pub fn accept(text: &str, batch: &[TermItem]) -> Vec<TermSuggestion> {
         by_number(text, batch)
             .into_iter()
             .filter_map(|(term, item)| {
                 let translation = field(item.translation.as_deref()).filter(|text| usable_label(&term.name, text))?;
-                let category = item.category.as_deref().and_then(|text| TermCategory::parse(&text.trim().to_lowercase()).ok());
-                let description = field(item.note.as_deref()).filter(|_| term.description.is_none());
-                Some(TermSuggestion { id: term.id, translation, category, description })
+                let category = item
+                    .category
+                    .as_deref()
+                    .filter(|_| term.category == TermCategory::General)
+                    .and_then(|text| TermCategory::parse(&text.trim().to_lowercase()).ok())
+                    .filter(|category| *category != TermCategory::General);
+                Some(TermSuggestion { id: term.id, translation, category })
             })
             .collect()
     }
@@ -299,7 +326,7 @@ impl SpeakersPrompt {
             system: SPEAKERS_SYSTEM.to_string(),
             user: format!("{}Speaker labels:\n{list}\nProvide JSON array now:", hints_block(&text, hints)),
             temperature: target.settings.temperature,
-            max_tokens: SPEAKER_ANSWER_TOKENS,
+            max_tokens: answer_tokens(SPEAKER_ANSWER_TOKENS, SPEAKER_ITEM_TOKENS, batch.len()),
         }
     }
 
@@ -331,7 +358,7 @@ impl TokensPrompt {
             system: TOKENS_SYSTEM.to_string(),
             user: format!("{}Variables:\n{list}\nProvide JSON array now:", hints_block(&text, hints)),
             temperature: target.settings.temperature,
-            max_tokens: TOKEN_ANSWER_TOKENS,
+            max_tokens: answer_tokens(TOKEN_ANSWER_TOKENS, TOKEN_ITEM_TOKENS, batch.len()),
         }
     }
 
@@ -359,7 +386,7 @@ mod tests {
             name: name.to_string(),
             category: TermCategory::General,
             description: description.map(str::to_string),
-            example: Some(format!("We met at the {name}.")),
+            examples: vec![format!("We met at the {name}.")],
         }
     }
 
@@ -372,11 +399,11 @@ mod tests {
         let hints = Hints { terms: vec![("PPF".to_string(), "ППФ".to_string())], ..Hints::default() };
         let request = TermsPrompt::build(&[term(7, "PPF Headquarters", Some("База"))], &hints, &target());
         assert!(request.user.starts_with("Known terms: PPF = ППФ"));
-        assert!(request.user.contains(r#"- id: 1, term: "PPF Headquarters", current_category: "general", about: "База", example: "We met at the PPF Headquarters.""#));
+        assert!(request.user.contains(r#"- id: 1, term: "PPF Headquarters", current_category: "general", about: "База", examples: ["We met at the PPF Headquarters."]"#));
     }
 
     #[test]
-    fn terms_answer_is_checked_by_number_markers_and_own_description() {
+    fn terms_answer_is_checked_by_number_markers_and_category() {
         let batch = [term(7, "Silver Key", None), term(8, "[mc]'s Room", Some("Своё")), term(9, "Harbor", None)];
         let answer = r#"Вот ответ:
         [
@@ -390,19 +417,25 @@ mod tests {
         assert_eq!(
             accepted,
             [
-                TermSuggestion {
-                    id: TermId::from_row(7),
-                    translation: "Серебряный ключ".to_string(),
-                    category: Some(TermCategory::Item),
-                    description: Some("Ключ от подвала".to_string()),
-                },
-                TermSuggestion { id: TermId::from_row(9), translation: "Гавань".to_string(), category: None, description: Some("Порт".to_string()) },
+                TermSuggestion { id: TermId::from_row(7), translation: "Серебряный ключ".to_string(), category: Some(TermCategory::Item) },
+                TermSuggestion { id: TermId::from_row(9), translation: "Гавань".to_string(), category: None },
             ],
             "без [mc] перевод не годится, неизвестная категория пропускается, повтор номера и чужой номер отброшены"
         );
-        let own = [term(8, "Room", Some("Своё"))];
-        let accepted = TermsPrompt::accept(r#"[{"id": 1, "translation": "Комната", "note": "Чужое"}]"#, &own);
-        assert_eq!(accepted[0].description, None, "своё описание модель не заменяет");
+        let placed = [TermItem { category: TermCategory::Location, ..term(8, "Room", None) }];
+        let accepted = TermsPrompt::accept(r#"[{"id": 1, "translation": "Комната", "category": "item"}]"#, &placed);
+        assert_eq!(accepted[0].category, None, "категорию разбора и пользователя перевод не меняет");
+    }
+
+    #[test]
+    fn a_cut_answer_keeps_its_finished_items_and_the_limit_grows_with_the_batch() {
+        let batch = [term(1, "Silver Key", None), term(2, "Harbor", None), term(3, "Old Mill", None)];
+        let cut = r#"[{"id": 1, "translation": "Серебряный ключ"}, {"id": 2, "translation": "Гавань", "category": "location"}, {"id": 3, "translat"#;
+        let accepted = TermsPrompt::accept(cut, &batch);
+        assert_eq!(accepted.iter().map(|found| found.translation.as_str()).collect::<Vec<_>>(), ["Серебряный ключ", "Гавань"]);
+
+        let limit = |count: usize| TermsPrompt::build(&vec![term(1, "Harbor", None); count], &Hints::default(), &target()).max_tokens;
+        assert_eq!((limit(1), limit(20), limit(40)), (2048, 2560, 5120));
     }
 
     #[test]

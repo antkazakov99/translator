@@ -1,20 +1,28 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { LoaderCircle } from "lucide-svelte";
-  import { commands, type EntryLineDto_Serialize as EntryLine, type OwnerDto } from "./bindings";
+  import type { EntryLineDto_Serialize as EntryLine } from "./bindings";
   import { matches } from "./glossary";
   import { sceneLabel } from "./scene-graph";
 
-  /** Реплики персонажа или термина по сюжету: где персонаж говорит или его упоминают, где есть термин. */
+  /** Реплики записи глоссария по сюжету: где говорит персонаж или говорящий, где упомянут персонаж или термин. */
   let {
-    projectId,
-    owner,
+    subject,
+    load,
+    mentions = false,
+    empty,
     revision = "",
     onOpenLine,
     onError,
   }: {
-    projectId: string;
-    owner: OwnerDto;
+    /** Чьи это реплики, например `character:12`: со сменой записи сбрасываются поиск и фильтр. */
+    subject: string;
+    /** Читает реплики записи `subject`. */
+    load: () => Promise<EntryLine[]>;
+    /** Среди реплик бывают упоминания (у персонажа): есть фильтр «Говорит / Упоминания». */
+    mentions?: boolean;
+    /** Подсказка, когда реплик нет. */
+    empty: string;
     /** Сохранённые имена и формы записи: их правка меняет найденные упоминания. */
     revision?: string;
     /** Реплика в таблице перевода или в исходнике. */
@@ -32,11 +40,8 @@
   let query = $state("");
   let limit = $state(PAGE);
 
-  const ownerKey = $derived(`${owner.kind}:${owner.id}`);
-  const isCharacter = $derived(owner.kind === "character");
-
   $effect(() => {
-    ownerKey;
+    subject;
     untrack(() => {
       filter = "all";
       query = "";
@@ -46,16 +51,18 @@
   });
 
   $effect(() => {
-    ownerKey;
+    subject;
     revision;
-    untrack(() => load(owner));
+    untrack(read);
   });
 
-  async function load(current: OwnerDto) {
+  async function read() {
+    const current = subject;
     loading = true;
     try {
-      const found = await commands.entryLines(projectId, current);
-      if (current.kind === owner.kind && current.id === owner.id) lines = found;
+      const found = await load();
+      // Пока шло чтение, открыли другую запись: её реплики придут своим чтением.
+      if (current === subject) lines = found;
     } catch (e) {
       onError(String(e));
     } finally {
@@ -84,7 +91,8 @@
 
   function summary() {
     if (!lines || lines.length === 0) return "";
-    if (!isCharacter) return `сцен: ${sceneCount} · реплик: ${lines.length}`;
+    // Число реплик стоит в заголовке панели: здесь только то, чего там нет.
+    if (!mentions) return `сцен: ${sceneCount}`;
     return `сцен: ${sceneCount} · говорит: ${spoken} · упоминается: ${lines.length - spoken}`;
   }
 
@@ -94,29 +102,31 @@
   }
 </script>
 
-<section class="card entry-lines" aria-label="Реплики">
+<section class="entry-lines" aria-label="Реплики">
   <div class="head">
-    <strong>Реплики</strong>
+    <strong>Реплики{lines && lines.length > 0 ? ` · ${lines.length}` : ""}</strong>
     {#if loading && !lines}<LoaderCircle size={12} class="spin" />{/if}
-    <span class="faint">{summary()}</span>
-    <span class="spacer"></span>
-    {#if isCharacter && lines && lines.length > 0}
-      <div class="segmented" role="radiogroup" aria-label="Какие реплики показать">
-        <button role="radio" aria-checked={filter === "all"} class:on={filter === "all"} onclick={() => (filter = "all")}>Все</button>
-        <button role="radio" aria-checked={filter === "spoken"} class:on={filter === "spoken"} onclick={() => (filter = "spoken")}>Говорит</button>
-        <button role="radio" aria-checked={filter === "mentioned"} class:on={filter === "mentioned"} onclick={() => (filter = "mentioned")}
-          >Упоминания</button
-        >
-      </div>
-    {/if}
+    <span class="faint summary" title={summary()}>{summary()}</span>
   </div>
 
   {#if lines && lines.length === 0}
-    <span class="faint">
-      {isCharacter ? "В репликах не найден: нет говорящих, а имя и формы не встречаются" : "В репликах не встречается"}
-    </span>
+    <div class="empty">
+      <strong>Реплик нет</strong>
+      <span>{empty}</span>
+    </div>
   {:else if lines}
-    <input class="input" type="search" bind:value={query} placeholder="Поиск по оригиналу и переводу" aria-label="Поиск по репликам" />
+    <div class="filters">
+      <input class="input" type="search" bind:value={query} placeholder="Поиск по репликам" title="Поиск по оригиналу и переводу" aria-label="Поиск по репликам" />
+      {#if mentions}
+        <div class="segmented" role="radiogroup" aria-label="Какие реплики показать">
+          <button role="radio" aria-checked={filter === "all"} class:on={filter === "all"} onclick={() => (filter = "all")}>Все</button>
+          <button role="radio" aria-checked={filter === "spoken"} class:on={filter === "spoken"} onclick={() => (filter = "spoken")}>Говорит</button>
+          <button role="radio" aria-checked={filter === "mentioned"} class:on={filter === "mentioned"} onclick={() => (filter = "mentioned")}
+            >Упоминания</button
+          >
+        </div>
+      {/if}
+    </div>
     <div class="lines">
       {#each groups as group, index (`${group.scene}-${index}`)}
         <!-- Своя обёртка у сцены: её заголовок прилипает, пока видны её реплики, и уступает место следующему. -->
@@ -150,17 +160,21 @@
 </section>
 
 <style>
-  /* Панель рядом с карточкой записи: заголовок, фильтр и поиск на месте, листаются только реплики. */
+  /* Область рядом с полями записи: заголовок, поиск и фильтр на месте, листаются только реплики. */
   .entry-lines {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
     min-height: 0;
     overflow: hidden;
   }
 
   .head {
     display: flex;
-    flex-wrap: wrap;
     gap: 8px;
     align-items: center;
+    min-height: 28px;
+    padding: 12px 14px 0;
   }
 
   .head strong {
@@ -169,8 +183,29 @@
     font-weight: 600;
   }
 
-  .spacer {
+  .summary {
     flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Поиск и фильтр одной строкой: поле сжимается, переключатель нет. */
+  .filters {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 12px 14px 10px;
+    border-bottom: 1px solid var(--divider);
+  }
+
+  .filters .input {
+    flex: 1;
+  }
+
+  .filters .segmented {
+    flex-shrink: 0;
   }
 
   .lines {
@@ -179,25 +214,25 @@
     flex-direction: column;
     min-height: 0;
     overflow-y: auto;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--bg-sunken);
   }
 
   .nothing {
-    padding: 8px;
+    padding: 10px 14px;
   }
 
   .scene {
     position: sticky;
     top: 0;
     z-index: 1;
-    padding: 6px 8px;
-    border-bottom: 1px solid var(--divider);
-    background: var(--surface);
-    color: var(--text-muted);
-    font-size: 11px;
+    overflow: hidden;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--divider-row);
+    background: var(--bg);
+    color: var(--accent-text);
+    font-size: 12px;
     font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .line {

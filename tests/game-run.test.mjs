@@ -1,7 +1,7 @@
 // @ts-nocheck -- Node runtime tests use native TypeScript loading, outside the browser type environment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { availableSteps, chainText, defaultSteps, fedBy, finishedText, leftLabel, plural, requestsLabel, stepOutcomes, stepsToRun } from '../src/lib/game-run.ts';
+import { chainText, finishedText, gameSteps, leftLabel, mergeFinished, orderedSteps, plural, requestsLabel, stepHints, stepOutcomes } from '../src/lib/game-run.ts';
 
 const work = (step, counts, requests = 0) => ({
   step,
@@ -24,30 +24,12 @@ test('left work shows only what is there', () => {
   assert.equal(leftLabel(work('lines', [['реплик без перевода', 0]])), 'Делать нечего');
 });
 
-test('steps without work are neither default nor run', () => {
-  const all = [work('review', [['реплик не вычитано', 3]]), work('analysis', [['сцен', 2]]), work('lines', [['реплик', 0]])];
-  assert.deepEqual(defaultSteps(all), ['analysis', 'review']);
-  assert.deepEqual(stepsToRun(['review', 'lines', 'analysis'], all), ['analysis', 'review'], 'порядок цепочки, пустой шаг выпал');
-});
-
-test('a step gets work from a chosen earlier step', () => {
-  const all = [
-    work('analysis', [['сцен', 140]]),
-    work('glossary', [['терминов', 0]]),
-    work('entries', [['без описания', 0]]),
-    work('scenes', [['сцен без описания', 140]]),
-    work('lines', [['реплик', 12300]]),
-    work('review', [['не вычитано', 0]]),
-  ];
-  assert.deepEqual(defaultSteps(all), ['analysis', 'glossary', 'entries', 'scenes', 'lines', 'review'], 'разбор найдёт записи, перевод даст вычитку');
-  assert.equal(fedBy('entries', defaultSteps(all), all), 'analysis');
-  assert.equal(fedBy('review', defaultSteps(all), all), 'lines');
-  assert.equal(fedBy('lines', defaultSteps(all), all), null, 'у перевода работа есть сейчас');
-
-  const withoutAnalysis = ['glossary', 'entries', 'scenes', 'lines', 'review'];
-  assert.deepEqual([...availableSteps(withoutAnalysis, all)], ['analysis', 'scenes', 'lines', 'review'], 'без разбора описывать некого, сам разбор отметить можно');
-  assert.deepEqual(stepsToRun(withoutAnalysis, all), ['scenes', 'lines', 'review']);
-  assert.deepEqual(stepsToRun(['review'], all), [], 'вычитке без перевода нечего читать');
+test('chosen steps run in the order of the chain', () => {
+  assert.deepEqual(orderedSteps(['review', 'lines', 'analysis']), ['analysis', 'lines', 'review']);
+  assert.deepEqual(orderedSteps([]), []);
+  assert.deepEqual(orderedSteps(['glossary', 'names']), ['names', 'glossary'], 'имена раньше терминов и подписей');
+  assert.deepEqual(orderedSteps(gameSteps), gameSteps, 'все шаги отмечены по умолчанию: сводка для запуска не нужна');
+  assert.deepEqual(Object.keys(stepHints), gameSteps, 'у каждого шага есть подпись без сводки');
 });
 
 test('run bar shows the step of the chain', () => {
@@ -57,7 +39,7 @@ test('run bar shows the step of the chain', () => {
     chainText({ done: 2, total: 5, written: 1, message: 'в пакете: Rusty Anchor', stage }, false),
     'Шаг 2 из 4 · Перевод терминов: запрос 3 из 5 · записано: 1 · в пакете: Rusty Anchor',
   );
-  assert.equal(chainText({ done: 2, total: 5, written: 1, message: null }, true), 'Вся игра: останавливается после текущего запроса');
+  assert.equal(chainText({ done: 2, total: 5, written: 1, message: null }, true), 'Автоперевод: останавливается после текущего запроса');
 });
 
 test('outcomes mark done, broken, waiting and skipped steps', () => {
@@ -78,4 +60,11 @@ test('outcomes mark done, broken, waiting and skipped steps', () => {
 test('finished summary names the steps', () => {
   assert.equal(finishedText([{ step: 'lines', written: 120 }], false), 'Готово: Перевод реплик · 120');
   assert.equal(finishedText([], true), 'Остановлено до конца первого шага');
+});
+
+test('names step before and after the picks is one step in the summary', () => {
+  const earlier = [{ step: 'analysis', written: 3 }, { step: 'names', written: 4 }];
+  const merged = mergeFinished(earlier, [{ step: 'names', written: 2 }, { step: 'lines', written: 120 }]);
+  assert.deepEqual(merged, [{ step: 'analysis', written: 3 }, { step: 'names', written: 6 }, { step: 'lines', written: 120 }]);
+  assert.equal(earlier[1].written, 4, 'прежний итог не меняется');
 });

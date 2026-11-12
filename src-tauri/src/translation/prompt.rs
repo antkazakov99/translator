@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
-use super::text::{is_wordless, mentions, token_names};
+use super::text::{is_wordless, token_names};
+use crate::glossary::mentions::mentioned;
 use super::{Batch, Hints, Scene, SceneLine};
 use crate::llm::{ChatRequest, LlmTarget};
 use crate::scan::SegmentId;
@@ -119,10 +120,11 @@ impl LinesPrompt {
             context.push(format!("Scene: {description}"));
         }
         context.extend(speakers_hint(&shown));
-        let text: String = shown.iter().map(|line| format!("{}\n{}\n", line.speaker.as_deref().unwrap_or(NARRATOR), line.source_text)).collect();
-        context.extend(glossary_hints(&text, hints));
-        let lines: String = shown.iter().map(|line| format!("{}\n", line.source_text)).collect();
-        context.extend(name_rules_hint(&lines, hints));
+        let texts: Vec<HintLine> = shown.iter().map(|line| (line.source_text.as_str(), line.source_hash.as_str())).collect();
+        let speakers = shown.iter().map(|line| (line.speaker.as_deref().unwrap_or(NARRATOR), ""));
+        let with_speakers: Vec<HintLine> = speakers.zip(&texts).flat_map(|(speaker, text)| [speaker, *text]).collect();
+        context.extend(glossary_hints(&with_speakers, hints));
+        context.extend(name_rules_hint(&texts, hints));
         if !earlier.is_empty() {
             context.push(format!("Earlier lines:\n{}", json(&earlier)));
         }
@@ -148,17 +150,26 @@ fn json(items: &[Item]) -> String {
 
 /// Подсказки глоссария по тексту запроса: пояснения токенов, имена с родом, термины. Ими пользуются
 /// и предложения модели в глоссарии.
-pub(crate) fn glossary_hints(text: &str, hints: &Hints) -> Vec<String> {
-    token_hint(text, hints).into_iter().chain(name_hint(text, hints)).chain(term_hint(text, hints)).collect()
+pub(crate) fn glossary_hints(lines: &[HintLine], hints: &Hints) -> Vec<String> {
+    let text: String = lines.iter().map(|(text, _)| format!("{text}\n")).collect();
+    token_hint(&text, hints).into_iter().chain(name_hint(lines, hints)).chain(term_hint(lines, hints)).collect()
+}
+
+/// Строка текста запроса и отпечаток оригинала её реплики (`segments.source_hash`): по нему берётся ответ модели,
+/// упомянута ли в ней запись. У подписи говорящего и текста не из реплики отпечаток пустой.
+pub(crate) type HintLine<'a> = (&'a str, &'a str);
+
+/// Упомянуто ли написание глоссария хоть в одной строке.
+fn named(lines: &[HintLine], name: &str, hints: &Hints) -> bool {
+    lines.iter().any(|(text, hash)| mentioned(text, hash, &[name], hints.checks.get(name)))
 }
 
 /// Правила языков имён, упомянутых в тексте реплик: как имя пишется и склоняется. Не больше
 /// `NAME_RULE_LANGUAGES` языков, первыми те, у кого больше упомянутых имён.
-fn name_rules_hint(text: &str, hints: &Hints) -> Option<String> {
-    let lower = text.to_lowercase();
+fn name_rules_hint(lines: &[HintLine], hints: &Hints) -> Option<String> {
     let mut languages: Vec<(&str, Vec<&str>)> = Vec::new();
     for (name, codes) in &hints.name_origins {
-        if !mentions(&lower, &name.to_lowercase()) {
+        if !named(lines, name, hints) {
             continue;
         }
         for code in codes.iter().filter(|code| hints.name_rules.iter().any(|(known, _)| known == *code)) {
@@ -207,22 +218,19 @@ fn token_hint(text: &str, hints: &Hints) -> Option<String> {
 }
 
 /// Переводы имён тех, кто упомянут в тексте. Род идёт отдельной строкой: пометку рядом с именем модель переписывала в ответ.
-fn name_hint(text: &str, hints: &Hints) -> Option<String> {
-    let lower = text.to_lowercase();
+fn name_hint(lines: &[HintLine], hints: &Hints) -> Option<String> {
     let mut seen = HashSet::new();
-    let named: Vec<_> = hints
+    let found: Vec<_> = hints
         .names
         .iter()
-        .filter(|(original, translated, _)| {
-            !translated.trim().is_empty() && seen.insert(original.as_str()) && mentions(&lower, &original.to_lowercase())
-        })
+        .filter(|(original, translated, _)| !translated.trim().is_empty() && seen.insert(original.as_str()) && named(lines, original, hints))
         .collect();
-    if named.is_empty() {
+    if found.is_empty() {
         return None;
     }
-    let pairs: Vec<String> = named.iter().map(|(original, translated, _)| format!("{original} = {translated}")).collect();
+    let pairs: Vec<String> = found.iter().map(|(original, translated, _)| format!("{original} = {translated}")).collect();
     let genders: Vec<String> =
-        named.iter().filter_map(|(original, _, gender)| Some(format!("{original} {}", gender.as_ref()?.as_str()))).collect();
+        found.iter().filter_map(|(original, _, gender)| Some(format!("{original} {}", gender.as_ref()?.as_str()))).collect();
     let mut hint = format!("Russian names: {}", pairs.join(", "));
     if !genders.is_empty() {
         hint.push_str(&format!("\nGender: {}", genders.join(", ")));
@@ -231,13 +239,12 @@ fn name_hint(text: &str, hints: &Hints) -> Option<String> {
 }
 
 /// Термины глоссария, которые есть в тексте, в пределах `MAX_TERM_HINT_CHARS`.
-fn term_hint(text: &str, hints: &Hints) -> Option<String> {
-    let lower = text.to_lowercase();
+fn term_hint(lines: &[HintLine], hints: &Hints) -> Option<String> {
     let mut size = 0;
     let pairs: Vec<String> = hints
         .terms
         .iter()
-        .filter(|(original, translated)| !translated.trim().is_empty() && mentions(&lower, &original.trim().to_lowercase()))
+        .filter(|(original, translated)| !translated.trim().is_empty() && named(lines, original, hints))
         .map(|(original, translated)| format!("{} = {}", original.trim(), translated.trim()))
         .take_while(|pair| {
             size += pair.chars().count() + 2;

@@ -1,22 +1,18 @@
-//! Разбор сцены моделью перед её описанием: новые персонажи и термины по частям сцены. Находки сводятся
-//! по `NameKey`, известное глоссарию, корзине терминов и подписям разобранных говорящих отсеивается, остальное сразу
-//! пишется в глоссарий. Описывает новые записи потом общий путь описаний.
+//! Разбор сцены моделью перед её описанием: запрос по части сцены и чтение ответа. Модель называет новых
+//! персонажей и термины, другое имя известной записи (`same_as`), известное имя у другой сущности
+//! (`other_than`), двух персонажей сцены как одного человека (`same_person`) и отвечает на вопросы о спорных
+//! упоминаниях (`check`). Что из находки получится в глоссарии, решает `resolve.rs`.
 
 use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 
-use super::repo::{CharacterRepo, LineSampleRepo, SpeakerRepo, TermRepo};
-use super::entries::scene_entries;
-use super::service::{give_term, merge_characters, merge_terms};
-use crate::engines::ContainerKey;
-use super::{
-    Character, CharacterId, DiscardReason, DiscardedTerm, Form, GlossaryData, NameKey, NoteOwner, NoteRepo, Speaker, SpeakerLink, Term, TermCategory,
-    TermId,
-};
-use crate::common::{Gender, Timestamp};
+use super::entries::{character_names, term_names};
+use super::mentions::{Casings, Checks, doubt, is_sure, mentioned, occurrences};
+use super::service::ExcludeOwner;
+use super::{CharacterId, GlossaryData, NameKey, TermCategory};
+use crate::common::Gender;
 use crate::llm::{ChatRequest, LlmTarget};
-use crate::storage::DbError;
 use crate::translation::answer::json_array;
 use crate::translation::text::mentions;
 
@@ -39,22 +35,32 @@ and anything inside [square brackets] or {curly brackets}. \
 A new spelling of a known or listed name is not skipped: an abbreviation, a short or full form, a nickname, \
 a synonym (\"PPF\" for \"People's Police Force\", \"Stuart\" for \"Stu\", \"Fey Court\" for \"Fairy Court\"). \
 List it with \"same_as\". \
+\"Characters of this scene\" lists known characters with ids like C3. When a name you list is another name \
+of one of them (a surname, a first name, a nickname, an alias or a false name they go by), \
+set \"same_as\" to that id (\"C3\"). \
+When the text shows that two listed characters are one person, add {\"kind\": \"same_person\", \"ids\": [\"C3\", \"C7\"]}. \
+Family members often share a surname: do not join them. \
+A known name that this text uses for someone or something else (another person with the same name or surname, \
+a place named like a person) is not skipped either: list it with \"other_than\" set to the id or the known name \
+it must not be confused with. \
 A rank, title or form of address before a name is not part of the name: for \"Detective-Colonel Karanovic\" \
 list the title \"Detective-Colonel\" and the name \"Karanovic\" separately, and skip \"Mr.\", \"Mrs.\" and similar. \
+When the request has \"Known names to check\", each question Q1, Q2... quotes a line with a known name. \
+Answer it in one more object {\"kind\": \"check\", \"yes\": [\"Q1\"], \"no\": [\"Q2\"]}: \"yes\" when the line \
+uses that known name (that person, place, thing or concept of the game), \"no\" when it is an ordinary word \
+or someone or something else. A name shared by several entries is asked once per entry, with that entry in parentheses. \
+A checked name is not new: do not list it as a character or term. \
 Answer with a JSON array, or [] if there is nothing new. Each object has the fields: \
 \"kind\": one of \"character\", \"location\", \"organization\", \"title\", \"item\", \"event\", \"general\"; \
 \"name\": the exact spelling from the text; \
 \"gender\": \"male\", \"female\" or \"unknown\", only for a character; \
 \"first_name\" and \"last_name\": only for a character with a personal name, its given name and surname as written \
 (\"Vera Karanovic\": \"Vera\" and \"Karanovic\"; a lone \"Karanovic\" that is a surname: only \"last_name\"); \
-\"same_as\": only when this is another name of a known name or of another name in your answer, its exact spelling. \
+\"same_as\": only when this is another name of a known name or of another name in your answer, its exact spelling \
+or id; \
+\"other_than\": only for a known name used for someone or something else, the id or name of the known one. \
 Respond with the JSON array only.";
 
-/// Обращения перед именем: не должность, термином не становятся.
-const HONORIFICS: [&str; 10] = ["mr", "mrs", "ms", "miss", "mx", "dr", "sir", "lady", "lord", "madam"];
-
-/// Служебные слова, которые аббревиатура пропускает: «People's Police Force» это PPF, «Order of the Dawn» это OD.
-const MINOR_WORDS: [&str; 10] = ["of", "the", "and", "for", "a", "an", "in", "on", "at", "to"];
 
 /// Что нашла модель: персонаж или термин своей категории.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,6 +89,9 @@ pub struct Finding {
     pub gender: Option<Gender>,
     /// Чьё это другое имя по словам модели: написание известной записи или другой находки.
     pub same_as: Option<String>,
+    /// С кем находку нельзя путать по словам модели: известное написание или номер персонажа сцены. Так модель
+    /// называет другую сущность с известным написанием.
+    pub other_than: Option<String>,
     /// Имя и фамилия персонажа по словам модели. `None`: не личное имя или части не сошлись с написанием.
     pub parts: Option<NameParts>,
 }
@@ -118,35 +127,186 @@ struct AnswerItem {
     gender: Option<String>,
     #[serde(alias = "alias_of", alias = "form_of", alias = "sameAs")]
     same_as: Option<String>,
+    #[serde(alias = "not", alias = "different_from", alias = "otherThan")]
+    other_than: Option<String>,
     #[serde(alias = "given_name", alias = "firstName")]
     first_name: Option<String>,
     #[serde(alias = "surname", alias = "lastName", alias = "family_name")]
     last_name: Option<String>,
+    /// У записи `same_person`: номера персонажей сцены.
+    #[serde(default)]
+    ids: Vec<serde_json::Value>,
+    /// У записи `check`: номера вопросов, где известная запись упомянута.
+    #[serde(default, alias = "used")]
+    yes: Vec<serde_json::Value>,
+    /// У записи `check`: номера вопросов, где это обычное слово.
+    #[serde(default, alias = "unused", alias = "not_used")]
+    no: Vec<serde_json::Value>,
+}
+
+/// Вопросов о спорных упоминаниях в одном запросе разбора не больше этого: длинный список модель читает хуже.
+const MAX_CHECKS: usize = 20;
+/// Реплика в вопросе не длиннее этого.
+const MAX_CHECK_LINE: usize = 300;
+
+/// Спорное упоминание известной записи в части: модель отвечает, запись это или обычное слово.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    pub owner: ExcludeOwner,
+    /// Написание записи, о котором спрашивается.
+    pub name: String,
+    /// Реплика строкой «Говорящий: текст», как в части.
+    pub line: String,
+    /// Отпечаток оригинала реплики: по нему пишется ответ.
+    pub hash: String,
+    /// Запись, о которой вопрос, если у написания несколько владельцев: «Vera Karanovic» у «Karanovic»,
+    /// а при одинаковых именах вид записи («character», «term»).
+    pub entry: Option<String>,
+    doubt: u8,
+}
+
+/// Запись глоссария для вопросов: чья, написания и уже полученные ответы модели.
+pub struct Asked<'a> {
+    pub owner: ExcludeOwner,
+    /// Главное имя записи: полное имя персонажа, название термина.
+    pub label: String,
+    pub names: Vec<String>,
+    pub checks: Option<&'a Checks>,
+}
+
+impl<'a> Asked<'a> {
+    /// Персонажи и термины глоссария с их написаниями и ответами.
+    pub fn all(glossary: &'a GlossaryData) -> Vec<Self> {
+        let characters = glossary.characters.iter().filter_map(|character| {
+            let id = character.id()?;
+            Some(Self {
+                owner: ExcludeOwner::Character(id),
+                label: character.full_name().unwrap_or_default(),
+                names: character_names(character),
+                checks: glossary.character_checks.get(&id),
+            })
+        });
+        let terms = glossary.terms.iter().filter_map(|term| {
+            let id = term.id()?;
+            Some(Self { owner: ExcludeOwner::Term(id), label: term.name().to_string(), names: term_names(term), checks: glossary.term_checks.get(&id) })
+        });
+        characters.chain(terms).filter(|entry| !entry.names.is_empty()).collect()
+    }
+}
+
+/// Реплика сцены для вопросов: строка как в части, текст с подстановками и отпечаток оригинала.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartLine {
+    pub script: String,
+    pub text: String,
+    pub hash: String,
+}
+
+/// Вопросы о спорных упоминаниях известных записей в части. Без вопроса остаются реплики, где у записи есть
+/// бесспорное упоминание или уже есть ответ модели. Написание с несколькими владельцами (фамилия семьи, город
+/// и человек с одним именем) бесспорным не бывает: вопрос задаётся для каждой записи и называет её.
+/// Первыми идут точные и необычные написания, обычные слова последними, не больше `MAX_CHECKS`.
+pub fn questions(part: &str, lines: &[PartLine], entries: &[Asked], casings: &mut Casings) -> Vec<Question> {
+    let by_script: HashMap<&str, &PartLine> = lines.iter().rev().map(|line| (line.script.as_str(), line)).collect();
+    let mut owners: HashMap<NameKey, usize> = HashMap::new();
+    for key in entries.iter().flat_map(|entry| entry.names.iter().filter_map(|name| NameKey::new(name)).collect::<HashSet<_>>()) {
+        *owners.entry(key).or_default() += 1;
+    }
+    let shared = |name: &str| NameKey::new(name).is_some_and(|key| owners.get(&key).is_some_and(|count| *count > 1));
+    let mut asked: Vec<Question> = Vec::new();
+    for script in part.lines() {
+        let Some(line) = by_script.get(script) else { continue };
+        for entry in entries {
+            if entry.checks.is_some_and(|checks| checks.contains_key(&line.hash))
+                || asked.iter().any(|question| question.owner == entry.owner && question.hash == line.hash)
+            {
+                continue;
+            }
+            let found: Vec<(&str, &str)> =
+                entry.names.iter().flat_map(|name| occurrences(&line.text, name).into_iter().map(move |found| (found, name.as_str()))).collect();
+            if found.is_empty() || found.iter().any(|(found, name)| !shared(name) && is_sure(found, name, casings)) {
+                continue;
+            }
+            let Some((doubt, name)) = found.iter().map(|(found, name)| (doubt(found, name), *name)).min_by_key(|(doubt, _)| *doubt) else { continue };
+            let named = shared(name).then(|| match entry.owner {
+                _ if NameKey::new(name) != NameKey::new(&entry.label) => entry.label.clone(),
+                ExcludeOwner::Character(_) => "character".to_string(),
+                ExcludeOwner::Term(_) => "term".to_string(),
+            });
+            let mut quoted: String = line.script.chars().take(MAX_CHECK_LINE).collect();
+            if line.script.chars().count() > MAX_CHECK_LINE {
+                quoted.push('…');
+            }
+            asked.push(Question { owner: entry.owner, name: name.to_string(), line: quoted, hash: line.hash.clone(), entry: named, doubt });
+        }
+    }
+    asked.sort_by_key(|question| question.doubt);
+    asked.truncate(MAX_CHECKS);
+    asked
+}
+
+/// Персонажи сцены в запросе разбора не больше этого: длинный список модель читает хуже.
+const MAX_CAST: usize = 40;
+
+/// Известный персонаж сцены в запросе разбора: модель ссылается на него номером `C<id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CastMember {
+    pub id: CharacterId,
+    /// Полное имя, имя, фамилия и формы.
+    pub names: Vec<String>,
+    pub gender: Option<Gender>,
+}
+
+/// Номер персонажа в запросе: «C3».
+pub fn cast_ref(id: CharacterId) -> String {
+    format!("C{}", id.get())
+}
+
+/// Персонаж по номеру из ответа модели: «C3», «c3», «3».
+pub fn parse_cast_ref(text: &str) -> Option<CharacterId> {
+    let text = text.trim();
+    let digits = text.strip_prefix(['C', 'c']).unwrap_or(text);
+    digits.parse::<i64>().ok().filter(|id| *id > 0).map(CharacterId::from_row)
 }
 
 /// Запрос разбора одной части.
 pub struct AnalysisPrompt;
 
 impl AnalysisPrompt {
-    /// `known`: имена и названия глоссария. В запрос идут только упомянутые в части.
-    pub fn build(part: &str, known: &[String], target: &LlmTarget) -> ChatRequest {
-        let lower = part.to_lowercase();
+    /// `known`: имена и названия глоссария. В запрос идут только упомянутые в части. `cast`: персонажи сцены
+    /// с номерами, по которым модель связывает находки и называет одного человека под двумя записями.
+    /// `questions`: спорные упоминания известных записей, о которых модель отвечает записью `check`.
+    pub fn build(part: &str, known: &[String], cast: &[CastMember], questions: &[Question], target: &LlmTarget) -> ChatRequest {
         let mut size = 0;
         let mut seen = HashSet::new();
-        let mentioned: Vec<&str> = known
+        let named: Vec<&str> = known
             .iter()
             .map(|name| name.trim())
-            .filter(|name| !name.is_empty() && mentions(&lower, &name.to_lowercase()))
+            .filter(|name| !name.is_empty() && mentioned(part, "", &[name], None))
             .filter(|name| seen.insert(name.to_lowercase()))
             .take_while(|name| {
                 size += name.chars().count() + 2;
                 size <= MAX_KNOWN_CHARS
             })
             .collect();
-        let known = if mentioned.is_empty() { String::new() } else { format!("Known names and terms: {}\n\n", mentioned.join(", ")) };
+        let known = if named.is_empty() { String::new() } else { format!("Known names and terms: {}\n\n", named.join(", ")) };
+        let cast: String = cast
+            .iter()
+            .filter(|member| !member.names.is_empty())
+            .take(MAX_CAST)
+            .map(|member| {
+                let gender = match member.gender {
+                    Some(Gender::Male) => " (male)",
+                    Some(Gender::Female) => " (female)",
+                    None => "",
+                };
+                format!("{}: {}{gender}\n", cast_ref(member.id), member.names.join(", "))
+            })
+            .collect();
+        let cast = if cast.is_empty() { String::new() } else { format!("Characters of this scene:\n{cast}\n") };
         ChatRequest {
             system: SYSTEM.to_string(),
-            user: format!("{known}Script:\n\n{part}\nNew names and terms (JSON array):"),
+            user: format!("{known}{cast}Script:\n\n{part}\n{}New names and terms (JSON array):", checks_block(questions)),
             temperature: target.settings.temperature,
             max_tokens: ANSWER_TOKENS,
         }
@@ -162,6 +322,9 @@ impl AnalysisPrompt {
             .into_iter()
             .filter_map(|value| serde_json::from_value::<AnswerItem>(value).ok())
             .filter_map(|item| {
+                if item.kind.as_deref().is_some_and(|kind| ["same_person", "check"].iter().any(|own| kind.trim().eq_ignore_ascii_case(own))) {
+                    return None;
+                }
                 let name = item.name.as_deref()?.trim().trim_matches(|c: char| "\"'«»“”".contains(c)).trim().to_string();
                 if name.is_empty() || name.contains(['[', ']', '{', '}', '\n']) || !mentions(&part, &name.to_lowercase()) {
                     return None;
@@ -177,13 +340,85 @@ impl AnalysisPrompt {
                     .as_deref()
                     .map(|text| text.trim().trim_matches(|c: char| "\"'«»“”".contains(c)).trim().to_string())
                     .filter(|text| !text.is_empty() && NameKey::new(text) != NameKey::new(&name));
+                let other_than = item
+                    .other_than
+                    .as_deref()
+                    .map(|text| text.trim().trim_matches(|c: char| "\"'«»“”".contains(c)).trim().to_string())
+                    .filter(|text| !text.is_empty());
                 let parts = match kind {
                     FoundKind::Character => NameParts::check(&name, item.first_name.as_deref(), item.last_name.as_deref()),
                     FoundKind::Term(_) => None,
                 };
-                Some(Finding { name, kind, gender, same_as, parts })
+                Some(Finding { name, kind, gender, same_as, other_than, parts })
             })
             .collect()
+    }
+
+    /// Ответы на вопросы `questions` из записи `check`: номер вопроса с нуля и «да». Номер вне вопросов и вопрос
+    /// с обоими ответами отбрасываются.
+    pub fn checks(text: &str, questions: usize) -> Vec<(usize, bool)> {
+        let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(json_array(text)) else { return Vec::new() };
+        let number = |value: &serde_json::Value| -> Option<usize> {
+            let number = match value {
+                serde_json::Value::String(text) => {
+                    let text = text.trim();
+                    text.strip_prefix(['Q', 'q']).unwrap_or(text).parse::<usize>().ok()?
+                }
+                serde_json::Value::Number(number) => usize::try_from(number.as_u64()?).ok()?,
+                _ => return None,
+            };
+            number.checked_sub(1).filter(|index| *index < questions)
+        };
+        let mut answers: Vec<(usize, bool)> = Vec::new();
+        let mut both: Vec<usize> = Vec::new();
+        for item in values.into_iter().filter_map(|value| serde_json::from_value::<AnswerItem>(value).ok()) {
+            if !item.kind.as_deref().is_some_and(|kind| kind.trim().eq_ignore_ascii_case("check")) {
+                continue;
+            }
+            for (list, used) in [(&item.yes, true), (&item.no, false)] {
+                for index in list.iter().filter_map(number) {
+                    match answers.iter().find(|(known, _)| *known == index) {
+                        Some((_, earlier)) if *earlier != used => both.push(index),
+                        Some(_) => {}
+                        None => answers.push((index, used)),
+                    }
+                }
+            }
+        }
+        answers.retain(|(index, _)| !both.contains(index));
+        answers
+    }
+
+    /// Пары персонажей, которых модель назвала одним человеком (`same_person`), по номерам из запроса.
+    /// Номер не из `cast` отбрасывается. Записи с тремя номерами дают пары первого с каждым.
+    pub fn same_people(text: &str, cast: &[CharacterId]) -> Vec<(CharacterId, CharacterId)> {
+        let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(json_array(text)) else { return Vec::new() };
+        let mut pairs = Vec::new();
+        for item in values.into_iter().filter_map(|value| serde_json::from_value::<AnswerItem>(value).ok()) {
+            let kind = item.kind.unwrap_or_default().trim().to_lowercase().replace([' ', '-'], "_");
+            if kind != "same_person" {
+                continue;
+            }
+            let mut ids: Vec<CharacterId> = item
+                .ids
+                .iter()
+                .filter_map(|value| match value {
+                    serde_json::Value::String(text) => parse_cast_ref(text),
+                    serde_json::Value::Number(number) => number.as_i64().filter(|id| *id > 0).map(CharacterId::from_row),
+                    _ => None,
+                })
+                .filter(|id| cast.contains(id))
+                .collect();
+            ids.dedup();
+            let Some((first, rest)) = ids.split_first() else { continue };
+            for other in rest {
+                let pair = (*first.min(other), *first.max(other));
+                if pair.0 != pair.1 && !pairs.contains(&pair) {
+                    pairs.push(pair);
+                }
+            }
+        }
+        pairs
     }
 }
 
@@ -204,7 +439,7 @@ pub fn merge(found: Vec<Finding>) -> Vec<Finding> {
         let Some(key) = NameKey::new(&finding.name) else { continue };
         let (merged, kinds) = entries.entry(key.clone()).or_insert_with(|| {
             order.push(key);
-            (Finding { name: finding.name.clone(), kind: finding.kind, gender: None, same_as: None, parts: None }, Vec::new())
+            (Finding { name: finding.name.clone(), kind: finding.kind, gender: None, same_as: None, other_than: None, parts: None }, Vec::new())
         });
         match kinds.iter_mut().find(|(kind, _)| *kind == finding.kind) {
             Some((_, count)) => *count += 1,
@@ -215,6 +450,9 @@ pub fn merge(found: Vec<Finding>) -> Vec<Finding> {
         }
         if merged.same_as.is_none() {
             merged.same_as = finding.same_as;
+        }
+        if merged.other_than.is_none() {
+            merged.other_than = finding.other_than;
         }
         if merged.parts.is_none() {
             merged.parts = finding.parts;
@@ -239,788 +477,29 @@ pub fn merge(found: Vec<Finding>) -> Vec<Finding> {
         .collect()
 }
 
-/// Аббревиатура: 2–8 заглавных букв или цифр, хотя бы две буквы, точки между ними допускаются («P.P.F.»).
-/// Возвращает её без точек.
-pub fn acronym(text: &str) -> Option<String> {
-    let bare: String = text.trim().chars().filter(|c| *c != '.').collect();
-    let letters = bare.chars().filter(|c| c.is_alphabetic()).count();
-    let fits = (2..=8).contains(&bare.chars().count())
-        && letters >= 2
-        && bare.chars().all(|c| c.is_alphanumeric() && !c.is_lowercase());
-    fits.then_some(bare)
-}
-
-/// Первые буквы значимых слов названия из нескольких слов: «People's Police Force» это «PPF».
-/// `None`: слово одно, сокращать нечего.
-pub fn initials(name: &str) -> Option<String> {
-    let words: Vec<&str> = name
-        .split(|c: char| c.is_whitespace() || c == '-')
-        .filter(|word| !word.is_empty() && !MINOR_WORDS.contains(&word.to_lowercase().as_str()))
-        .collect();
-    if words.len() < 2 {
-        return None;
+/// Блок вопросов в запрос разбора. Пустой, если спрашивать нечего.
+fn checks_block(questions: &[Question]) -> String {
+    if questions.is_empty() {
+        return String::new();
     }
-    words.iter().map(|word| word.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().to_string())).collect()
-}
-
-/// Одно название сокращает другое: аббревиатура совпала с первыми буквами полного названия.
-pub fn abbreviates(short: &str, long: &str) -> bool {
-    match (acronym(short), initials(long)) {
-        (Some(short), Some(long)) => short.to_uppercase() == long,
-        _ => false,
-    }
-}
-
-/// Запись глоссария, к которой ложится форма.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Owner {
-    Character(CharacterId),
-    Term(TermId),
-}
-
-/// Написания записей глоссария и их владельцы: термины по названию и формам, персонажи по полному имени,
-/// имени, фамилии и формам. Растёт по мере записи находок.
-struct Owners {
-    by_key: HashMap<NameKey, Owner>,
-    /// Названия и формы терминов: по ним ищется аббревиатура.
-    term_names: Vec<(String, TermId)>,
-    /// Имена персонажей: по ним короткая форма находит полное имя («Dimi» у «Dimitria»).
-    first_names: Vec<(String, CharacterId)>,
-    /// Персонажи, которые говорят или упомянуты в разобранной сцене: из нескольких похожих выбирается свой.
-    present: Vec<CharacterId>,
-}
-
-/// Короткая форма имени не короче этого: «Al» у «Alice» слишком случайно.
-const MIN_SHORT_NAME: usize = 3;
-/// Короткая форма не длиннее этого и короче полной хотя бы на `MIN_SHORT_GAP` букв: «Eileen» и «Eileenor»
-/// разные имена, а не форма одного.
-const MAX_SHORT_NAME: usize = 5;
-const MIN_SHORT_GAP: usize = 2;
-
-/// Одно имя короткая форма другого без подсказки модели: «Dimi» и «Dimitria», «Stu» и «Stuart» в любом порядке.
-pub fn short_and_full(one: &str, other: &str) -> bool {
-    let (a, b) = (one.trim().chars().count(), other.trim().chars().count());
-    let (short, long) = (a.min(b), a.max(b));
-    (MIN_SHORT_NAME..=MAX_SHORT_NAME).contains(&short) && long >= short + MIN_SHORT_GAP && (is_fuller(one, other) || is_fuller(other, one))
-}
-
-impl Owners {
-    /// Персонаж, чьё имя это короткая или полная форма `name`: единственный такой, иначе единственный такой
-    /// среди персонажей сцены. `exclude`: сам персонаж находки.
-    fn short_form_owner(&self, name: &str, exclude: Option<CharacterId>) -> Option<CharacterId> {
-        let mut candidates: Vec<CharacterId> =
-            self.first_names.iter().filter(|(first, id)| Some(*id) != exclude && short_and_full(name, first)).map(|(_, id)| *id).collect();
-        candidates.dedup();
-        match candidates.as_slice() {
-            [only] => Some(*only),
-            [] => None,
-            several => match several.iter().filter(|id| self.present.contains(id)).collect::<Vec<_>>().as_slice() {
-                [only] => Some(**only),
-                _ => None,
-            },
-        }
-    }
-
-    /// `speakers`: говорящие снимка. Подпись говорящего с одним персонажем ведёт к этому персонажу.
-    fn load(glossary: &GlossaryData, speakers: &[Speaker]) -> Self {
-        let mut owners = Self { by_key: HashMap::new(), term_names: Vec::new(), first_names: Vec::new(), present: Vec::new() };
-        for character in &glossary.characters {
-            if let (Some(id), Some(first)) = (character.id(), character.first_name()) {
-                owners.first_names.push((first.to_string(), id));
-            }
-        }
-        for term in &glossary.terms {
-            let Some(id) = term.id() else { continue };
-            owners.add_term(term.name(), id);
-            for form in term.forms() {
-                owners.add_term(form.text(), id);
-            }
-        }
-        for character in &glossary.characters {
-            let Some(id) = character.id() else { continue };
-            let names = character
-                .full_name()
-                .into_iter()
-                .chain(character.first_name().map(str::to_string))
-                .chain(character.last_name().map(str::to_string))
-                .chain(character.forms().iter().map(|form| form.text().to_string()));
-            for name in names {
-                owners.add(&name, Owner::Character(id));
-            }
-        }
-        for speaker in speakers {
-            let Some(label) = &speaker.label else { continue };
-            let linked: Vec<CharacterId> = glossary.links.iter().filter(|link| link.speaker == speaker.key).map(|link| link.character).collect();
-            if let [only] = linked.as_slice() {
-                owners.add(label, Owner::Character(*only));
-            }
-        }
-        owners
-    }
-
-    fn add(&mut self, name: &str, owner: Owner) {
-        for name in [name, without_article(name)] {
-            if let Some(key) = NameKey::new(name) {
-                self.by_key.entry(key).or_insert(owner);
-            }
-        }
-    }
-
-    /// Владелец написания, с артиклем или без: «The Fairy King» находит «Fairy King».
-    fn find(&self, name: &str) -> Option<Owner> {
-        [name, without_article(name)].iter().find_map(|name| NameKey::new(name).and_then(|key| self.by_key.get(&key).copied()))
-    }
-
-    fn add_term(&mut self, name: &str, id: TermId) {
-        self.add(name, Owner::Term(id));
-        self.term_names.push((name.to_string(), id));
-    }
-
-    /// Чья это форма: запись, которую назвала модель, иначе термин, который сокращает находка или который
-    /// сокращает её. `own`: запись самой находки, если она уже есть, на себя находка не ссылается.
-    fn owner_of(&self, finding: &Finding, own: Option<Owner>) -> Option<Owner> {
-        let named = finding.same_as.as_deref().and_then(|name| self.find(name));
-        if let Some(owner) = named.filter(|owner| Some(*owner) != own) {
-            return Some(owner);
-        }
-        let abbreviated = self
-            .term_names
-            .iter()
-            .filter(|(_, id)| Some(Owner::Term(*id)) != own)
-            .find(|(name, _)| {
-                let plural = matches!(finding.kind, FoundKind::Term(_)) && (plural_of(&finding.name, name) || plural_of(name, &finding.name));
-                plural || abbreviates(&finding.name, name) || abbreviates(name, &finding.name)
-            })
-            .map(|(_, id)| Owner::Term(*id));
-        if abbreviated.is_some() || finding.kind != FoundKind::Character || finding.name.contains(char::is_whitespace) {
-            return abbreviated;
-        }
-        let exclude = match own {
-            Some(Owner::Character(id)) => Some(id),
-            _ => None,
-        };
-        self.short_form_owner(&finding.name, exclude).map(Owner::Character)
-    }
-}
-
-/// Две записи глоссария оказались одной: связь нашлась позже, в другой сцене. Главной у терминов становится
-/// полное название, термин уходит персонажу формой, персонаж `own` сливается в `other`. Персонаж в термин не
-/// сливается. Возвращает строку итога: «PPF → People's Police Force (объединено)».
-fn merge_entries(tx: &rusqlite::Connection, own: Owner, other: Owner) -> Result<Option<String>, DbError> {
-    let terms = TermRepo { conn: tx };
-    let characters = CharacterRepo { conn: tx };
-    let character_name = |id| -> Result<String, DbError> { Ok(characters.get(id)?.full_name().unwrap_or_default()) };
-    let text = match (own, other) {
-        (Owner::Term(a), Owner::Term(b)) => {
-            let (a_name, b_name) = (terms.get(a)?.name().to_string(), terms.get(b)?.name().to_string());
-            // Главным остаётся полное название и единственное число.
-            let swap = (acronym(&b_name).is_some() && acronym(&a_name).is_none()) || plural_of(&b_name, &a_name);
-            let (from, into, from_name, into_name) = if swap { (b, a, b_name, a_name) } else { (a, b, a_name, b_name) };
-            merge_terms(tx, from, into)?;
-            format!("{from_name} → {into_name} (объединено)")
-        }
-        (Owner::Term(a), Owner::Character(b)) => {
-            let name = terms.get(a)?.name().to_string();
-            give_term(tx, a, b)?;
-            format!("{name} → {} (объединено)", character_name(b)?)
-        }
-        (Owner::Character(a), Owner::Character(b)) => {
-            // Главным остаётся персонаж с полным именем: «Stu» уходит формой в «Stuart».
-            let first = |id| -> Result<String, DbError> { Ok(characters.get(id)?.first_name().unwrap_or_default().to_string()) };
-            let (from, into) = if is_fuller(&first(a)?, &first(b)?) { (b, a) } else { (a, b) };
-            let name = character_name(from)?;
-            merge_characters(tx, from, into)?;
-            format!("{name} → {} (объединено)", character_name(into)?)
-        }
-        (Owner::Character(_), Owner::Term(_)) => return Ok(None),
-    };
-    Ok(Some(text))
-}
-
-/// Сначала находки без ссылки на другую находку: тогда запись, к которой ложится форма, уже есть.
-fn ordered(found: &[Finding]) -> Vec<&Finding> {
-    let keys: HashSet<NameKey> = found.iter().filter_map(|finding| NameKey::new(&finding.name)).collect();
-    let linked = |finding: &Finding| finding.same_as.as_deref().and_then(NameKey::new).is_some_and(|key| keys.contains(&key));
-    found.iter().filter(|finding| !linked(finding)).chain(found.iter().filter(|finding| linked(finding))).collect()
-}
-
-/// `long` это полная форма имени `short`: одно слово, длиннее и начинается с него («Stuart» у «Stu»).
-pub fn is_fuller(long: &str, short: &str) -> bool {
-    let (long, short) = (long.trim().to_lowercase(), short.trim().to_lowercase());
-    !short.is_empty() && !long.contains(char::is_whitespace) && !short.contains(char::is_whitespace) && long.len() > short.len() && long.starts_with(&short)
-}
-
-/// Должности и звания перед именем: по ним «Detective-Colonel Karanovic» делится на должность и имя.
-const RANKS: [&str; 34] = [
-    "detective", "colonel", "general", "major", "captain", "lieutenant", "sergeant", "corporal", "private", "officer", "agent", "inspector",
-    "commander", "admiral", "chief", "director", "president", "doctor", "professor", "nurse", "coach", "principal", "judge", "senator",
-    "king", "queen", "prince", "princess", "duke", "count", "father", "sister", "brother", "deputy",
-];
-
-/// Должность или обращение перед именем: «Detective-Colonel» и «Karanovic» у «Detective-Colonel Karanovic»,
-/// «Mr.» и «Lee» у «Mr. Lee». `None`: впереди нет должности или после неё не осталось имени.
-pub fn title_and_name(name: &str) -> Option<(String, String)> {
-    let words: Vec<&str> = name.split_whitespace().collect();
-    let titled = |word: &str| {
-        word.split('-').all(|piece| {
-            let piece = piece.trim_matches('.').to_lowercase();
-            !piece.is_empty() && (RANKS.contains(&piece.as_str()) || HONORIFICS.contains(&piece.as_str()))
-        })
-    };
-    let count = words.iter().take_while(|word| titled(word)).count();
-    if count == 0 || count == words.len() {
-        return None;
-    }
-    Some((words[..count].join(" "), words[count..].join(" ")))
-}
-
-/// Имя без артикля впереди: «Fairy Queen» у «The Fairy Queen».
-pub fn without_article(name: &str) -> &str {
-    let name = name.trim();
-    for article in ["the ", "a ", "an "] {
-        if name.len() > article.len() && name.is_char_boundary(article.len()) && name[..article.len()].eq_ignore_ascii_case(article) {
-            let rest = name[article.len()..].trim_start();
-            if !rest.is_empty() {
-                return rest;
-            }
-        }
-    }
-    name
-}
-
-/// Титул как имя одного лица: несколько слов, последнее из них звание («Fairy Queen», «The Fairy King»).
-/// «Order of the King» с предлогом это название, а не лицо.
-pub fn is_person_title(name: &str) -> bool {
-    let words: Vec<String> = without_article(name).split_whitespace().map(str::to_lowercase).collect();
-    words.len() >= 2 && words.last().is_some_and(|last| RANKS.contains(&last.as_str())) && !words.iter().any(|word| MINOR_WORDS.contains(&word.as_str()))
-}
-
-/// Одно название множественное число другого: «pixies» у «pixie», «truthsayers» у «truthsayer».
-pub fn plural_of(plural: &str, single: &str) -> bool {
-    let (plural, single) = (plural.trim().to_lowercase(), single.trim().to_lowercase());
-    single.chars().count() >= 3 && (plural == format!("{single}s") || plural == format!("{single}es"))
-}
-
-/// Имя из одного слова это обычное слово, а не имя: в репликах игры оно есть со строчной буквы и ни разу
-/// с заглавной посреди фразы («Boobjob» строкой выбора в меню и «a boobjob» в репликах). Имя, которое модель
-/// сама написала строчными, тоже обычное слово.
-pub fn is_common_word(name: &str, lines: &[String]) -> bool {
-    let name = name.trim();
-    if name.is_empty() || name.contains(char::is_whitespace) || !name.chars().any(char::is_alphabetic) {
-        return false;
-    }
-    let lower = name.to_lowercase();
-    if lower == name {
-        return true;
-    }
-    let mut lowercase = false;
-    for line in lines {
-        for (start, _) in line.match_indices(name) {
-            let after = line[start + name.len()..].chars().next();
-            let before = line[..start].trim_end().chars().next_back();
-            let whole = !line[..start].chars().next_back().is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric);
-            if whole && before.is_some_and(|c| c.is_alphanumeric() || c == ',') {
-                return false;
-            }
-        }
-        lowercase |= mentions(line, &lower);
-    }
-    lowercase
-}
-
-/// Подпись из одного токена: «[mc]», «[player_name]». «[mc]'s mom» это роль, а не токен.
-pub fn is_token_label(label: &str) -> bool {
-    let label = label.trim();
-    label.len() > 2 && label.starts_with('[') && label.ends_with(']') && !label[1..label.len() - 1].contains(['[', ']'])
-}
-
-/// Одно обычное звание или обращение («King», «Princess», «Sister», «Mr.»): это обычное слово, а не термин игры.
-/// Его перевод очевиден, а одно написание на всю игру вредит: «Sister» бывает монахиней и сестрой. Составное
-/// звание («Detective-Colonel», «Grand Duke») термином остаётся.
-pub fn is_common_title(name: &str) -> bool {
-    let word = name.trim().trim_matches('.').to_lowercase();
-    !word.is_empty()
-        && !word.contains(|c: char| c.is_whitespace() || c == '-')
-        && (RANKS.contains(&word.as_str()) || HONORIFICS.contains(&word.as_str()))
-}
-
-/// Запись находок одного разбора: что уже известно, чьи это написания, что добавлено.
-struct Saver<'c> {
-    tx: &'c rusqlite::Connection,
-    known: HashSet<NameKey>,
-    /// Говорящие снимка: по подписям связанных находится персонаж.
-    speakers: Vec<Speaker>,
-    /// Подписи говорящих, которых пользователь ещё не разобрал: термином такая находка не становится.
-    new_labels: HashSet<NameKey>,
-    owners: Owners,
-    added: Vec<String>,
-}
-
-impl Saver<'_> {
-    fn is_known(&self, key: &NameKey) -> Result<bool, DbError> {
-        Ok(self.known.contains(key) || TermRepo { conn: self.tx }.is_known(key)?)
-    }
-
-    fn reload(&mut self) -> Result<(), DbError> {
-        let present = std::mem::take(&mut self.owners.present);
-        self.owners = Owners::load(&GlossaryData::load(self.tx)?, &self.speakers);
-        self.owners.present = present;
-        Ok(())
-    }
-
-    /// Титул как имя лица («Fairy Queen») это персонаж, а не термин, имя персонажа пишется без артикля.
-    fn normalized(finding: &Finding) -> Finding {
-        let mut finding = finding.clone();
-        if matches!(finding.kind, FoundKind::Term(TermCategory::General | TermCategory::Title)) && is_person_title(&finding.name) {
-            finding.kind = FoundKind::Character;
-        }
-        if finding.kind == FoundKind::Character {
-            finding.name = without_article(&finding.name).to_string();
-        }
-        finding
-    }
-
-    /// Все реплики игры, где есть name: по ним видно, имя это или обычное слово.
-    fn is_common_word(&self, name: &str) -> Result<bool, DbError> {
-        if name.contains(char::is_whitespace) {
-            return Ok(false);
-        }
-        let lines: Vec<String> = LineSampleRepo { conn: self.tx }.containing(name, None)?.into_iter().map(|line| line.text).collect();
-        Ok(is_common_word(name, &lines))
-    }
-
-    fn save(&mut self, finding: &Finding) -> Result<(), DbError> {
-        let finding = &Self::normalized(finding);
-        let Some(key) = NameKey::new(&finding.name) else { return Ok(()) };
-        // Личное имя с частями от модели должностью не считается.
-        let personal = finding.parts.as_ref().is_some_and(|parts| parts.first.is_some());
-        if let (false, Some((title, name))) = (personal, title_and_name(&finding.name))
-            && self.names_a_person(finding, &name)
-        {
-            return self.save_titled(finding, &title, &name);
-        }
-        // Подпись говорящего («Waitress») переводится шагом подписей, а не термином, обычное звание тоже не термин.
-        if matches!(finding.kind, FoundKind::Term(_)) && (self.new_labels.contains(&key) || is_common_title(&finding.name)) {
-            return Ok(());
-        }
-        if self.is_known(&key)? {
-            // Известная запись оказалась другим именем другой записи: связь нашлась позже, записи сливаются.
-            if let Some(own) = self.owners.by_key.get(&key).copied()
-                && let Some(other) = self.owners.owner_of(finding, Some(own))
-                && let Some(text) = merge_entries(self.tx, own, other)?
-            {
-                self.added.push(text);
-                self.reload()?;
-            }
-            return Ok(());
-        }
-        match self.owners.owner_of(finding, None) {
-            Some(Owner::Term(id)) => self.term_form(finding, id)?,
-            Some(Owner::Character(id)) => self.character_form(finding, id)?,
-            // Обычное слово персонажем не становится. Подпись говорящего не проверяется: он говорит.
-            None if finding.kind == FoundKind::Character && !self.new_labels.contains(&key) && self.is_common_word(&finding.name)? => return Ok(()),
-            None => self.create(finding)?,
-        }
-        self.known.insert(key);
-        Ok(())
-    }
-
-    /// Должность с именем это человек, а не название: находка-персонаж, находка-должность или остаток уже известен
-    /// как персонаж. «General Store» у места делиться не должен.
-    fn names_a_person(&self, finding: &Finding, name: &str) -> bool {
-        let known_person = NameKey::new(name).and_then(|key| self.owners.by_key.get(&key)).is_some_and(|owner| matches!(owner, Owner::Character(_)));
-        matches!(finding.kind, FoundKind::Character | FoundKind::Term(TermCategory::Title)) || known_person
-    }
-
-    /// Должность пишется термином-должностью (обращения нет), имя после неё как отдельная находка. Термин с тем же
-    /// написанием, записанный раньше («Princess Selena»), удаляется: его название уходит в корзину.
-    fn save_titled(&mut self, finding: &Finding, title: &str, name: &str) -> Result<(), DbError> {
-        if let Some(Owner::Term(id)) = NameKey::new(&finding.name).and_then(|key| self.owners.by_key.get(&key)).copied() {
-            let old = self.discard_term(id)?;
-            let parts = if is_common_title(title) { name.to_string() } else { format!("{title} + {name}") };
-            self.added.push(format!("{old} → {parts} (разделено)"));
-            self.reload()?;
-        }
-        if !is_common_title(title)
-            && let Some(key) = NameKey::new(title)
-            && !self.is_known(&key)?
-            && let Ok(term) = Term::new(title, TermCategory::Title)
-        {
-            let id = TermRepo { conn: self.tx }.save(&term)?;
-            self.owners.add_term(title, id);
-            self.known.insert(key);
-            self.added.push(title.to_string());
-        }
-        let parts = finding.parts.as_ref().and_then(|parts| NameParts::check(name, parts.first.as_deref(), parts.last.as_deref()));
-        let rest = Finding { name: name.to_string(), kind: FoundKind::Character, gender: finding.gender, same_as: None, parts };
-        if title_and_name(name).is_some() { Ok(()) } else { self.save(&rest) }
-    }
-
-    /// Термин удаляется вместе с заметками, его название уходит в корзину как мусор: разбор его больше не предложит.
-    fn discard_term(&mut self, id: TermId) -> Result<String, DbError> {
-        let terms = TermRepo { conn: self.tx };
-        let term = terms.get(id)?;
-        terms.delete(id)?;
-        NoteRepo { conn: self.tx }.delete_owner(&NoteOwner::Term(id))?;
-        terms.discard(&DiscardedTerm {
-            text: term.name().to_string(),
-            key: term.name_key().clone(),
-            reason: DiscardReason::Junk,
-            discarded_at: Timestamp::now(),
-        })?;
-        Ok(term.name().to_string())
-    }
-
-    /// Обычные звания, записанные терминами раньше («Princess», «Sister»), уходят в корзину. Термин, которому
-    /// дали перевод, остаётся: его оставили намеренно.
-    fn drop_common_titles(&mut self) -> Result<(), DbError> {
-        let terms = TermRepo { conn: self.tx }.list()?;
-        let mut dropped = false;
-        for term in terms.iter().filter(|term| term.translation().is_none() && is_common_title(term.name())) {
-            let Some(id) = term.id() else { continue };
-            let name = self.discard_term(id)?;
-            self.added.push(format!("{name} (обычное слово, убрано)"));
-            dropped = true;
-        }
-        if dropped {
-            self.reload()?;
-        }
-        Ok(())
-    }
-
-    /// Термины-титулы лиц, записанные раньше («Fairy Queen»), становятся персонажами: имя без артикля, перевод
-    /// термина и его формы переходят персонажу, название уходит в корзину как переданное персонажу.
-    fn titled_terms_to_characters(&mut self) -> Result<(), DbError> {
-        let terms = TermRepo { conn: self.tx };
-        let mut changed = false;
-        for term in terms.list()? {
-            let Some(id) = term.id() else { continue };
-            if !matches!(term.category(), TermCategory::General | TermCategory::Title) || !is_person_title(term.name()) {
-                continue;
-            }
-            let mut character = Character::new(without_article(term.name()));
-            character.set_translated_names(term.translation().unwrap_or_default(), "");
-            for form in term.forms() {
-                let _ = character.add_form(form.clone());
-            }
-            CharacterRepo { conn: self.tx }.save(&character)?;
-            terms.delete(id)?;
-            NoteRepo { conn: self.tx }.delete_owner(&NoteOwner::Term(id))?;
-            terms.discard(&DiscardedTerm {
-                text: term.name().to_string(),
-                key: term.name_key().clone(),
-                reason: DiscardReason::GivenToCharacter,
-                discarded_at: Timestamp::now(),
-            })?;
-            self.added.push(format!("{} (термин → персонаж)", term.name()));
-            changed = true;
-        }
-        if changed {
-            self.reload()?;
-        }
-        Ok(())
-    }
-
-    /// Персонажи из одного обычного слова, записанные раньше («Boobjob»), удаляются: без фамилии, без говорящего,
-    /// слово в игре есть только строчными. Слово уходит в корзину терминов, разбор его больше не предложит.
-    fn drop_common_characters(&mut self) -> Result<(), DbError> {
-        let characters = CharacterRepo { conn: self.tx };
-        let speakers = SpeakerRepo { conn: self.tx };
-        let mut changed = false;
-        for character in characters.list()? {
-            let (Some(id), Some(name), None) = (character.id(), character.first_name(), character.last_name()) else { continue };
-            let Some(key) = NameKey::new(name) else { continue };
-            if !speakers.links_of(id)?.is_empty() || !self.is_common_word(name)? {
-                continue;
-            }
-            characters.delete(id)?;
-            NoteRepo { conn: self.tx }.delete_owner(&NoteOwner::Character(id))?;
-            TermRepo { conn: self.tx }.discard(&DiscardedTerm { text: name.to_string(), key, reason: DiscardReason::Junk, discarded_at: Timestamp::now() })?;
-            self.added.push(format!("{name} (обычное слово, убрано)"));
-            changed = true;
-        }
-        if changed {
-            self.reload()?;
-        }
-        Ok(())
-    }
-
-    fn term_form(&mut self, finding: &Finding, id: TermId) -> Result<(), DbError> {
-        let terms = TermRepo { conn: self.tx };
-        let mut term = terms.get(id)?;
-        if acronym(term.name()).is_some() && acronym(&finding.name).is_none() {
-            // Полное название к термину-аббревиатуре: оно становится названием, аббревиатура формой со своим
-            // переводом, перевод полного названия даст шаг переводов глоссария.
-            let (old, translation) = (term.name().to_string(), term.translation().map(str::to_string));
-            if term.rename(&finding.name).is_err() {
-                return Ok(());
-            }
-            term.set_translation("");
-            if let Ok(form) = Form::new(&old, translation.as_deref()) {
-                let _ = term.add_form(form);
-            }
-            terms.save(&term)?;
-            self.added.push(format!("{old} → {}", finding.name));
-        } else {
-            let Ok(form) = Form::new(&finding.name, None) else { return Ok(()) };
-            if term.add_form(form).is_err() {
-                return Ok(());
-            }
-            terms.save(&term)?;
-            self.added.push(format!("{} → {}", finding.name, term.name()));
-        }
-        self.owners.add_term(&finding.name, id);
-        Ok(())
-    }
-
-    fn character_form(&mut self, finding: &Finding, id: CharacterId) -> Result<(), DbError> {
-        let characters = CharacterRepo { conn: self.tx };
-        let mut character = characters.get(id)?;
-        let first = character.first_name().unwrap_or_default().to_string();
-        if is_fuller(&finding.name, &first) {
-            // Полное имя к уменьшительному: оно становится именем, уменьшительное формой со своим переводом.
-            let translated = character.translated_first_name().map(str::to_string);
-            let last = character.translated_last_name().unwrap_or_default().to_string();
-            character.set_first_name(&finding.name);
-            character.set_translated_names("", &last);
-            if let Ok(form) = Form::new(&first, translated.as_deref()) {
-                let _ = character.add_form(form);
-            }
-            characters.save(&character)?;
-            self.added.push(format!("{first} → {}", finding.name));
-        } else {
-            let Ok(form) = Form::new(&finding.name, None) else { return Ok(()) };
-            if character.add_form(form).is_err() {
-                return Ok(());
-            }
-            characters.save(&character)?;
-            self.added.push(format!("{} → {}", finding.name, character.full_name().unwrap_or_default()));
-        }
-        self.owners.add(&finding.name, Owner::Character(id));
-        Ok(())
-    }
-
-    /// Новая запись: персонаж с именем и фамилией по частям от модели и родом, термин с категорией.
-    fn create(&mut self, finding: &Finding) -> Result<(), DbError> {
-        match finding.kind {
-            FoundKind::Character => {
-                let mut character = match &finding.parts {
-                    Some(parts) => {
-                        let mut character = Character::new(parts.first.as_deref().unwrap_or_default());
-                        if let Some(last) = &parts.last {
-                            character.set_last_name(last);
-                        }
-                        character
-                    }
-                    None => Character::new(&finding.name),
-                };
-                character.set_gender(finding.gender);
-                let id = CharacterRepo { conn: self.tx }.save(&character)?;
-                for name in character.full_name().into_iter().chain(character.first_name().map(str::to_string)).chain(character.last_name().map(str::to_string)) {
-                    self.owners.add(&name, Owner::Character(id));
-                }
-            }
-            FoundKind::Term(category) => {
-                let Ok(term) = Term::new(&finding.name, category) else { return Ok(()) };
-                let id = TermRepo { conn: self.tx }.save(&term)?;
-                self.owners.add_term(&finding.name, id);
-            }
-        }
-        self.added.push(finding.name.clone());
-        Ok(())
-    }
-
-    /// Термины вида «должность + имя известного персонажа», записанные раньше («Princess Selena», когда Selena уже
-    /// персонаж), делятся на должность и персонажа.
-    fn split_titled_terms(&mut self) -> Result<(), DbError> {
-        let terms = TermRepo { conn: self.tx }.list()?;
-        for term in terms.iter().filter(|term| term.category() != TermCategory::Title) {
-            let Some((title, name)) = title_and_name(term.name()) else { continue };
-            let person = Finding { name: term.name().to_string(), kind: FoundKind::Term(term.category()), gender: None, same_as: None, parts: None };
-            if self.names_a_person(&person, &name) {
-                self.save_titled(&person, &title, &name)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Говорящие, которых пользователь ещё не разобрал, привязываются к персонажу по подписи: подпись это имя,
-    /// фамилия, полное имя или форма персонажа, то же после должности («Detective-Colonel Karanovic») или короткая
-    /// форма единственного имени («Dimi» у «Dimitria», при нескольких решает сцена). Связь становится основной, если
-    /// у персонажа основной ещё нет. Говорящий с подписью из одного токена («[mc]», «[player_name]»), обычно герой,
-    /// модели не виден: если у него есть реплики, он становится персонажем с этой подписью.
-    fn link_speakers(&mut self) -> Result<(), DbError> {
-        let repo = SpeakerRepo { conn: self.tx };
-        let characters = CharacterRepo { conn: self.tx };
-        let speaking: HashSet<_> = repo.current()?.into_iter().filter(|used| used.lines > 0).map(|used| used.speaker.key).collect();
-        for speaker in repo.new_speakers()? {
-            let Some(label) = speaker.label.as_deref() else { continue };
-            let owner = |name: &str| self.owners.find(name);
-            let found = owner(label)
-                .or_else(|| title_and_name(label).and_then(|(_, name)| owner(&name)))
-                .or_else(|| (!label.contains(char::is_whitespace)).then(|| self.owners.short_form_owner(label, None).map(Owner::Character)).flatten());
-            let id = match found {
-                Some(Owner::Character(id)) => id,
-                Some(Owner::Term(_)) => continue,
-                None if is_token_label(label) && speaking.contains(&speaker.key) => {
-                    let id = characters.save(&Character::new(label))?;
-                    repo.link(&SpeakerLink { speaker: speaker.key.clone(), character: id, is_primary: true })?;
-                    self.owners.add(label, Owner::Character(id));
-                    self.added.push(format!("{label} (говорящий, новый персонаж)"));
-                    continue;
-                }
-                None => continue,
-            };
-            let primary = !repo.links_of(id)?.iter().any(|link| link.is_primary);
-            repo.link(&SpeakerLink { speaker: speaker.key.clone(), character: id, is_primary: primary })?;
-            self.added.push(format!("{label} (говорящий) → {}", characters.get(id)?.full_name().unwrap_or_default()));
-        }
-        Ok(())
-    }
-
-    /// Персонаж из одного слова сливается с единственным персонажем, у которого это слово фамилия или имя
-    /// при фамилии («Karanovic» в «Vera Karanovic»), иначе с единственным, чьё имя это его полная или короткая
-    /// форма («Dimi» и «Dimitria», при нескольких таких решает сцена). Главным остаётся полное имя.
-    fn merge_single_names(&mut self) -> Result<(), DbError> {
-        let characters = CharacterRepo { conn: self.tx }.list()?;
-        let mut gone: HashSet<CharacterId> = HashSet::new();
-        for single in &characters {
-            let (Some(id), Some(first), None) = (single.id(), single.first_name(), single.last_name()) else { continue };
-            if gone.contains(&id) || first.contains(char::is_whitespace) {
-                continue;
-            }
-            let Some(key) = NameKey::new(first) else { continue };
-            let alive = |other: &&Character| other.id().is_some_and(|other| other != id && !gone.contains(&other));
-            let full: Vec<CharacterId> = characters
-                .iter()
-                .filter(alive)
-                .filter(|other| other.last_name().is_some())
-                .filter(|other| {
-                    let same = |name: Option<&str>| name.and_then(NameKey::new).as_ref() == Some(&key);
-                    same(other.last_name()) || same(other.first_name())
-                })
-                .filter_map(Character::id)
-                .collect();
-            let into = match full.as_slice() {
-                [into] => Some(*into),
-                [] => self.owners.short_form_owner(first, Some(id)).filter(|other| !gone.contains(other)),
-                _ => None,
-            };
-            let Some(into) = into else { continue };
-            if let Some(text) = merge_entries(self.tx, Owner::Character(id), Owner::Character(into))? {
-                // Удалённым мог оказаться и второй: главным остаётся полное имя.
-                let removed = if (CharacterRepo { conn: self.tx }).get(id).is_ok() { into } else { id };
-                gone.insert(removed);
-                self.added.push(text);
-                self.reload()?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Термины-дубли сливаются: множественное число с единственным («pixies» и «pixie») и термины одной категории
-/// с одинаковым переводом («Fey Court» и «Fairy Court», оба «Двор фей»). Главным остаётся единственное число,
-/// иначе записанный раньше; второй ложится формой со своим переводом. Возвращает строки итога.
-pub fn merge_duplicate_terms(tx: &rusqlite::Connection) -> Result<Vec<String>, DbError> {
-    let mut terms = TermRepo { conn: tx }.list()?;
-    terms.sort_by_key(|term| term.id().map(TermId::get));
-    let translation = |term: &Term| term.translation().and_then(NameKey::new);
-    let mut gone: HashSet<TermId> = HashSet::new();
-    let mut merged = Vec::new();
-    for (index, first) in terms.iter().enumerate() {
-        let Some(a) = first.id() else { continue };
-        for second in &terms[index + 1..] {
-            let Some(b) = second.id() else { continue };
-            if gone.contains(&a) {
-                break;
-            }
-            if gone.contains(&b) {
-                continue;
-            }
-            let plural = plural_of(first.name(), second.name()) || plural_of(second.name(), first.name());
-            let same = first.category() == second.category() && translation(first).is_some() && translation(first) == translation(second);
-            if !plural && !same {
-                continue;
-            }
-            if let Some(text) = merge_entries(tx, Owner::Term(b), Owner::Term(a))? {
-                gone.insert(if (TermRepo { conn: tx }).get(a).is_ok() { b } else { a });
-                merged.push(text);
-            }
-        }
-    }
-    Ok(merged)
-}
-
-/// Новые записи разбора в глоссарий: персонаж с именем, фамилией и родом, термин с категорией. Другое имя
-/// известной записи или другой находки становится формой той записи, должность перед именем термином, персонаж
-/// из одного слова сливается с единственным полным, неразобранный говорящий привязывается к персонажу по подписи.
-/// Известное глоссарию, корзине терминов и подписям разобранных говорящих
-/// пропускается. Возвращает написания добавленных, форму как «PPF → People's Police Force».
-pub fn save_found(tx: &rusqlite::Connection, found: &[Finding]) -> Result<Vec<String>, DbError> {
-    save_scene_found(tx, found, None)
-}
-
-/// `save_found` для находок сцены `scene`: из похожих персонажей выбирается тот, кто в ней говорит или упомянут.
-pub fn save_scene_found(tx: &rusqlite::Connection, found: &[Finding], scene: Option<&ContainerKey>) -> Result<Vec<String>, DbError> {
-    let known: HashSet<NameKey> = known_for_prompt(tx)?.iter().filter_map(|name| NameKey::new(name)).collect();
-    let glossary = GlossaryData::load(tx)?;
-    let speakers: Vec<Speaker> = SpeakerRepo { conn: tx }.current()?.into_iter().map(|used| used.speaker).collect();
-    let new_labels = SpeakerRepo { conn: tx }
-        .new_speakers()?
+    let lines: String = questions
         .iter()
-        .filter_map(|speaker| speaker.label.as_deref())
-        .flat_map(|label| [NameKey::new(label), NameKey::new(without_article(label))])
-        .flatten()
+        .enumerate()
+        .map(|(index, question)| {
+            let entry = question.entry.as_deref().map(|entry| format!(" ({entry})")).unwrap_or_default();
+            format!("Q{} {}{entry}: {}\n", index + 1, question.name, serde_json::to_string(&question.line).unwrap_or_default())
+        })
         .collect();
-    let mut owners = Owners::load(&glossary, &speakers);
-    if let Some(key) = scene {
-        owners.present = scene_entries(&glossary, &LineSampleRepo { conn: tx }.scene_lines(key)?).0;
-    }
-    let mut saver = Saver { tx, known, speakers, new_labels, owners, added: Vec::new() };
-    for finding in ordered(found) {
-        saver.save(finding)?;
-    }
-    saver.split_titled_terms()?;
-    saver.drop_common_titles()?;
-    saver.titled_terms_to_characters()?;
-    saver.drop_common_characters()?;
-    let merged = merge_duplicate_terms(tx)?;
-    if !merged.is_empty() {
-        saver.added.extend(merged);
-        saver.reload()?;
-    }
-    saver.merge_single_names()?;
-    saver.link_speakers()?;
-    Ok(saver.added)
-}
-
-/// Имена, фамилии, полные имена и формы персонажей, термины и их формы и подписи разобранных говорящих текущего
-/// снимка. Подписи говорящих, которых пользователь ещё не разобрал, известными не считаются: модель называет их
-/// персонажами, и говорящий привязывается к найденному персонажу.
-pub fn known_for_prompt(tx: &rusqlite::Connection) -> Result<Vec<String>, DbError> {
-    let glossary = GlossaryData::load(tx)?;
-    let speakers = SpeakerRepo { conn: tx };
-    let new: HashSet<_> = speakers.new_speakers()?.into_iter().map(|speaker| speaker.key).collect();
-    let labels = speakers.current()?.into_iter().filter(|used| !new.contains(&used.speaker.key)).filter_map(|used| used.speaker.label);
-    let characters = glossary.characters.iter().flat_map(|character| {
-        character
-            .full_name()
-            .into_iter()
-            .chain(character.first_name().map(str::to_string))
-            .chain(character.last_name().map(str::to_string))
-            .chain(character.forms().iter().map(|form| form.text().to_string()))
-    });
-    let terms = glossary.terms.iter().flat_map(|term| std::iter::once(term.name().to_string()).chain(term.forms().iter().map(|form| form.text().to_string())));
-    Ok(characters.chain(terms).chain(labels).collect())
+    format!("Known names to check. For each, is it used here as that name, or is it an ordinary word?\n{lines}\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::glossary::TermId;
 
     fn finding(name: &str, kind: FoundKind) -> Finding {
-        Finding { name: name.to_string(), kind, gender: None, same_as: None, parts: None }
+        Finding { name: name.to_string(), kind, gender: None, same_as: None, other_than: None, parts: None }
     }
 
     #[test]
@@ -1050,12 +529,126 @@ mod tests {
     }
 
     #[test]
+    fn prompt_numbers_the_cast_and_reads_same_person_pairs() {
+        let target = crate::translation::prompt::tests::target();
+        let id = CharacterId::from_row;
+        let cast = [
+            CastMember { id: id(3), names: vec!["Dimitria".to_string(), "Dimi".to_string()], gender: Some(Gender::Female) },
+            CastMember { id: id(7), names: vec!["Vellnikov".to_string()], gender: None },
+        ];
+        let request = AnalysisPrompt::build("Hilde: Chief Vellnikov.\n", &[], &cast, &[], &target);
+        assert!(request.user.starts_with("Characters of this scene:\nC3: Dimitria, Dimi (female)\nC7: Vellnikov\n\nScript:"), "{}", request.user);
+
+        let answer = r#"[{"kind": "same_person", "ids": ["C7", "C3"]}, {"kind": "same_person", "ids": ["C3", "C99"]}, {"kind": "character", "name": "Chief", "same_as": "C7"}]"#;
+        assert_eq!(AnalysisPrompt::same_people(answer, &[id(3), id(7)]), [(id(3), id(7))], "номер не из сцены отброшен");
+        let found = AnalysisPrompt::accept(answer, "Hilde: Chief Vellnikov.\n");
+        assert_eq!(found.len(), 1, "same_person не находка");
+        assert_eq!(found[0].same_as.as_deref(), Some("C7"));
+        assert_eq!(parse_cast_ref(" c12 "), Some(id(12)));
+        assert_eq!(parse_cast_ref("Dimitria"), None);
+    }
+
+    #[test]
     fn prompt_lists_only_known_names_from_the_part() {
         let target = crate::translation::prompt::tests::target();
         let known = vec!["Eileen".to_string(), "Lis".to_string(), "Nowhere".to_string(), "eileen".to_string()];
-        let request = AnalysisPrompt::build("Eileen: Hi, Lis.\n", &known, &target);
+        let request = AnalysisPrompt::build("Eileen: Hi, Lis.\n", &known, &[], &[], &target);
         assert!(request.user.starts_with("Known names and terms: Eileen, Lis\n\nScript:\n\nEileen: Hi, Lis.\n"), "{}", request.user);
-        assert!(AnalysisPrompt::build("Narration.\n", &known, &target).user.starts_with("Script:"));
+        assert!(AnalysisPrompt::build("Narration.\n", &known, &[], &[], &target).user.starts_with("Script:"));
+    }
+
+    #[test]
+    fn known_names_follow_spelling() {
+        let target = crate::translation::prompt::tests::target();
+        let known = vec!["MInD".to_string(), "Hope".to_string()];
+        let request = AnalysisPrompt::build("Lis: Never mind, I hope so.\n", &known, &[], &[], &target);
+        assert!(request.user.starts_with("Script:"), "обычные слова не подсказываются известными: {}", request.user);
+    }
+
+    fn part_line(script: &str, hash: &str) -> PartLine {
+        let text = script.split_once(": ").map_or(script, |(_, text)| text);
+        PartLine { script: script.to_string(), text: text.to_string(), hash: hash.to_string() }
+    }
+
+    fn asked<'a>(owner: ExcludeOwner, label: &str, names: &[&str], checks: Option<&'a Checks>) -> Asked<'a> {
+        Asked { owner, label: label.to_string(), names: names.iter().map(|name| name.to_string()).collect(), checks }
+    }
+
+    #[test]
+    fn questions_cover_only_doubtful_mentions() {
+        let lines = [
+            part_line("Hope: Hope you're right.", "h1"),
+            part_line("Lis: Never mind, MInD knows.", "h2"),
+            part_line("Lis: Never mind.", "h3"),
+            part_line("Lis: Karanovic and MIND!", "h4"),
+            part_line("Lis: Hope, wait!", "h5"),
+        ];
+        let part: String = lines.iter().map(|line| format!("{}\n", line.script)).collect();
+        let mut casings = Casings::new(["I hope so.", "Never mind.", "Karanovic came."].map(String::from));
+        let answered: Checks = [("h5".to_string(), true)].into();
+        let hope = ExcludeOwner::Character(CharacterId::from_row(1));
+        let mind = ExcludeOwner::Term(TermId::from_row(2));
+        let karanovic = ExcludeOwner::Character(CharacterId::from_row(3));
+        let entries = [asked(hope, "Hope", &["Hope"], Some(&answered)), asked(mind, "MInD", &["MInD"], None), asked(karanovic, "Karanovic", &["Karanovic"], None)];
+        let found: Vec<(ExcludeOwner, String)> =
+            questions(&part, &lines, &entries, &mut casings).into_iter().map(|question| (question.owner, question.hash)).collect();
+        let expected = [(hope, "h1"), (mind, "h4"), (mind, "h3")].map(|(owner, hash)| (owner, hash.to_string()));
+        assert_eq!(found, expected, "бесспорное не спрашивается, отвеченное тоже, обычные слова последними");
+    }
+
+    #[test]
+    fn a_name_shared_by_entries_is_asked_for_each_of_them() {
+        let lines = [part_line("Lis: Karanovic is late.", "k1"), part_line("Lis: Vera Karanovic called.", "k2"), part_line("Lis: Welcome to Hope.", "k3")];
+        let part: String = lines.iter().map(|line| format!("{}\n", line.script)).collect();
+        let mut casings = Casings::new(["Karanovic is late.", "Welcome to Hope."].map(String::from));
+        let vera = ExcludeOwner::Character(CharacterId::from_row(1));
+        let ivan = ExcludeOwner::Character(CharacterId::from_row(2));
+        let girl = ExcludeOwner::Character(CharacterId::from_row(3));
+        let town = ExcludeOwner::Term(TermId::from_row(4));
+        let entries = [
+            asked(vera, "Vera Karanovic", &["Vera Karanovic", "Vera", "Karanovic"], None),
+            asked(ivan, "Ivan Karanovic", &["Ivan Karanovic", "Ivan", "Karanovic"], None),
+            asked(girl, "Hope", &["Hope"], None),
+            asked(town, "Hope", &["Hope"], None),
+        ];
+        let found: Vec<(ExcludeOwner, String, Option<String>)> =
+            questions(&part, &lines, &entries, &mut casings).into_iter().map(|question| (question.owner, question.hash, question.entry)).collect();
+        let name = |text: &str| Some(text.to_string());
+        assert_eq!(
+            found,
+            [
+                (vera, "k1".to_string(), name("Vera Karanovic")),
+                (ivan, "k1".to_string(), name("Ivan Karanovic")),
+                (ivan, "k2".to_string(), name("Ivan Karanovic")),
+                (girl, "k3".to_string(), name("character")),
+                (town, "k3".to_string(), name("term")),
+            ],
+            "общая фамилия спрашивается у каждого, полное имя Веры бесспорно"
+        );
+
+        let target = crate::translation::prompt::tests::target();
+        let all = questions(&part, &lines, &entries, &mut casings);
+        let request = AnalysisPrompt::build(&part, &[], &[], &all, &target);
+        assert!(request.user.contains("Q1 Karanovic (Vera Karanovic): \"Lis: Karanovic is late.\"\nQ2 Karanovic (Ivan Karanovic):"), "{}", request.user);
+    }
+
+    #[test]
+    fn prompt_asks_and_reads_checks() {
+        let target = crate::translation::prompt::tests::target();
+        let question = Question {
+            owner: ExcludeOwner::Term(TermId::from_row(2)),
+            name: "MInD".to_string(),
+            line: "Lis: Never mind.".to_string(),
+            hash: "h".to_string(),
+            entry: None,
+            doubt: 2,
+        };
+        let request = AnalysisPrompt::build("Lis: Never mind.\n", &[], &[], &[question.clone(), question], &target);
+        assert!(request.user.contains("Known names to check. For each, is it used here as that name, or is it an ordinary word?\nQ1 MInD: \"Lis: Never mind.\"\nQ2"), "{}", request.user);
+
+        let answer = r#"[{"kind": "check", "yes": ["Q2", 3], "no": ["q1", "Q2", "Q9"]}, {"kind": "check", "used": ["Q3"]}, {"kind": "general", "name": "Never"}]"#;
+        assert_eq!(AnalysisPrompt::checks(answer, 3), [(2, true), (0, false)], "противоречивый и чужой номер отброшены");
+        assert!(AnalysisPrompt::accept(answer, "Lis: Never mind.\n").iter().all(|found| found.name == "Never"), "check не находка");
     }
 
     #[test]
@@ -1067,62 +660,6 @@ mod tests {
 
         let ppf = Finding { same_as: Some("People's Police Force".to_string()), ..finding("PPF", location) };
         assert_eq!(merge(vec![finding("PPF", location), ppf.clone()]), [ppf], "ссылка берётся у любой части");
-    }
-
-    #[test]
-    fn acronyms_match_initials_of_significant_words() {
-        assert_eq!(acronym("P.P.F."), Some("PPF".to_string()));
-        assert_eq!(acronym("Ppf"), None, "строчные буквы это не аббревиатура");
-        assert_eq!(acronym("A"), None);
-        assert_eq!(initials("People's Police Force"), Some("PPF".to_string()));
-        assert_eq!(initials("the Order of the Dawn"), Some("OD".to_string()), "служебные слова пропущены");
-        assert_eq!(initials("Rusty"), None);
-        assert!(abbreviates("PPF", "People's Police Force"));
-        assert!(abbreviates("ppf".to_uppercase().as_str(), "people's police force"));
-        assert!(!abbreviates("PPF", "Police Force"));
-        assert!(!abbreviates("People's Police Force", "PPF"), "порядок важен: короткое первым");
-    }
-
-    #[test]
-    fn titles_split_off_the_name() {
-        assert_eq!(title_and_name("Detective-Colonel Karanovic"), Some(("Detective-Colonel".to_string(), "Karanovic".to_string())));
-        assert_eq!(title_and_name("Mr. Lee"), Some(("Mr.".to_string(), "Lee".to_string())));
-        assert_eq!(title_and_name("Captain Jack Morgan"), Some(("Captain".to_string(), "Jack Morgan".to_string())));
-        assert_eq!(title_and_name("Vera Karanovic"), None);
-        assert_eq!(title_and_name("Captain"), None, "без имени после должности делить нечего");
-        assert!(is_common_title("Mr.") && is_common_title("Princess") && is_common_title(" sister "));
-        assert!(is_token_label("[mc]") && is_token_label(" [player_name] "));
-        assert!(!is_token_label("[mc]'s mom") && !is_token_label("[]") && !is_token_label("[a] [b]") && !is_token_label("Eileen"));
-        assert!(!is_common_title("Detective-Colonel") && !is_common_title("Grand Duke") && !is_common_title("Selena"));
-    }
-
-    #[test]
-    fn common_words_articles_titles_and_plurals() {
-        let lines = |texts: &[&str]| texts.iter().map(|text| text.to_string()).collect::<Vec<_>>();
-        let game = lines(&["Boobjob", "Give him a... boobjob.", "Are you ready for your b-boobjob?", "Merek", "I saw Merek today.", "Crone! Ask the crone, Crone knows."]);
-        assert!(is_common_word("Boobjob", &game), "только строчными и строкой меню");
-        assert!(!is_common_word("Merek", &game) && !is_common_word("Crone", &game), "с заглавной посреди фразы это имя");
-        assert!(!is_common_word("Kastia", &game), "строчными не встречается");
-        assert!(is_common_word("boobjob", &game) && !is_common_word("Fairy Queen", &game));
-
-        assert_eq!(without_article("The Fairy Queen"), "Fairy Queen");
-        assert_eq!((without_article("the Order"), without_article("Theodore"), without_article("The")), ("Order", "Theodore", "The"));
-        assert!(is_person_title("Fairy Queen") && is_person_title("The Fairy King"));
-        assert!(!is_person_title("Queen") && !is_person_title("Order of the King") && !is_person_title("Ancient Forest"));
-        assert!(plural_of("pixies", "pixie") && plural_of("Witches", "witch") && !plural_of("pixie", "pixies") && !plural_of("as", "a"));
-    }
-
-    #[test]
-    fn full_given_name_is_fuller_than_its_short_form() {
-        assert!(is_fuller("Stuart", "Stu"));
-        assert!(is_fuller("alexander", "Alex"));
-        assert!(!is_fuller("Stu", "Stuart"));
-        assert!(!is_fuller("Stuart Lee", "Stu"), "полное имя из двух слов не уменьшительное");
-        assert!(!is_fuller("Stu", "Stu"));
-        assert!(short_and_full("Dimi", "Dimitria") && short_and_full("Stuart", "Stu"));
-        assert!(!short_and_full("Eileen", "Eileenor"), "длинное имя не короткая форма");
-        assert!(!short_and_full("Al", "Alice"), "слишком коротко");
-        assert!(!short_and_full("Anya", "Anastasia"));
     }
 
     #[test]
@@ -1139,16 +676,22 @@ mod tests {
     }
 
     #[test]
-    fn answer_keeps_the_name_it_belongs_to() {
-        let part = "Eileen: The PPF is here.\n";
-        let answer = r#"[{"kind": "organization", "name": "PPF", "same_as": "People's Police Force"}, {"kind": "character", "name": "Eileen", "alias_of": "eileen"}]"#;
+    fn answer_keeps_the_name_it_belongs_to_and_the_one_it_is_not() {
+        let part = "Eileen: The PPF is here, and Karanovic too.\n";
+        let answer = r#"[{"kind": "organization", "name": "PPF", "same_as": "People's Police Force"}, {"kind": "character", "name": "Eileen", "alias_of": "eileen"},
+            {"kind": "character", "name": "Karanovic", "last_name": "Karanovic", "other_than": "C5"}]"#;
         assert_eq!(
             AnalysisPrompt::accept(answer, part),
             [
                 Finding { same_as: Some("People's Police Force".to_string()), ..finding("PPF", FoundKind::Term(TermCategory::Organization)) },
                 finding("Eileen", FoundKind::Character),
+                Finding {
+                    other_than: Some("C5".to_string()),
+                    parts: NameParts::check("Karanovic", None, Some("Karanovic")),
+                    ..finding("Karanovic", FoundKind::Character)
+                },
             ],
-            "ссылка на само имя отброшена"
+            "ссылка на само имя отброшена, other_than остаётся"
         );
     }
 }

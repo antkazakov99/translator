@@ -10,7 +10,10 @@ use crate::glossary::NamesFound;
 pub enum GameStep {
     /// Разбор сцен: новые персонажи и термины.
     Analysis,
-    /// Переводы глоссария: термины, подписи говорящих, значения токенов, имена.
+    /// Имена персонажей: имена и фамилии, потом формы. Раньше остальных переводов: термин и подпись с именем
+    /// берут готовое написание.
+    Names,
+    /// Переводы глоссария: термины, подписи говорящих, значения токенов.
     Glossary,
     /// Описания персонажей и терминов.
     Entries,
@@ -23,11 +26,12 @@ pub enum GameStep {
 }
 
 impl GameStep {
-    pub const ALL: [GameStep; 6] = [Self::Analysis, Self::Glossary, Self::Entries, Self::Scenes, Self::Lines, Self::Review];
+    pub const ALL: [GameStep; 7] = [Self::Analysis, Self::Names, Self::Glossary, Self::Entries, Self::Scenes, Self::Lines, Self::Review];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Analysis => "Разбор сцен",
+            Self::Names => "Перевод имён",
             Self::Glossary => "Переводы глоссария",
             Self::Entries => "Описания персонажей и терминов",
             Self::Scenes => "Описания сцен",
@@ -46,9 +50,9 @@ pub fn ordered(steps: &[GameStep]) -> Vec<GameStep> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub enum NamesMode {
-    /// Первый вариант модели: промпт ставит первым самое устоявшееся написание.
+    /// Написание, на котором перевод и проверка сошлись, пишется сразу. Спорные идут в отбор, как в ручном режиме.
     Auto,
-    /// Цепочка останавливается на отборе имён, окно продолжает её после записи.
+    /// Все написания идут в отбор: цепочка останавливается на нём, окно продолжает её после записи.
     Manual,
 }
 
@@ -90,7 +94,8 @@ pub struct GameRun {
     pub stopped: bool,
     /// Ошибка, которая оборвала цепочку, с названием шага.
     pub error: Option<String>,
-    /// Ручной выбор имён: написания для отбора. Цепочка встала, `rest` это шаги после отбора.
+    /// Написания имён для отбора: все в ручном режиме, спорные в «Авто». Цепочка встала, `rest` это шаги после
+    /// отбора. Шаг имён стоит в них первым: после записи он спросит формы.
     pub names: Option<NamesFound>,
     pub rest: Vec<GameStep>,
 }

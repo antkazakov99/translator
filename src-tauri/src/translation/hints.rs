@@ -6,6 +6,7 @@ use super::text::fill_tokens;
 use super::{Hints, Scene};
 use crate::common::Gender;
 use crate::engines::SpeakerKey;
+use crate::glossary::mentions::Checks;
 use crate::glossary::{CharacterId, GlossaryData, NameField, NameOrigin, speaker_gender};
 use crate::name_rules::{LanguageTag, NameRule};
 
@@ -39,13 +40,21 @@ impl GlossaryContext {
                 (character.last_name().map(str::to_string), character.translated_last_name().map(str::to_string)),
             ];
             let forms = character.forms().iter().map(|form| (Some(form.text().to_string()), form.translation().map(str::to_string)));
+            let checks = character.id().and_then(|id| data.character_checks.get(&id));
             for (original, translated) in pairs.into_iter().chain(forms) {
+                if let Some(original) = &original {
+                    add_checks(&mut hints, original, checks);
+                }
                 if let (Some(original), Some(translated)) = (original, translated) {
                     hints.names.push((original, translated, gender));
                 }
             }
         }
         for term in &data.terms {
+            let checks = term.id().and_then(|id| data.term_checks.get(&id));
+            for name in std::iter::once(term.name()).chain(term.forms().iter().map(|form| form.text())) {
+                add_checks(&mut hints, name, checks);
+            }
             let Some(translation) = term.translation() else { continue };
             hints.terms.push((term.name().to_string(), translation.to_string()));
             for form in term.forms() {
@@ -164,6 +173,13 @@ impl GlossaryContext {
     }
 }
 
+/// Ответы модели записи под её написанием.
+fn add_checks(hints: &mut Hints, name: &str, checks: Option<&Checks>) {
+    if let Some(checks) = checks.filter(|checks| !checks.is_empty()) {
+        hints.checks.entry(name.to_string()).or_default().extend(checks.iter().map(|(hash, used)| (hash.clone(), *used)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +220,7 @@ mod tests {
             entries: vec![entry],
             terms: vec![term],
             tokens: vec![mother, hero],
+            ..GlossaryData::default()
         };
 
         let mut context = GlossaryContext::new(&data);
@@ -240,7 +257,7 @@ mod tests {
             None,
             vec![Form::new("Mrs. Karanovic", None).unwrap()],
         );
-        let data = GlossaryData { characters: vec![anja], links: Vec::new(), entries: Vec::new(), terms: Vec::new(), tokens: Vec::new() };
+        let data = GlossaryData { characters: vec![anja], links: Vec::new(), entries: Vec::new(), terms: Vec::new(), tokens: Vec::new(), ..GlossaryData::default() };
         let tag = |code: &str| LanguageTag::parse(code).unwrap();
         let origin = |field: NameField, source: &str, context: &str, languages: &[&str]| NameOrigin {
             field,

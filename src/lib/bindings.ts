@@ -61,18 +61,23 @@ export const commands = {
 	takeTerm: (project: string, name: string, category: TermCategory) => __TAURI_INVOKE<RowRef>("take_term", { project, name, category }),
 	/**  Сохраняет термин целиком. */
 	saveTerm: (project: string, term: TermDto_Deserialize) => __TAURI_INVOKE<null>("save_term", { project, term }),
-	deleteTerm: (project: string, term: RowRef) => __TAURI_INVOKE<null>("delete_term", { project, term }),
+	/**  Термин в корзину вместе с полями: модель не предложит его снова, из корзины он возвращается целиком. */
+	trashTerm: (project: string, term: RowRef) => __TAURI_INVOKE<null>("trash_term", { project, term }),
+	/**  Название из корзины снова термин. Возвращает его id. */
+	restoreTerm: (project: string, key: string) => __TAURI_INVOKE<RowRef>("restore_term", { project, key }),
 	/**  Термин становится формой персонажа, название уходит в корзину. */
 	giveTermToCharacter: (project: string, term: RowRef, character: RowRef) => __TAURI_INVOKE<null>("give_term_to_character", { project, term, character }),
-	/**  Название в корзину: модель не предложит его снова. */
-	discardTermName: (project: string, name: string) => __TAURI_INVOKE<null>("discard_term_name", { project, name }),
-	restoreTermName: (project: string, key: string) => __TAURI_INVOKE<null>("restore_term_name", { project, key }),
+	/**  Окончательное удаление из корзины: название забывается, модель может найти его снова. */
+	forgetTermName: (project: string, key: string) => __TAURI_INVOKE<null>("forget_term_name", { project, key }),
 	/**  Значение или пояснение токена. Пустые оба удаляют запись. */
 	saveToken: (project: string, name: string, value: string, note: string) => __TAURI_INVOKE<null>("save_token", { project, name, value, note }),
 	/**  Глубина чтения приложения. Пока её не меняли, действует значение из кода. */
 	readingDepth: () => __TAURI_INVOKE<ReadingDepthDto_Serialize>("reading_depth"),
 	saveReadingDepth: (depth: ReadingDepthDto_Deserialize) => __TAURI_INVOKE<null>("save_reading_depth", { depth }),
-	/**  Перевод имён, фамилий и форм персонажей без перевода. Отмеченное окно записывает через `save_character`. */
+	/**
+	 *  Перевод имён и фамилий персонажей без перевода, а у персонажей с записанным именем и форм. Всё идёт в отбор,
+	 *  отмеченное окно записывает через `write_names`.
+	 */
 	suggestNames: (project: string, characters: RowRef[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<NameSuggestionsDto_Serialize>("suggest_names", { project, characters, profile, progress }),
 	/**  Языки имён проекта и библиотеки с правилами. */
 	nameRules: (project: string) => __TAURI_INVOKE<LanguageRulesDto_Serialize[]>("name_rules", { project }),
@@ -82,12 +87,18 @@ export const commands = {
 	saveOwnNameRule: (project: string, language: string, rules: string) => __TAURI_INVOKE<null>("save_own_name_rule", { project, language, rules }),
 	/**  Черновик правил моделью. Ничего не записывает: окно показывает его в поле общих правил. */
 	draftNameRule: (project: string, language: string, existing: string | null, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<RulesDraftDto_Serialize>("draft_name_rule", { project, language, existing, profile, progress }),
-	/**  Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `save_term`. */
+	/**  Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `accept_terms`. */
 	suggestTerms: (project: string, terms: RowRef[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<TermSuggestionsDto_Serialize>("suggest_terms", { project, terms, profile, progress }),
-	/**  Перевод подписей и род говорящих моделью. Отмеченное окно записывает через `save_speaker_entry`. */
+	/**  Перевод подписей и род говорящих моделью. Отмеченное окно записывает через `accept_speakers`. */
 	suggestSpeakers: (project: string, speakers: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<SpeakerSuggestionsDto_Serialize>("suggest_speakers", { project, speakers, profile, progress }),
-	/**  Значения и пояснения токенов моделью. Отмеченное окно записывает через `save_token`. */
+	/**  Значения и пояснения токенов моделью. Отмеченное окно записывает через `accept_tokens`. */
 	suggestTokens: (project: string, tokens: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<TokenSuggestionsDto_Serialize>("suggest_tokens", { project, tokens, profile, progress }),
+	/**  Отмеченные в отборе переводы терминов: тем же путём, что цепочка автоперевода. Возвращает число записанных. */
+	acceptTerms: (project: string, items: TermSuggestionDto_Deserialize[]) => __TAURI_INVOKE<number>("accept_terms", { project, items }),
+	/**  Отмеченные в отборе переводы подписей и род говорящих. Возвращает число записанных. */
+	acceptSpeakers: (project: string, items: SpeakerSuggestionDto_Deserialize[]) => __TAURI_INVOKE<number>("accept_speakers", { project, items }),
+	/**  Отмеченные в отборе значения и пояснения токенов. Возвращает число записанных. */
+	acceptTokens: (project: string, items: TokenSuggestionDto_Deserialize[]) => __TAURI_INVOKE<number>("accept_tokens", { project, items }),
 	/**  Правка названия и описания сцены. Пустые поля удаляют запись. */
 	saveSceneDescription: (project: string, key: string, title: string, description: string) => __TAURI_INVOKE<null>("save_scene_description", { project, key, title, description }),
 	/**  Части сцены с заметками модели. */
@@ -103,7 +114,7 @@ export const commands = {
 	sceneEntries: (project: string, key: string) => __TAURI_INVOKE<SceneEntriesDto_Serialize>("scene_entries", { project, key }),
 	/**  Описывает сцены по очереди с глубиной чтения проекта. Описанные сцены без новых частей пропускаются. */
 	describeScenes: (project: string, keys: string[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_scenes", { project, keys, profile, progress }),
-	/**  Сводка шагов «Вся игра»: сколько осталось и примерное число запросов. */
+	/**  Сводка шагов автоперевода: сколько осталось и примерное число запросов. */
 	gameOverview: (project: string) => __TAURI_INVOKE<StepWorkDto[]>("game_overview", { project }),
 	/**  Отмеченные шаги по порядку одной цепочкой. Повторный запуск продолжает с того же места. */
 	runGame: (project: string, steps: GameStep[], names: NamesMode, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<GameRunDto_Serialize>("run_game", { project, steps, names, progress }),
@@ -128,6 +139,10 @@ export const commands = {
 	excludeScene: (project: string, owner: OwnerDto, key: string, excluded: boolean) => __TAURI_INVOKE<null>("exclude_scene", { project, owner, key, excluded }),
 	/**  Реплики персонажа или термина по сюжету: где персонаж говорит или его упоминают, где есть термин. */
 	entryLines: (project: string, owner: OwnerDto) => __TAURI_INVOKE<EntryLineDto_Serialize[]>("entry_lines", { project, owner }),
+	/**  Реплики говорящего по сюжету. */
+	speakerLines: (project: string, speaker: string) => __TAURI_INVOKE<EntryLineDto_Serialize[]>("speaker_lines", { project, speaker }),
+	/**  Реплики токена по сюжету. */
+	tokenLines: (project: string, token: string) => __TAURI_INVOKE<EntryLineDto_Serialize[]>("token_lines", { project, token }),
 	/**  Собирает `ru_lang.rpa` в папке проекта. Папка игры не нужна. */
 	buildMod: (project: string) => __TAURI_INVOKE<ModResultDto>("build_mod", { project }),
 	/**  Собирает мод заново и ставит в привязанную папку игры. */
@@ -304,11 +319,26 @@ export type DescribedDto_Serialize = {
 };
 
 /**  Название в корзине. */
-export type DiscardedTermDto = {
+export type DiscardedTermDto = DiscardedTermDto_Serialize | DiscardedTermDto_Deserialize;
+
+/**  Название в корзине. */
+export type DiscardedTermDto_Deserialize = {
 	key: string,
 	text: string,
 	/**  Передано персонажу, а не мусор. */
 	givenToCharacter: boolean,
+	/**  Перевод удалённого термина: с ним он вернётся. `None`: в корзине только название или перевода не было. */
+	translation?: string | null,
+};
+
+/**  Название в корзине. */
+export type DiscardedTermDto_Serialize = {
+	key: string,
+	text: string,
+	/**  Передано персонажу, а не мусор. */
+	givenToCharacter: boolean,
+	/**  Перевод удалённого термина: с ним он вернётся. `None`: в корзине только название или перевода не было. */
+	translation: string | null,
 };
 
 /**  Реплика, где встречается персонаж или термин: строка таблицы, её сцена и файл. */
@@ -500,7 +530,12 @@ export type GameRunDto_Serialize = {
 export type GameStep = 
 /**  Разбор сцен: новые персонажи и термины. */
 "analysis" | 
-/**  Переводы глоссария: термины, подписи говорящих, значения токенов, имена. */
+/**
+ *  Имена персонажей: имена и фамилии, потом формы. Раньше остальных переводов: термин и подпись с именем
+ *  берут готовое написание.
+ */
+"names" | 
+/**  Переводы глоссария: термины, подписи говорящих, значения токенов. */
 "glossary" | 
 /**  Описания персонажей и терминов. */
 "entries" | 
@@ -520,7 +555,7 @@ export type GlossaryDto_Deserialize = {
 	speakers: SpeakerDto_Deserialize[],
 	characters: CharacterDto_Deserialize[],
 	terms: TermDto_Deserialize[],
-	discardedTerms: DiscardedTermDto[],
+	discardedTerms: DiscardedTermDto_Deserialize[],
 	tokens: TokenDto_Deserialize[],
 };
 
@@ -528,7 +563,7 @@ export type GlossaryDto_Serialize = {
 	speakers: SpeakerDto_Serialize[],
 	characters: CharacterDto_Serialize[],
 	terms: TermDto_Serialize[],
-	discardedTerms: DiscardedTermDto[],
+	discardedTerms: DiscardedTermDto_Serialize[],
 	tokens: TokenDto_Serialize[],
 };
 
@@ -785,6 +820,8 @@ export type NameSuggestionsDto_Deserialize = {
 	error?: string | null,
 	/**  Языки имён без правил: перевод шёл без них. */
 	missingRules: string[],
+	/**  Формы, которые ждут записи имени владельца: их спросит следующий запуск. */
+	waitingForms: number,
 };
 
 export type NameSuggestionsDto_Serialize = {
@@ -792,6 +829,8 @@ export type NameSuggestionsDto_Serialize = {
 	error: string | null,
 	/**  Языки имён без правил: перевод шёл без них. */
 	missingRules: string[],
+	/**  Формы, которые ждут записи имени владельца: их спросит следующий запуск. */
+	waitingForms: number,
 };
 
 export type NameVariantDto = NameVariantDto_Serialize | NameVariantDto_Deserialize;
@@ -808,9 +847,9 @@ export type NameVariantDto_Serialize = {
 
 /**  Как цепочка выбирает написание имени. */
 export type NamesMode = 
-/**  Первый вариант модели: промпт ставит первым самое устоявшееся написание. */
+/**  Написание, на котором перевод и проверка сошлись, пишется сразу. Спорные идут в отбор, как в ручном режиме. */
 "auto" | 
-/**  Цепочка останавливается на отборе имён, окно продолжает её после записи. */
+/**  Все написания идут в отбор: цепочка останавливается на нём, окно продолжает её после записи. */
 "manual";
 
 /**  Персонаж или термин, которого описывает модель. */
@@ -1054,7 +1093,7 @@ export type RunProgress_Deserialize = {
 	/**  Реплик записано за запуск. */
 	written: number,
 	message?: string | null,
-	/**  Шаг цепочки «Вся игра»: есть только у запуска внутри цепочки. */
+	/**  Шаг цепочки автоперевода: есть только у запуска внутри цепочки. */
 	stage?: RunStage | null,
 };
 
@@ -1068,7 +1107,7 @@ export type RunProgress_Serialize = {
 	/**  Реплик записано за запуск. */
 	written: number,
 	message: string | null,
-	/**  Шаг цепочки «Вся игра»: есть только у запуска внутри цепочки. */
+	/**  Шаг цепочки автоперевода: есть только у запуска внутри цепочки. */
 	stage?: RunStage,
 };
 
@@ -1261,11 +1300,12 @@ export type SpeakerDto_Serialize = {
 
 /**  Как разобран говорящий. */
 export type SpeakerState = 
-/**  В «Новых»: ещё не разобран. */
-"new" | 
 /**  Связан с персонажами. */
 "character" | 
-/**  Запись говорящего без персонажей. */
+/**
+ *  Говорящий без персонажей и не в корзине: роль или тот, кого ещё не связали. Свой перевод подписи
+ *  у него есть при `has_entry`.
+ */
 "speaker" | "discarded";
 
 export type SpeakerSuggestionDto = SpeakerSuggestionDto_Serialize | SpeakerSuggestionDto_Deserialize;
@@ -1332,27 +1372,23 @@ export type TermDto_Serialize = {
 	forms: FormDto_Serialize[],
 };
 
-/**  Предложение перевода термина. */
+/**  Предложение перевода термина: приходит из запуска и возвращается из отбора в `accept_terms`. */
 export type TermSuggestionDto = TermSuggestionDto_Serialize | TermSuggestionDto_Deserialize;
 
-/**  Предложение перевода термина. */
+/**  Предложение перевода термина: приходит из запуска и возвращается из отбора в `accept_terms`. */
 export type TermSuggestionDto_Deserialize = {
 	id: RowRef,
 	translation: string,
 	/**  `None`: категория остаётся прежней. */
 	category?: TermCategory | null,
-	/**  Только у термина без своего описания. */
-	description?: string | null,
 };
 
-/**  Предложение перевода термина. */
+/**  Предложение перевода термина: приходит из запуска и возвращается из отбора в `accept_terms`. */
 export type TermSuggestionDto_Serialize = {
 	id: RowRef,
 	translation: string,
 	/**  `None`: категория остаётся прежней. */
 	category: TermCategory | null,
-	/**  Только у термина без своего описания. */
-	description: string | null,
 };
 
 /**  Предложения запуска. `error`: запуск оборвался, готовые предложения всё равно пришли. */

@@ -26,7 +26,12 @@
 </script>
 
 <div class="forms">
-  <span class="label">Другие формы</span>
+  <div class="forms-head">
+    <span class="label">Другие формы</span>
+    <button class="icon-button" aria-label="Добавить форму" title="Добавить форму" onclick={() => rows.push({ text: "", translation: null })} {disabled}>
+      <Plus size={14} />
+    </button>
+  </div>
   {#each rows as form, index (index)}
     <div class="form-row">
       <input class="input" placeholder="Как написано в игре" bind:value={form.text} onchange={commit} {disabled} aria-label="Форма" />
@@ -36,10 +41,6 @@
   {:else}
     <span class="hint">{hint}</span>
   {/each}
-  <button class="btn small add" onclick={() => rows.push({ text: "", translation: null })} {disabled}>
-    <Plus size={12} />
-    <span>Добавить форму</span>
-  </button>
 </div>
 
 <style>
@@ -47,6 +48,15 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+  }
+
+  /* Подпись блока и «добавить» одной строкой. */
+  .forms-head {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 28px;
   }
 
   .label {
@@ -64,9 +74,5 @@
   .hint {
     color: var(--text-faint);
     font-size: 12px;
-  }
-
-  .add {
-    align-self: flex-start;
   }
 </style>

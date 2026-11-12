@@ -8,21 +8,20 @@
     CheckCheck,
     Eraser,
     FileCode,
+    Gamepad2,
     History,
     Languages,
+    ListChecks,
     LoaderCircle,
-    Package,
-    RefreshCw,
     SpellCheck,
     TriangleAlert,
     Undo2,
     Waypoints,
     X,
   } from "lucide-svelte";
-  import GamePage from "./GamePage.svelte";
+  import GameFolderPanel from "./GameFolderPanel.svelte";
+  import GamePanel from "./GamePanel.svelte";
   import Glossary from "./Glossary.svelte";
-  import ModPanel from "./ModPanel.svelte";
-  import ScanPanel from "./ScanPanel.svelte";
   import SceneCard from "./SceneCard.svelte";
   import SceneGraph from "./SceneGraph.svelte";
   import SourceViewer from "./SourceViewer.svelte";
@@ -68,11 +67,11 @@
   let filter = $state<Filter>("all");
   let editing = $state<{ id: number; text: string } | null>(null);
   let saving = $state(false);
-  let view = $state<"table" | "graph" | "glossary" | "game">("table");
-  /** Карточка мода под шапкой. */
-  let modOpen = $state(false);
-  /** Карточка версии игры: считывание, смена папки, «Пропавшие». */
-  let scanOpen = $state(false);
+  let view = $state<"table" | "graph" | "glossary">("table");
+  /** Окно автоперевода. */
+  let gameOpen = $state(false);
+  /** Окно «Игра»: папка игры, мод, «Пропавшие». */
+  let folderOpen = $state(false);
   /** Сцена в центре графа: переживает переключение вида. */
   let graphFocus = $state<string | null>(null);
   /** Открытый исходник: файл снимка и строка. */
@@ -105,8 +104,16 @@
   });
   /** Описание открытой сцены моделью. */
   const describe = new WriteRun("Описания");
-  /** Цепочка «Вся игра»: живёт здесь, чтобы переход между видами не терял запуск, отбор имён и итог. */
+  /** Цепочка автоперевода: живёт здесь, чтобы закрытое окно не теряло запуск, отбор имён и итог. */
   const game = new GameRun(() => project.id, () => refresh());
+
+  /** Цепочка кончилась или встала на отборе имён: окно открывается само, чтобы итог и отбор не прошли мимо. */
+  let gameWasActive = false;
+  $effect(() => {
+    const active = game.active;
+    if (gameWasActive && !active) gameOpen = true;
+    gameWasActive = active;
+  });
 
   type RunMode = "translate" | "review";
   /** Запуск перевода или редактуры из этого окна. */
@@ -572,15 +579,24 @@
       <button role="tab" aria-selected={view === "table"} class:on={view === "table"} onclick={() => (view = "table")}>Таблица</button>
       <button role="tab" aria-selected={view === "graph"} class:on={view === "graph"} onclick={() => (view = "graph")}>Граф</button>
       <button role="tab" aria-selected={view === "glossary"} class:on={view === "glossary"} onclick={() => (view = "glossary")}>Глоссарий</button>
-      <button role="tab" aria-selected={view === "game"} class:on={view === "game"} onclick={() => (view = "game")}>Вся игра</button>
     </div>
-    <button class="btn small" class:active={scanOpen} onclick={() => (scanOpen = !scanOpen)} title="Считать новую версию игры, сменить папку, пропавшие реплики">
-      <RefreshCw size={15} />
-      <span>Версия игры</span>
+    <button
+      class="btn small"
+      class:active={gameOpen}
+      onclick={() => (gameOpen = !gameOpen)}
+      title="Шаги модели по всей игре одной очередью: разбор сцен, имена, глоссарий, описания, перевод и вычитка"
+    >
+      {#if game.active}<LoaderCircle size={15} class="spin" />{:else}<ListChecks size={15} />{/if}
+      <span>Автоперевод</span>
     </button>
-    <button class="btn small" class:active={modOpen} onclick={() => (modOpen = !modOpen)} title="Собрать мод перевода и поставить его в игру">
-      <Package size={15} />
-      <span>Мод</span>
+    <button
+      class="btn small"
+      class:active={folderOpen}
+      onclick={() => (folderOpen = !folderOpen)}
+      title="Папка игры и новая версия, мод перевода, пропавшие реплики"
+    >
+      {#if project.gameMissing || !project.gameRoot}<TriangleAlert size={15} />{:else}<Gamepad2 size={15} />{/if}
+      <span>Игра</span>
     </button>
     <button class="btn small" onclick={onSettings} title="Провайдеры, модели и настройки действий">
       <Bot size={15} />
@@ -590,11 +606,11 @@
 
   <RunBar />
 
-  {#if scanOpen}
-    <ScanPanel {project} {onProject} onClose={() => (scanOpen = false)} onChanged={reloadSnapshot} />
+  {#if folderOpen}
+    <GameFolderPanel {project} {onProject} onClose={() => (folderOpen = false)} onChanged={reloadSnapshot} />
   {/if}
-  {#if modOpen}
-    <ModPanel {project} onClose={() => (modOpen = false)} />
+  {#if gameOpen}
+    <GamePanel projectId={project.id} {game} onClose={() => (gameOpen = false)} />
   {/if}
 
   {#if view === "graph"}
@@ -604,10 +620,6 @@
   {:else if view === "glossary"}
     <div class="body">
       <Glossary projectId={project.id} onOpenLine={openLine} />
-    </div>
-  {:else if view === "game"}
-    <div class="body">
-      <GamePage projectId={project.id} {game} />
     </div>
   {:else}
   <div class="body">

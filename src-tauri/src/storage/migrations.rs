@@ -44,6 +44,11 @@ pub const PROJECT: &[Migration] = &[
     Migration { version: 3, name: "scene_analysis", sql: include_str!("schema/project/0003_scene_analysis.sql") },
     Migration { version: 4, name: "app_reading_depth", sql: include_str!("schema/project/0004_app_reading_depth.sql") },
     Migration { version: 5, name: "game_run", sql: include_str!("schema/project/0005_game_run.sql") },
+    Migration { version: 6, name: "discarded_term_payload", sql: include_str!("schema/project/0006_discarded_term_payload.sql") },
+    Migration { version: 7, name: "character_pair_checks", sql: include_str!("schema/project/0007_character_pair_checks.sql") },
+    Migration { version: 8, name: "mention_checks", sql: include_str!("schema/project/0008_mention_checks.sql") },
+    Migration { version: 9, name: "entry_pair_checks", sql: include_str!("schema/project/0009_entry_pair_checks.sql") },
+    Migration { version: 10, name: "glossary_asks", sql: include_str!("schema/project/0010_glossary_asks.sql") },
 ];
 
 /// История шагов. Её создаёт механизм миграций, в самих шагах её нет.

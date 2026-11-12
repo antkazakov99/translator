@@ -7,14 +7,15 @@ import {
   type RunProgress_Deserialize as RunProgress,
   type StepResultDto,
 } from "./bindings";
-import { chainText } from "./game-run";
+import { chainText, mergeFinished } from "./game-run";
 import type { NameSuggestion } from "./glossary";
 import { trackRun } from "./run-status.svelte";
 import type { Picked } from "./suggest-run.svelte";
 
 /**
- * Цепочка «Вся игра»: запуск, ход в общей полосе, остановка и отбор имён в ручном режиме. Живёт в окне
- * проекта, а не на странице: переход на другой вид не обрывает запуск и не теряет отбор и итог.
+ * Цепочка автоперевода: запуск, ход в общей полосе, остановка и отбор имён (все написания в ручном режиме,
+ * спорные в «Авто»). Живёт в окне проекта, а не в панели: закрытая панель не обрывает запуск и не теряет
+ * отбор и итог.
  */
 export class GameRun {
   progress = $state<RunProgress | null>(null);
@@ -28,7 +29,7 @@ export class GameRun {
   writing = $state(false);
   /** Шаги, отмеченные при последнем запуске: по ним строится итог по шагам. */
   requested = $state<GameStep[]>([]);
-  /** Шаги после отбора и режим имён: с ними цепочка продолжится. */
+  /** Шаги после отбора и режим имён: с ними цепочка продолжится. Первым стоит шаг имён: он спросит формы. */
   private rest: GameStep[] = [];
   private mode: NamesMode = "auto";
 
@@ -64,7 +65,7 @@ export class GameRun {
     const untrack = trackRun(this);
     try {
       const result = await commands.runGame(this.project(), steps, mode, channel);
-      this.result = { ...result, finished: [...earlier, ...result.finished] };
+      this.result = { ...result, finished: mergeFinished(earlier, result.finished) };
       if (result.names && result.names.items.length > 0) {
         this.names = result.names.items.map((item) => ({ ...item, selected: true }));
         this.missingRules = result.names.missingRules;

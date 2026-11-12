@@ -1,11 +1,13 @@
 //! Правки глоссария без модели: разбор «Новых», связи, передача термина персонажу, удаление.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rusqlite::Connection;
 use super::{NameField, SpeakerSuggestion, TermSuggestion, TokenSuggestion};
 
-use super::entries::{EntryLine, character_lines, character_names, scene_entries, term_lines, term_names};
+use super::mentions::Checks;
+use super::repo::MentionCheckRepo;
+use super::entries::{EntryLine, character_lines, character_names, scene_entries, speaker_lines, term_lines, term_names, token_lines};
 use super::{
     Character, CharacterId, CharacterRepo, DiscardReason, DiscardedTerm, Form, LineSampleRepo, NameKey, NoteOwner, NoteRepo,
     SceneDescription, SceneDescriptionRepo, Speaker, SpeakerEntry, SpeakerLink, SpeakerRepo, SpeakerUse, Term,
@@ -26,6 +28,10 @@ pub struct GlossaryData {
     pub entries: Vec<SpeakerEntry>,
     pub terms: Vec<Term>,
     pub tokens: Vec<Token>,
+    /// Ответы модели, упомянут ли персонаж в реплике.
+    pub character_checks: HashMap<CharacterId, Checks>,
+    /// Ответы модели, упомянут ли термин в реплике.
+    pub term_checks: HashMap<TermId, Checks>,
 }
 
 impl GlossaryData {
@@ -38,6 +44,8 @@ impl GlossaryData {
             entries: speakers.entries()?,
             terms: TermRepo { conn }.list()?,
             tokens: TokenRepo { conn }.list()?,
+            character_checks: MentionCheckRepo { conn }.characters()?,
+            term_checks: MentionCheckRepo { conn }.terms()?,
         })
     }
 }
@@ -178,12 +186,26 @@ impl GlossaryService<'_> {
         self.write(project, |tx| TermRepo { conn: tx }.save(term).map(|_| ()))
     }
 
-    /// Удаляет термин и его заметки: название вернётся в «Новые».
-    pub fn delete_term(&self, project: ProjectId, id: TermId) -> Result<(), AppError> {
+    /// Единственное удаление термина из окна. Одной транзакцией: термин и его заметки удаляются, а корзина
+    /// получает название и поля термина. Разбор сцены его больше не предложит.
+    pub fn trash_term(&self, project: ProjectId, id: TermId) -> Result<(), AppError> {
         self.write(project, |tx| {
-            TermRepo { conn: tx }.delete(id)?;
+            let terms = TermRepo { conn: tx };
+            let term = terms.get(id)?;
+            terms.delete(id)?;
             NoteRepo { conn: tx }.delete_owner(&NoteOwner::Term(id))?;
-            Ok(())
+            terms.discard(&DiscardedTerm::trashed(&term, Timestamp::now()))
+        })
+    }
+
+    /// Название из корзины снова термин: с полями, с которыми его убрали, а без них категории `general`.
+    pub fn restore_term(&self, project: ProjectId, name: &NameKey) -> Result<TermId, AppError> {
+        self.write(project, |tx| {
+            let terms = TermRepo { conn: tx };
+            let discarded = terms.discarded()?.into_iter().find(|term| &term.key == name).ok_or(DbError::NotFound)?;
+            let term = discarded.into_term().map_err(|error| DbError::bad_value("discarded_terms", "text", error))?;
+            terms.restore_discarded(name)?;
+            terms.save(&term)
         })
     }
 
@@ -201,19 +223,8 @@ impl GlossaryService<'_> {
         })
     }
 
-    pub fn discard_term_name(&self, project: ProjectId, name: &str) -> Result<(), AppError> {
-        let key = NameKey::new(name).ok_or(ValidationError::Empty("name"))?;
-        self.write(project, |tx| {
-            TermRepo { conn: tx }.discard(&DiscardedTerm {
-                text: name.trim().to_string(),
-                key: key.clone(),
-                reason: DiscardReason::Junk,
-                discarded_at: Timestamp::now(),
-            })
-        })
-    }
-
-    pub fn restore_term_name(&self, project: ProjectId, name: &NameKey) -> Result<(), AppError> {
+    /// Окончательное удаление из корзины: название забывается, разбор сцены может найти его снова.
+    pub fn forget_term_name(&self, project: ProjectId, name: &NameKey) -> Result<(), AppError> {
         self.write(project, |tx| TermRepo { conn: tx }.restore_discarded(name))
     }
 
@@ -259,14 +270,26 @@ impl GlossaryService<'_> {
                 ExcludeOwner::Character(id) => {
                     let Some(character) = glossary.characters.iter().find(|character| character.id() == Some(id)) else { return Ok(Vec::new()) };
                     let speakers = glossary.links.iter().filter(|link| link.character == id).map(|link| link.speaker.clone()).collect();
-                    character_lines(TranslationRepo { conn: tx }.story()?, &speakers, &character_names(character))
+                    character_lines(TranslationRepo { conn: tx }.story()?, &speakers, &character_names(character), glossary.character_checks.get(&id))
                 }
                 ExcludeOwner::Term(id) => {
                     let Some(term) = glossary.terms.iter().find(|term| term.id() == Some(id)) else { return Ok(Vec::new()) };
-                    term_lines(TranslationRepo { conn: tx }.story()?, &term_names(term))
+                    term_lines(TranslationRepo { conn: tx }.story()?, &term_names(term), glossary.term_checks.get(&id))
                 }
             })
         })?)
+    }
+
+    /// Реплики говорящего по сюжету с переводом и местом в игре.
+    pub fn speaker_lines(&self, project: ProjectId, speaker: &SpeakerKey) -> Result<Vec<EntryLine>, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| Ok(speaker_lines(TranslationRepo { conn: tx }.story()?, speaker)))?)
+    }
+
+    /// Реплики токена по сюжету с переводом и местом в игре.
+    pub fn token_lines(&self, project: ProjectId, name: &str) -> Result<Vec<EntryLine>, AppError> {
+        let open = self.state.open_project(project)?;
+        Ok(open.project.read(|tx| Ok(token_lines(TranslationRepo { conn: tx }.story()?, name)))?)
     }
 
     /// Сцена не передаётся модели при описании персонажа или термина.
@@ -286,8 +309,10 @@ impl GlossaryService<'_> {
         Ok(self.state.app.write(|tx| super::ReadingDepthRepo { conn: tx }.save(depth))?)
     }
 
-    /// Переводы терминов от модели без отбора: только термину без перевода. Категория меняется на названную
-    /// моделью, описание пишется в пустое. Возвращает число записанных.
+    /// Переводы терминов от модели: только термину без перевода. Категорию предложение несёт, только если модель
+    /// назвала её термину категории `general` или её выбрал пользователь в отборе. Описания перевод не пишет:
+    /// оно закрыло бы термин от описания по сценам. Единственная запись ответа модели: её зовут и цепочка после
+    /// пакета, и окно после отбора. Возвращает число записанных.
     pub fn accept_terms(&self, project: ProjectId, items: &[TermSuggestion]) -> Result<usize, AppError> {
         self.write(project, |tx| {
             let repo = TermRepo { conn: tx };
@@ -305,29 +330,27 @@ impl GlossaryService<'_> {
                 if let Some(category) = item.category {
                     term.set_category(category);
                 }
-                // Пояснение модели к переводу («Название локации») описанием не пишется: оно повторяет категорию
-                // и закрыло бы термин от описания по сценам.
                 repo.save(&term)?;
                 written += 1;
             }
-            // Одинаковый перевод у двух терминов одной категории: это одно и то же («Fey Court» и «Fairy Court»).
-            super::analyze::merge_duplicate_terms(tx)?;
             Ok(written)
         })
     }
 
-    /// Переводы подписей от модели без отбора: только записи говорящего без перевода, род в пустое поле.
+    /// Переводы подписей от модели, из цепочки и из отбора окна: только говорящему без перевода подписи, род
+    /// в пустое поле.
     pub fn accept_speakers(&self, project: ProjectId, items: &[SpeakerSuggestion]) -> Result<usize, AppError> {
         self.write(project, |tx| {
             let repo = SpeakerRepo { conn: tx };
             let entries = repo.entries()?;
             let mut written = 0;
             for item in items {
-                let Some(entry) = entries.iter().find(|entry| entry.key() == &item.key) else { continue };
-                if entry.translation().is_some() || item.translation.trim().is_empty() {
+                // Говорящий без записи получает её вместе с переводом: отдельного шага «оставить говорящим» нет.
+                let entry = entries.iter().find(|entry| entry.key() == &item.key);
+                if entry.is_some_and(|entry| entry.translation().is_some()) || item.translation.trim().is_empty() {
                     continue;
                 }
-                let mut entry = entry.clone();
+                let mut entry = entry.cloned().unwrap_or_else(|| SpeakerEntry::new(item.key.clone(), Timestamp::now()));
                 entry.set_translation(&item.translation);
                 if entry.gender().is_none() {
                     entry.set_gender(item.gender);
@@ -339,7 +362,7 @@ impl GlossaryService<'_> {
         })
     }
 
-    /// Значения и пояснения токенов от модели без отбора: только в пустые поля.
+    /// Значения и пояснения токенов от модели, из цепочки и из отбора окна: только в пустые поля.
     pub fn accept_tokens(&self, project: ProjectId, items: &[TokenSuggestion]) -> Result<usize, AppError> {
         let open = self.state.open_project(project)?;
         Ok(open.project.write(|tx| {
@@ -434,14 +457,10 @@ pub(crate) fn give_term(tx: &Connection, term: TermId, character: CharacterId) -
     let term = terms.get(term)?;
     let id = term.id().ok_or(DbError::NotFound)?;
     add_form(tx, character, term.name(), term.translation())?;
+    MentionCheckRepo { conn: tx }.copy(ExcludeOwner::Term(id), ExcludeOwner::Character(character))?;
     terms.delete(id)?;
     NoteRepo { conn: tx }.delete_owner(&NoteOwner::Term(id))?;
-    terms.discard(&DiscardedTerm {
-        text: term.name().to_string(),
-        key: term.name_key().clone(),
-        reason: DiscardReason::GivenToCharacter,
-        discarded_at: Timestamp::now(),
-    })
+    terms.discard(&DiscardedTerm::name(term.name(), term.name_key().clone(), DiscardReason::GivenToCharacter, Timestamp::now()))
 }
 
 /// Термин `from` сливается в `into`: название и формы `from` становятся формами `into` со своими переводами,
@@ -462,6 +481,7 @@ pub(crate) fn merge_terms(tx: &Connection, from: TermId, into: TermId) -> Result
         target.set_description(description);
     }
     let excluded = terms.excluded_containers(from)?;
+    MentionCheckRepo { conn: tx }.copy(ExcludeOwner::Term(from), ExcludeOwner::Term(into))?;
     terms.delete(from)?;
     NoteRepo { conn: tx }.delete_owner(&NoteOwner::Term(from))?;
     terms.save(&target)?;
@@ -483,6 +503,7 @@ pub(crate) fn merge_characters(tx: &Connection, from: CharacterId, into: Charact
     let source = characters.get(from)?;
     let links = speakers.links_of(from)?;
     let excluded = characters.excluded_containers(from)?;
+    MentionCheckRepo { conn: tx }.copy(ExcludeOwner::Character(from), ExcludeOwner::Character(into))?;
     characters.delete(from)?;
     NoteRepo { conn: tx }.delete_owner(&NoteOwner::Character(from))?;
     let names = source
@@ -653,10 +674,47 @@ mod tests {
         assert!(forms.iter().any(|form| form.text() == "Lee Manor" && form.translation() == Some("Поместье Ли")));
         assert_eq!(overview.discarded_terms[0].reason, DiscardReason::GivenToCharacter);
 
-        service.discard_term_name(id, "Silver Key").unwrap();
-        assert!(known("silver key"));
-        service.restore_term_name(id, &key("Silver Key")).unwrap();
-        assert!(!known("silver key"));
+        // Название, переданное персонажу, лежит в корзине без полей термина: окончательное удаление его забывает.
+        service.forget_term_name(id, &key("Lee Manor")).unwrap();
+        assert!(service.overview(id).unwrap().discarded_terms.is_empty());
+    }
+
+    #[test]
+    fn term_goes_to_trash_and_returns_with_its_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path());
+        let service = GlossaryService { state: &state };
+        let open = state.open_project(id).unwrap();
+        let key = |text: &str| NameKey::new(text).unwrap();
+        let known = |text: &str| open.project.read(|tx| TermRepo { conn: tx }.is_known(&key(text))).unwrap();
+
+        let term = service.take_term(id, "People's Police Force", TermCategory::Organization).unwrap();
+        let mut police = open.project.read(|tx| TermRepo { conn: tx }.get(term)).unwrap();
+        police.set_translation("Народная полиция");
+        police.set_description("Полиция города.");
+        police.add_form(Form::new("PPF", Some("НП")).unwrap()).unwrap();
+        service.save_term(id, &police).unwrap();
+
+        service.trash_term(id, term).unwrap();
+        let overview = service.overview(id).unwrap();
+        assert!(overview.data.terms.is_empty());
+        assert_eq!(overview.discarded_terms.len(), 1);
+        assert_eq!(overview.discarded_terms[0].reason, DiscardReason::Junk);
+        assert!(known("people's police force"), "название в корзине: разбор его не предложит");
+
+        let restored = service.restore_term(id, &key("People's Police Force")).unwrap();
+        let overview = service.overview(id).unwrap();
+        assert!(overview.discarded_terms.is_empty());
+        let back = &overview.data.terms[0];
+        assert_eq!(back.id(), Some(restored));
+        assert_eq!((back.name(), back.category()), ("People's Police Force", TermCategory::Organization));
+        assert_eq!((back.translation(), back.description()), (Some("Народная полиция"), Some("Полиция города.")));
+        assert!(back.forms().iter().any(|form| form.text() == "PPF" && form.translation() == Some("НП")));
+
+        service.trash_term(id, restored).unwrap();
+        service.forget_term_name(id, &key("People's Police Force")).unwrap();
+        assert!(!known("people's police force"), "название забыто: разбор может найти его снова");
+        assert!(service.restore_term(id, &key("People's Police Force")).is_err(), "в корзине его больше нет");
     }
 
     #[test]

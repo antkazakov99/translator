@@ -58,7 +58,7 @@
   });
 
   /**
-   * Запуск модели (разбор сцен, «Вся игра», описания) пишет в глоссарий по ходу: пока он идёт, список
+   * Запуск модели (разбор сцен, автоперевод, описания) пишет в глоссарий по ходу: пока он идёт, список
    * перечитывается не чаще раза в `REFRESH_MS` и ещё раз после конца. Открытая карточка держит свой черновик.
    */
   const REFRESH_MS = 1500;
@@ -117,7 +117,7 @@
   }
 
   const sections = $derived([
-    { id: "speakers" as const, label: "Говорящие", icon: MessagesSquare, count: data?.speakers.filter((item) => item.state === "new").length ?? 0, hint: "новых" },
+    { id: "speakers" as const, label: "Говорящие", icon: MessagesSquare, count: data?.speakers.filter((item) => item.state !== "discarded").length ?? 0, hint: "" },
     { id: "characters" as const, label: "Персонажи", icon: Users, count: data?.characters.length ?? 0, hint: "" },
     { id: "rules" as const, label: "Правила имён", icon: SpellCheck, count: null, hint: "" },
     { id: "terms" as const, label: "Термины", icon: BookText, count: data?.terms.length ?? 0, hint: "" },
@@ -128,7 +128,7 @@
 <div class="glossary">
   <nav class="sections" aria-label="Разделы глоссария">
     {#each sections as item (item.id)}
-      <button class="section" class:active={section === item.id} onclick={() => open(item.id)}>
+      <button class="section" class:active={section === item.id} title={item.label} aria-label={item.label} onclick={() => open(item.id)}>
         <item.icon size={14} />
         <span class="section-name">{item.label}</span>
         {#if data && item.count !== null}<span class="section-count">{item.hint ? `${item.hint}: ${item.count}` : item.count}</span>{/if}
@@ -158,6 +158,7 @@
           character = id;
           open("characters");
         }}
+        {onOpenLine}
       />
     {:else if section === "characters"}
       <GlossaryCharacters
@@ -184,7 +185,7 @@
         onError={(message) => (error = message)}
       />
     {:else}
-      <GlossaryTokens {projectId} {data} {runs} reload={load} patch={patchToken} onError={(message) => (error = message)} />
+      <GlossaryTokens {projectId} {data} {runs} reload={load} patch={patchToken} {onOpenLine} onError={(message) => (error = message)} />
     {/if}
   </section>
 </div>
@@ -244,6 +245,18 @@
     min-height: 0;
   }
 
+  /* В узком окне от разделов остаются иконки: место нужно списку, записи и её репликам. */
+  @media (max-width: 1100px) {
+    .sections {
+      width: auto;
+    }
+
+    .section-name,
+    .section-count {
+      display: none;
+    }
+  }
+
   /* Общее для разделов глоссария. */
 
   .glossary :global(.toolbar) {
@@ -278,6 +291,12 @@
     margin: 10px 16px 0;
   }
 
+  /* Баннер над списком и записью: области начинаются с разделителя, а не вплотную к баннеру. */
+  .glossary :global(.page-error + .master) {
+    margin-top: 10px;
+    border-top: 1px solid var(--divider);
+  }
+
   .glossary :global(.empty) {
     display: flex;
     flex: 1;
@@ -297,10 +316,18 @@
     font-weight: 600;
   }
 
+  /* Таблица раздела: строки на всю ширину через разделители, как реплики в таблице перевода. */
   .glossary :global(.list) {
+    display: flex;
     flex: 1;
-    overflow: auto;
-    padding: 8px 16px 16px;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+    padding-bottom: 16px;
+  }
+
+  .glossary :global(.list > *) {
+    flex-shrink: 0;
   }
 
   .glossary :global(.list > .row) {
@@ -308,35 +335,41 @@
     gap: 12px;
     align-items: center;
     justify-content: space-between;
-    padding: 8px 4px;
+    padding: 8px 16px;
     border-bottom: 1px solid var(--divider-row);
   }
 
+  .glossary :global(.list > .row:hover) {
+    background: var(--hover-row);
+  }
+
+  /*
+   * Список и запись: области на всю высоту раздела через разделители, как сцены и описание в таблице.
+   * Ряд по высоте раздела, каждая область листается сама.
+   */
   .glossary :global(.master) {
     display: grid;
     flex: 1;
-    grid-template-columns: minmax(220px, 300px) 1fr;
-    gap: 16px;
+    grid-template-columns: clamp(200px, 22%, 260px) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
     min-height: 0;
-    padding: 12px 16px 16px;
+  }
+
+  /* Персонажи и термины: список, поля записи и её реплики. */
+  .glossary :global(.master.with-lines) {
+    grid-template-columns: clamp(200px, 22%, 260px) clamp(300px, 36%, 420px) minmax(0, 1fr);
   }
 
   .glossary :global(.list-side) {
     display: flex;
     flex-direction: column;
-    gap: 8px;
     min-height: 0;
+    border-right: 1px solid var(--divider);
+    background: var(--surface-side);
   }
 
-  /* Персонажи и термины: список, карточка и панель реплик. Ряд по высоте раздела, колонки листаются сами. */
-  .glossary :global(.master.with-lines) {
-    grid-template-columns: clamp(180px, 22%, 280px) minmax(0, 1fr) minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1fr);
-  }
-
-  /* Высота карточки с отступами не больше ряда: иначе её низ уходит за край окна. */
-  .glossary :global(.master.with-lines > .editor) {
-    box-sizing: border-box;
+  .glossary :global(.list-side > .input) {
+    margin: 10px 8px 8px;
   }
 
   .glossary :global(.items) {
@@ -344,13 +377,21 @@
     flex: 1;
     flex-direction: column;
     gap: 2px;
-    overflow: auto;
+    overflow-y: auto;
+    padding: 0 8px 8px;
+  }
+
+  .glossary :global(.items > .faint) {
+    margin: 0;
+    padding: 4px 10px;
   }
 
   .glossary :global(.item) {
     display: flex;
+    flex: 0 0 auto;
     flex-direction: column;
     gap: 2px;
+    min-width: 0;
     padding: 8px 10px;
     border: 1px solid transparent;
     border-radius: 8px;
@@ -365,12 +406,12 @@
   }
 
   .glossary :global(.item strong) {
-    display: flex;
-    gap: 6px;
-    align-items: center;
+    overflow: hidden;
     color: var(--text);
     font-size: 12px;
     font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .glossary :global(.item > span) {
@@ -381,53 +422,111 @@
     white-space: nowrap;
   }
 
-  .glossary :global(.add) {
+  /* Новая запись: поле и кнопка одной строкой внизу списка. */
+  .glossary :global(.list-side > .add) {
     display: flex;
     gap: 6px;
+    align-items: center;
+    padding: 8px;
+    border-top: 1px solid var(--divider);
   }
 
-  .glossary :global(.add .input) {
+  .glossary :global(.list-side > .add .input) {
     flex: 1;
     min-width: 0;
-  }
-
-  .glossary :global(.add.stacked) {
-    flex-wrap: wrap;
-  }
-
-  .glossary :global(.add.stacked .name) {
-    flex-basis: 100%;
   }
 
   .glossary :global(.editor) {
     display: flex;
     flex-direction: column;
     gap: 12px;
-    align-self: start;
-    max-height: 100%;
-    overflow: auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px 14px 16px;
+  }
+
+  .glossary :global(.master.with-lines > .editor) {
+    border-right: 1px solid var(--divider);
+  }
+
+  /* Без панели реплик поля не растягиваются на всю ширину окна. */
+  .glossary :global(.master:not(.with-lines) > .editor) {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 760px;
   }
 
   .glossary :global(.editor.saving) {
     opacity: 0.75;
   }
 
-  .glossary :global(.card-head) {
+  /* Переключатель по своей ширине, а не на всю строку поля. */
+  .glossary :global(.editor .field > .segmented) {
+    align-self: flex-start;
+  }
+
+  .glossary :global(.editor .page-error) {
+    margin: 0;
+  }
+
+  .glossary :global(.master > .empty) {
+    grid-column: 2 / -1;
+  }
+
+  /* Шапка записи: название и действия одной строкой. */
+  .glossary :global(.editor-head) {
     display: flex;
     gap: 8px;
     align-items: center;
+    min-height: 28px;
   }
 
-  .glossary :global(.card-head strong) {
+  .glossary :global(.editor-head strong) {
     flex: 1;
+    min-width: 0;
+    overflow: hidden;
     color: var(--text-strong);
     font-size: 13px;
     font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Действия записи справа в шапке: кнопки-иконки вплотную, подтверждение на их месте. */
+  .glossary :global(.editor-tools) {
+    display: flex;
+    flex-shrink: 0;
+    gap: 2px;
+    align-items: center;
+  }
+
+  .glossary :global(.editor-tools > .btn),
+  .glossary :global(.editor-tools > .confirm-text),
+  .glossary :global(.editor-tools > .faint),
+  .glossary :global(.row-tools > .btn),
+  .glossary :global(.row-tools > .confirm-text) {
+    margin-left: 4px;
+  }
+
+  /* Действия строки таблицы справа: те же кнопки-иконки, подтверждение на их месте. */
+  .glossary :global(.row-tools) {
+    display: flex;
+    flex-shrink: 0;
+    gap: 2px;
+    align-items: center;
+    min-height: 28px;
+  }
+
+  .glossary :global(.editor-tools > .icon-button.active),
+  .glossary :global(.row-tools > .icon-button.active) {
+    background: var(--hover-icon);
+    color: var(--text-strong);
   }
 
   .glossary :global(.confirm-text) {
     color: var(--text-soft);
     font-size: 12px;
+    white-space: nowrap;
   }
 
   .glossary :global(.grid) {
@@ -436,23 +535,15 @@
     gap: 10px;
   }
 
+  /* Строка pill одной высоты с pill и без них: при переходе между записями поля ниже не прыгают. */
   .glossary :global(.badges) {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
-  }
-
-  .glossary :global(.card-actions) {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
     align-items: center;
-    justify-content: flex-end;
+    min-height: 22px;
   }
 
-  .glossary :global(.card-actions .picker) {
-    width: 240px;
-  }
 
   .glossary :global(.field textarea) {
     resize: vertical;
@@ -461,7 +552,9 @@
   /* Отбор предложений модели. */
 
   .glossary :global(.pick-head) {
-    margin: 4px 4px 8px;
+    margin: 0;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--divider);
     color: var(--text-faint);
     font-size: 11px;
   }
@@ -470,7 +563,7 @@
     display: grid;
     gap: 10px;
     align-items: center;
-    padding: 8px 4px;
+    padding: 8px 16px;
     border-bottom: 1px solid var(--divider-row);
   }
 
@@ -479,7 +572,7 @@
   }
 
   .glossary :global(.pick-row.terms) {
-    grid-template-columns: auto minmax(140px, 1fr) 1.2fr 140px 1.2fr;
+    grid-template-columns: auto minmax(140px, 1fr) 1.6fr 160px;
   }
 
   .glossary :global(.pick-row.speakers) {
@@ -494,14 +587,16 @@
     opacity: 0.55;
   }
 
-  .glossary :global(.pick-row .name) {
+  .glossary :global(.pick-row .name),
+  .glossary :global(.list > .row .name) {
     display: flex;
     flex-direction: column;
     gap: 2px;
     min-width: 0;
   }
 
-  .glossary :global(.pick-row .name strong) {
+  .glossary :global(.pick-row .name strong),
+  .glossary :global(.list > .row .name strong) {
     overflow: hidden;
     color: var(--text);
     font-size: 12px;
@@ -510,7 +605,8 @@
     white-space: nowrap;
   }
 
-  .glossary :global(.pick-row .name span) {
+  .glossary :global(.pick-row .name span),
+  .glossary :global(.list > .row .name span) {
     overflow: hidden;
     color: var(--text-muted);
     font-size: 11px;

@@ -150,26 +150,34 @@
     </div>
     <form class="add" onsubmit={(event) => (event.preventDefault(), add())}>
       <input class="input" placeholder="Код языка: sr, de, ja" bind:value={newCode} aria-label="Код нового языка" />
-      <button class="btn small" type="submit" disabled={!newCode.trim()}>
-        <Plus size={12} />
-        <span>Добавить</span>
+      <button class="icon-button" type="submit" disabled={!newCode.trim()} aria-label="Добавить язык" title="Добавить язык по коду">
+        <Plus size={14} />
       </button>
     </form>
   </div>
 
   {#if current && edit}
-    <div class="card editor" class:saving>
-      <div class="card-head">
+    <div class="editor" class:saving>
+      <div class="editor-head">
         <strong>{languageName(current.language)} · {current.language}</strong>
-        <button
-          class="btn small"
-          disabled={drafting || runsBusy(runs)}
-          title={runsBusy(runs) ? "Модель уже работает или ждёт отбор" : "Модель составит правила по общим правилам этого языка и дополнит то, что уже написано"}
-          onclick={draft}
-        >
-          {#if drafting}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
-          <span>Черновик моделью</span>
-        </button>
+        <div class="editor-tools">
+          {#if notice}<span class="faint">{notice}</span>{/if}
+          <button
+            class="icon-button"
+            disabled={drafting || runsBusy(runs)}
+            aria-label="Черновик моделью"
+            title={runsBusy(runs)
+              ? "Черновик моделью. Модель уже работает или ждёт отбор"
+              : "Черновик моделью: модель составит правила по общим правилам этого языка и дополнит то, что уже написано"}
+            onclick={draft}
+          >
+            {#if drafting}<LoaderCircle size={14} class="spin" />{:else}<Sparkles size={14} />{/if}
+          </button>
+          <button class="btn small primary" disabled={!dirty || saving || drafting} title={dirty ? "" : "Правок нет"} onclick={save}>
+            {#if saving}<LoaderCircle size={13} class="spin" />{:else}<Save size={13} />{/if}
+            <span>Сохранить</span>
+          </button>
+        </div>
       </div>
 
       <label class="field">
@@ -200,14 +208,7 @@
         ></textarea>
       </label>
 
-      <div class="card-actions">
-        {#if notice}<span class="faint">{notice}</span>{/if}
-        <button class="btn small primary" disabled={!dirty || saving || drafting} onclick={save}>
-          {#if saving}<LoaderCircle size={13} class="spin" />{:else}<Save size={13} />{/if}
-          <span>Сохранить</span>
-        </button>
-      </div>
-      <p class="faint">Пустое поле удаляет правила при сохранении.</p>
+      <span class="faint">Пустое поле удаляет правила при сохранении</span>
     </div>
   {:else}
     <div class="empty">

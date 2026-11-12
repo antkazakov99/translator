@@ -1,12 +1,13 @@
 //! Перевод имён моделью: какие имена спросить, разбор их происхождения, запрос написания с правилами языков,
-//! проверка написаний и разбор ответов. Написания в базу сами не пишутся: отмеченное в отборе записывает окно.
-//! Происхождение записывает сервис сразу после ответа.
+//! проверка написаний и разбор ответов. Происхождение записывает сервис сразу после ответа. Написание, на котором
+//! перевод и проверка сошлись (`NameSuggestion::agreed`), цепочка в режиме «Авто» пишет сама, остальное идёт в отбор.
+//! Формы спрашиваются после имён и строятся от записанного написания.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
 
-use super::suggest::{AnswerItem, by_number, field, hints_block, quoted, usable_label};
+use super::suggest::{AnswerItem, answer_tokens, by_number, field, hints_block, quoted, usable_label};
 use super::{Character, CharacterId, NameField, NameKey, NameOrigin};
 use crate::common::Gender;
 use crate::llm::{ChatRequest, LlmTarget};
@@ -133,6 +134,9 @@ pub struct NameSuggestion {
     pub variants: Vec<NameVariant>,
     /// Что стоит знать перед выбором: неоднозначное происхождение, замечания проверки, непроверенное написание.
     pub issues: Vec<String>,
+    /// Первое написание перевода и первое написание проверки совпали, и проверка не дала замечаний: два
+    /// независимых запроса сошлись. Такое написание цепочка пишет без отбора.
+    pub agreed: bool,
 }
 
 /// Написание имени в ответе.
@@ -179,22 +183,19 @@ pub fn name_items(characters: &[&Character]) -> Vec<NameItem> {
     items
 }
 
+/// У персонажа есть имя или фамилия без перевода: его формы ждут, пока написание запишут.
+pub fn awaits_names(character: &Character) -> bool {
+    (character.first_name().is_some() && character.translated_first_name().is_none())
+        || (character.last_name().is_some() && character.translated_last_name().is_none())
+}
+
 /// Формы без перевода, каждая своей записью: основа у каждого владельца своя. Основа это полное имя по-русски
-/// из глоссария, а поле без перевода берёт первое написание модели из `spelled`.
-pub fn form_items(characters: &[&Character], spelled: &[NameSuggestion]) -> Vec<NameItem> {
-    let first_spelling = |id: CharacterId, field: NameField| {
-        spelled
-            .iter()
-            .find(|item| item.character == id && item.field == field)
-            .and_then(|item| item.variants.first())
-            .map(|variant| variant.translation.as_str())
-    };
+/// из глоссария: форма строится от записанного написания, а не от варианта, который ещё ждёт отбора.
+pub fn form_items(characters: &[&Character]) -> Vec<NameItem> {
     let mut items = Vec::new();
     for character in characters {
         let Some(owner) = owner(character) else { continue };
-        let first = character.translated_first_name().or_else(|| first_spelling(owner.character, NameField::First));
-        let last = character.translated_last_name().or_else(|| first_spelling(owner.character, NameField::Last));
-        let base = [first, last].into_iter().flatten().collect::<Vec<_>>().join(" ");
+        let base = [character.translated_first_name(), character.translated_last_name()].into_iter().flatten().collect::<Vec<_>>().join(" ");
         for form in character.forms().iter().filter(|form| form.translation().is_none()) {
             items.push(NameItem {
                 name: form.text().to_string(),
@@ -208,6 +209,29 @@ pub fn form_items(characters: &[&Character], spelled: &[NameSuggestion]) -> Vec<
         }
     }
     items
+}
+
+/// Ключ отметки «спрошено» в `glossary_asks`: персонаж, поле и написание. `None`: у написания нет ключа.
+pub fn ask_key(character: CharacterId, field: NameField, name: &str) -> Option<String> {
+    Some(format!("{}:{}:{}", character.get(), field.as_str(), NameKey::new(name)?.as_str()))
+}
+
+/// Записи без владельцев, о чьём написании цепочка уже спрашивала. Запись без владельцев уходит целиком.
+pub fn unasked(items: Vec<NameItem>, asked: &HashSet<String>) -> Vec<NameItem> {
+    items
+        .into_iter()
+        .filter_map(|mut item| {
+            item.owners.retain(|owner| ask_key(owner.character, item.field, &item.name).is_none_or(|key| !asked.contains(&key)));
+            (!item.owners.is_empty()).then_some(item)
+        })
+        .collect()
+}
+
+/// Примерное число запросов: разбор происхождения имён без него, написание и проверка каждого пакета.
+pub fn requests(names: &[NameItem], forms: &[NameItem], batch: usize) -> usize {
+    let batch = batch.max(1);
+    let unknown = names.iter().chain(forms).filter(|item| item.languages.is_empty()).count();
+    unknown.div_ceil(ORIGIN_BATCH) + 2 * (names.len().div_ceil(batch) + forms.len().div_ceil(batch))
 }
 
 /// Подставляет записям действующее происхождение владельцев: то же поле, то же написание, то же полное имя.
@@ -440,6 +464,7 @@ impl NamesPrompt {
                         languages: item.languages.clone(),
                         variants: variants.clone(),
                         issues: origin_issues(&item.languages),
+                        agreed: false,
                     })
                     .collect::<Vec<_>>()
             })
@@ -447,9 +472,19 @@ impl NamesPrompt {
     }
 }
 
-/// Предложения пакета по записям: первое предложение каждой записи.
+/// Имя переводится по смыслу: единственное происхождение `zxx` (роль, родство, сокращение: «Mom», «Old
+/// Bartender», «MC»). Проверять его написание по правилам языка нечем, поэтому проверка его не читает,
+/// а перевод считается бесспорным, как перевод термина.
+pub fn by_meaning(languages: &[LanguageTag]) -> bool {
+    matches!(languages, [only] if only.as_str() == "zxx")
+}
+
+/// Предложения пакета по записям: первое предложение каждой записи. Имена по смыслу проверке не идут.
 fn proposals<'s>(batch: &[NameItem], spelled: &'s [NameSuggestion]) -> Vec<Option<&'s NameSuggestion>> {
-    batch.iter().map(|item| spelled.iter().find(|suggestion| belongs(item, suggestion))).collect()
+    batch
+        .iter()
+        .map(|item| spelled.iter().find(|suggestion| belongs(item, suggestion)).filter(|_| !by_meaning(&item.languages)))
+        .collect()
 }
 
 fn belongs(item: &NameItem, suggestion: &NameSuggestion) -> bool {
@@ -478,12 +513,13 @@ impl CheckPrompt {
             system: CHECK_SYSTEM.to_string(),
             user: format!("{}Names and proposed spellings:\n{list}{}\nProvide JSON array now:", hints_block(&text, hints), plan_block(batch, rules)),
             temperature: target.settings.temperature,
-            max_tokens: CHECK_ANSWER_TOKENS,
+            max_tokens: answer_tokens(CHECK_ANSWER_TOKENS, NEXT_NAME_TOKENS, batch.len()),
         })
     }
 
     /// Годные написания проверки заменяют написания перевода, замечания добавляются. Имя, которое проверка
-    /// пропустила или не смогла написать, остаётся как было с замечанием.
+    /// пропустила или не смогла написать, остаётся как было с замечанием. Написание бесспорно (`agreed`), если
+    /// первое написание проверки то же, что у перевода, и своих замечаний у проверки нет.
     pub fn apply(text: &str, batch: &[NameItem], spelled: &mut [NameSuggestion]) {
         let mut answers: HashMap<usize, (Vec<NameVariant>, Vec<String>)> = HashMap::new();
         for (item, answer) in by_number(text, batch) {
@@ -502,11 +538,20 @@ impl CheckPrompt {
         }
         for suggestion in spelled.iter_mut() {
             let Some(index) = batch.iter().position(|item| belongs(item, suggestion)) else { continue };
+            if by_meaning(&suggestion.languages) {
+                suggestion.agreed = true;
+                continue;
+            }
             match answers.get(&index) {
                 Some((variants, issues)) => {
                     if variants.is_empty() {
                         suggestion.issues.push("Проверка не дала годного написания: выберите сами.".to_string());
                     } else {
+                        let same = suggestion.variants.first().map(|variant| &variant.translation) == variants.first().map(|variant| &variant.translation);
+                        suggestion.agreed = same && issues.is_empty();
+                        if !same {
+                            suggestion.issues.push("Перевод и проверка разошлись: выберите написание.".to_string());
+                        }
                         suggestion.variants = variants.clone();
                     }
                     suggestion.issues.extend(issues.iter().cloned());
@@ -516,10 +561,15 @@ impl CheckPrompt {
         }
     }
 
-    /// Проверки не было: запуск остановился или запрос не удался.
+    /// Проверки не было: запуск остановился, запрос не удался или проверять было нечего. Имя по смыслу проверки
+    /// и не ждёт.
     pub fn unchecked(spelled: &mut [NameSuggestion]) {
         for suggestion in spelled {
-            suggestion.issues.push("Написание не проверено.".to_string());
+            if by_meaning(&suggestion.languages) {
+                suggestion.agreed = true;
+            } else {
+                suggestion.issues.push("Написание не проверено.".to_string());
+            }
         }
     }
 }
@@ -583,7 +633,22 @@ mod tests {
         let spelled = NamesPrompt::accept(r#"[{"id": 1, "translated_name": "Анна"}, {"id": 2, "translated_name": "Каранович"}]"#, &names[..2]);
         assert_eq!(spelled.len(), 3, "фамилию получили обе владелицы");
         assert_eq!(spelled[0].issues, ["Происхождение не определено: проверьте написание."]);
-        let forms = form_items(&chosen, &spelled);
+        assert!(!spelled[0].agreed, "без проверки написание спорно");
+        assert!(awaits_names(&all[0]) && awaits_names(&all[1]), "у Марко фамилия без перевода");
+        assert_eq!(form_items(&chosen)[0].base, None, "форма не строится от написания, которое ещё не записано");
+
+        let asked = HashSet::from([ask_key(CharacterId::from_row(1), NameField::Last, "KARANOVIC").unwrap()]);
+        let left = unasked(names.clone(), &asked);
+        assert_eq!(left[1].owners.len(), 1, "у спрошенной владелицы фамилию больше не спрашивают");
+        assert_eq!(left[1].owners[0].character, CharacterId::from_row(3));
+        let all_asked: HashSet<String> = [1, 3].iter().filter_map(|id| ask_key(CharacterId::from_row(*id), NameField::Last, "Karanovic")).collect();
+        assert_eq!(unasked(names.clone(), &all_asked).len(), 3, "запись без владельцев уходит целиком");
+        assert_eq!(requests(&names, &[], 3), 1 + 2 * 2, "происхождение одним пакетом, написание и проверка двух пакетов");
+
+        let mut written = all.clone();
+        written[0].set_translated_names("Анна", "Каранович");
+        let chosen: Vec<&Character> = written.iter().collect();
+        let forms = form_items(&chosen);
         assert_eq!(forms.len(), 1);
         assert_eq!(forms[0].base.as_deref(), Some("Анна Каранович"));
 
@@ -649,9 +714,21 @@ mod tests {
         assert!(!request.user.contains("ei это ай"));
         assert_eq!(missing_rules(&batch, &rules), [tag("hr")], "у zxx правил не бывает");
 
-        let spelled = NamesPrompt::accept(r#"[{"id": 1, "translated_name": "Аня"}, {"id": 2, "translated_name": "Мама"}]"#, &batch);
+        let mut spelled = NamesPrompt::accept(r#"[{"id": 1, "translated_name": "Аня"}, {"id": 2, "translated_name": "Мама"}]"#, &batch);
         assert_eq!(spelled[0].issues, ["Происхождение неоднозначно: проверьте написание."]);
         assert!(spelled[1].issues.is_empty());
+
+        // «Mom» переводится по смыслу: проверка её не читает, и перевод бесспорен без неё.
+        let check = CheckPrompt::build(&batch, &spelled, &Hints::default(), &rules, &target()).unwrap();
+        assert!(check.user.contains("name: \"Anja\"") && !check.user.contains("Mom"), "{}", check.user);
+        CheckPrompt::apply(r#"[{"id": 1, "variants": [{"source": "Anja", "translated": "Аня"}]}]"#, &batch, &mut spelled);
+        assert_eq!((spelled[0].agreed, spelled[1].agreed), (true, true));
+        assert!(spelled[1].issues.is_empty());
+        let only_meaning = [batch[1].clone()];
+        let mut alone = NamesPrompt::accept(r#"[{"id": 1, "translated_name": "Мама"}]"#, &only_meaning);
+        assert!(CheckPrompt::build(&only_meaning, &alone, &Hints::default(), &rules, &target()).is_none(), "проверять нечего");
+        CheckPrompt::unchecked(&mut alone);
+        assert_eq!((alone[0].agreed, alone[0].issues.len()), (true, 0));
     }
 
     #[test]
@@ -672,7 +749,15 @@ mod tests {
         CheckPrompt::apply(answer, &batch, &mut spelled);
         let first: Vec<&str> = spelled[0].variants.iter().map(|variant| variant.translation.as_str()).collect();
         assert_eq!(first, ["Аня", "Анья"]);
-        assert_eq!(spelled[0].issues, ["Сербское имя"]);
+        assert_eq!(spelled[0].issues, ["Перевод и проверка разошлись: выберите написание.", "Сербское имя"]);
+        assert!(!spelled.iter().any(|suggestion| suggestion.agreed), "разошлись, не проверено, пропущено");
+
+        let mut agreed = NamesPrompt::accept(r#"[{"id": 3, "translated_name": "Ли"}]"#, &batch);
+        CheckPrompt::apply(r#"[{"id": 3, "variants": [{"source": "Lee", "translated": "Ли"}, {"source": "Lee", "translated": "Лии"}], "issues": []}]"#, &batch, &mut agreed);
+        assert!(agreed[0].agreed, "первое написание то же и замечаний нет");
+        let mut noted = NamesPrompt::accept(r#"[{"id": 3, "translated_name": "Ли"}]"#, &batch);
+        CheckPrompt::apply(r#"[{"id": 3, "variants": [{"source": "Lee", "translated": "Ли"}], "issues": ["Может быть китайской"]}]"#, &batch, &mut noted);
+        assert!(!noted[0].agreed, "замечание проверки оставляет написание спорным");
         assert_eq!(spelled[1].variants[0].translation, "Петровик", "латиница проверки не заменяет написание");
         assert_eq!(spelled[1].issues, ["Проверка не дала годного написания: выберите сами."]);
         assert_eq!(spelled[2].issues, ["Проверка пропустила это имя."]);

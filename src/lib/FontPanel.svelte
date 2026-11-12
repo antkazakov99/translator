@@ -14,7 +14,7 @@
     type GameFont,
   } from "./font-preview";
 
-  /** Шрифты игры и их замены для языка перевода. Замены лежат в проекте и уходят в мод. */
+  /** Раздел «Шрифты» окна «Игра»: шрифты игры и их замены для языка перевода. Замены лежат в проекте и уходят в мод. */
   let { projectId }: { projectId: string } = $props();
 
   type Preview = { family: string } | { failed: true };
@@ -208,8 +208,6 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    padding-top: 10px;
-    border-top: 1px solid var(--divider);
   }
 
   .fonts-head,
@@ -220,7 +218,12 @@
     justify-content: space-between;
   }
 
-  .fonts-head strong,
+  .fonts-head strong {
+    color: var(--text-strong);
+    font-size: 13px;
+    font-weight: 600;
+  }
+
   .font-title strong,
   .font-head strong {
     color: var(--text-strong);

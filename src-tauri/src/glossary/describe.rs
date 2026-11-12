@@ -1,51 +1,38 @@
-//! Запуски модели по глоссарию: описания по частям сцен, имена, токены, подписи говорящих, термины.
+//! Описания моделью: разбор сцен, описания сцен, персонажей и терминов по частям. Ход запуска лежит в `run.rs`,
+//! предложения по записям глоссария (имена, термины, подписи, токены) в `suggest_service.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-
-use super::analyze::{AnalysisPrompt, known_for_prompt, merge, save_scene_found};
+use super::analyze::{AnalysisPrompt, Asked, PartLine, merge, questions};
+use super::mentions::Casings;
+use super::relations::Pair;
+use super::repo::MentionCheckRepo;
+use super::resolve::{known_for_prompt, merge_pair, save_scene_found, scene_cast};
+use super::run::{Ask, BatchRun, RunAsk, Sent};
+use super::same_entry::{self, SameEntryPrompt};
+use super::service::ExcludeOwner;
 use super::describe_prompt::{
     CharacterAnswer, CharacterPrompt, CondensePrompt, EntryKind, EntryPartPrompt, PartPrompt, ScenePrompt, TermPrompt, TitlePrompt, clean_note,
     is_useful,
 };
 use super::entries::{character_names, character_scenes, entry_parts, scene_entries, term_names, term_scenes};
 use super::parts::{MAX_PART_TEXT, Part, ScenesPart, pick_parts, scene_hash, script_line, split_lines};
-use super::repo::{AnalyzedPartRepo, LineSampleRepo, NoteRepo, ReadingDepthRepo, SampleLine, SceneDescriptionRepo, StoryLine, TermRepo};
+use super::repo::{AnalyzedPartRepo, LineSampleRepo, NoteRepo, PairCheckRepo, ReadingDepthRepo, SceneDescriptionRepo, StoryLine, TermRepo};
 use super::{Note, NoteOwner, SceneDescription};
 use crate::common::Timestamp;
 use crate::storage::DbError;
 use crate::translation::TranslationRepo;
-use super::names::{
-    CheckPrompt, NameItem, NameSuggestion, NamesPrompt, ORIGIN_BATCH, OriginsPrompt, cast, form_items, missing_rules, name_items, with_origins,
-};
-use super::suggest::{
-    SPEAKER_SAMPLES, SpeakerItem, SpeakerSuggestion, SpeakersPrompt, TOKEN_SAMPLES, TermItem, TermSuggestion, TermsPrompt, TokenItem,
-    TokenSuggestion, TokensPrompt, sample_line, spread, token_line,
-};
-use super::{Character, CharacterId, CharacterRepo, GlossaryData, NameOrigin, SpeakerRepo, TermId};
+use super::suggest::spread;
+use super::{CharacterId, CharacterRepo, GlossaryData, TermId};
 use crate::common::ValidationError;
-use crate::name_rules::{LanguageTag, NameRule, NameRuleService, RulesDraftPrompt};
 use crate::translation::Hints;
 use crate::common::AppError;
-use crate::engines::{ContainerKey, SpeakerKey};
-use crate::llm::{Action, ChatRequest, LlmClient, LlmError, LlmRun, LlmTarget, LlmTargetService, ProfileId, RunHost, RunProgress, RunStatus};
+use crate::engines::ContainerKey;
+use crate::llm::{Action, ChatRequest, LlmTarget, LlmTargetService, ProfileId, RunHost};
 use crate::projects::ProjectId;
 use crate::state::{AppState, OpenProject};
 use crate::translation::hints::GlossaryContext;
-use crate::translation::text::{mentions, token_names};
-
-/// Сколько раз спрашивается пакет при сбое сети.
-const ATTEMPTS: usize = 3;
-/// Сколько реплик с названием термина просматривается в поиске примера: граница слова проверяется в Rust.
-const EXAMPLE_CANDIDATES: usize = 20;
-
-/// Предложения запуска. Остановка и ошибка не теряют готового: `error` говорит, что запуск оборвался.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Suggestions<T> {
-    pub items: Vec<T>,
-    pub error: Option<String>,
-}
 
 /// Что описывается общим путём: части, заметки по частям, описание по заметкам.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +159,8 @@ struct ScenePlan {
     label: String,
     /// Отпечатки частей сцены, которые уже прочитал разбор.
     analyzed: HashSet<String>,
+    /// Реплики сцены, как они стоят в частях: по ним разбор задаёт вопросы о спорных упоминаниях.
+    lines: Vec<PartLine>,
 }
 
 impl ScenePlan {
@@ -328,12 +317,12 @@ impl DescribeService<'_> {
         if plans.is_empty() {
             return Ok(Described::default());
         }
-        let mut known = open.project.read(|tx| known_for_prompt(tx))?;
+        let (mut known, mut casings) = open.project.read(|tx| Ok((known_for_prompt(tx)?, game_casings(tx)?)))?;
         let total = plans.iter().map(|plan| plan.unanalyzed().len()).sum();
         let mut run = BatchRun::begin(self.state, &open, Action::Analysis, &target, host, total)?;
         let mut added = Vec::new();
         for plan in &plans {
-            match analyze_scene(&open, &mut run, &target, plan, &mut known, added.len()).await {
+            match analyze_scene(&open, &mut run, &target, plan, &mut known, &mut casings, added.len()).await {
                 Ok((found, going)) => {
                     added.extend(found);
                     if !going {
@@ -341,7 +330,7 @@ impl DescribeService<'_> {
                     }
                 }
                 Err(error) => {
-                    run.error = Some(error.to_string());
+                    run.fail(&error);
                     break;
                 }
             }
@@ -434,7 +423,7 @@ impl DescribeService<'_> {
         Ok(open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let mut context = GlossaryContext::new(&glossary);
-            let parts = scene_text(tx, &mut context, key)?.map(|(parts, _)| parts).unwrap_or_default();
+            let parts = scene_text(tx, &mut context, key)?.map(|(parts, _, _)| parts).unwrap_or_default();
             let notes = NoteRepo { conn: tx }.all_of(&NoteOwner::Container(key.clone()))?;
             Ok(parts
                 .into_iter()
@@ -471,12 +460,12 @@ impl DescribeService<'_> {
             None
         };
         let depth = ReadingDepth::load(self.state)?;
-        let (plans, hints, mut known) = open.project.read(|tx| {
+        let (plans, hints, mut known, mut casings) = open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let mut context = GlossaryContext::new(&glossary);
             let plans = plan_all(tx, &mut context, &glossary, targets, &model, choice, fill)?;
-            let known = if analysis.is_some() { known_for_prompt(tx)? } else { Vec::new() };
-            Ok((plans, context.hints, known))
+            let (known, casings) = if analysis.is_some() { (known_for_prompt(tx)?, game_casings(tx)?) } else { (Vec::new(), Casings::new([])) };
+            Ok((plans, context.hints, known, casings))
         })?;
         let mut described = Described::default();
         if plans.is_empty() {
@@ -495,13 +484,13 @@ impl DescribeService<'_> {
                 Plan::Scene(scene) => {
                     let mut going = true;
                     if let Some(analysis) = &analysis {
-                        match analyze_scene(&open, &mut run, analysis, scene, &mut known, done).await {
+                        match analyze_scene(&open, &mut run, analysis, scene, &mut known, &mut casings, done).await {
                             Ok((added, still)) => {
                                 described.added.extend(added);
                                 going = still;
                             }
                             Err(error) => {
-                                run.error = Some(error.to_string());
+                                run.fail(&error);
                                 break;
                             }
                         }
@@ -512,7 +501,7 @@ impl DescribeService<'_> {
                                     going = still;
                                 }
                                 Err(error) => {
-                                    run.error = Some(error.to_string());
+                                    run.fail(&error);
                                     break;
                                 }
                             }
@@ -535,7 +524,7 @@ impl DescribeService<'_> {
                     }
                 }
                 Err(error) => {
-                    run.error = Some(error.to_string());
+                    run.fail(&error);
                     break;
                 }
             }
@@ -610,14 +599,22 @@ pub struct PartNote {
     pub useful: bool,
 }
 
-/// Разбор частей сцены моделью действия `analysis` и запись новых персонажей и терминов в глоссарий.
+/// Регистры слов всех реплик игры: по ним разбор решает, о каком упоминании спросить модель.
+fn game_casings(tx: &rusqlite::Connection) -> Result<Casings, DbError> {
+    Ok(Casings::new(LineSampleRepo { conn: tx }.story_lines()?.into_iter().map(|line| line.text)))
+}
+
+/// Разбор частей сцены моделью действия `analysis` и запись новых персонажей и терминов в глоссарий. Вместе
+/// с поиском модель отвечает на вопросы о спорных упоминаниях известных записей, ответы пишутся по репликам.
 /// Остановленный разбор записывает найденное до остановки. Возвращает добавленное и идёт ли запуск дальше.
+#[allow(clippy::too_many_arguments)]
 async fn analyze_scene(
     open: &Arc<OpenProject>,
     run: &mut BatchRun<'_>,
     target: &LlmTarget,
     plan: &ScenePlan,
     known: &mut Vec<String>,
+    casings: &mut Casings,
     written: usize,
 ) -> Result<(Vec<String>, bool), AppError> {
     let mut found = Vec::new();
@@ -625,10 +622,29 @@ async fn analyze_scene(
     let parts = plan.unanalyzed();
     let total = parts.len();
     let mut read = Vec::new();
+    let (cast, glossary) = open.project.read(|tx| Ok((scene_cast(tx, &plan.key)?, GlossaryData::load(tx)?)))?;
+    let entries = Asked::all(&glossary);
+    let mut answers: Vec<(ExcludeOwner, String, bool)> = Vec::new();
+    let cast_ids: Vec<CharacterId> = cast.iter().map(|member| member.id).collect();
+    let mut suggested: Vec<Pair> = Vec::new();
     for (index, part) in parts.into_iter().enumerate() {
         run.note(format!("{}: поиск персонажей и терминов, часть {} из {total}", plan.label, index + 1));
-        match run.send_to(target, &AnalysisPrompt::build(&part.text, known, target)).await {
-            Sent::Text(text) => found.extend(AnalysisPrompt::accept(&text, &part.text)),
+        let mut asking = questions(&part.text, &plan.lines, &entries, casings);
+        asking.retain(|question| !answers.iter().any(|(owner, hash, _)| *owner == question.owner && *hash == question.hash));
+        match run.send_to(target, &AnalysisPrompt::build(&part.text, known, &cast, &asking, target)).await {
+            Sent::Text(text) => {
+                found.extend(AnalysisPrompt::accept(&text, &part.text));
+                for (number, used) in AnalysisPrompt::checks(&text, asking.len()) {
+                    if let Some(question) = asking.get(number) {
+                        answers.push((question.owner, question.hash.clone(), used));
+                    }
+                }
+                for pair in AnalysisPrompt::same_people(&text, &cast_ids).into_iter().filter_map(|(a, b)| Pair::people(a, b)) {
+                    if !suggested.contains(&pair) {
+                        suggested.push(pair);
+                    }
+                }
+            }
             Sent::Skipped => {}
             Sent::Stop => {
                 going = false;
@@ -643,19 +659,82 @@ async fn analyze_scene(
     }
     let merged = merge(found);
     // Находки и отметки прочитанных частей одной транзакцией: повторный разбор не пропустит часть без её находок.
-    let added = open.project.write(|tx| {
+    let saved = open.project.write(|tx| {
         let marks = AnalyzedPartRepo { conn: tx };
         let now = Timestamp::now();
         for hash in &read {
             marks.mark(&plan.key, hash, now)?;
         }
+        let checks = MentionCheckRepo { conn: tx };
+        for (owner, hash, used) in &answers {
+            checks.mark(*owner, hash, *used, now)?;
+        }
         save_scene_found(tx, &merged, Some(&plan.key))
     })?;
+    let mut added = saved.added;
     if !added.is_empty() {
         run.note(format!("{}: добавлено в глоссарий: {}", plan.label, added.join(", ")));
     }
+    if going {
+        // Сначала пары, о которых модель сказала при записи находок, потом её `same_person`.
+        let mut pairs: Vec<Pair> = saved.claims.iter().map(|claim| claim.pair).collect();
+        for pair in suggested {
+            if !pairs.contains(&pair) {
+                pairs.push(pair);
+            }
+        }
+        let (joined, still) = check_pairs(open, run, target, plan, &pairs, written).await?;
+        added.extend(joined);
+        going = still;
+    }
     known.extend(added.iter().cloned());
     Ok((added, going))
+}
+
+/// Вопросы модели, одно ли это пары записей (`same_entry`): пары от разбора и пары, которые видит скрипт. Ответ
+/// «да» сливает пару, «нет» запоминается. Число запросов запуска растёт на число вопросов. Возвращает итог
+/// слияний и идёт ли запуск дальше.
+async fn check_pairs(
+    open: &Arc<OpenProject>,
+    run: &mut BatchRun<'_>,
+    target: &LlmTarget,
+    plan: &ScenePlan,
+    claimed: &[Pair],
+    written: usize,
+) -> Result<(Vec<String>, bool), AppError> {
+    let questions = open.project.read(|tx| same_entry::questions(tx, &plan.key, claimed))?;
+    if questions.is_empty() {
+        return Ok((Vec::new(), true));
+    }
+    run.grow(questions.len());
+    let mut joined = Vec::new();
+    for question in &questions {
+        let Some(pair) = question.pair() else { continue };
+        let ask = if question.a.is_person() && question.b.is_person() { "один ли человек" } else { "одно ли это" };
+        run.note(format!("{}: {ask} {} и {}", plan.label, question.a.label(), question.b.label()));
+        match run.send_to(target, &SameEntryPrompt::build(question, target)).await {
+            Sent::Text(text) => {
+                let merged = match SameEntryPrompt::accept(&text) {
+                    Some(true) => open.project.write(|tx| merge_pair(tx, pair))?,
+                    Some(false) => {
+                        open.project.write(|tx| PairCheckRepo { conn: tx }.mark(pair.a, pair.b, false, Timestamp::now()))?;
+                        None
+                    }
+                    None => None,
+                };
+                if let Some(text) = merged {
+                    run.note(format!("{}: {text}", plan.label));
+                    joined.push(text);
+                }
+            }
+            Sent::Skipped => {}
+            Sent::Stop => return Ok((joined, false)),
+        }
+        if !run.step(written) {
+            return Ok((joined, false));
+        }
+    }
+    Ok((joined, true))
 }
 
 /// Планы записей запуска описаний по порядку. Пропущенные записи (нечего читать, заполнены) в план не входят.
@@ -690,9 +769,12 @@ fn owner_of(target: &DescribeTarget) -> NoteOwner {
     }
 }
 
+/// Части сцены, отпечаток её текста и реплики, как они стоят в частях.
+type SceneText = (Vec<Part>, String, Vec<PartLine>);
+
 /// Реплики сцены строками «Говорящий: текст» с подписями из глоссария и значениями токенов, разрезанные на части,
-/// и отпечаток текста сцены. `None`: сцены нет в текущем снимке.
-fn scene_text(tx: &rusqlite::Connection, context: &mut GlossaryContext, key: &ContainerKey) -> Result<Option<(Vec<Part>, String)>, DbError> {
+/// отпечаток текста сцены и сами реплики. `None`: сцены нет в текущем снимке.
+fn scene_text(tx: &rusqlite::Connection, context: &mut GlossaryContext, key: &ContainerKey) -> Result<Option<SceneText>, DbError> {
     let found = TranslationRepo { conn: tx }.scene(key);
     let mut scene = match found {
         Ok(scene) => scene,
@@ -701,8 +783,17 @@ fn scene_text(tx: &rusqlite::Connection, context: &mut GlossaryContext, key: &Co
     };
     let text_hash = scene_hash(scene.lines.iter().map(|line| line.source_hash.as_str()));
     context.apply(&mut scene);
-    let lines: Vec<String> = scene.lines.iter().map(|line| script_line(line.speaker.as_deref(), &line.source_text)).collect();
-    Ok(Some((split_lines(&lines), text_hash)))
+    let lines: Vec<PartLine> = scene
+        .lines
+        .iter()
+        .map(|line| PartLine {
+            script: script_line(line.speaker.as_deref(), &line.source_text),
+            text: line.source_text.replace('\n', " "),
+            hash: line.source_hash.clone(),
+        })
+        .collect();
+    let scripts: Vec<String> = lines.iter().map(|line| line.script.clone()).collect();
+    Ok(Some((split_lines(&scripts), text_hash, lines)))
 }
 
 /// План сцены. `None`: сцену пропускаем, у неё нет реплик или она заполнена и новых частей нет.
@@ -715,7 +806,7 @@ fn plan_scene(
     fill: Fill,
     first: Option<&ContainerKey>,
 ) -> Result<Option<ScenePlan>, DbError> {
-    let Some((all, text_hash)) = scene_text(tx, context, &key)? else { return Ok(None) };
+    let Some((all, text_hash, lines)) = scene_text(tx, context, &key)? else { return Ok(None) };
     if all.is_empty() {
         return Ok(None);
     }
@@ -749,7 +840,7 @@ fn plan_scene(
     let name = description.as_ref().and_then(|scene| scene.title()).map_or_else(|| key.to_string(), str::to_string);
     let label = format!("Сцена «{name}»");
     let analyzed = AnalyzedPartRepo { conn: tx }.of(&key)?;
-    Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening, fill, label, analyzed }))
+    Ok(Some(ScenePlan { key, parts, stored, text, text_hash, need_title, opening, fill, label, analyzed, lines }))
 }
 
 /// Сцены записи без исключённых и части из них.
@@ -778,14 +869,14 @@ fn select_entry(
             let Some(name) = character.full_name() else { return Ok(None) };
             let excluded = if ignore_exclusions { Vec::new() } else { CharacterRepo { conn: tx }.excluded_containers(*id)? };
             let speakers = glossary.links.iter().filter(|link| link.character == *id).map(|link| link.speaker.clone()).collect();
-            let scenes = character_scenes(lines, &speakers, &character_names(character), &excluded);
+            let scenes = character_scenes(lines, &speakers, &character_names(character), glossary.character_checks.get(id), &excluded);
             let parts = entry_parts(lines, &scenes, context);
             Some(Selection { kind: EntryKind::Character, name, parts, excluded, described: character.description().is_some() })
         }
         DescribeTarget::Term(id) => {
             let Some(term) = glossary.terms.iter().find(|term| term.id() == Some(*id)) else { return Ok(None) };
             let excluded = if ignore_exclusions { Vec::new() } else { TermRepo { conn: tx }.excluded_containers(*id)? };
-            let scenes = term_scenes(lines, &term_names(term), &excluded);
+            let scenes = term_scenes(lines, &term_names(term), glossary.term_checks.get(id), &excluded);
             let parts = entry_parts(lines, &scenes, context);
             Some(Selection { kind: EntryKind::Term, name: term.name().to_string(), parts, excluded, described: term.description().is_some() })
         }
@@ -810,7 +901,7 @@ pub(crate) fn prune_notes(tx: &rusqlite::Connection) -> Result<usize, DbError> {
     for owner in owners {
         let hashes: Vec<String> = match &owner {
             NoteOwner::Container(key) => {
-                scene_text(tx, &mut context, key)?.map(|(parts, _)| parts.into_iter().map(|part| part.hash).collect()).unwrap_or_default()
+                scene_text(tx, &mut context, key)?.map(|(parts, _, _)| parts.into_iter().map(|part| part.hash).collect()).unwrap_or_default()
             }
             NoteOwner::Character(id) => entry_hashes(tx, &context, &glossary, &lines, &DescribeTarget::Character(*id))?,
             NoteOwner::Term(id) => entry_hashes(tx, &context, &glossary, &lines, &DescribeTarget::Term(*id))?,
@@ -821,7 +912,7 @@ pub(crate) fn prune_notes(tx: &rusqlite::Connection) -> Result<usize, DbError> {
     let marks = AnalyzedPartRepo { conn: tx };
     for key in marks.scenes()? {
         let hashes: Vec<String> =
-            scene_text(tx, &mut context, &key)?.map(|(parts, _)| parts.into_iter().map(|part| part.hash).collect()).unwrap_or_default();
+            scene_text(tx, &mut context, &key)?.map(|(parts, _, _)| parts.into_iter().map(|part| part.hash).collect()).unwrap_or_default();
         marks.retain(&key, &hashes)?;
     }
     Ok(removed)
@@ -1150,564 +1241,23 @@ impl SceneWriter<'_> {
     }
 }
 
-/// Имена и другие запуски по записям глоссария.
-pub struct NamesService<'a> {
-    pub state: &'a AppState,
-}
-
-impl NamesService<'_> {
-    /// Имена без перевода всей группой в одном запуске: разбор происхождения тех, у кого его нет, правила их
-    /// языков, перевод имён и фамилий, потом форм от написанных имён, и проверка каждого пакета перевода.
-    /// Происхождение записывается сразу, написания возвращаются для отбора.
-    pub async fn translate_names(
-        &self,
-        project: ProjectId,
-        characters: Vec<CharacterId>,
-        one_off: Option<ProfileId>,
-        host: impl Into<RunHost>,
-    ) -> Result<NamesFound, AppError> {
-        let open = self.state.open_project(project)?;
-        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Names, one_off)?;
-        let (glossary, stored) = open.project.read(|tx| Ok((GlossaryData::load(tx)?, CharacterRepo { conn: tx }.all_origins()?)))?;
-        let mut known: Vec<(CharacterId, NameOrigin)> =
-            stored.into_iter().flat_map(|(id, origins)| origins.into_iter().map(move |origin| (id, origin))).collect();
-        let context = GlossaryContext::new(&glossary);
-        let cast = cast(&glossary.characters);
-        let chosen: Vec<&Character> =
-            glossary.characters.iter().filter(|character| character.id().is_some_and(|id| characters.contains(&id))).collect();
-        let mut names = name_items(&chosen);
-        let mut forms = form_items(&chosen, &[]);
-        with_origins(&mut names, known.iter().map(|(id, origin)| (*id, origin)));
-        with_origins(&mut forms, known.iter().map(|(id, origin)| (*id, origin)));
-        if names.is_empty() && forms.is_empty() {
-            return Ok(NamesFound::default());
-        }
-        let unknown: Vec<NameItem> = names.iter().chain(&forms).filter(|item| item.languages.is_empty()).cloned().collect();
-        let origin_batches: Vec<&[NameItem]> = unknown.chunks(ORIGIN_BATCH).collect();
-        let size = target.settings.batch_size.get();
-        let total = origin_batches.len() + 2 * (names.len().div_ceil(size) + forms.len().div_ceil(size));
-        let mut run = BatchRun::begin(self.state, &open, Action::Names, &target, host, total)?;
-        let mut items: Vec<NameSuggestion> = Vec::new();
-        let mut missing = Vec::new();
-
-        let mut going = true;
-        let origin_count = origin_batches.len();
-        for (index, batch) in origin_batches.into_iter().enumerate() {
-            run.note(format!("Происхождение имён: пакет {} из {origin_count}: {}", index + 1, item_names(batch.iter().map(|item| item.name.as_str()))));
-            match run.send(&OriginsPrompt::build(batch, &cast, &target)).await {
-                Sent::Text(text) => {
-                    let found = OriginsPrompt::accept(&text, batch);
-                    open.project.write(|tx| {
-                        let repo = CharacterRepo { conn: tx };
-                        for (id, origin) in &found {
-                            repo.save_origins(*id, std::slice::from_ref(origin))?;
-                        }
-                        Ok(())
-                    })?;
-                    known.extend(found);
-                }
-                Sent::Skipped => {}
-                Sent::Stop => {
-                    going = false;
-                    break;
-                }
-            }
-            if !run.step(0) {
-                going = false;
-                break;
-            }
-        }
-
-        if going {
-            with_origins(&mut names, known.iter().map(|(id, origin)| (*id, origin)));
-            with_origins(&mut forms, known.iter().map(|(id, origin)| (*id, origin)));
-            let languages: Vec<LanguageTag> = names.iter().chain(&forms).flat_map(|item| item.languages.iter().cloned()).collect();
-            let rules = NameRuleService { state: self.state }.effective(project, &languages)?;
-            missing = missing_rules(&names.iter().chain(&forms).cloned().collect::<Vec<_>>(), &rules);
-            let spell = Spell { cast: &cast, hints: &context.hints, rules: &rules, target: &target };
-            let batches = chunks(names, &target);
-            let count = batches.len();
-            for (index, batch) in batches.iter().enumerate() {
-                going = spell.batch(&mut run, &format!("Написание имён: пакет {} из {count}", index + 1), batch, &mut items).await;
-                if !going {
-                    break;
-                }
-            }
-            if going {
-                let mut forms = form_items(&chosen, &items);
-                with_origins(&mut forms, known.iter().map(|(id, origin)| (*id, origin)));
-                let batches = chunks(forms, &target);
-                let count = batches.len();
-                for (index, batch) in batches.iter().enumerate() {
-                    if !spell.batch(&mut run, &format!("Написание форм: пакет {} из {count}", index + 1), batch, &mut items).await {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(NamesFound { suggestions: run.finish(items)?, missing_rules: missing })
-    }
-
-    /// Черновик правил передачи имён с языка `from` на язык перевода проекта. `existing`: текст, который
-    /// черновик дополняет. В базу ничего не пишется.
-    pub async fn draft_rules(
-        &self,
-        project: ProjectId,
-        from: LanguageTag,
-        existing: Option<String>,
-        one_off: Option<ProfileId>,
-        host: impl Into<RunHost>,
-    ) -> Result<Suggestions<String>, AppError> {
-        if !crate::name_rules::has_rules(&from) {
-            return Err(ValidationError::BadLanguage(from.to_string()).into());
-        }
-        let open = self.state.open_project(project)?;
-        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Names, one_off)?;
-        let request = RulesDraftPrompt::build(&from, existing.as_deref(), &target);
-        let note = format!("Черновик правил имён: {from}");
-        run_batches(self.state, &open, Action::Names, &target, host, vec![(note, request)], |_, text| {
-            RulesDraftPrompt::accept(text).into_iter().collect()
-        })
-        .await
-    }
-
-    /// Перевод, категория и описание терминов. Модель видит своё описание термина и реплику с ним.
-    pub async fn translate_terms(
-        &self,
-        project: ProjectId,
-        terms: Vec<TermId>,
-        one_off: Option<ProfileId>,
-        host: impl Into<RunHost>,
-    ) -> Result<Suggestions<TermSuggestion>, AppError> {
-        let open = self.state.open_project(project)?;
-        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Terms, one_off)?;
-        let (items, glossary) = open.project.read(|tx| {
-            let data = GlossaryData::load(tx)?;
-            let samples = LineSampleRepo { conn: tx };
-            let mut items = Vec::new();
-            for id in &terms {
-                let Some(term) = data.terms.iter().find(|term| term.id() == Some(*id)) else { continue };
-                let lower = term.name().to_lowercase();
-                let example = samples
-                    .containing(term.name(), Some(EXAMPLE_CANDIDATES))?
-                    .into_iter()
-                    .find(|line| mentions(&line.text.to_lowercase(), &lower));
-                items.push((term.clone(), example));
-            }
-            Ok((items, data))
-        })?;
-        let context = GlossaryContext::new(&glossary);
-        let values = token_values(&glossary);
-        let items: Vec<TermItem> = items
-            .into_iter()
-            .filter_map(|(term, example)| {
-                Some(TermItem {
-                    id: term.id()?,
-                    name: term.name().to_string(),
-                    category: term.category(),
-                    description: term.description().map(str::to_string),
-                    example: example.map(|line| sample_line(line.speaker.as_deref(), &line.text, &values)),
-                })
-            })
-            .collect();
-        let batches = chunks(items, &target);
-        let requests = batches
-            .iter()
-            .map(|batch| (batch_note(batch.iter().map(|item| item.name.as_str())), TermsPrompt::build(batch, &context.hints, &target)))
-            .collect();
-        run_batches(self.state, &open, Action::Terms, &target, host, requests, |index, text| TermsPrompt::accept(text, &batches[index])).await
-    }
-
-    /// Пояснения и значения токенов по репликам с `[___]` вместо токена. Токен без реплик пропускается: судить не о чем.
-    pub async fn suggest_tokens(
-        &self,
-        project: ProjectId,
-        tokens: Vec<String>,
-        one_off: Option<ProfileId>,
-        host: impl Into<RunHost>,
-    ) -> Result<Suggestions<TokenSuggestion>, AppError> {
-        let open = self.state.open_project(project)?;
-        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Tokens, one_off)?;
-        let (lines, glossary) = open.project.read(|tx| {
-            let samples = LineSampleRepo { conn: tx };
-            let mut lines = Vec::new();
-            for name in &tokens {
-                let found: Vec<SampleLine> = samples
-                    .containing(&format!("[{name}"), None)?
-                    .into_iter()
-                    .filter(|line| token_names(&line.text).any(|found| found == name.as_str()))
-                    .collect();
-                lines.push((name.clone(), found));
-            }
-            Ok((lines, GlossaryData::load(tx)?))
-        })?;
-        let context = GlossaryContext::new(&glossary);
-        let values = token_values(&glossary);
-        let items: Vec<TokenItem> = lines
-            .into_iter()
-            .filter(|(_, found)| !found.is_empty())
-            .map(|(name, found)| {
-                let lines =
-                    spread(&found, TOKEN_SAMPLES).iter().map(|line| token_line(line.speaker.as_deref(), &line.text, &name, &values)).collect();
-                TokenItem { name, lines }
-            })
-            .collect();
-        let batches = chunks(items, &target);
-        let requests = batches
-            .iter()
-            .map(|batch| (batch_note(batch.iter().map(|item| item.name.as_str())), TokensPrompt::build(batch, &context.hints, &target)))
-            .collect();
-        run_batches(self.state, &open, Action::Tokens, &target, host, requests, |index, text| TokensPrompt::accept(text, &batches[index])).await
-    }
-
-    /// Перевод подписи и род говорящих по нескольким их репликам.
-    pub async fn suggest_speakers(
-        &self,
-        project: ProjectId,
-        speakers: Vec<SpeakerKey>,
-        one_off: Option<ProfileId>,
-        host: impl Into<RunHost>,
-    ) -> Result<Suggestions<SpeakerSuggestion>, AppError> {
-        let open = self.state.open_project(project)?;
-        let target = LlmTargetService { state: self.state }.target(Some(&open), Action::Speakers, one_off)?;
-        let (found, glossary) = open.project.read(|tx| {
-            let current = SpeakerRepo { conn: tx }.current()?;
-            let samples = LineSampleRepo { conn: tx };
-            let mut found = Vec::new();
-            for key in &speakers {
-                let Some(speaker) = current.iter().find(|item| &item.speaker.key == key) else { continue };
-                let label = speaker.speaker.label.clone().unwrap_or_else(|| key_tail(key).to_string());
-                found.push((key.clone(), label, samples.of_speaker(key)?));
-            }
-            Ok((found, GlossaryData::load(tx)?))
-        })?;
-        let context = GlossaryContext::new(&glossary);
-        let values = token_values(&glossary);
-        let items: Vec<SpeakerItem> = found
-            .into_iter()
-            .map(|(key, label, lines)| {
-                let lines = spread(&lines, SPEAKER_SAMPLES).iter().map(|line| sample_line(None, &line.text, &values)).collect();
-                SpeakerItem { key, label, lines }
-            })
-            .collect();
-        let batches = chunks(items, &target);
-        let requests = batches
-            .iter()
-            .map(|batch| (batch_note(batch.iter().map(|item| item.label.as_str())), SpeakersPrompt::build(batch, &context.hints, &target)))
-            .collect();
-        run_batches(self.state, &open, Action::Speakers, &target, host, requests, |index, text| SpeakersPrompt::accept(text, &batches[index]))
-            .await
-    }
-}
-
-/// Значения токенов: подставляются в реплики образцов, как при переводе.
-fn token_values(glossary: &GlossaryData) -> HashMap<String, String> {
-    glossary.tokens.iter().filter_map(|token| Some((token.name().to_string(), token.value()?.to_string()))).collect()
-}
-
-fn key_tail(key: &SpeakerKey) -> &str {
-    key.as_str().split_once(':').map_or(key.as_str(), |(_, tail)| tail)
-}
-
-/// Пакеты по `batch_size` действия.
-fn chunks<T: Clone>(items: Vec<T>, target: &LlmTarget) -> Vec<Vec<T>> {
-    items.chunks(target.settings.batch_size.get()).map(<[T]>::to_vec).collect()
-}
-
-/// Запуск предложений: место запуска, запросы по очереди, разбор, итог в `llm_runs`. Ответ модели ждётся вне транзакции,
-/// а в базу ничего не пишется. Запрос идёт со строкой хода: что в пакете. `accept` получает номер пакета и текст ответа.
-async fn run_batches<T>(
-    state: &AppState,
-    open: &Arc<OpenProject>,
-    action: Action,
-    target: &LlmTarget,
-    host: impl Into<RunHost>,
-    requests: Vec<(String, ChatRequest)>,
-    accept: impl Fn(usize, &str) -> Vec<T>,
-) -> Result<Suggestions<T>, AppError> {
-    if requests.is_empty() {
-        return Ok(Suggestions { items: Vec::new(), error: None });
-    }
-    let mut run = BatchRun::begin(state, open, action, target, host, requests.len())?;
-    let mut items = Vec::new();
-    for (index, (note, request)) in requests.iter().enumerate() {
-        run.note(note.clone());
-        if !run.ask(request, &mut items, |text| accept(index, text)).await {
-            break;
-        }
-    }
-    run.finish(items)
-}
-
-/// Записи пакета для строки хода: первые пять через запятую, остальные числом.
-fn item_names<'a>(names: impl Iterator<Item = &'a str>) -> String {
-    const SHOWN: usize = 5;
-    let names: Vec<&str> = names.collect();
-    let mut text = names.iter().take(SHOWN).copied().collect::<Vec<_>>().join(", ");
-    if names.len() > SHOWN {
-        text.push_str(&format!(" и ещё {}", names.len() - SHOWN));
-    }
-    text
-}
-
-/// «В пакете: Rusty Anchor, Old Lantern»: строка хода запуска предложений.
-fn batch_note<'a>(names: impl Iterator<Item = &'a str>) -> String {
-    format!("в пакете: {}", item_names(names))
-}
-
-/// Итог перевода имён: написания и языки имён, для которых не нашлось правил.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NamesFound {
-    pub suggestions: Suggestions<NameSuggestion>,
-    pub missing_rules: Vec<LanguageTag>,
-}
-
-impl<T> Default for Suggestions<T> {
-    fn default() -> Self {
-        Self { items: Vec::new(), error: None }
-    }
-}
-
-/// Перевод одного пакета имён с проверкой.
-struct Spell<'a> {
-    cast: &'a [String],
-    hints: &'a Hints,
-    rules: &'a [NameRule],
-    target: &'a LlmTarget,
-}
-
-impl Spell<'_> {
-    /// Перевод и проверка: два шага прогресса. `false`: запуск остановлен или оборвался, написания пакета
-    /// остаются непроверенными.
-    /// `label`: «Написание имён: пакет 1 из 3» для хода запуска.
-    async fn batch(&self, run: &mut BatchRun<'_>, label: &str, batch: &[NameItem], items: &mut Vec<NameSuggestion>) -> bool {
-        let start = items.len();
-        let names = item_names(batch.iter().map(|item| item.name.as_str()));
-        run.note(format!("{label}: {names}"));
-        let request = NamesPrompt::build(batch, self.cast, self.hints, self.rules, self.target);
-        if !run.ask(&request, items, |text| NamesPrompt::accept(text, batch)).await {
-            CheckPrompt::unchecked(&mut items[start..]);
-            return false;
-        }
-        if let Some(request) = CheckPrompt::build(batch, &items[start..], self.hints, self.rules, self.target) {
-            run.note(format!("{label}: проверка написаний"));
-            match run.send(&request).await {
-                Sent::Text(text) => CheckPrompt::apply(&text, batch, &mut items[start..]),
-                Sent::Skipped => CheckPrompt::unchecked(&mut items[start..]),
-                Sent::Stop => {
-                    CheckPrompt::unchecked(&mut items[start..]);
-                    return false;
-                }
-            }
-        }
-        run.step(items.len())
-    }
-}
-
-/// Ответ на запрос пакета.
-pub(crate) enum Sent {
-    Text(String),
-    /// Модель отказалась отвечать: пакет пропускается.
-    Skipped,
-    /// Запуск остановлен или оборвался.
-    Stop,
-}
-
-/// Ход запуска предложений по пакетам: место запуска, прогресс, ошибка, которая обрывает запуск.
-struct BatchRun<'a> {
-    run: LlmRun,
-    target: &'a LlmTarget,
-    report: RunProgress,
-    error: Option<String>,
-}
-
-impl<'a> BatchRun<'a> {
-    fn begin(
-        state: &AppState,
-        open: &Arc<OpenProject>,
-        action: Action,
-        target: &'a LlmTarget,
-        host: impl Into<RunHost>,
-        total: usize,
-    ) -> Result<Self, AppError> {
-        let run = LlmRun::begin(state, Some(open.clone()), action, target, host)?;
-        let report = RunProgress { total: total as u32, ..RunProgress::default() };
-        run.report(report.clone());
-        Ok(Self { run, target, report, error: None })
-    }
-
-    /// Пакет: запрос, разбор в `items`, отчёт. `false`: запуск остановлен или оборвался, дальше не спрашивать.
-    async fn ask<T>(&mut self, request: &ChatRequest, items: &mut Vec<T>, accept: impl FnOnce(&str) -> Vec<T>) -> bool {
-        match self.send(request).await {
-            Sent::Text(text) => {
-                let accepted = accept(&text);
-                if accepted.is_empty() {
-                    tracing::warn!("Из ответа модели ничего не взято:\n{text}");
-                }
-                items.extend(accepted);
-            }
-            Sent::Skipped => {}
-            Sent::Stop => return false,
-        }
-        self.step(items.len())
-    }
-
-    /// Запрос без отчёта. Ошибка запоминается и обрывает запуск.
-    async fn send(&mut self, request: &ChatRequest) -> Sent {
-        let target = self.target;
-        self.send_to(target, request).await
-    }
-
-    /// Запрос к модели другого действия внутри этого запуска, например разбор сцены в запуске описаний.
-    async fn send_to(&mut self, target: &LlmTarget, request: &ChatRequest) -> Sent {
-        if self.run.cancelled() || self.error.is_some() {
-            return Sent::Stop;
-        }
-        match ask(LlmClient::for_kind(target.provider.kind()), target, request, &self.run).await {
-            Ok(Some(text)) => Sent::Text(text),
-            Ok(None) => {
-                tracing::warn!("Модель отказалась отвечать на пакет, он пропущен");
-                Sent::Skipped
-            }
-            Err(error) => {
-                self.error = Some(error.to_string());
-                Sent::Stop
-            }
-        }
-    }
-
-    /// Запуск узнал о запросах, которых не было в плане, например о сжатии заметок.
-    fn grow(&mut self, more: usize) {
-        self.report.total += more as u32;
-        self.run.report(self.report.clone());
-    }
-
-    /// Что модель делает сейчас: строка хода запуска для окна.
-    fn note(&mut self, message: String) {
-        self.report.message = Some(message);
-        self.run.report(self.report.clone());
-    }
-
-    /// Пакет готов: отчёт с числом предложений. `false`: запуск остановлен.
-    fn step(&mut self, written: usize) -> bool {
-        self.report.done += 1;
-        self.report.written = written as u32;
-        self.run.report(self.report.clone());
-        !self.run.cancelled()
-    }
-
-    /// Итог в `llm_runs`. Готовое не теряется и при ошибке.
-    fn finish<T>(self, items: Vec<T>) -> Result<Suggestions<T>, AppError> {
-        let status = match &self.error {
-            Some(_) => RunStatus::Failed,
-            None if self.run.cancelled() => RunStatus::Cancelled,
-            None => RunStatus::Done,
-        };
-        self.run.finish(status, self.error.as_deref())?;
-        Ok(Suggestions { items, error: self.error })
-    }
-}
-
-/// Запросы запуска, в котором читаются сцены: свой запуск описаний или чужой запуск, например перевода.
-pub(crate) trait Ask {
-    /// Запрос без отчёта. Ошибка запоминается и обрывает запуск.
-    async fn send(&mut self, request: &ChatRequest) -> Sent;
-    /// Запрос готов. `false`: запуск остановлен.
-    fn step(&mut self, written: usize) -> bool;
-    /// Запросов больше, чем было в плане.
-    fn grow(&mut self, more: usize);
-    /// Что модель делает сейчас: строка хода запуска для окна.
-    fn note(&mut self, message: String);
-}
-
-impl Ask for BatchRun<'_> {
-    async fn send(&mut self, request: &ChatRequest) -> Sent {
-        BatchRun::send(self, request).await
-    }
-
-    fn step(&mut self, written: usize) -> bool {
-        BatchRun::step(self, written)
-    }
-
-    fn grow(&mut self, more: usize) {
-        BatchRun::grow(self, more);
-    }
-
-    fn note(&mut self, message: String) {
-        BatchRun::note(self, message);
-    }
-}
-
-/// Запросы чтения сцены внутри запуска перевода: прогресс общий, ошибка запоминается для запуска.
-pub(crate) struct RunAsk<'a> {
-    pub run: &'a LlmRun,
-    pub target: &'a LlmTarget,
-    pub progress: &'a mut RunProgress,
-    pub error: Option<LlmError>,
-}
-
-impl Ask for RunAsk<'_> {
-    async fn send(&mut self, request: &ChatRequest) -> Sent {
-        if self.run.cancelled() || self.error.is_some() {
-            return Sent::Stop;
-        }
-        match ask(LlmClient::for_kind(self.target.provider.kind()), self.target, request, self.run).await {
-            Ok(Some(text)) => Sent::Text(text),
-            Ok(None) => Sent::Skipped,
-            Err(error) => {
-                self.error = Some(error);
-                Sent::Stop
-            }
-        }
-    }
-
-    fn step(&mut self, _written: usize) -> bool {
-        self.progress.done += 1;
-        self.run.report(self.progress.clone());
-        !self.run.cancelled()
-    }
-
-    fn grow(&mut self, more: usize) {
-        self.progress.total += more as u32;
-        self.run.report(self.progress.clone());
-    }
-
-    fn note(&mut self, message: String) {
-        self.progress.message = Some(message);
-        self.run.report(self.progress.clone());
-    }
-}
-
-/// Один запрос с повтором при сбое сети. `None`: модель отказалась отвечать.
-async fn ask(client: LlmClient, target: &LlmTarget, request: &ChatRequest, run: &LlmRun) -> Result<Option<String>, LlmError> {
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match client.send(target, request).await {
-            Ok(text) => return Ok(Some(text)),
-            Err(LlmError::Refused) => return Ok(None),
-            Err(error) if error.is_transient() && attempt < ATTEMPTS && !run.cancelled() => {
-                tracing::warn!("Запрос к модели не удался, повтор: {error}");
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tauri::ipc::Channel;
-    use super::super::analyze::save_found;
-    use crate::glossary::{GlossaryService, NameField, TermCategory};
+    use super::super::analyze::{Finding, FoundKind, NameParts};
+    use super::super::relations;
+    use super::super::resolve::{Claim, save_found};
+    use crate::glossary::{Character, GlossaryService, SpeakerRepo, Term, TermCategory};
 
     use crate::llm::client::tests::{completion, fake_model};
-    use crate::llm::{LlmSettingsService, Profile, Provider, ProviderKind};
+    use crate::engines::SpeakerKey;
+    use crate::llm::{LlmSettingsService, Profile, Provider, ProviderKind, RunProgress};
     use crate::projects::ProjectService;
     use crate::state::tests::memory_secrets;
 
     /// Открытый проект по синтетической игре с моделью на `url`.
-    fn project(dir: &std::path::Path, url: &str) -> (AppState, ProjectId) {
+    pub(crate) fn project(dir: &std::path::Path, url: &str) -> (AppState, ProjectId) {
         let state = AppState::start(dir.join("data"), memory_secrets()).unwrap();
         let root = crate::engines::renpy::snapshot::tests::sample_game(&dir.join("game"));
         let service = ProjectService { state: &state };
@@ -1720,12 +1270,16 @@ mod tests {
         (state, id)
     }
 
-    fn user_text(body: &serde_json::Value) -> String {
+    pub(crate) fn user_text(body: &serde_json::Value) -> String {
         body["messages"][1]["content"].as_str().unwrap_or_default().to_string()
     }
 
-    fn silent() -> Channel<RunProgress> {
+    pub(crate) fn silent() -> Channel<RunProgress> {
         Channel::new(|_| Ok(()))
+    }
+
+    pub(crate) fn system_text(body: &serde_json::Value) -> String {
+        body["messages"][0]["content"].as_str().unwrap_or_default().to_string()
     }
 
     /// Канал, который запоминает строки хода запуска без повторов подряд.
@@ -1746,242 +1300,6 @@ mod tests {
         });
         (channel, notes)
     }
-
-    #[test]
-    fn terms_and_speakers_come_back_as_suggestions_without_writing() {
-        let (url, seen) = fake_model(|body| {
-            let user = user_text(body);
-            let answer = if user.contains("Speaker labels:") {
-                r#"[{"id": 1, "translation": "Радио", "gender": "unknown"}]"#
-            } else {
-                r#"[{"id": 1, "translation": "Сторона", "category": "location", "note": "Левая сторона"}]"#
-            };
-            completion(answer)
-        });
-        let dir = tempfile::tempdir().unwrap();
-        let (state, id) = project(dir.path(), &url);
-        let glossary = GlossaryService { state: &state };
-        let term = glossary.take_term(id, "side", TermCategory::General).unwrap();
-        let radio = SpeakerKey::new("label:Radio Chatter").unwrap();
-        glossary.keep_as_speaker(id, &radio).unwrap();
-        let service = NamesService { state: &state };
-
-        let terms = tauri::async_runtime::block_on(service.translate_terms(id, vec![term], None, silent())).unwrap();
-        assert_eq!(
-            terms,
-            Suggestions {
-                items: vec![TermSuggestion {
-                    id: term,
-                    translation: "Сторона".to_string(),
-                    category: Some(TermCategory::Location),
-                    description: Some("Левая сторона".to_string()),
-                }],
-                error: None,
-            }
-        );
-        let request = user_text(&seen.lock().unwrap()[0]);
-        assert!(request.contains(r#"example: "Eileen: Left side.""#), "{request}");
-
-        let speakers = tauri::async_runtime::block_on(service.suggest_speakers(id, vec![radio.clone()], None, silent())).unwrap();
-        assert_eq!(speakers.items, [SpeakerSuggestion { key: radio, translation: "Радио".to_string(), gender: None }]);
-        let request = user_text(&seen.lock().unwrap()[1]);
-        assert!(request.contains("Label: Radio Chatter\nLines:\nStatic.\n"), "{request}");
-
-        let open = state.open_project(id).unwrap();
-        let (translation, runs): (Option<String>, i64) = open
-            .project
-            .read(|tx| {
-                Ok((
-                    tx.query_row("SELECT translation FROM terms", [], |row| row.get(0))?,
-                    tx.query_row("SELECT count(*) FROM llm_runs WHERE status = 'done'", [], |row| row.get(0))?,
-                ))
-            })
-            .unwrap();
-        assert_eq!((translation, runs), (None, 2), "предложения в базу не пишутся, запуски записаны");
-        assert!(!state.llm_run.is_active());
-    }
-
-    fn system_text(body: &serde_json::Value) -> String {
-        body["messages"][0]["content"].as_str().unwrap_or_default().to_string()
-    }
-
-    #[test]
-    fn names_get_origins_rules_spelling_and_check_in_one_run() {
-        let (url, seen) = fake_model(|body| {
-            let (system, user) = (system_text(body), user_text(body));
-            let answer = if system.contains("linguistic origins") {
-                r#"[{"id": 1, "languages": ["ga", "en"], "reason": "Ирландское имя"}, {"id": 2, "languages": ["en"]}, {"id": 3, "languages": ["en"]}]"#
-            } else if system.contains("review proposed") && user.contains("Miss Lee") {
-                r#"[{"id": 1, "variants": [{"source": "Miss Lee", "translated": "Мисс Ли"}]}]"#
-            } else if system.contains("review proposed") {
-                r#"[{"id": 1, "variants": [{"source": "Eileen", "translated": "Айлин", "description": "Ирландское чтение"}, {"translated": "Эйлин"}], "issues": ["Чтение спорное"]}]"#
-            } else if user.contains("form of") {
-                r#"[{"id": 1, "translated_name": "Мисс Ли"}]"#
-            } else {
-                r#"[{"id": 1, "translated_name": "Эйлин"}, {"id": 2, "translated_name": "Ли"}]"#
-            };
-            completion(answer)
-        });
-        let dir = tempfile::tempdir().unwrap();
-        let (state, id) = project(dir.path(), &url);
-        let glossary = GlossaryService { state: &state };
-        let eileen = glossary.create_character(id, "Eileen").unwrap();
-        let open = state.open_project(id).unwrap();
-        let mut character = open.project.read(|tx| GlossaryData::load(tx)).unwrap().characters.remove(0);
-        character.set_last_name("Lee");
-        character.set_gender(Some(crate::common::Gender::Female));
-        character.add_form(crate::glossary::Form::new("Miss Lee", None).unwrap()).unwrap();
-        glossary.save_character(id, &character).unwrap();
-        open.project
-            .write(|tx| {
-                tx.execute("INSERT INTO llm_action_settings (action_id, batch_size) VALUES ('names', 5)", [])?;
-                Ok(())
-            })
-            .unwrap();
-
-        let rules = NameRuleService { state: &state };
-        rules.save_shared(id, &LanguageTag::parse("en").unwrap(), "Ee это и").unwrap();
-
-        let service = NamesService { state: &state };
-        let found = tauri::async_runtime::block_on(service.translate_names(id, vec![eileen], None, silent())).unwrap();
-        assert_eq!(found.suggestions.error, None);
-        assert_eq!(found.missing_rules, [LanguageTag::parse("ga").unwrap()]);
-        let spelled: Vec<(NameField, &str, Vec<&str>, Vec<&str>)> = found
-            .suggestions
-            .items
-            .iter()
-            .map(|item| {
-                (
-                    item.field,
-                    item.source.as_str(),
-                    item.variants.iter().map(|variant| variant.translation.as_str()).collect(),
-                    item.issues.iter().map(String::as_str).collect(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            spelled,
-            [
-                (NameField::First, "Eileen", vec!["Айлин", "Эйлин"], vec!["Происхождение неоднозначно: проверьте написание.", "Чтение спорное"]),
-                (NameField::Last, "Lee", vec!["Ли"], vec!["Проверка пропустила это имя."]),
-                (NameField::Form, "Miss Lee", vec!["Мисс Ли"], vec![]),
-            ],
-            "проверка заменила написание имени, пропущенная фамилия осталась с замечанием"
-        );
-        {
-            let requests = seen.lock().unwrap();
-            assert_eq!(requests.len(), 5, "разбор, перевод и проверка имён, перевод и проверка формы");
-            let origins = user_text(&requests[0]);
-            assert!(origins.contains("- id: 3, name: \"Miss Lee\", another way to call the character, owner: \"Eileen Lee\"\n"), "{origins}");
-            let names = user_text(&requests[1]);
-            assert!(names.contains("All names in this game: Eileen Lee\n"), "{names}");
-            assert!(names.contains("- id: 1: ga, en (Ирландское имя)\n- id: 2: en\n"), "{names}");
-            assert!(names.contains("[en]\nEe это и\n"), "{names}");
-            assert!(user_text(&requests[3]).contains("- id: 1, name: \"Miss Lee\", name of a woman, form of Айлин Ли\n"), "форма от проверенного имени");
-        }
-        let open = state.open_project(id).unwrap();
-        let (translated, origins): (Option<String>, i64) = open
-            .project
-            .read(|tx| {
-                Ok((
-                    tx.query_row("SELECT translated_first_name FROM characters", [], |row| row.get(0))?,
-                    tx.query_row("SELECT count(*) FROM name_origins", [], |row| row.get(0))?,
-                ))
-            })
-            .unwrap();
-        assert_eq!((translated, origins), (None, 3), "написания в базу не пишутся, происхождение записано");
-
-        tauri::async_runtime::block_on(service.translate_names(id, vec![eileen], None, silent())).unwrap();
-        assert_eq!(seen.lock().unwrap().len(), 9, "второй раз происхождение не спрашивается");
-    }
-
-    #[test]
-    fn own_rules_of_the_project_win_over_shared_ones() {
-        let (url, _) = fake_model(|_| completion("[]"));
-        let dir = tempfile::tempdir().unwrap();
-        let (state, id) = project(dir.path(), &url);
-        let rules = NameRuleService { state: &state };
-        let (sr, de) = (LanguageTag::parse("sr").unwrap(), LanguageTag::parse("de").unwrap());
-        rules.save_shared(id, &sr, "общее").unwrap();
-        rules.save_shared(id, &de, "немецкое").unwrap();
-        rules.save_own(id, &sr, "своё").unwrap();
-        let effective = rules.effective(id, &[sr.clone(), LanguageTag::undetermined(), sr.clone()]).unwrap();
-        assert_eq!(effective.iter().map(NameRule::rules).collect::<Vec<_>>(), ["своё"]);
-
-        let eileen = GlossaryService { state: &state }.create_character(id, "Eileen").unwrap();
-        let open = state.open_project(id).unwrap();
-        let origin = NameOrigin {
-            field: NameField::First,
-            source: "Eileen".to_string(),
-            context: "Eileen".to_string(),
-            languages: vec![LanguageTag::parse("ga").unwrap(), LanguageTag::undetermined()],
-            reason: None,
-        };
-        open.project.write(|tx| CharacterRepo { conn: tx }.save_origins(eileen, std::slice::from_ref(&origin))).unwrap();
-        assert_eq!(open.project.read(|tx| CharacterRepo { conn: tx }.origins(eileen)).unwrap(), [origin]);
-
-        let overview: Vec<(String, usize, Option<String>, Option<String>)> = rules
-            .overview(id)
-            .unwrap()
-            .into_iter()
-            .map(|item| (item.language.to_string(), item.names, item.rules, item.own))
-            .collect();
-        assert_eq!(
-            overview,
-            [
-                ("ga".to_string(), 1, None, None),
-                ("de".to_string(), 0, Some("немецкое".to_string()), None),
-                ("sr".to_string(), 0, Some("общее".to_string()), Some("своё".to_string())),
-            ],
-            "сначала языки имён проекта, und не язык правил"
-        );
-        rules.save_own(id, &sr, " ").unwrap();
-        rules.save_shared(id, &de, "").unwrap();
-        assert_eq!(rules.overview(id).unwrap().len(), 2);
-    }
-
-    #[test]
-    fn tokens_without_lines_send_nothing() {
-        let (url, seen) = fake_model(|_| completion("[]"));
-        let dir = tempfile::tempdir().unwrap();
-        let (state, id) = project(dir.path(), &url);
-        let found = tauri::async_runtime::block_on(NamesService { state: &state }.suggest_tokens(id, vec!["mc".to_string()], None, silent()));
-        assert_eq!(found.unwrap(), Suggestions { items: Vec::new(), error: None });
-        assert!(seen.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_failed_request_keeps_earlier_suggestions() {
-        let (url, _) = fake_model(|body| {
-            if user_text(body).contains("\"first\"") {
-                completion(r#"[{"id": 1, "translation": "Первый"}]"#)
-            } else {
-                serde_json::json!({ "error": "boom" }).to_string()
-            }
-        });
-        let dir = tempfile::tempdir().unwrap();
-        let (state, id) = project(dir.path(), &url);
-        let glossary = GlossaryService { state: &state };
-        let first = glossary.take_term(id, "first", TermCategory::General).unwrap();
-        let second = glossary.take_term(id, "second", TermCategory::General).unwrap();
-        let open = state.open_project(id).unwrap();
-        open.project
-            .write(|tx| {
-                tx.execute("INSERT INTO llm_action_settings (action_id, batch_size) VALUES ('terms', 1)", [])?;
-                Ok(())
-            })
-            .unwrap();
-
-        let found =
-            tauri::async_runtime::block_on(NamesService { state: &state }.translate_terms(id, vec![first, second], None, silent())).unwrap();
-        assert_eq!(found.items.len(), 1);
-        assert_eq!(found.items[0].id, first);
-        assert!(found.error.is_some(), "второй пакет оборвал запуск");
-        let failed: i64 =
-            open.project.read(|tx| Ok(tx.query_row("SELECT count(*) FROM llm_runs WHERE status = 'failed'", [], |row| row.get(0))?)).unwrap();
-        assert_eq!(failed, 1);
-    }
-
 
     #[test]
     fn scenes_are_described_from_part_notes_and_named_once() {
@@ -2171,9 +1489,16 @@ mod tests {
         assert!(parts.parts[0].note.is_none(), "у новой части заметки нет");
     }
 
+    fn found(name: &str, kind: FoundKind, same_as: Option<&str>) -> Finding {
+        Finding { name: name.to_string(), kind, gender: None, same_as: same_as.map(str::to_string), other_than: None, parts: None }
+    }
+
+    fn person(name: &str, first: Option<&str>, last: Option<&str>, same_as: Option<&str>) -> Finding {
+        Finding { parts: NameParts::check(name, first, last), ..found(name, FoundKind::Character, same_as) }
+    }
+
     #[test]
     fn findings_that_name_a_known_entry_become_its_forms() {
-        use super::super::analyze::{Finding, FoundKind};
         let dir = tempfile::tempdir().unwrap();
         let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
         let glossary = GlossaryService { state: &state };
@@ -2185,14 +1510,13 @@ mod tests {
         glossary.save_character(id, &character).unwrap();
 
         let org = FoundKind::Term(TermCategory::Organization);
-        let found = |name: &str, kind, same_as: Option<&str>| Finding { name: name.to_string(), kind, gender: None, same_as: same_as.map(str::to_string), parts: None };
         let added = open
             .project
             .write(|tx| {
                 save_found(
                     tx,
                     &[
-                        found("PPF", org, None),
+                        found("PPF", org, Some("People's Police Force")),
                         found("Mr. Lee", FoundKind::Character, Some("Eileen Lee")),
                         found("the Order", org, Some("Order of the Dawn")),
                         found("Order of the Dawn", org, None),
@@ -2209,48 +1533,53 @@ mod tests {
 
         let (terms, character) = open.project.read(|tx| Ok((TermRepo { conn: tx }.list()?, CharacterRepo { conn: tx }.get(eileen)?))).unwrap();
         let police = terms.iter().find(|term| term.id() == Some(police)).unwrap();
-        assert_eq!(police.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["PPF"], "аббревиатура легла формой без подсказки модели");
+        assert_eq!(police.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["PPF"], "аббревиатура легла формой по слову модели");
         assert!(character.forms().is_empty(), "«Mr. Lee» не стал формой");
         let order = terms.iter().find(|term| term.name() == "Order of the Dawn").unwrap();
         assert_eq!(order.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["the Order"], "ссылка на находку того же ответа");
         assert_eq!(terms.len(), 2, "PPF и the Order не стали отдельными терминами");
 
+        // Аббревиатура с точками это то же слово, известная форма пропущена.
         let again = open.project.write(|tx| save_found(tx, &[found("P.P.F.", org, None), found("PPF", org, None)])).unwrap();
-        assert_eq!(again, ["P.P.F. → People's Police Force"], "известная форма пропущена");
+        assert_eq!(again, ["P.P.F. → People's Police Force"]);
+
+        // Без слова модели аббревиатура к названию сама не ложится: это отдельный термин, пару решит вопрос.
+        assert_eq!(open.project.write(|tx| save_found(tx, &[found("OD", org, None)])).unwrap(), ["OD"]);
+        assert_eq!(open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap().len(), 3);
     }
 
     #[test]
-    fn entries_linked_later_are_merged() {
-        use super::super::analyze::{Finding, FoundKind};
+    fn known_entries_named_as_one_merge_only_when_the_script_agrees() {
         let dir = tempfile::tempdir().unwrap();
         let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
         let glossary = GlossaryService { state: &state };
         let open = state.open_project(id).unwrap();
         let org = FoundKind::Term(TermCategory::Organization);
-        let found = |name: &str, kind, same_as: Option<&str>| Finding { name: name.to_string(), kind, gender: None, same_as: same_as.map(str::to_string), parts: None };
-        let save = |findings: &[Finding]| open.project.write(|tx| save_found(tx, findings)).unwrap();
+        let save = |findings: &[Finding]| open.project.write(|tx| save_scene_found(tx, findings, None)).unwrap();
         let terms = || open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap();
         let forms = |term: &crate::glossary::Term| term.forms().iter().map(|form| (form.text().to_string(), form.translation().map(str::to_string))).collect::<Vec<_>>();
 
-        // Аббревиатура записана раньше полного названия: полное становится названием, аббревиатура формой со своим переводом.
+        // Полное название к термину-аббревиатуре: оно становится названием, аббревиатура формой со своим переводом.
         let ppf = glossary.take_term(id, "PPF", TermCategory::Organization).unwrap();
         let mut term = open.project.read(|tx| TermRepo { conn: tx }.get(ppf)).unwrap();
         term.set_translation("НПС");
         glossary.save_term(id, &term).unwrap();
-        assert_eq!(save(&[found("People's Police Force", org, None)]), ["PPF → People's Police Force"]);
+        assert_eq!(save(&[found("People's Police Force", org, Some("PPF"))]).added, ["PPF → People's Police Force"]);
         let list = terms();
         assert_eq!((list.len(), list[0].name(), list[0].translation()), (1, "People's Police Force", None));
         assert_eq!(forms(&list[0]), [("PPF".to_string(), Some("НПС".to_string()))]);
 
-        // Два отдельных термина: связь нашлась позже, главным остаётся полное название в любую сторону ссылки.
+        // Два известных термина, модель назвала их одним, и скрипт видит аббревиатуру: слияние сразу.
         let order = glossary.take_term(id, "Order of the Dawn", TermCategory::Organization).unwrap();
         let od = glossary.take_term(id, "OD", TermCategory::Organization).unwrap();
-        assert_eq!(save(&[found("Order of the Dawn", org, Some("OD"))]), ["OD → Order of the Dawn (объединено)"]);
+        let saved = save(&[found("Order of the Dawn", org, Some("OD"))]);
+        assert_eq!(saved.added, ["OD → Order of the Dawn (объединено)"]);
+        assert!(saved.claims.is_empty());
         let list = terms();
         assert!(list.iter().all(|term| term.id() != Some(od)), "аббревиатура слита");
         assert_eq!(forms(list.iter().find(|term| term.id() == Some(order)).unwrap()), [("OD".to_string(), None)]);
 
-        // Персонаж под другим именем сливается в того, на кого указала модель: формы и связи говорящих переходят.
+        // Два известных персонажа, короткая и полная форма имени: главным остаётся полное имя.
         let eileen = glossary.create_character(id, "Eileen").unwrap();
         let mut character = open.project.read(|tx| CharacterRepo { conn: tx }.get(eileen)).unwrap();
         character.set_last_name("Lee");
@@ -2262,7 +1591,7 @@ mod tests {
         character.set_description("Учитель.");
         glossary.save_character(id, &character).unwrap();
         let stuart = glossary.create_character(id, "Stuart").unwrap();
-        assert_eq!(save(&[found("Stuart", FoundKind::Character, Some("Stu"))]), ["Stu → Stuart (объединено)"], "главным осталось полное имя");
+        assert_eq!(save(&[found("Stuart", FoundKind::Character, Some("Stu"))]).added, ["Stu → Stuart (объединено)"]);
         let (characters, links) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.list()?, SpeakerRepo { conn: tx }.links_of(stuart)?))).unwrap();
         assert_eq!(characters.len(), 2, "Eileen Lee и Stuart");
         let merged = characters.iter().find(|character| character.id() == Some(stuart)).unwrap();
@@ -2271,64 +1600,132 @@ mod tests {
         assert_eq!(merged.description(), Some("Учитель."), "пустое описание заполнено");
         assert_eq!(links.iter().map(|link| link.speaker.as_str()).collect::<Vec<_>>(), ["code:e"], "говорящий перешёл");
 
-        // Термин оказался именем персонажа: уходит ему формой.
-        glossary.take_term(id, "Leeway", TermCategory::General).unwrap();
-        assert_eq!(save(&[found("Leeway", FoundKind::Character, Some("Eileen Lee"))]), ["Leeway → Eileen Lee (объединено)"]);
+        // Скрипт связи не видит: известные записи по одному слову модели не сливаются, пара идёт вопросом.
+        let leeway = glossary.take_term(id, "Leeway", TermCategory::General).unwrap();
+        let saved = save(&[found("Leeway", FoundKind::Character, Some("Eileen Lee"))]);
+        assert!(saved.added.is_empty());
+        let pair = Pair::new(ExcludeOwner::Term(leeway), ExcludeOwner::Character(eileen)).unwrap();
+        assert_eq!(saved.claims, [Claim { pair, same: true }]);
+        assert!(terms().iter().any(|term| term.name() == "Leeway"));
+
+        // Ответ «да» на вопрос отдаёт термин персонажу формой, ответ «нет» запоминается, и пара больше не идёт.
+        assert_eq!(open.project.write(|tx| merge_pair(tx, pair)).unwrap().as_deref(), Some("Leeway → Eileen Lee (объединено)"));
         assert!(terms().iter().all(|term| term.name() != "Leeway"));
-        assert_eq!(save(&[found("Leeway", FoundKind::Character, Some("Eileen Lee"))]), Vec::<String>::new(), "второй раз сливать нечего");
+        let mara = glossary.take_term(id, "Mara", TermCategory::General).unwrap();
+        open.project.write(|tx| PairCheckRepo { conn: tx }.mark(ExcludeOwner::Term(mara), ExcludeOwner::Character(eileen), false, Timestamp::now())).unwrap();
+        assert!(save(&[found("Mara", FoundKind::Character, Some("Eileen Lee"))]).claims.is_empty(), "отвеченная пара не спрашивается");
     }
 
     #[test]
-    fn names_titles_and_short_forms_from_a_real_game() {
-        use super::super::analyze::{Finding, FoundKind, NameParts};
+    fn names_titles_and_name_parts_from_a_real_game() {
         let dir = tempfile::tempdir().unwrap();
         let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
         let glossary = GlossaryService { state: &state };
         let open = state.open_project(id).unwrap();
         let karanovic = glossary.create_character(id, "Karanovic").unwrap();
         let stu = glossary.create_character(id, "Stu").unwrap();
-        let person = |name: &str, first: Option<&str>, last: Option<&str>, same_as: Option<&str>| Finding {
-            name: name.to_string(),
-            kind: FoundKind::Character,
-            gender: None,
-            same_as: same_as.map(str::to_string),
-            parts: NameParts::check(name, first, last),
-        };
+        let dimitria = glossary.create_character(id, "Dimitria").unwrap();
+        let save = |findings: &[Finding]| open.project.write(|tx| save_scene_found(tx, findings, None)).unwrap();
+        let get = |id: CharacterId| open.project.read(|tx| CharacterRepo { conn: tx }.get(id)).unwrap();
 
-        let added = open
-            .project
-            .write(|tx| {
-                save_found(
-                    tx,
-                    &[
-                        person("Vera Karanovic", Some("Vera"), Some("Karanovic"), None),
-                        person("Detective-Colonel Karanovic", None, None, None),
-                        person("Stuart", None, None, Some("Stu")),
-                    ],
-                )
-            })
-            .unwrap();
-        assert_eq!(added, ["Vera Karanovic", "Detective-Colonel", "Stu → Stuart", "Karanovic → Vera Karanovic (объединено)"]);
+        let saved = save(&[
+            person("Vera Karanovic", Some("Vera"), Some("Karanovic"), None),
+            person("Detective-Colonel Karanovic", None, None, None),
+            person("Stuart", None, None, Some("Stu")),
+            person("Vellnikov", None, Some("Vellnikov"), Some("Dimitria")),
+            person("Dimi", Some("Dimi"), None, Some("Dimitria")),
+        ]);
+        assert_eq!(saved.added, ["Vera Karanovic", "Detective-Colonel", "Stu → Stuart", "Vellnikov → Dimitria Vellnikov", "Dimi → Dimitria Vellnikov"]);
+        assert!(saved.claims.is_empty());
 
         let (characters, terms) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.list()?, TermRepo { conn: tx }.list()?))).unwrap();
         let vera = characters.iter().find(|character| character.first_name() == Some("Vera")).unwrap();
         assert_eq!(vera.last_name(), Some("Karanovic"), "имя и фамилия по отдельности");
         assert!(vera.forms().is_empty(), "должность с фамилией не форма");
-        assert!(characters.iter().all(|character| character.id() != Some(karanovic)), "одиночная фамилия слита с Vera Karanovic");
-        let stuart = characters.iter().find(|character| character.id() == Some(stu)).unwrap();
-        assert_eq!(stuart.first_name(), Some("Stuart"), "полное имя стало основным");
-        assert_eq!(stuart.forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Stu"]);
+        assert_eq!(get(karanovic).full_name().as_deref(), Some("Karanovic"), "одиночная фамилия сама с однофамилицей не сливается");
+        assert_eq!(get(stu).first_name(), Some("Stuart"), "полное имя стало основным");
+        assert_eq!(get(stu).forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Stu"]);
+        assert_eq!((get(dimitria).last_name(), get(dimitria).forms().iter().map(|form| form.text()).collect::<Vec<_>>()), (Some("Vellnikov"), vec!["Dimi"]));
         assert_eq!(terms.iter().map(|term| (term.name(), term.category())).collect::<Vec<_>>(), [("Detective-Colonel", TermCategory::Title)]);
+
+        // Модель назвала одиночную фамилию Верой, и скрипт видит общую фамилию: слияние сразу.
+        let merged = save(&[person("Karanovic", None, Some("Karanovic"), Some("Vera Karanovic"))]);
+        assert_eq!(merged.added, ["Karanovic → Vera Karanovic (объединено)"]);
+        assert!(open.project.read(|tx| CharacterRepo { conn: tx }.get(karanovic)).is_err());
+
+        // Полное имя к известному имени без фамилии: фамилия в пустое поле.
+        let hilde = glossary.create_character(id, "Hilde").unwrap();
+        assert_eq!(save(&[person("Hilde Tominskova", Some("Hilde"), Some("Tominskova"), Some("Hilde"))]).added, ["Hilde → Hilde Tominskova"]);
+        assert_eq!(get(hilde).full_name().as_deref(), Some("Hilde Tominskova"));
+    }
+
+    #[test]
+    fn an_occupied_name_field_makes_a_separate_entry_and_a_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let open = state.open_project(id).unwrap();
+        let save = |findings: &[Finding]| open.project.write(|tx| save_scene_found(tx, findings, None)).unwrap();
+        let list = || open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap();
+        save(&[person("Vera Karanovic", Some("Vera"), Some("Karanovic"), None)]);
+        let vera = list()[0].id().unwrap();
+
+        // Вторая фамилия: поле занято, модель одна, скрипт связи не видит. Отдельная запись и пара для вопроса.
+        let saved = save(&[person("Petrova", None, Some("Petrova"), Some("Vera Karanovic"))]);
+        assert_eq!(saved.added, ["Petrova"]);
+        let petrova = list().iter().find(|character| character.last_name() == Some("Petrova")).and_then(Character::id).unwrap();
+        assert_eq!(saved.claims, [Claim { pair: Pair::people(vera, petrova).unwrap(), same: true }]);
+        // «Да» кладёт вторую фамилию формой.
+        let text = open.project.write(|tx| merge_pair(tx, Pair::people(vera, petrova).unwrap())).unwrap();
+        assert_eq!(text.as_deref(), Some("Petrova → Vera Karanovic (объединено)"));
+        assert_eq!(list()[0].forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Petrova"]);
+
+        // Опечатка в фамилии: поле занято, но скрипт видит опечатку. Два довода, слияние сразу.
+        let saved = save(&[person("Karanovich", None, Some("Karanovich"), Some("Vera Karanovic"))]);
+        assert_eq!(saved.added, ["Karanovich", "Karanovich → Vera Karanovic (объединено)"]);
+        assert!(saved.claims.is_empty());
+        assert_eq!(list().len(), 1);
+
+        // Псевдоним без частей имени ложится формой сразу: другого довода у него не бывает.
+        assert_eq!(save(&[found("Nightingale", FoundKind::Character, Some("Vera Karanovic"))]).added, ["Nightingale → Vera Karanovic"]);
+        assert_eq!(list()[0].forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Petrova", "Karanovich", "Nightingale"]);
+    }
+
+    #[test]
+    fn a_known_name_of_someone_else_becomes_a_namesake() {
+        use crate::common::Gender;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let open = state.open_project(id).unwrap();
+        let save = |findings: &[Finding]| open.project.write(|tx| save_scene_found(tx, findings, None)).unwrap();
+        let list = || open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap();
+        save(&[person("Vera Karanovic", Some("Vera"), Some("Karanovic"), None), found("Hope", FoundKind::Character, None)]);
+        let vera = list().iter().find(|character| character.first_name() == Some("Vera")).and_then(Character::id).unwrap();
+
+        // Без слова модели известная фамилия это та же Вера: находка пропущена.
+        assert!(save(&[person("Karanovic", None, Some("Karanovic"), None)]).added.is_empty());
+
+        // Модель сказала, что это не Вера: вторая запись с тем же написанием и пара для вопроса.
+        let other = Finding { other_than: Some("Vera Karanovic".to_string()), gender: Some(Gender::Male), ..person("Karanovic", None, Some("Karanovic"), None) };
+        let saved = save(std::slice::from_ref(&other));
+        assert_eq!(saved.added, ["Karanovic (не Vera Karanovic)"]);
+        let husband = list().iter().find(|character| character.first_name().is_none()).and_then(Character::id).unwrap();
+        assert_eq!(saved.claims, [Claim { pair: Pair::people(vera, husband).unwrap(), same: false }]);
+        assert!(save(std::slice::from_ref(&other)).added.is_empty(), "тёзка создаётся один раз");
+        assert_eq!(list().len(), 3);
+
+        // Город с именем персонажа: термин с тем же написанием.
+        let town = Finding { other_than: Some("Hope".to_string()), ..found("Hope", FoundKind::Term(TermCategory::Location), None) };
+        assert_eq!(save(std::slice::from_ref(&town)).added, ["Hope (не Hope)"]);
+        assert!(save(std::slice::from_ref(&town)).added.is_empty());
+        assert_eq!(open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap().len(), 1);
     }
 
     #[test]
     fn a_titled_name_is_never_a_term() {
-        use super::super::analyze::{Finding, FoundKind};
         let dir = tempfile::tempdir().unwrap();
         let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
         let open = state.open_project(id).unwrap();
         let glossary = GlossaryService { state: &state };
-        let found = |name: &str, kind| Finding { name: name.to_string(), kind, gender: None, same_as: None, parts: None };
         let save = |findings: &[Finding]| open.project.write(|tx| save_found(tx, findings)).unwrap();
         let names = || {
             open.project
@@ -2340,51 +1737,32 @@ mod tests {
                 .unwrap()
         };
 
-        assert_eq!(save(&[found("General Store", FoundKind::Term(TermCategory::Location))]), ["General Store"], "место с «General» не делится");
-
-        // Термин, записанный до разделения должностей, превращается, когда разбор снова находит это имя.
-        glossary.take_term(id, "Princess Selena", TermCategory::General).unwrap();
-        assert_eq!(save(&[found("Princess Selena", FoundKind::Character)]), ["Princess Selena → Selena (разделено)", "Selena"], "обычное звание не термин");
-        assert_eq!(names(), (vec!["General Store".to_string()], vec!["Selena".to_string()]));
-
-        // И когда имя после должности стало известным персонажем.
-        glossary.take_term(id, "Queen Mara", TermCategory::General).unwrap();
-        assert_eq!(save(&[found("Mara", FoundKind::Character)]), ["Mara", "Queen Mara → Mara (разделено)"]);
-        let (terms, characters) = names();
-        assert_eq!(terms, ["General Store"]);
-        assert_eq!(characters, ["Mara", "Selena"]);
-        assert!(save(&[found("Princess Selena", FoundKind::Term(TermCategory::General))]).is_empty(), "разделённое название в корзине");
-
+        assert_eq!(save(&[found("General Store", FoundKind::Term(TermCategory::Location), None)]), ["General Store"], "место с «General» не делится");
+        assert_eq!(save(&[found("Princess Selena", FoundKind::Character, None)]), ["Selena"], "обычное звание не термин");
         // Составное звание остаётся термином, одиночное от модели не записывается.
-        let added = save(&[found("Detective-Colonel Orin", FoundKind::Character), found("Princess", FoundKind::Term(TermCategory::Title))]);
+        let added = save(&[found("Detective-Colonel Orin", FoundKind::Character, None), found("Princess", FoundKind::Term(TermCategory::Title), None)]);
         assert_eq!(added, ["Detective-Colonel", "Orin"]);
+        // Должность перед именем известного персонажа делится и у находки-термина.
+        assert!(save(&[found("Queen Selena", FoundKind::Term(TermCategory::General), None)]).is_empty());
+        assert_eq!(names(), (vec!["Detective-Colonel".to_string(), "General Store".to_string()], vec!["Orin".to_string(), "Selena".to_string()]));
 
-        // Обычные звания, записанные раньше, уходят в корзину, кроме переведённых.
-        let sister = glossary.take_term(id, "Sister", TermCategory::Title).unwrap();
-        let king = glossary.take_term(id, "King", TermCategory::Title).unwrap();
-        open.project
-            .write(|tx| {
-                let repo = TermRepo { conn: tx };
-                let mut term = repo.get(king)?;
-                term.set_translation("Государь");
-                repo.save(&term)?;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(save(&[]), ["Sister (обычное слово, убрано)"]);
-        assert!(open.project.read(|tx| TermRepo { conn: tx }.get(sister)).is_err());
-        assert_eq!(names().0, ["Detective-Colonel", "General Store", "King"]);
+        // Записанное раньше разбор сам не чинит: термин с должностью и именем остаётся, пару с персонажем решит вопрос.
+        let term = glossary.take_term(id, "Princess Mara", TermCategory::General).unwrap();
+        glossary.take_term(id, "Sister", TermCategory::Title).unwrap();
+        assert_eq!(save(&[found("Mara", FoundKind::Character, None)]), ["Mara"]);
+        assert_eq!(names().0, ["Detective-Colonel", "General Store", "Princess Mara", "Sister"]);
+        let glossary_data = open.project.read(|tx| GlossaryData::load(tx)).unwrap();
+        let mara = glossary_data.characters.iter().find(|character| character.first_name() == Some("Mara")).and_then(Character::id).unwrap();
+        let relation = relations::between(&glossary_data, ExcludeOwner::Term(term), ExcludeOwner::Character(mara), false, false);
+        assert_eq!(relation, Some(relations::Relation::Titled));
     }
 
     #[test]
-    fn junk_names_titled_people_and_duplicate_terms_from_a_real_game() {
-        use super::super::analyze::{Finding, FoundKind};
-        use crate::glossary::TermSuggestion;
+    fn junk_names_titled_people_and_plural_terms_from_a_real_game() {
         let dir = tempfile::tempdir().unwrap();
         let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
         let open = state.open_project(id).unwrap();
         let glossary = GlossaryService { state: &state };
-        let found = |name: &str, kind| Finding { name: name.to_string(), kind, gender: None, same_as: None, parts: None };
         let save = |findings: &[Finding]| open.project.write(|tx| save_found(tx, findings)).unwrap();
         let general = FoundKind::Term(TermCategory::General);
         let characters = || {
@@ -2401,97 +1779,299 @@ mod tests {
             .unwrap();
 
         // Слово из меню не персонаж, имя посреди фразы персонаж.
-        assert_eq!(save(&[found("Boobjob", FoundKind::Character), found("Merek", FoundKind::Character)]), ["Merek"]);
-        // Записанный раньше мусор убирается и больше не предлагается.
-        let junk = glossary.create_character(id, "Boobjob").unwrap();
-        assert_eq!(save(&[]), ["Boobjob (обычное слово, убрано)"]);
-        assert!(open.project.read(|tx| CharacterRepo { conn: tx }.get(junk)).is_err());
-        assert!(save(&[found("Boobjob", general)]).is_empty(), "слово в корзине");
+        assert_eq!(save(&[found("Boobjob", FoundKind::Character, None), found("Merek", FoundKind::Character, None)]), ["Merek"]);
+        // Должность со служебным словом остаётся должностью целиком, обрывок после неё персонажем не становится.
+        let title = FoundKind::Term(TermCategory::Title);
+        assert_eq!(save(&[found("Director of Engineering", title, None), found("of Engineering", FoundKind::Character, None)]), ["Director of Engineering"]);
+        // Должность со служебным словом перед именем отделяется целиком (реплика Take Over).
+        assert_eq!(save(&[found("Chief of Engineering Ristovski", FoundKind::Character, None)]), ["Chief of Engineering", "Ristovski"]);
+        // Титул как имя лица это персонаж без артикля.
+        assert_eq!(save(&[found("The Fairy Queen", general, None)]), ["Fairy Queen"]);
+        assert_eq!(characters(), ["Fairy Queen", "Merek", "Ristovski"]);
 
-        // Титул как имя лица это персонаж без артикля, а записанный термином превращается в персонажа с переводом.
-        assert_eq!(save(&[found("The Fairy Queen", general)]), ["Fairy Queen"]);
-        let king = glossary.take_term(id, "Fairy King", TermCategory::Title).unwrap();
-        glossary.accept_terms(id, &[TermSuggestion { id: king, translation: "Король фей".to_string(), category: None, description: None }]).unwrap();
-        assert_eq!(save(&[]), ["Fairy King (термин → персонаж)"]);
-        assert_eq!(characters(), ["Fairy King", "Fairy Queen", "Merek"]);
-        let saved = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap();
-        assert_eq!(saved.iter().find(|character| character.first_name() == Some("Fairy King")).unwrap().translated_first_name(), Some("Король фей"));
-        assert!(terms().is_empty());
-
-        // Множественное число ложится формой единственного.
+        // Множественное число это то же слово: ложится формой, а единственное к множественному становится названием.
         glossary.take_term(id, "pixie", TermCategory::General).unwrap();
-        assert_eq!(save(&[found("pixies", general)]), ["pixies → pixie"]);
+        glossary.take_term(id, "witches", TermCategory::General).unwrap();
+        assert_eq!(save(&[found("pixies", general, None), found("witch", general, None)]), ["pixies → pixie", "witches → witch"]);
 
-        // Пояснение модели к переводу описанием не пишется, одинаковый перевод одной категории сливает термины.
-        let fey = glossary.take_term(id, "Fey Court", TermCategory::Location).unwrap();
-        let fairy = glossary.take_term(id, "Fairy Court", TermCategory::Location).unwrap();
-        let forest = glossary.take_term(id, "Ancient Forest", TermCategory::Location).unwrap();
-        let suggestion = |id, translation: &str, note: &str| TermSuggestion { id, translation: translation.to_string(), category: None, description: Some(note.to_string()) };
-        let written = glossary
-            .accept_terms(id, &[suggestion(fey, "Двор фей", "Место обитания фей"), suggestion(fairy, "Двор фей", "Резиденция фей"), suggestion(forest, "Древний лес", "Название локации")])
-            .unwrap();
-        assert_eq!(written, 3);
-        let names: Vec<(String, Vec<String>, Option<String>)> = terms()
+        let names: Vec<(String, Vec<String>)> = terms()
             .iter()
-            .map(|term| (term.name().to_string(), term.forms().iter().map(|form| form.text().to_string()).collect(), term.description().map(str::to_string)))
+            .filter(|term| term.category() != TermCategory::Title)
+            .map(|term| (term.name().to_string(), term.forms().iter().map(|form| form.text().to_string()).collect()))
             .collect();
-        assert_eq!(
-            names,
-            [
-                ("Ancient Forest".to_string(), vec![], None),
-                ("Fey Court".to_string(), vec!["Fairy Court".to_string()], None),
-                ("pixie".to_string(), vec!["pixies".to_string()], None),
-            ]
-        );
+        assert_eq!(names, [("pixie".to_string(), vec!["pixies".to_string()]), ("witch".to_string(), vec!["witches".to_string()])]);
     }
 
     #[test]
-    fn short_names_find_their_full_name_and_the_scene_breaks_ties() {
-        use super::super::analyze::{Finding, FoundKind, save_scene_found};
+    fn a_shared_name_belongs_to_the_character_of_the_scene() {
         let dir = tempfile::tempdir().unwrap();
         let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
         let glossary = GlossaryService { state: &state };
         let open = state.open_project(id).unwrap();
-        let person = |name: &str| Finding { name: name.to_string(), kind: FoundKind::Character, gender: None, same_as: None, parts: None };
         let forms = |id: CharacterId| {
             open.project.read(|tx| CharacterRepo { conn: tx }.get(id)).unwrap().forms().iter().map(|form| form.text().to_string()).collect::<Vec<_>>()
         };
 
-        // Новая короткая форма без подсказки модели ложится к единственному полному имени.
+        // Короткая форма без слова модели к полному имени сама не ложится: отдельная запись, пару решит вопрос.
         let dimitria = glossary.create_character(id, "Dimitria").unwrap();
-        assert_eq!(open.project.write(|tx| save_found(tx, &[person("Dimi")])).unwrap(), ["Dimi → Dimitria"]);
-        assert_eq!(forms(dimitria), ["Dimi"]);
+        assert_eq!(open.project.write(|tx| save_found(tx, &[found("Dimi", FoundKind::Character, None)])).unwrap(), ["Dimi"]);
+        assert!(forms(dimitria).is_empty());
 
-        // Оба уже записаны отдельно: сливаются, главным остаётся полное имя.
-        let anya = glossary.create_character(id, "Anya").unwrap();
-        let anastasia = glossary.create_character(id, "Anastasia").unwrap();
-        let _ = anya;
-        let ana = glossary.create_character(id, "Ana").unwrap();
-        let added = open.project.write(|tx| save_found(tx, &[])).unwrap();
-        assert_eq!(added, ["Ana → Anastasia (объединено)"], "Anya не короткая форма Anastasia, Ana короткая: у неё один кандидат");
-        assert!(open.project.read(|tx| CharacterRepo { conn: tx }.get(ana)).is_err());
-        assert_eq!(forms(anastasia), ["Ana"]);
-
-        // Несколько полных имён: выбирается тот, кто говорит в разобранной сцене.
+        // Фамилия у двоих: модель назвала её, и выбрать можно только того, кто есть в разобранной сцене.
         let eileen = glossary.speaker_to_character(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
-        glossary.create_character(id, "Eileenor").unwrap();
+        let tom = glossary.create_character(id, "Tom").unwrap();
+        for person in [eileen, tom] {
+            let mut character = open.project.read(|tx| CharacterRepo { conn: tx }.get(person)).unwrap();
+            character.set_last_name("Grant");
+            glossary.save_character(id, &character).unwrap();
+        }
         let start = ContainerKey::new("label:start").unwrap();
-        assert_eq!(open.project.write(|tx| save_found(tx, &[person("Eile")])).unwrap(), ["Eile"], "без сцены двух кандидатов не различить");
-        let eile = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap().into_iter().find(|character| character.first_name() == Some("Eile")).unwrap();
-        glossary.delete_character(id, eile.id().unwrap()).unwrap();
-        assert_eq!(open.project.write(|tx| save_scene_found(tx, &[person("Eile")], Some(&start))).unwrap(), ["Eile → Eileen"]);
-        assert_eq!(forms(eileen), ["Eile"]);
+        let boss = found("Boss", FoundKind::Character, Some("Grant"));
+        assert_eq!(open.project.write(|tx| save_found(tx, std::slice::from_ref(&boss))).unwrap(), ["Boss"], "без сцены двух владельцев не различить");
+        let created = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap().into_iter().find(|character| character.first_name() == Some("Boss")).unwrap();
+        glossary.delete_character(id, created.id().unwrap()).unwrap();
+        assert_eq!(open.project.write(|tx| save_scene_found(tx, std::slice::from_ref(&boss), Some(&start))).unwrap().added, ["Boss → Eileen Grant"]);
+        assert_eq!(forms(eileen), ["Boss"]);
+        assert!(forms(tom).is_empty());
+    }
+
+    #[test]
+    fn scene_analysis_checks_doubtful_mentions_and_keeps_the_answers() {
+        let (url, seen) = fake_model(|body| {
+            if system_text(body).contains("proper names") {
+                completion(r#"[{"kind": "check", "no": ["Q1"]}]"#)
+            } else {
+                completion("Описание.")
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let service = DescribeService { state: &state };
+        let open = state.open_project(id).unwrap();
+        let start = ContainerKey::new("label:start").unwrap();
+        let (mind, hash) = open
+            .project
+            .write(|tx| {
+                tx.execute("UPDATE segments SET source_text = 'Never mind, it is fine.' WHERE source_text = 'Static.'", [])?;
+                tx.execute("UPDATE segments SET source_text = 'MInD is watching.' WHERE source_text = 'Narration.'", [])?;
+                let hash: String = tx.query_row("SELECT source_hash FROM segments WHERE source_text = 'Never mind, it is fine.'", [], |row| row.get(0))?;
+                Ok((TermRepo { conn: tx }.save(&Term::new("MInD", TermCategory::Organization).unwrap())?, hash))
+            })
+            .unwrap();
+
+        let analyzed = tauri::async_runtime::block_on(service.analyze(id, vec![start.clone()], None, silent())).unwrap();
+        assert_eq!(analyzed.error, None);
+        let request = seen.lock().unwrap().iter().find(|body| system_text(body).contains("proper names")).cloned().unwrap();
+        let user = user_text(&request);
+        assert!(user.contains("Known names to check."), "{user}");
+        assert!(user.contains("Q1 MInD: \"") && user.contains("Never mind, it is fine.\"\n"), "{user}");
+        assert!(!user.contains("Q2"), "точное необычное написание не спрашивается: {user}");
+
+        let checks = open.project.read(|tx| MentionCheckRepo { conn: tx }.terms()).unwrap();
+        assert_eq!(checks.get(&mind).and_then(|checks| checks.get(&hash)), Some(&false), "ответ записан по отпечатку реплики");
+        let lines = GlossaryService { state: &state }.entry_lines(id, ExcludeOwner::Term(mind)).unwrap();
+        let texts: Vec<&str> = lines.iter().map(|line| line.placed.line.source_text.as_str()).collect();
+        assert_eq!(texts, ["MInD is watching."]);
+
+        // Ответ «да» важнее написания: строчное «mind» становится упоминанием.
+        open.project.write(|tx| MentionCheckRepo { conn: tx }.mark(ExcludeOwner::Term(mind), &hash, true, Timestamp::now())).unwrap();
+        assert_eq!(GlossaryService { state: &state }.entry_lines(id, ExcludeOwner::Term(mind)).unwrap().len(), 2);
+
+        // Слияние: ответы уходят к оставшейся записи, её собственный ответ важнее.
+        open.project
+            .write(|tx| {
+                let other = TermRepo { conn: tx }.save(&Term::new("MIND Corp", TermCategory::Organization).unwrap())?;
+                let checks = MentionCheckRepo { conn: tx };
+                checks.mark(ExcludeOwner::Term(other), "elsewhere", true, Timestamp::now())?;
+                checks.mark(ExcludeOwner::Term(other), &hash, false, Timestamp::now())?;
+                crate::glossary::service::merge_terms(tx, other, mind)
+            })
+            .unwrap();
+        let checks = open.project.read(|tx| MentionCheckRepo { conn: tx }.terms()).unwrap();
+        assert_eq!(checks.len(), 1, "у слитой записи ответов не осталось");
+        assert_eq!((checks[&mind].get("elsewhere"), checks[&mind].get(&hash)), (Some(&true), Some(&true)));
+    }
+
+    #[test]
+    fn scene_analysis_asks_whether_two_characters_are_one_person() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let same = Arc::new(AtomicBool::new(false));
+        let answer = same.clone();
+        let (url, seen) = fake_model(move |body| {
+            let system = system_text(body);
+            if system.contains("proper names") {
+                completion("[]")
+            } else if system.contains("same person") {
+                completion(if answer.load(Ordering::SeqCst) { r#"{"same": true}"# } else { r#"{"same": false}"# })
+            } else {
+                completion("Описание.")
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let service = DescribeService { state: &state };
+        let open = state.open_project(id).unwrap();
+        let start = ContainerKey::new("label:start").unwrap();
+        let (dimitria, vellnikov) = open
+            .project
+            .write(|tx| {
+                tx.execute("UPDATE segments SET source_text = 'Chief Vellnikov runs the lab.' WHERE source_text = 'Static.'", [])?;
+                tx.execute("UPDATE segments SET source_text = 'Dimitria shows the detective around.' WHERE source_text = 'Narration.'", [])?;
+                let characters = CharacterRepo { conn: tx };
+                let mut first = Character::new("Dimitria");
+                first.set_gender(Some(crate::common::Gender::Female));
+                let mut last = Character::new("");
+                last.set_last_name("Vellnikov");
+                Ok((characters.save(&first)?, characters.save(&last)?))
+            })
+            .unwrap();
+        let questions = || seen.lock().unwrap().iter().filter(|body| system_text(body).contains("same person")).cloned().collect::<Vec<_>>();
+        let analyze = || tauri::async_runtime::block_on(service.analyze(id, vec![start.clone()], None, silent())).unwrap();
+
+        // Модель видит персонажей сцены с номерами; «нет» запоминается, пара больше не спрашивается.
+        let first = analyze();
+        assert_eq!(first.error, None);
+        let analysis = seen.lock().unwrap().iter().find(|body| system_text(body).contains("proper names")).cloned().unwrap();
+        let cast = format!("Characters of this scene:\nC{}: Dimitria (female)\nC{}: Vellnikov\n", dimitria.get(), vellnikov.get());
+        assert!(user_text(&analysis).contains(&cast), "{}", user_text(&analysis));
+        let asked = questions();
+        assert_eq!(asked.len(), 1);
+        assert!(user_text(&asked[0]).starts_with("A: Dimitria\nGender: female\nB: Vellnikov\n"), "{}", user_text(&asked[0]));
+        assert!(user_text(&asked[0]).contains("Chief Vellnikov runs the lab."));
+        assert_eq!(open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap().len(), 2);
+        open.project.write(|tx| Ok(tx.execute("DELETE FROM analyzed_parts", [])?)).unwrap();
+        analyze();
+        assert_eq!(questions().len(), 1, "отвеченная пара не спрашивается снова");
+
+        // «Да»: имя и фамилия соединяются в одного персонажа.
+        open.project.write(|tx| PairCheckRepo { conn: tx }.clear()).unwrap();
+        open.project.write(|tx| Ok(tx.execute("DELETE FROM analyzed_parts", [])?)).unwrap();
+        same.store(true, Ordering::SeqCst);
+        let joined = analyze();
+        assert_eq!(joined.added, ["Vellnikov → Dimitria Vellnikov (объединено)"]);
+        let characters = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap();
+        let names: Vec<_> = characters.iter().filter_map(Character::full_name).collect();
+        assert_eq!(names, ["Dimitria Vellnikov"]);
+        assert_eq!(characters[0].id(), Some(dimitria));
+    }
+
+    #[test]
+    fn name_halves_named_together_elsewhere_are_asked_about_and_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
+        let open = state.open_project(id).unwrap();
+        let list = || open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap();
+        let half = |first: &str, last: &str, translation: &str| {
+            open.project
+                .write(|tx| {
+                    let mut character = Character::new(first);
+                    if !last.is_empty() {
+                        character.set_last_name(last);
+                    }
+                    character.set_translated_names(if last.is_empty() { translation } else { "" }, if last.is_empty() { "" } else { translation });
+                    CharacterRepo { conn: tx }.save(&character)
+                })
+                .unwrap()
+        };
+        let start = ContainerKey::new("label:start").unwrap();
+        let asked = |claimed: &[Pair]| open.project.read(|tx| same_entry::questions(tx, &start, claimed)).unwrap();
+
+        // Разобранные сцены назвали имя и фамилию порознь. Скрипт их сам не соединяет.
+        let dimitria = half("Dimitria", "", "Димитрия");
+        let vellnikov = half("", "Vellnikov", "Велльникова");
+        open.project.write(|tx| Ok(tx.execute("UPDATE segments SET source_text = 'Dimitria shows the lab.' WHERE source_text = 'Static.'", [])?)).unwrap();
+        assert!(open.project.write(|tx| save_found(tx, &[])).unwrap().is_empty());
+        assert!(asked(&[]).is_empty(), "в сцене только имя, а общей реплики в игре нет");
+
+        // Полное имя есть в другой сцене игры: пара становится вопросом с этой репликой.
+        open.project.write(|tx| Ok(tx.execute("UPDATE segments SET source_text = '{size=24}Dr Dimitria Vellnikov{/size}' WHERE source_text = 'Left side.'", [])?)).unwrap();
+        let questions = asked(&[]);
+        let [question] = questions.as_slice() else { panic!("один вопрос: {questions:?}") };
+        let pair = Pair::people(dimitria, vellnikov).unwrap();
+        assert_eq!(question.pair(), Some(pair));
+        assert_eq!(question.game_lines, ["{size=24}Dr Dimitria Vellnikov{/size}"]);
+
+        // «Да»: фамилия с переводом становится фамилией персонажа с именем.
+        assert_eq!(open.project.write(|tx| merge_pair(tx, pair)).unwrap().as_deref(), Some("Vellnikov → Dimitria Vellnikov (объединено)"));
+        let [joined] = list().try_into().unwrap_or_else(|all: Vec<Character>| panic!("один персонаж: {all:?}"));
+        assert_eq!(joined.id(), Some(dimitria));
+        assert_eq!((joined.last_name(), joined.translated_last_name()), (Some("Vellnikov"), Some("Велльникова")));
+        assert!(joined.forms().is_empty(), "фамилия не остаётся формой");
+
+        // «Нет» запоминается: пара не спрашивается и скриптом не сливается.
+        let dimi = half("Dimi", "", "");
+        let pair = Pair::people(dimitria, dimi).unwrap();
+        assert_eq!(asked(&[]).iter().filter_map(same_entry::Question::pair).collect::<Vec<_>>(), [pair], "короткая форма имени персонажа сцены");
+        open.project.write(|tx| PairCheckRepo { conn: tx }.mark(pair.a, pair.b, false, Timestamp::now())).unwrap();
+        assert!(asked(&[]).is_empty());
+        assert!(asked(&[pair]).is_empty(), "и по слову модели тоже");
+        assert_eq!(list().len(), 2);
+
+        // Фамилия записана именем (модель назвала её без `last_name`): пару даёт только общая реплика игры,
+        // а кто из двоих фамилия, решает порядок в ней.
+        let tominskova = half("Tominskova", "", "Томинскова");
+        let hilde = half("Hilde", "", "Хильда");
+        open.project.write(|tx| Ok(tx.execute("UPDATE segments SET source_text = 'Hilde waits outside.' WHERE source_text = 'Narration.'", [])?)).unwrap();
+        assert!(asked(&[]).is_empty(), "два имени без общей реплики не пара");
+        open.project.write(|tx| Ok(tx.execute("UPDATE segments SET source_text = 'Officer Hilde Tominskova reporting.' WHERE source_text = 'Who?'", [])?)).unwrap();
+        let pair = Pair::people(hilde, tominskova).unwrap();
+        assert_eq!(asked(&[]).iter().filter_map(same_entry::Question::pair).collect::<Vec<_>>(), [pair]);
+        assert_eq!(open.project.write(|tx| merge_pair(tx, pair)).unwrap().as_deref(), Some("Tominskova → Hilde Tominskova (объединено)"));
+        let joined = list().into_iter().find(|character| character.id() == Some(hilde)).unwrap();
+        assert_eq!((joined.last_name(), joined.translated_first_name(), joined.translated_last_name()), (Some("Tominskova"), Some("Хильда"), Some("Томинскова")));
+        assert!(joined.forms().is_empty() && list().len() == 3);
+    }
+
+    #[test]
+    fn scene_analysis_asks_about_terms_too() {
+        let (url, seen) = fake_model(|body| {
+            let system = system_text(body);
+            if system.contains("proper names") {
+                completion("[]")
+            } else if system.contains("same person") {
+                completion(r#"{"same": true}"#)
+            } else {
+                completion("Описание.")
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let service = DescribeService { state: &state };
+        let open = state.open_project(id).unwrap();
+        let start = ContainerKey::new("label:start").unwrap();
+        open.project
+            .write(|tx| {
+                tx.execute("UPDATE segments SET source_text = 'The PPF is here.' WHERE source_text = 'Static.'", [])?;
+                tx.execute("UPDATE segments SET source_text = 'The People''s Police Force arrived.' WHERE source_text = 'Narration.'", [])?;
+                let terms = TermRepo { conn: tx };
+                terms.save(&Term::new("People's Police Force", TermCategory::Organization).unwrap())?;
+                terms.save(&Term::new("PPF", TermCategory::Organization).unwrap())?;
+                Ok(())
+            })
+            .unwrap();
+
+        let (channel, notes) = recorded();
+        let analyzed = tauri::async_runtime::block_on(service.analyze(id, vec![start], None, channel)).unwrap();
+        assert_eq!(analyzed.error, None);
+        assert_eq!(analyzed.added, ["PPF → People's Police Force (объединено)"]);
+        let asked: Vec<_> = seen.lock().unwrap().iter().filter(|body| system_text(body).contains("same person")).cloned().collect();
+        assert_eq!(asked.len(), 1);
+        let user = user_text(&asked[0]);
+        assert!(user.starts_with("A (term, organization): People's Police Force\nB (term, organization): PPF\n"), "{user}");
+        assert!(user.contains("The PPF is here.") && user.ends_with("Are A and B the same thing?"), "{user}");
+        assert!(notes.lock().unwrap().iter().any(|note| note.contains("одно ли это People's Police Force и PPF")), "{:?}", notes.lock().unwrap());
+        let terms = open.project.read(|tx| TermRepo { conn: tx }.list()).unwrap();
+        let [term] = terms.as_slice() else { panic!("один термин: {terms:?}") };
+        assert_eq!((term.name(), term.forms().iter().map(|form| form.text()).collect::<Vec<_>>()), ("People's Police Force", vec!["PPF"]));
     }
 
     #[test]
     fn speakers_without_a_character_are_linked_to_found_characters() {
-        use super::super::analyze::{Finding, FoundKind, NameParts, known_for_prompt};
         use crate::common::Gender;
         use crate::glossary::SpeakerLink;
         let dir = tempfile::tempdir().unwrap();
         let (state, id) = project(dir.path(), "http://127.0.0.1:9/v1");
         let open = state.open_project(id).unwrap();
-        let found = |name: &str, kind| Finding { name: name.to_string(), kind, gender: None, same_as: None, parts: None };
         let links = || open.project.read(|tx| SpeakerRepo { conn: tx }.links()).unwrap();
 
         // Неразобранный говорящий моделью не скрыт: она назовёт его персонажем.
@@ -2499,12 +2079,8 @@ mod tests {
         assert!(!known.contains(&"Eileen".to_string()) && !known.contains(&"Radio Chatter".to_string()));
 
         // Персонаж с подписью говорящего привязывает говорящего, подпись-роль термином не становится.
-        let eileen = Finding {
-            gender: Some(Gender::Female),
-            parts: NameParts::check("Eileen Grant", Some("Eileen"), Some("Grant")),
-            ..found("Eileen Grant", FoundKind::Character)
-        };
-        let added = open.project.write(|tx| save_found(tx, &[eileen, found("Radio Chatter", FoundKind::Term(TermCategory::General))])).unwrap();
+        let eileen = Finding { gender: Some(Gender::Female), ..person("Eileen Grant", Some("Eileen"), Some("Grant"), None) };
+        let added = open.project.write(|tx| save_found(tx, &[eileen, found("Radio Chatter", FoundKind::Term(TermCategory::General), None)])).unwrap();
         assert_eq!(added, ["Eileen Grant", "Eileen (говорящий) → Eileen Grant"]);
         let characters = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap();
         let [character] = characters.as_slice() else { panic!("один персонаж: {characters:?}") };
@@ -2513,7 +2089,7 @@ mod tests {
 
         // Привязанный говорящий снова известен, повтор ничего не меняет.
         assert!(open.project.read(|tx| known_for_prompt(tx)).unwrap().contains(&"Eileen".to_string()));
-        assert!(open.project.write(|tx| save_found(tx, &[found("Eileen", FoundKind::Character)])).unwrap().is_empty());
+        assert!(open.project.write(|tx| save_found(tx, &[found("Eileen", FoundKind::Character, None)])).unwrap().is_empty());
         assert_eq!(links().len(), 1);
 
         // Герой с подписью-токеном модели не виден: говорящий с репликами сам становится персонажем.

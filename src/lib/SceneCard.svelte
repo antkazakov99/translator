@@ -120,6 +120,12 @@
 
   const total = $derived(notes?.length ?? 0);
   const parts = $derived(Math.min(picked ?? partsFor(depth, total), total));
+
+  function describeTitle() {
+    if (busy) return "Описать моделью. Модель уже работает";
+    const count = total > 1 ? ` Частей сцены: ${total}, запуск прочитает: ${Math.max(parts, 1)}.` : "";
+    return `Описать моделью.${count} Модель найдёт новых персонажей и термины и добавит их в глоссарий, опишет записи сцены без описания, потом заменит описание сцены. Название она пишет только в пустое поле`;
+  }
 </script>
 
 <div class="scene-card" class:saving>
@@ -129,6 +135,14 @@
       <span>Игра изменила текст сцены после того, как модель его прочитала. Опишите сцену заново или поправьте описание</span>
     </div>
   {/if}
+
+  <!-- Действия панели стоят в шапке кнопками-иконками, как у записи глоссария. -->
+  <div class="head">
+    <strong>Описание сцены</strong>
+    <button class="icon-button" disabled={busy || notes === null} aria-label="Описать моделью" title={describeTitle()} onclick={() => onDescribe(sceneKey, Math.max(parts, 1))}>
+      {#if describing}<LoaderCircle size={14} class="spin" />{:else}<Sparkles size={14} />{/if}
+    </button>
+  </div>
 
   <div class="fields">
     <label class="field">Название<input class="input" bind:value={draftTitle} onchange={save} placeholder="Модель предложит при описании" /></label>
@@ -143,32 +157,19 @@
     >
   </div>
 
-  <div class="describe">
-    {#if total > 1}
-      <RequestSlider
-        id="scene-parts-{sceneKey}"
-        label="Читать частей"
-        status="{parts} из {total}{picked === null ? ' · по глубине чтения' : ''}"
-        max={total}
-        value={parts}
-        disabled={busy}
-        onchange={(value) => (picked = value)}
-      >
-        {#snippet ends()}<span>1</span><span>все</span>{/snippet}
-      </RequestSlider>
-    {/if}
-    <button
-      class="btn small primary"
-      disabled={busy || notes === null}
-      title={busy
-        ? "Модель уже работает"
-        : "Модель найдёт в выбранных частях новых персонажей и термины и добавит их в глоссарий, опишет записи сцены без описания, потом заменит описание сцены. Название она пишет только в пустое поле"}
-      onclick={() => onDescribe(sceneKey, Math.max(parts, 1))}
+  {#if total > 1}
+    <RequestSlider
+      id="scene-parts-{sceneKey}"
+      label="Модель прочитает частей"
+      status="{parts} из {total}{picked === null ? ' · по глубине чтения' : ''}"
+      max={total}
+      value={parts}
+      disabled={busy}
+      onchange={(value) => (picked = value)}
     >
-      {#if describing}<LoaderCircle size={13} class="spin" />{:else}<Sparkles size={13} />{/if}
-      <span>Описать моделью</span>
-    </button>
-  </div>
+      {#snippet ends()}<span>1</span><span>все</span>{/snippet}
+    </RequestSlider>
+  {/if}
 
   <div class="entries" aria-label="Персонажи и термины сцены">
     {#if entries === null}
@@ -205,15 +206,19 @@
     opacity: 0.8;
   }
 
-  .describe {
+  .head {
     display: flex;
-    flex-direction: column;
-    align-items: stretch;
     gap: 8px;
+    align-items: center;
+    min-height: 28px;
   }
 
-  .describe > .btn {
-    align-self: flex-start;
+  .head strong {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-strong);
+    font-size: 13px;
+    font-weight: 600;
   }
 
   .fields {

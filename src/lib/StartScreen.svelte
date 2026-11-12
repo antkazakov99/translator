@@ -5,10 +5,8 @@
     Archive,
     Bot,
     ArchiveRestore,
-    Check,
     ChevronDown,
     ChevronRight,
-    FolderInput,
     FolderOpen,
     FolderPlus,
     LoaderCircle,
@@ -34,12 +32,6 @@
   let renaming = $state<{ id: string; title: string } | null>(null);
   let deleting = $state<Project | null>(null);
   let busy = $state(false);
-  /** Проект, которому сейчас привязывается папка, и сама папка. */
-  let rebinding = $state<{ project: Project; root: string } | null>(null);
-  /** Папка похожа на другую игру: ждёт подтверждения. */
-  let otherGame = $state<{ project: Project; root: string; shared: number; total: number } | null>(null);
-  /** Итог смены папки. */
-  let notice = $state("");
 
   const query = $derived(search.trim().toLowerCase());
   const matches = (project: Project) =>
@@ -121,35 +113,6 @@
     }
   }
 
-  /** Привязывает проекту другую папку игры и считывает её с переносом перевода. */
-  async function chooseRoot(project: Project) {
-    const picked = await openDialog({ directory: true, title: `Корневая папка игры «${project.title}»` });
-    if (typeof picked === "string") await rebind(project, picked, false);
-  }
-
-  async function rebind(project: Project, root: string, confirmed: boolean) {
-    otherGame = null;
-    notice = "";
-    error = "";
-    rebinding = { project, root };
-    try {
-      const result = await commands.rebindProject(project.id, root, confirmed);
-      if (result.kind === "looksLikeOtherGame") {
-        otherGame = { project, root, shared: result.shared, total: result.total };
-      } else {
-        const report = result.report;
-        notice = `«${project.title}» привязан к папке ${result.project.gameRoot ?? root}: реплик ${report.lines}, новых ${report.newLines}, в «Пропавших» ${report.missing}`;
-      }
-    } catch (e) {
-      error = String(e);
-    } finally {
-      rebinding = null;
-      // Смена папки открывает проект: на стартовом экране он не нужен.
-      await commands.closeProject(project.id).catch(() => {});
-      await load();
-    }
-  }
-
   async function saveTitle() {
     if (!renaming) return;
     const { id, title } = renaming;
@@ -196,15 +159,6 @@
         <span class="when">{when(project)}</span>
       </button>
       <div class="actions">
-        <button
-          class="icon-button"
-          aria-label="Указать папку игры"
-          title={project.gameRoot ? "Сменить папку игры: игра считается заново, перевод перейдёт на её реплики" : "Указать папку игры"}
-          disabled={busy || creatingRoot !== null || rebinding !== null}
-          onclick={() => chooseRoot(project)}
-        >
-          <FolderInput size={14} />
-        </button>
         <button class="icon-button" aria-label="Переименовать" title="Переименовать" onclick={() => (renaming = { id: project.id, title: project.title })}>
           <Pencil size={14} />
         </button>
@@ -255,34 +209,6 @@
     <div class="banner progress" role="status">
       <LoaderCircle size={15} class="spin" />
       <span>Считываю игру: <strong>{creatingRoot}</strong>. Большие игры читаются до минуты.</span>
-    </div>
-  {/if}
-
-  {#if rebinding}
-    <div class="banner progress" role="status">
-      <LoaderCircle size={15} class="spin" />
-      <span>Считываю игру для «{rebinding.project.title}»: <strong>{rebinding.root}</strong></span>
-    </div>
-  {/if}
-
-  {#if otherGame}
-    <div class="banner choice">
-      <div class="choice-text">
-        <strong>Похоже на другую игру</strong>
-        <span>Из {otherGame.total} реплик проекта «{otherGame.project.title}» в папке нашлось {otherGame.shared}. Перевод остальных уйдёт в «Пропавшие»</span>
-      </div>
-      <div class="choice-actions">
-        <button class="btn small primary" onclick={() => otherGame && rebind(otherGame.project, otherGame.root, true)}>Всё равно привязать</button>
-        <button class="btn small" onclick={() => (otherGame = null)}>Отмена</button>
-      </div>
-    </div>
-  {/if}
-
-  {#if notice}
-    <div class="banner" role="status">
-      <Check size={15} />
-      <span>{notice}</span>
-      <button class="icon-button" aria-label="Скрыть итог" onclick={() => (notice = "")}><X size={14} /></button>
     </div>
   {/if}
 

@@ -8,7 +8,8 @@ use super::{Character, CharacterId, GlossaryData, Term, TermId};
 use crate::engines::{ContainerKey, SpeakerKey};
 use crate::translation::PlacedLine;
 use crate::translation::hints::GlossaryContext;
-use crate::translation::text::mentions;
+use crate::translation::text::token_names;
+use super::mentions::{Checks, mentioned};
 
 /// Реплика, где встречается персонаж или термин.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,39 +20,52 @@ pub struct EntryLine {
 }
 
 /// Как персонаж встречается в реплике: говорит сам или его упоминают. `None`: не встречается.
-/// Упоминание это имя целым словом с учётом регистра, чтобы «Rose» не находила «rose».
-fn character_use(speaker: Option<&SpeakerKey>, text: &str, speakers: &HashSet<SpeakerKey>, names: &[String]) -> Option<bool> {
+/// Упоминание решает `mentions::mentioned`: «Rose» не находит «rose», пока модель не сказала иначе.
+fn character_use(speaker: Option<&SpeakerKey>, text: &str, hash: &str, speakers: &HashSet<SpeakerKey>, names: &[String], checks: Option<&Checks>) -> Option<bool> {
     if speaker.is_some_and(|key| speakers.contains(key)) {
         Some(true)
-    } else if names.iter().any(|name| mentions(text, name)) {
+    } else if mentioned(text, hash, names, checks) {
         Some(false)
     } else {
         None
     }
 }
 
-/// Есть ли в реплике название или форма термина целым словом без учёта регистра.
-fn term_used(text: &str, names: &[String]) -> bool {
-    let lower = text.to_lowercase();
-    names.iter().any(|name| mentions(&lower, name))
-}
-
 /// Реплики персонажа по сюжету: где говорит связанный с ним говорящий или упомянуто его имя.
-pub fn character_lines(lines: Vec<PlacedLine>, speakers: &HashSet<SpeakerKey>, names: &[String]) -> Vec<EntryLine> {
+pub fn character_lines(lines: Vec<PlacedLine>, speakers: &HashSet<SpeakerKey>, names: &[String], checks: Option<&Checks>) -> Vec<EntryLine> {
     lines
         .into_iter()
         .filter_map(|placed| {
-            let spoken = character_use(placed.line.speaker_key.as_ref(), &placed.line.source_text, speakers, names)?;
+            let line = &placed.line;
+            let spoken = character_use(line.speaker_key.as_ref(), &line.source_text, &line.source_hash, speakers, names, checks)?;
             Some(EntryLine { placed, spoken })
         })
         .collect()
 }
 
-/// Реплики термина по сюжету: где есть его название или форма.
-pub fn term_lines(lines: Vec<PlacedLine>, names: &[String]) -> Vec<EntryLine> {
+/// Реплики говорящего по сюжету: все, где говорит он сам.
+pub fn speaker_lines(lines: Vec<PlacedLine>, speaker: &SpeakerKey) -> Vec<EntryLine> {
     lines
         .into_iter()
-        .filter(|placed| term_used(&placed.line.source_text, names))
+        .filter(|placed| placed.line.speaker_key.as_ref() == Some(speaker))
+        .map(|placed| EntryLine { placed, spoken: true })
+        .collect()
+}
+
+/// Реплики токена по сюжету: где он стоит в тексте, `[mom]` или `[mom!c]`.
+pub fn token_lines(lines: Vec<PlacedLine>, name: &str) -> Vec<EntryLine> {
+    lines
+        .into_iter()
+        .filter(|placed| token_names(&placed.line.source_text).any(|found| found == name))
+        .map(|placed| EntryLine { placed, spoken: false })
+        .collect()
+}
+
+/// Реплики термина по сюжету: где есть его название или форма.
+pub fn term_lines(lines: Vec<PlacedLine>, names: &[String], checks: Option<&Checks>) -> Vec<EntryLine> {
+    lines
+        .into_iter()
+        .filter(|placed| mentioned(&placed.line.source_text, &placed.line.source_hash, names, checks))
         .map(|placed| EntryLine { placed, spoken: false })
         .collect()
 }
@@ -75,23 +89,29 @@ pub fn character_names(character: &Character) -> Vec<String> {
     names
 }
 
-/// Название и формы термина в нижнем регистре: термин ищется без учёта регистра.
+/// Название и формы термина, как они написаны: регистр решает `mentions::mentioned`.
 pub fn term_names(term: &Term) -> Vec<String> {
     std::iter::once(term.name())
         .chain(term.forms().iter().map(|form| form.text()))
-        .map(|name| name.trim().to_lowercase())
+        .map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .collect()
 }
 
 /// Сцены персонажа: где говорит связанный с ним говорящий или упомянуто его имя.
-pub fn character_scenes(lines: &[StoryLine], speakers: &HashSet<SpeakerKey>, names: &[String], excluded: &[ContainerKey]) -> Vec<ContainerKey> {
-    scenes_where(lines, excluded, |line| character_use(line.speaker_key.as_ref(), &line.text, speakers, names).is_some())
+pub fn character_scenes(
+    lines: &[StoryLine],
+    speakers: &HashSet<SpeakerKey>,
+    names: &[String],
+    checks: Option<&Checks>,
+    excluded: &[ContainerKey],
+) -> Vec<ContainerKey> {
+    scenes_where(lines, excluded, |line| character_use(line.speaker_key.as_ref(), &line.text, &line.source_hash, speakers, names, checks).is_some())
 }
 
 /// Сцены термина: где есть название или форма.
-pub fn term_scenes(lines: &[StoryLine], names: &[String], excluded: &[ContainerKey]) -> Vec<ContainerKey> {
-    scenes_where(lines, excluded, |line| term_used(&line.text, names))
+pub fn term_scenes(lines: &[StoryLine], names: &[String], checks: Option<&Checks>, excluded: &[ContainerKey]) -> Vec<ContainerKey> {
+    scenes_where(lines, excluded, |line| mentioned(&line.text, &line.source_hash, names, checks))
 }
 
 fn scenes_where(lines: &[StoryLine], excluded: &[ContainerKey], wanted: impl Fn(&StoryLine) -> bool) -> Vec<ContainerKey> {
@@ -119,15 +139,21 @@ pub fn scene_entries(glossary: &GlossaryData, lines: &[StoryLine]) -> (Vec<Chara
             let id = character.id()?;
             let speakers: HashSet<SpeakerKey> = glossary.links.iter().filter(|link| link.character == id).map(|link| link.speaker.clone()).collect();
             let names = character_names(character);
-            lines.iter().any(|line| character_use(line.speaker_key.as_ref(), &line.text, &speakers, &names).is_some()).then_some(id)
+            let checks = glossary.character_checks.get(&id);
+            lines
+                .iter()
+                .any(|line| character_use(line.speaker_key.as_ref(), &line.text, &line.source_hash, &speakers, &names, checks).is_some())
+                .then_some(id)
         })
         .collect();
     let terms = glossary
         .terms
         .iter()
         .filter_map(|term| {
+            let id = term.id()?;
             let names = term_names(term);
-            lines.iter().any(|line| term_used(&line.text, &names)).then_some(term.id()?)
+            let checks = glossary.term_checks.get(&id);
+            lines.iter().any(|line| mentioned(&line.text, &line.source_hash, &names, checks)).then_some(id)
         })
         .collect();
     (characters, terms)
@@ -163,6 +189,7 @@ mod tests {
             speaker_key: speaker.map(|key| SpeakerKey::new(key).unwrap()),
             label: None,
             text: text.to_string(),
+            source_hash: format!("hash:{text}"),
         }
     }
 
@@ -177,16 +204,19 @@ mod tests {
         ];
         let speakers = HashSet::from([SpeakerKey::new("code:r").unwrap()]);
         let names = vec!["Rose".to_string()];
-        let found = character_scenes(&lines, &speakers, &names, &[ContainerKey::new("label:e").unwrap()]);
+        let found = character_scenes(&lines, &speakers, &names, None, &[ContainerKey::new("label:e").unwrap()]);
         let keys: Vec<&str> = found.iter().map(ContainerKey::as_str).collect();
         assert_eq!(keys, ["label:b", "label:c"], "строчная «rose» не упоминание, исключённая сцена пропущена");
     }
 
     #[test]
-    fn term_is_found_in_any_case() {
-        let lines = [line("label:a", None, "The OLD KEY opens it."), line("label:b", None, "Keystone.")];
-        assert_eq!(term_scenes(&lines, &["old key".to_string()], &[]).len(), 1);
-        assert!(term_scenes(&lines, &["key".to_string()], &[]).iter().all(|key| key.as_str() == "label:a"));
+    fn term_is_found_by_spelling_and_answers() {
+        let lines = [line("label:a", None, "The OLD KEY opens it."), line("label:b", None, "Keystone."), line("label:c", None, "Never mind.")];
+        assert_eq!(term_scenes(&lines, &["old key".to_string()], None, &[]).len(), 1, "целиком заглавными засчитывается");
+        assert!(term_scenes(&lines, &["key".to_string()], None, &[]).iter().all(|key| key.as_str() == "label:a"));
+        assert!(term_scenes(&lines, &["MInD".to_string()], None, &[]).is_empty(), "обычное слово не термин");
+        let checks: Checks = [("hash:Never mind.".to_string(), true)].into();
+        assert_eq!(term_scenes(&lines, &["MInD".to_string()], Some(&checks), &[]).len(), 1, "ответ модели важнее написания");
     }
 
     #[test]
@@ -214,17 +244,32 @@ mod tests {
             placed(4, Some("code:x"), "Hi, Rosie."),
         ];
         let speakers = HashSet::from([SpeakerKey::new("code:r").unwrap()]);
-        let found = character_lines(lines, &speakers, &["Rose".to_string(), "Rosie".to_string()]);
+        let found = character_lines(lines, &speakers, &["Rose".to_string(), "Rosie".to_string()], None);
         let seen: Vec<(i64, bool)> = found.iter().map(|line| (line.placed.line.id.get(), line.spoken)).collect();
         assert_eq!(seen, [(1, true), (2, false), (4, false)], "своя реплика с именем это речь, строчная «rose» не упоминание");
     }
 
     #[test]
-    fn term_lines_ignore_case_and_word_parts() {
-        let lines = vec![placed(1, None, "The OLD KEY opens it."), placed(2, None, "Keystone."), placed(3, None, "A key.")];
-        let found = term_lines(lines, &["key".to_string()]);
-        let ids: Vec<i64> = found.iter().map(|line| line.placed.line.id.get()).collect();
+    fn speaker_lines_are_only_his_own() {
+        let lines = vec![placed(1, Some("code:r"), "Rose here."), placed(2, None, "Where is Rose?"), placed(3, Some("code:x"), "Hi.")];
+        let found = speaker_lines(lines, &SpeakerKey::new("code:r").unwrap());
+        let seen: Vec<(i64, bool)> = found.iter().map(|line| (line.placed.line.id.get(), line.spoken)).collect();
+        assert_eq!(seen, [(1, true)]);
+    }
+
+    #[test]
+    fn token_lines_find_the_token_with_modifiers() {
+        let lines = vec![placed(1, None, "Hi, [mom]."), placed(2, None, "[Mom!c] said."), placed(3, None, "[mom!c] said."), placed(4, None, "mom")];
+        let ids: Vec<i64> = token_lines(lines, "mom").iter().map(|line| line.placed.line.id.get()).collect();
         assert_eq!(ids, [1, 3]);
+    }
+
+    #[test]
+    fn term_lines_follow_spelling_and_skip_word_parts() {
+        let lines = vec![placed(1, None, "The OLD KEY opens it."), placed(2, None, "Keystone."), placed(3, None, "A key."), placed(4, None, "Key Lime.")];
+        let found = term_lines(lines, &["key".to_string()], None);
+        let ids: Vec<i64> = found.iter().map(|line| line.placed.line.id.get()).collect();
+        assert_eq!(ids, [1, 3, 4]);
         assert!(found.iter().all(|line| !line.spoken));
     }
 }

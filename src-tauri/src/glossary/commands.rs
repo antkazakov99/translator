@@ -7,9 +7,10 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
 use super::describe::{EntryPart, PartNote};
+use super::{NameTaking, Taking};
 use super::entries::EntryLine;
 use super::{
-    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesFound, NamesService, SpeakerEntry,
+    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesFound, SuggestService, SpeakerEntry,
     SpeakerSuggestion, Term,
     TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
 };
@@ -25,11 +26,10 @@ use crate::translation::commands::{LineDto, RowRef};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "lowercase")]
 pub enum SpeakerState {
-    /// В «Новых»: ещё не разобран.
-    New,
     /// Связан с персонажами.
     Character,
-    /// Запись говорящего без персонажей.
+    /// Говорящий без персонажей и не в корзине: роль или тот, кого ещё не связали. Свой перевод подписи
+    /// у него есть при `has_entry`.
     Speaker,
     Discarded,
 }
@@ -175,6 +175,8 @@ pub struct DiscardedTermDto {
     pub text: String,
     /// Передано персонажу, а не мусор.
     pub given_to_character: bool,
+    /// Перевод удалённого термина: с ним он вернётся. `None`: в корзине только название или перевода не было.
+    pub translation: Option<String>,
 }
 
 /// Токен из текста игры или глоссария.
@@ -210,14 +212,13 @@ impl From<GlossaryOverview> for GlossaryDto {
                 let mut links: Vec<_> = data.links.iter().filter(|link| &link.speaker == key).collect();
                 links.sort_by_key(|link| !link.is_primary);
                 let entry = data.entries.iter().find(|entry| entry.key() == key);
+                // Корзина важнее записи: говорящий со своим переводом подписи уходит в корзину вместе с ним.
                 let state = if !links.is_empty() {
                     SpeakerState::Character
-                } else if entry.is_some() {
-                    SpeakerState::Speaker
                 } else if discarded.contains(&key) {
                     SpeakerState::Discarded
                 } else {
-                    SpeakerState::New
+                    SpeakerState::Speaker
                 };
                 SpeakerDto {
                     key: key.as_str().to_string(),
@@ -254,6 +255,7 @@ impl From<GlossaryOverview> for GlossaryDto {
                     key: term.key.as_str().to_string(),
                     text: term.text,
                     given_to_character: term.reason == super::DiscardReason::GivenToCharacter,
+                    translation: term.kept.and_then(|kept| kept.translation),
                 })
                 .collect(),
             tokens: tokens.into_values().collect(),
@@ -393,10 +395,21 @@ pub async fn save_term(app: AppHandle, project: String, term: TermDto) -> Result
     blocking(app, move |state| GlossaryService { state }.save_term(self::project(&project)?, &term.into_term()?)).await
 }
 
+/// Термин в корзину вместе с полями: модель не предложит его снова, из корзины он возвращается целиком.
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_term(app: AppHandle, project: String, term: RowRef) -> Result<(), String> {
-    blocking(app, move |state| GlossaryService { state }.delete_term(self::project(&project)?, TermId::from_row(term.0))).await
+pub async fn trash_term(app: AppHandle, project: String, term: RowRef) -> Result<(), String> {
+    blocking(app, move |state| GlossaryService { state }.trash_term(self::project(&project)?, TermId::from_row(term.0))).await
+}
+
+/// Название из корзины снова термин. Возвращает его id.
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_term(app: AppHandle, project: String, key: String) -> Result<RowRef, String> {
+    blocking(app, move |state| {
+        Ok(RowRef(GlossaryService { state }.restore_term(self::project(&project)?, &NameKey::from_stored(key))?.get()))
+    })
+    .await
 }
 
 /// Термин становится формой персонажа, название уходит в корзину.
@@ -413,17 +426,11 @@ pub async fn give_term_to_character(app: AppHandle, project: String, term: RowRe
     .await
 }
 
-/// Название в корзину: модель не предложит его снова.
+/// Окончательное удаление из корзины: название забывается, модель может найти его снова.
 #[tauri::command]
 #[specta::specta]
-pub async fn discard_term_name(app: AppHandle, project: String, name: String) -> Result<(), String> {
-    blocking(app, move |state| GlossaryService { state }.discard_term_name(self::project(&project)?, &name)).await
-}
-
-#[tauri::command]
-#[specta::specta]
-pub async fn restore_term_name(app: AppHandle, project: String, key: String) -> Result<(), String> {
-    blocking(app, move |state| GlossaryService { state }.restore_term_name(self::project(&project)?, &NameKey::from_stored(key))).await
+pub async fn forget_term_name(app: AppHandle, project: String, key: String) -> Result<(), String> {
+    blocking(app, move |state| GlossaryService { state }.forget_term_name(self::project(&project)?, &NameKey::from_stored(key))).await
 }
 
 /// Глубина чтения для описаний моделью: минимум и максимум частей и процент.
@@ -473,19 +480,17 @@ pub async fn save_token(app: AppHandle, project: String, name: String, value: St
     .await
 }
 
-/// Предложение перевода термина.
-#[derive(Debug, Clone, Serialize, specta::Type)]
+/// Предложение перевода термина: приходит из запуска и возвращается из отбора в `accept_terms`.
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TermSuggestionDto {
     pub id: RowRef,
     pub translation: String,
     /// `None`: категория остаётся прежней.
     pub category: Option<TermCategory>,
-    /// Только у термина без своего описания.
-    pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, specta::Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeakerSuggestionDto {
     pub key: String,
@@ -493,7 +498,7 @@ pub struct SpeakerSuggestionDto {
     pub gender: Option<Gender>,
 }
 
-#[derive(Debug, Clone, Serialize, specta::Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenSuggestionDto {
     pub name: String,
@@ -532,6 +537,8 @@ pub struct NameSuggestionsDto {
     pub error: Option<String>,
     /// Языки имён без правил: перевод шёл без них.
     pub missing_rules: Vec<String>,
+    /// Формы, которые ждут записи имени владельца: их спросит следующий запуск.
+    pub waiting_forms: u32,
 }
 
 /// Язык имён: сколько имён проекта на нём, общие правила и свои правила проекта.
@@ -579,7 +586,8 @@ fn profile(id: Option<String>) -> Result<Option<ProfileId>, AppError> {
     Ok(id.as_deref().map(ProfileId::parse).transpose()?)
 }
 
-/// Перевод имён, фамилий и форм персонажей без перевода. Отмеченное окно записывает через `save_character`.
+/// Перевод имён и фамилий персонажей без перевода, а у персонажей с записанным именем и форм. Всё идёт в отбор,
+/// отмеченное окно записывает через `write_names`.
 #[tauri::command]
 #[specta::specta]
 pub async fn suggest_names(
@@ -590,7 +598,9 @@ pub async fn suggest_names(
     progress: Channel<RunProgress>,
 ) -> Result<NameSuggestionsDto, String> {
     let characters = characters.iter().map(|id| CharacterId::from_row(id.0)).collect();
-    let found = NamesService { state: &state }.translate_names(self::project(&project)?, characters, self::profile(profile)?, progress).await?;
+    let found = SuggestService { state: &state }
+        .translate_names(self::project(&project)?, characters, self::profile(profile)?, progress, NameTaking::Offer)
+        .await?;
     Ok(found.into())
 }
 
@@ -617,6 +627,7 @@ impl From<NamesFound> for NameSuggestionsDto {
                 .collect(),
             error: found.suggestions.error,
             missing_rules: found.missing_rules.iter().map(ToString::to_string).collect(),
+            waiting_forms: found.waiting_forms as u32,
         }
     }
 }
@@ -664,13 +675,53 @@ pub async fn draft_name_rule(
     profile: Option<String>,
     progress: Channel<RunProgress>,
 ) -> Result<RulesDraftDto, String> {
-    let found = NamesService { state: &state }
+    let found = SuggestService { state: &state }
         .draft_rules(self::project(&project)?, self::language(&language)?, existing, self::profile(profile)?, progress)
         .await?;
     Ok(RulesDraftDto { text: found.items.into_iter().next(), error: found.error })
 }
 
-/// Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `save_term`.
+/// Отмеченные в отборе переводы терминов: тем же путём, что цепочка автоперевода. Возвращает число записанных.
+#[tauri::command]
+#[specta::specta]
+pub async fn accept_terms(app: AppHandle, project: String, items: Vec<TermSuggestionDto>) -> Result<u32, String> {
+    blocking(app, move |state| {
+        let items: Vec<TermSuggestion> = items
+            .into_iter()
+            .map(|item| TermSuggestion { id: TermId::from_row(item.id.0), translation: item.translation, category: item.category })
+            .collect();
+        Ok(GlossaryService { state }.accept_terms(self::project(&project)?, &items)? as u32)
+    })
+    .await
+}
+
+/// Отмеченные в отборе переводы подписей и род говорящих. Возвращает число записанных.
+#[tauri::command]
+#[specta::specta]
+pub async fn accept_speakers(app: AppHandle, project: String, items: Vec<SpeakerSuggestionDto>) -> Result<u32, String> {
+    blocking(app, move |state| {
+        let items = items
+            .into_iter()
+            .map(|item| Ok(SpeakerSuggestion { key: speaker(&item.key)?, translation: item.translation, gender: item.gender }))
+            .collect::<Result<Vec<_>, AppError>>()?;
+        Ok(GlossaryService { state }.accept_speakers(self::project(&project)?, &items)? as u32)
+    })
+    .await
+}
+
+/// Отмеченные в отборе значения и пояснения токенов. Возвращает число записанных.
+#[tauri::command]
+#[specta::specta]
+pub async fn accept_tokens(app: AppHandle, project: String, items: Vec<TokenSuggestionDto>) -> Result<u32, String> {
+    blocking(app, move |state| {
+        let items: Vec<TokenSuggestion> =
+            items.into_iter().map(|item| TokenSuggestion { name: item.name, value: item.value, note: item.note }).collect();
+        Ok(GlossaryService { state }.accept_tokens(self::project(&project)?, &items)? as u32)
+    })
+    .await
+}
+
+/// Перевод терминов моделью. В базу ничего не пишется: отмеченное в отборе окно записывает через `accept_terms`.
 #[tauri::command]
 #[specta::specta]
 pub async fn suggest_terms(
@@ -681,23 +732,19 @@ pub async fn suggest_terms(
     progress: Channel<RunProgress>,
 ) -> Result<TermSuggestionsDto, String> {
     let terms = terms.iter().map(|id| TermId::from_row(id.0)).collect();
-    let found = NamesService { state: &state }.translate_terms(self::project(&project)?, terms, self::profile(profile)?, progress).await?;
+    let found =
+        SuggestService { state: &state }.translate_terms(self::project(&project)?, terms, self::profile(profile)?, progress, Taking::Offer).await?;
     Ok(TermSuggestionsDto {
         items: found
             .items
             .into_iter()
-            .map(|item: TermSuggestion| TermSuggestionDto {
-                id: RowRef(item.id.get()),
-                translation: item.translation,
-                category: item.category,
-                description: item.description,
-            })
+            .map(|item: TermSuggestion| TermSuggestionDto { id: RowRef(item.id.get()), translation: item.translation, category: item.category })
             .collect(),
         error: found.error,
     })
 }
 
-/// Перевод подписей и род говорящих моделью. Отмеченное окно записывает через `save_speaker_entry`.
+/// Перевод подписей и род говорящих моделью. Отмеченное окно записывает через `accept_speakers`.
 #[tauri::command]
 #[specta::specta]
 pub async fn suggest_speakers(
@@ -708,7 +755,8 @@ pub async fn suggest_speakers(
     progress: Channel<RunProgress>,
 ) -> Result<SpeakerSuggestionsDto, String> {
     let speakers = speakers.iter().map(|key| speaker(key)).collect::<Result<Vec<_>, _>>()?;
-    let found = NamesService { state: &state }.suggest_speakers(self::project(&project)?, speakers, self::profile(profile)?, progress).await?;
+    let found =
+        SuggestService { state: &state }.suggest_speakers(self::project(&project)?, speakers, self::profile(profile)?, progress, Taking::Offer).await?;
     Ok(SpeakerSuggestionsDto {
         items: found
             .items
@@ -723,7 +771,7 @@ pub async fn suggest_speakers(
     })
 }
 
-/// Значения и пояснения токенов моделью. Отмеченное окно записывает через `save_token`.
+/// Значения и пояснения токенов моделью. Отмеченное окно записывает через `accept_tokens`.
 #[tauri::command]
 #[specta::specta]
 pub async fn suggest_tokens(
@@ -733,7 +781,8 @@ pub async fn suggest_tokens(
     profile: Option<String>,
     progress: Channel<RunProgress>,
 ) -> Result<TokenSuggestionsDto, String> {
-    let found = NamesService { state: &state }.suggest_tokens(self::project(&project)?, tokens, self::profile(profile)?, progress).await?;
+    let found =
+        SuggestService { state: &state }.suggest_tokens(self::project(&project)?, tokens, self::profile(profile)?, progress, Taking::Offer).await?;
     Ok(TokenSuggestionsDto {
         items: found
             .items
@@ -992,22 +1041,47 @@ pub struct EntryLineDto {
     pub spoken: bool,
 }
 
+impl From<EntryLine> for EntryLineDto {
+    fn from(found: EntryLine) -> Self {
+        Self {
+            scene: found.placed.scene.map(|key| key.to_string()),
+            scene_title: found.placed.scene_title,
+            file: RowRef(found.placed.file.get()),
+            line: found.placed.line.into(),
+            spoken: found.spoken,
+        }
+    }
+}
+
 /// Реплики персонажа или термина по сюжету: где персонаж говорит или его упоминают, где есть термин.
 #[tauri::command]
 #[specta::specta]
 pub async fn entry_lines(app: AppHandle, project: String, owner: OwnerDto) -> Result<Vec<EntryLineDto>, String> {
     blocking(app, move |state| {
         let lines = GlossaryService { state }.entry_lines(self::project(&project)?, owner.exclude())?;
-        Ok(lines
-            .into_iter()
-            .map(|found: EntryLine| EntryLineDto {
-                scene: found.placed.scene.map(|key| key.to_string()),
-                scene_title: found.placed.scene_title,
-                file: RowRef(found.placed.file.get()),
-                line: found.placed.line.into(),
-                spoken: found.spoken,
-            })
-            .collect())
+        Ok(lines.into_iter().map(EntryLineDto::from).collect())
+    })
+    .await
+}
+
+/// Реплики говорящего по сюжету.
+#[tauri::command]
+#[specta::specta]
+pub async fn speaker_lines(app: AppHandle, project: String, speaker: String) -> Result<Vec<EntryLineDto>, String> {
+    blocking(app, move |state| {
+        let lines = GlossaryService { state }.speaker_lines(self::project(&project)?, &self::speaker(&speaker)?)?;
+        Ok(lines.into_iter().map(EntryLineDto::from).collect())
+    })
+    .await
+}
+
+/// Реплики токена по сюжету.
+#[tauri::command]
+#[specta::specta]
+pub async fn token_lines(app: AppHandle, project: String, token: String) -> Result<Vec<EntryLineDto>, String> {
+    blocking(app, move |state| {
+        let lines = GlossaryService { state }.token_lines(self::project(&project)?, &token)?;
+        Ok(lines.into_iter().map(EntryLineDto::from).collect())
     })
     .await
 }

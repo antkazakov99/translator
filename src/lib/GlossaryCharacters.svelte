@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Check, Languages, LoaderCircle, Sparkles, Plus, Trash2, TriangleAlert } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Plus, Trash2, TriangleAlert } from "lucide-svelte";
   import DescribeParts from "./DescribeParts.svelte";
   import EntryLines from "./EntryLines.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
@@ -15,7 +15,6 @@
     runsBusy,
     speakerName,
     untranslatedNames,
-    withSpelledNames,
     type Character,
     type Glossary,
     type GlossaryRuns,
@@ -52,34 +51,40 @@
   function runTitle() {
     if (untranslated === 0) return "У всех имён, фамилий и форм есть перевод";
     if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
-    return "Модель определит происхождение имён, напишет имена, фамилии и формы без перевода по правилам их языков и проверит написания";
+    return "Модель определит происхождение имён, напишет имена и фамилии без перевода по правилам их языков и проверит написания. Формы пишутся от записанного имени: у персонажа без перевода имени их спросит следующий запуск";
   }
+
+  /** Формы, которые ждут записи имени владельца: после записи отбора их спросит следующий запуск. */
+  let waitingForms = $state(0);
 
   function startRun() {
     const ids = data.characters.filter((character) => untranslatedNames(character) > 0).map((character) => character.id);
     run.start(async (channel) => {
       const result = await commands.suggestNames(projectId, ids, null, channel);
+      waitingForms = result.waitingForms;
+      const warnings: string[] = [];
       if (result.missingRules.length > 0) {
-        run.warning = `Нет правил для языков: ${languageList(result.missingRules)}. Имена этих языков написаны без них: правила можно добавить в «Правилах имён» и перевести заново`;
+        warnings.push(
+          `Нет правил для языков: ${languageList(result.missingRules)}. Имена этих языков написаны без них: правила можно добавить в «Правилах имён» и перевести заново`,
+        );
       }
+      if (result.waitingForms > 0) {
+        warnings.push(`Форм без перевода: ${result.waitingForms}. Они пишутся от записанного имени: запишите отбор и запустите перевод ещё раз`);
+      }
+      run.warning = warnings.join(". ");
       return result;
     }, onError);
   }
 
-  /** Отмеченное ложится в пустые поля карточки и записывается персонажем целиком. */
+  /** Отмеченное пишет `write_names`, та же запись, что у автоперевода: написания ложатся в пустые поля. */
   async function writeChosen() {
-    const chosen = run.chosen.filter((item) => item.translation.trim());
+    const picks = run.chosen
+      .filter((item) => item.translation.trim())
+      .map((item) => ({ character: item.character, field: item.field, source: item.source, translation: item.translation.trim() }));
     writing = true;
     try {
-      let written = 0;
-      for (const id of new Set(chosen.map((item) => item.character))) {
-        const character = data.characters.find((known) => known.id === id);
-        const next = character && withSpelledNames($state.snapshot(character), chosen.filter((item) => item.character === id));
-        if (!next) continue;
-        await commands.saveCharacter(projectId, next);
-        written += 1;
-      }
-      run.finish(`Записано персонажей: ${written}`);
+      const written = await commands.writeNames(projectId, picks);
+      run.finish(waitingForms > 0 ? `Записано персонажей: ${written}. Теперь можно перевести формы: ${waitingForms}` : `Записано персонажей: ${written}`);
       await reload();
     } catch (e) {
       onError(String(e));
@@ -99,41 +104,10 @@
   let saving = $state(false);
   let fieldError = $state("");
   let confirmDelete = $state(false);
+  /** Открыт вопрос о сбросе заметок модели: остальные действия шапки на это время скрыты. */
+  let resetting = $state(false);
   /** Карточка в правке. Сбрасывается только при выборе другого персонажа. */
   let draft = $state<Character | null>(null);
-
-  /** Отмеченные для описания моделью. По умолчанию ничего: чтение сцен дорого. */
-  let marked = $state<number[]>([]);
-  const entriesRun = $derived(runs.entries);
-
-  function toggleMark(id: number, on: boolean) {
-    marked = on ? [...marked, id] : marked.filter((item) => item !== id);
-  }
-
-  function markShown() {
-    marked = [...new Set([...marked, ...shown.map((item) => item.id)])];
-  }
-
-  function describeTitle() {
-    if (marked.length === 0) return "Отметьте персонажей в списке";
-    if (runsBusy(runs)) return "Модель уже работает или ждёт отбор";
-    return "Модель прочитает части сцен каждого персонажа и напишет описание. Описанные без новых частей пропускаются";
-  }
-
-  async function describeMarked() {
-    const owners = marked.map((id) => ({ kind: "character" as const, id }));
-    const written = await entriesRun.start(
-      (channel) => commands.describeEntries(projectId, owners, null, channel),
-      onError,
-      (count, stopped) => {
-        const text = `Описано: ${count}`;
-        return stopped ? `Остановлено. ${text}` : text;
-      },
-    );
-    const done = new Set(written);
-    marked = marked.filter((id) => !done.has(`character:${id}`));
-    if (written.length > 0) await reload();
-  }
 
   const shown = $derived(
     data.characters.filter((character) =>
@@ -228,7 +202,7 @@
 </div>
 
 <SuggestStatus {run} {onError} />
-{#if !draft}<SuggestStatus run={entriesRun} {onError} />{/if}
+<SuggestStatus run={runs.entries} {onError} />
 
 {#if run.review}
   {#if run.warning}
@@ -252,54 +226,60 @@
 <div class="master with-lines">
   <div class="list-side">
     <input class="input" placeholder="Поиск по имени и формам" bind:value={query} aria-label="Поиск персонажей" />
-    <div class="marks">
-      <button class="btn small" disabled={shown.length === 0} onclick={markShown}>Отметить показанных</button>
-      <button class="btn small" disabled={marked.length === 0} onclick={() => (marked = [])}>Снять</button>
-      <button class="btn small primary" disabled={marked.length === 0 || runsBusy(runs)} title={describeTitle()} onclick={describeMarked}>
-        {#if entriesRun.active}<LoaderCircle size={12} class="spin" />{:else}<Sparkles size={12} />{/if}
-        <span>Описать · {marked.length}</span>
-      </button>
-    </div>
     <div class="items">
       {#each shown as character (character.id)}
-        <div class="marked-item">
-          <input
-            type="checkbox"
-            checked={marked.includes(character.id)}
-            onchange={(event) => toggleMark(character.id, event.currentTarget.checked)}
-            aria-label="Отметить {characterName(character)}"
-          />
-          <button class="item" class:active={character.id === draft?.id} onclick={() => (selected = character.id)}>
-            <strong>{characterName(character)}</strong>
-            <span>{characterTranslation(character) || "Нет перевода"}</span>
-          </button>
-        </div>
+        <button class="item" class:active={character.id === draft?.id} onclick={() => (selected = character.id)}>
+          <strong>{characterName(character)}</strong>
+          <span>{characterTranslation(character) || "Нет перевода"}</span>
+        </button>
       {:else}
         <p class="faint">{data.characters.length ? "Никого не нашлось" : "Персонажей пока нет: возьмите их из «Говорящих» или добавьте ниже"}</p>
       {/each}
     </div>
     <form class="add" onsubmit={(event) => (event.preventDefault(), create())}>
-      <input class="input" placeholder="Имя персонажа" bind:value={newName} aria-label="Имя нового персонажа" />
-      <button class="btn small" type="submit" disabled={creating || !newName.trim()} title="Персонаж, которого только упоминают">
-        {#if creating}<LoaderCircle size={12} class="spin" />{:else}<Plus size={12} />{/if}
-        <span>Добавить</span>
+      <input class="input" placeholder="Новый персонаж" bind:value={newName} aria-label="Имя нового персонажа" />
+      <button
+        class="icon-button"
+        type="submit"
+        disabled={creating || !newName.trim()}
+        aria-label="Добавить персонажа"
+        title="Добавить персонажа, которого только упоминают"
+      >
+        {#if creating}<LoaderCircle size={14} class="spin" />{:else}<Plus size={14} />{/if}
       </button>
     </form>
   </div>
 
   {#if draft}
-    <div class="card editor" class:saving>
-      <div class="card-head">
-        <strong>{characterName(draft)}</strong>
-        {#if confirmDelete}
-          <span class="confirm-text">Удалить?</span>
-          <button class="btn small danger" onclick={remove}>Да</button>
-          <button class="btn small" onclick={() => (confirmDelete = false)}>Нет</button>
-        {:else}
-          <button class="icon-button danger" aria-label="Удалить персонажа" title="Удалить персонажа" onclick={() => (confirmDelete = true)}>
-            <Trash2 size={14} />
-          </button>
-        {/if}
+    <div class="editor" class:saving>
+      <div class="editor-head">
+        <strong title={characterName(draft)}>{characterName(draft)}</strong>
+        <div class="editor-tools">
+          {#if confirmDelete}
+            <span class="confirm-text">Удалить?</span>
+            <button class="btn small danger" onclick={remove}>Да</button>
+            <button class="btn small" onclick={() => (confirmDelete = false)}>Нет</button>
+          {:else}
+            <DescribeParts {projectId} owner={{ kind: "character", id: draft.id }} {runs} bind:confirming={resetting} onDescribed={described} {onError} />
+            {#if !resetting}
+              <button class="icon-button danger" aria-label="Удалить персонажа" title="Удалить персонажа" onclick={() => (confirmDelete = true)}>
+                <Trash2 size={14} />
+              </button>
+            {/if}
+          {/if}
+        </div>
+      </div>
+
+      <!-- Связи стоят сразу под шапкой, как персонажи у говорящего. -->
+      <div class="field">
+        <span>Говорящие</span>
+        <div class="badges">
+          {#each speakers as speaker (speaker.key)}
+            <span class="badge" class:accent={speaker.characters[0] === draft.id} title={speaker.key}>{speakerName(speaker)}</span>
+          {:else}
+            <span class="faint">Только упоминается: говорящих нет</span>
+          {/each}
+        </div>
       </div>
 
       <div class="grid">
@@ -329,23 +309,19 @@
       <GlossaryForms forms={draft.forms} hint="Обращения, прозвища, подписи из игры" onchange={setForms} />
 
       <label class="field">Манера речи<input class="input" bind:value={draft.speech} onchange={save} placeholder="Например: грубит, говорит коротко" /></label>
-      <label class="field">Описание<textarea class="input" rows="4" bind:value={draft.description} onchange={save}></textarea></label>
-      <DescribeParts {projectId} owner={{ kind: "character", id: draft.id }} {runs} onDescribed={described} {onError} />
-
-      <div class="field">
-        <span>Говорящие</span>
-        <div class="badges">
-          {#each speakers as speaker (speaker.key)}
-            <span class="badge" class:accent={speaker.characters[0] === draft.id} title={speaker.key}>{speakerName(speaker)}</span>
-          {:else}
-            <span class="faint">Только упоминается: говорящих нет</span>
-          {/each}
-        </div>
-      </div>
+      <label class="field">Описание<textarea class="input" rows="6" bind:value={draft.description} onchange={save}></textarea></label>
 
       {#if fieldError}<p class="error-text">{fieldError}</p>{/if}
     </div>
-    <EntryLines {projectId} owner={{ kind: "character", id: draft.id }} revision={linesRevision} {onOpenLine} {onError} />
+    <EntryLines
+      subject={`character:${draft.id}`}
+      load={() => commands.entryLines(projectId, { kind: "character", id: draft?.id ?? 0 })}
+      mentions
+      empty="Говорящих нет, а имя и формы в тексте не встречаются"
+      revision={linesRevision}
+      {onOpenLine}
+      {onError}
+    />
   {:else}
     <div class="empty">
       <strong>Персонаж не выбран</strong>
@@ -354,22 +330,3 @@
   {/if}
 </div>
 {/if}
-
-<style>
-  .marks {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-
-  .marked-item {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-  }
-
-  .marked-item .item {
-    flex: 1;
-    min-width: 0;
-  }
-</style>
