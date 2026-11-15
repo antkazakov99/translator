@@ -72,7 +72,20 @@ const ORIGINS_SYSTEM: &str = r#"You analyze the probable linguistic origins of p
 Use the whole cast and each owner's full name as context: names of one game usually share a setting. Analyze given names and surnames separately. Do not assume English from Latin spelling: a name may lack its diacritics. Do not translate.
 If the origin is ambiguous, list several probable languages, most probable first; never present a guess as certain.
 
-Answer with BCP 47 language codes: the ISO 639-1 two-letter code when it exists ("sr", "hr", "de", "en", "ja"), otherwise the ISO 639-3 code.
+Identify the language of each name, not the country, nationality, or region of its owner.
+
+Return BCP 47 language tags: use the ISO 639-1 two-letter language code when available, otherwise the ISO 639-3 code.
+Never use a country code as a substitute for a language code:
+- Japanese: "ja", not "jp".
+- Korean: "ko", not "kr".
+- Chinese: "zh", not "cn".
+- Swedish: "sv", not "se" ("se" identifies Northern Sami).
+- Ukrainian: "uk", not "ua".
+
+A country may provide context, but does not uniquely identify a language. Choose the language from the name and the available context.
+Add a script or region subtag only when it matters for the name's pronunciation or Russian spelling, for example "pt-BR".
+Do not invent language codes. If you cannot determine the language, use "und".
+
 - Roles, titles, kinship words, descriptions and abbreviations ("Old Bartender", "Mom", "MC") use "zxx": they are translated by meaning.
 - A form like "Mrs. Karanovic" takes the language of the name inside it.
 - An origin you cannot tell uses "und".
