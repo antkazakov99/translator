@@ -265,7 +265,7 @@ mod tests {
         service.save_action(Action::Lines, &settings).unwrap();
         let actions = service.settings().unwrap().actions;
         assert_eq!(actions.iter().map(|(action, _)| *action).collect::<Vec<_>>(), Action::ALL);
-        assert_eq!(actions[0], (Action::Lines, settings));
+        assert!(actions.contains(&(Action::Lines, settings)));
         let stored: f64 = state
             .app
             .read(|tx| Ok(tx.query_row("SELECT temperature FROM llm_action_settings", [], |row| row.get(0))?))

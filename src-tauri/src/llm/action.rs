@@ -22,16 +22,16 @@ pub enum Action {
 }
 
 impl Action {
-    /// Порядок в меню.
+    /// Порядок в меню: как шаги цепочки автоперевода (`GameStep::ALL`).
     pub const ALL: [Action; 8] = [
-        Self::Lines,
-        Self::Review,
         Self::Analysis,
-        Self::Descriptions,
         Self::Names,
         Self::Terms,
         Self::Speakers,
         Self::Tokens,
+        Self::Descriptions,
+        Self::Lines,
+        Self::Review,
     ];
 
     pub fn id(self) -> &'static str {
