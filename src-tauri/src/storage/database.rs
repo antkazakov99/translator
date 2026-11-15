@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 use super::{DbError, migrations};
 use crate::common::Timestamp;
 use crate::glossary::NameKey;
 use crate::name_rules::LanguageTag;
-use crate::projects::{Project, ProjectInfoRepo};
+use crate::projects::{Project, ProjectId, ProjectInfoRepo};
 
 /// Сколько ждать чужую блокировку файла, прежде чем вернуть `SQLITE_BUSY`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -154,6 +154,37 @@ pub struct ProjectDb(Database);
 
 impl ProjectDb {
     const FILE: &str = "project.db";
+
+    /// Копия SQLite с учётом завершённых транзакций в WAL.
+    pub fn save_snapshot(&self, dir: &Path) -> Result<(), DbError> {
+        let path = dir.join(Self::FILE);
+        let path = path.to_str().ok_or_else(|| std::io::Error::new(
+            std::io::ErrorKind::InvalidInput, "путь к снимку не в UTF-8",
+        ))?;
+        self.with_writer(|conn| {
+            conn.execute("VACUUM INTO ?1", [path])?;
+            Ok(())
+        })
+    }
+
+    pub fn copy_snapshot(source: &Path, destination: &Path) -> Result<Self, DbError> {
+        std::fs::copy(source.join(Self::FILE), destination.join(Self::FILE))?;
+        Self::open(destination)
+    }
+
+    pub fn snapshot_owner(dir: &Path) -> Result<ProjectId, DbError> {
+        let conn = Connection::open_with_flags(dir.join(Self::FILE), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok((ProjectInfoRepo { conn: &conn }).get()?.id)
+    }
+
+    /// Переносит подготовленный снимок одной транзакцией SQLite.
+    pub fn restore_snapshot(&self, snapshot: &Self) -> Result<(), DbError> {
+        self.readers.lock().clear();
+        self.with_writer(|conn| {
+            conn.restore(rusqlite::MAIN_DB, snapshot.path(), rusqlite::backup::NO_PROGRESS)?;
+            Ok(())
+        })
+    }
 
     /// Новая база проекта со строкой `project`. Существующую базу не трогает.
     pub fn create(dir: &Path, project: &Project) -> Result<Self, DbError> {

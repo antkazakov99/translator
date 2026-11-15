@@ -4,6 +4,7 @@ pub mod commands;
 pub mod model;
 pub mod repo;
 pub mod service;
+pub mod snapshots;
 
 pub use model::{GameRoot, Project, ProjectId, ProjectRow, ProjectStatus, Title};
 pub use repo::{ProjectInfo, ProjectInfoRepo, ProjectRepo};

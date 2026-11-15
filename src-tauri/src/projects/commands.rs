@@ -6,6 +6,7 @@ use serde::Serialize;
 use tauri::AppHandle;
 
 use super::{GameRoot, Project, ProjectId, ProjectService, RebindCheck, Title};
+use super::snapshots::{SnapshotId, SnapshotService};
 use crate::common::AppError;
 use crate::scan::ScanService;
 use crate::scan::commands::ScanReportDto;
@@ -102,6 +103,62 @@ pub async fn close_project(app: AppHandle, id: String) -> Result<(), String> {
         Ok(())
     })
     .await
+}
+
+#[derive(Serialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSnapshotDto {
+    id: String,
+    title: String,
+    #[specta(type = specta_typescript::Number)]
+    created_at: i64,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_project_snapshots(app: AppHandle, id: String) -> Result<Vec<ProjectSnapshotDto>, String> {
+    blocking(app, move |state| {
+        Ok(SnapshotService { state }
+            .list(self::id(&id)?)?
+            .into_iter()
+            .map(|(id, snapshot)| ProjectSnapshotDto {
+                id: id.to_string(),
+                title: snapshot.title,
+                created_at: snapshot.created_at,
+            })
+            .collect())
+    })
+    .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn save_project_snapshot(app: AppHandle, id: String, title: String) -> Result<(), String> {
+    blocking(app, move |state| SnapshotService { state }.save(self::id(&id)?, Title::new(&title)?)).await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_project_snapshot(app: AppHandle, id: String, snapshot_id: String) -> Result<(), String> {
+    blocking(app, move |state| {
+        SnapshotService { state }.restore(self::id(&id)?, SnapshotId::parse(&snapshot_id)?)
+    })
+    .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn rename_project_snapshot(app: AppHandle, id: String, snapshot_id: String, title: String) -> Result<(), String> {
+    blocking(app, move |state| {
+        SnapshotService { state }.rename(self::id(&id)?, SnapshotId::parse(&snapshot_id)?, Title::new(&title)?)
+    })
+    .await
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_project_snapshot(app: AppHandle, id: String, snapshot_id: String) -> Result<(), String> {
+    blocking(app, move |state| SnapshotService { state }.delete(self::id(&id)?, SnapshotId::parse(&snapshot_id)?)).await
 }
 
 #[tauri::command]

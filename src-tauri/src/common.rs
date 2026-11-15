@@ -78,6 +78,10 @@ pub enum AppError {
     ProjectNotFound,
     #[error("Проект не открыт")]
     ProjectNotOpen,
+    #[error("Проект занят другой операцией. Повторите восстановление после её завершения")]
+    ProjectBusy,
+    #[error("Снимок проекта не найден")]
+    SnapshotNotFound,
     #[error("Папка игры не привязана к проекту")]
     Unbound,
     #[error("Папки игры нет на диске")]

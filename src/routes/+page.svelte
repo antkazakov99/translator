@@ -10,6 +10,7 @@
 
   let project = $state<Project | null>(null);
   let restoring = $state(true);
+  let snapshotRevision = $state(0);
   let showLlmSettings = $state(false);
 
   function remember(id: string | null) {
@@ -54,8 +55,14 @@
 {#if restoring}
   <div class="blank"></div>
 {:else if project}
-  {#key project.id}
-    <Workspace {project} onBack={backToProjects} onSettings={() => (showLlmSettings = true)} onProject={(next) => (project = next)} />
+  {#key `${project.id}:${snapshotRevision}`}
+    <Workspace
+      {project}
+      onBack={backToProjects}
+      onSettings={() => (showLlmSettings = true)}
+      onProject={(next) => (project = next)}
+      onSnapshotRestored={() => (snapshotRevision += 1)}
+    />
   {/key}
 {:else}
   <StartScreen onOpen={opened} onSettings={() => (showLlmSettings = true)} />

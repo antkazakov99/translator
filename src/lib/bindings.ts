@@ -185,6 +185,11 @@ export const commands = {
 	 */
 	openProject: (id: string) => __TAURI_INVOKE<ProjectDto_Serialize>("open_project", { id }),
 	closeProject: (id: string) => __TAURI_INVOKE<null>("close_project", { id }),
+	listProjectSnapshots: (id: string) => __TAURI_INVOKE<ProjectSnapshotDto[]>("list_project_snapshots", { id }),
+	saveProjectSnapshot: (id: string, title: string) => __TAURI_INVOKE<null>("save_project_snapshot", { id, title }),
+	restoreProjectSnapshot: (id: string, snapshotId: string) => __TAURI_INVOKE<null>("restore_project_snapshot", { id, snapshotId }),
+	renameProjectSnapshot: (id: string, snapshotId: string, title: string) => __TAURI_INVOKE<null>("rename_project_snapshot", { id, snapshotId, title }),
+	deleteProjectSnapshot: (id: string, snapshotId: string) => __TAURI_INVOKE<null>("delete_project_snapshot", { id, snapshotId }),
 	archiveProject: (id: string) => __TAURI_INVOKE<ProjectDto_Serialize>("archive_project", { id }),
 	unarchiveProject: (id: string) => __TAURI_INVOKE<ProjectDto_Serialize>("unarchive_project", { id }),
 	renameProject: (id: string, title: string) => __TAURI_INVOKE<ProjectDto_Serialize>("rename_project", { id, title }),
@@ -936,6 +941,12 @@ export type ProjectDto_Serialize = {
 	createdAt: number,
 	openedAt: number | null,
 	archived: boolean,
+};
+
+export type ProjectSnapshotDto = {
+	id: string,
+	title: string,
+	createdAt: number,
 };
 
 /**  Провайдер для окна. Ключа нет, только признак, что он задан. */

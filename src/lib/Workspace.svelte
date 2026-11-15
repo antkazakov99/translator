@@ -4,6 +4,7 @@
   import {
     ArrowLeft,
     Bot,
+    Camera,
     Check,
     CheckCheck,
     Eraser,
@@ -21,6 +22,7 @@
   } from "lucide-svelte";
   import GameFolderPanel from "./GameFolderPanel.svelte";
   import GamePanel from "./GamePanel.svelte";
+  import ProjectSnapshots from "./ProjectSnapshots.svelte";
   import Glossary from "./Glossary.svelte";
   import SceneCard from "./SceneCard.svelte";
   import SceneGraph from "./SceneGraph.svelte";
@@ -51,7 +53,16 @@
     onBack,
     onSettings,
     onProject,
-  }: { project: Project; onBack: () => void; onSettings: () => void; onProject: (next: Project) => void } = $props();
+    onSnapshotRestored,
+  }: {
+    project: Project;
+    onBack: () => void;
+    onSettings: () => void;
+    onProject: (next: Project) => void;
+    onSnapshotRestored: () => void;
+  } = $props();
+
+  let snapshotsOpen = $state(false);
 
   type Filter = "all" | "empty" | "draft";
 
@@ -602,10 +613,17 @@
       <Bot size={15} />
       <span>Модели</span>
     </button>
+    <button class="btn small" disabled={busy || working} onclick={() => (snapshotsOpen = true)}>
+      <Camera size={15} />
+      <span>Снимки</span>
+    </button>
   </header>
 
   <RunBar />
 
+  {#if snapshotsOpen}
+    <ProjectSnapshots projectId={project.id} onClose={() => (snapshotsOpen = false)} onRestore={onSnapshotRestored} />
+  {/if}
   {#if folderOpen}
     <GameFolderPanel {project} {onProject} onClose={() => (folderOpen = false)} onChanged={reloadSnapshot} />
   {/if}
