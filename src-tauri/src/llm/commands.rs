@@ -345,6 +345,13 @@ pub fn cancel_llm_run(state: tauri::State<'_, crate::state::AppState>) {
     state.llm_run.cancel();
 }
 
+/// Останавливает текущий запуск модели, не дожидаясь ответа на идущий запрос: его ответ теряется, готовое остаётся.
+#[tauri::command]
+#[specta::specta]
+pub fn abort_llm_run(state: tauri::State<'_, crate::state::AppState>) {
+    state.llm_run.abort();
+}
+
 /// Идёт ли запуск модели: окно, открытое заново, узнаёт, что место занято.
 #[tauri::command]
 #[specta::specta]

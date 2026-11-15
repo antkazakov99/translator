@@ -1,14 +1,31 @@
 <script lang="ts">
-  import { LoaderCircle, Square, TriangleAlert } from "lucide-svelte";
+  import { LoaderCircle, OctagonX, Square, TriangleAlert } from "lucide-svelte";
+  import { commands } from "./bindings";
   import { activeRun } from "./run-status.svelte";
 
   /** Ошибка остановки: запуск идёт дальше, полоса говорит об этом сама. */
   let error = $state("");
+  /** Обрыв отправлен: ответ на идущий запрос уже не ждётся. */
+  let aborting = $state(false);
   const run = $derived(activeRun.current);
 
   $effect(() => {
-    if (!run) error = "";
+    if (!run) {
+      error = "";
+      aborting = false;
+    }
   });
+
+  /** Rust держит один запуск во всём приложении, поэтому обрыв не знает источника запуска. */
+  async function abort() {
+    aborting = true;
+    try {
+      await commands.abortLlmRun();
+    } catch (cause) {
+      aborting = false;
+      error = String(cause);
+    }
+  }
 </script>
 
 {#if run}
@@ -18,9 +35,18 @@
     {#if error}
       <em class="run-error"><TriangleAlert size={12} /> {error}</em>
     {/if}
-    <button class="btn small" disabled={run.stopping} onclick={() => run?.stop((message) => (error = message))}>
+    <button
+      class="btn small"
+      disabled={run.stopping || aborting}
+      title="Остановить после текущего запроса"
+      onclick={() => run?.stop((message) => (error = message))}
+    >
       <Square size={13} />
-      <b>{run.stopping ? "Останавливается" : "Остановить"}</b>
+      <b>{run.stopping || aborting ? "Останавливается" : "Остановить"}</b>
+    </button>
+    <button class="btn small" disabled={aborting} title="Остановить сразу: ответ на текущий запрос теряется" onclick={abort}>
+      <OctagonX size={13} />
+      <b>Оборвать</b>
     </button>
   </div>
 {/if}

@@ -41,11 +41,13 @@ flate2 = "1.0"
 
 # Сеть и LLM
 reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["sync", "macros"] }
 md5 = "0.7"
 
 # Хранилище 2.0
-rusqlite = { version = "0.41", features = ["bundled", "functions"] }
+rusqlite = { version = "0.41", features = ["backup", "bundled", "functions"] }
 sha2 = "0.11"
+tempfile = "3"
 
 # Ключи API в хранилище ОС
 keyring = "4"
@@ -66,5 +68,3 @@ opt-level = 3
 panic = "abort"
 strip = true
 
-[dev-dependencies]
-tempfile = "3"

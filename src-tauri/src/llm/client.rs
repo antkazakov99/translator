@@ -12,8 +12,10 @@ use super::{ApiKey, ChatRequest, LlmTarget, Provider, ProviderKind};
 pub enum LlmError {
     #[error("Нет ключа API для «{0}»")]
     NoKey(String),
-    #[error("Сервер не ответил: {0}")]
+    #[error("Сервер не ответил: {}", chain(.0))]
     Http(#[from] reqwest::Error),
+    #[error("Ответ сервера не разобран ({reason}): {body}")]
+    BadAnswer { reason: String, body: String },
     #[error("Сервер вернул {status}: {body}")]
     Status { status: u16, body: String },
     #[error("Пустой ответ модели")]
@@ -24,6 +26,9 @@ pub enum LlmError {
     Refused,
     #[error("Запрос не помещается в контекст модели: увеличьте окно контекста на сервере или уменьшите пакет")]
     ContextOverflow,
+    /// Запрос оборвали из окна: это остановка, а не сбой.
+    #[error("Запрос оборван")]
+    Aborted,
 }
 
 impl LlmError {
@@ -31,9 +36,9 @@ impl LlmError {
     /// Нет ключа, отказ модели, переполненный контекст и неверный запрос повтор не исправит.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Http(_) | Self::Empty | Self::Truncated => true,
+            Self::Http(_) | Self::BadAnswer { .. } | Self::Empty | Self::Truncated => true,
             Self::Status { status, .. } => *status == 429 || *status >= 500,
-            Self::NoKey(_) | Self::Refused | Self::ContextOverflow => false,
+            Self::NoKey(_) | Self::Refused | Self::ContextOverflow | Self::Aborted => false,
         }
     }
 }
@@ -82,9 +87,10 @@ impl LlmClient {
             }
             return Err(LlmError::Status { status: status.as_u16(), body: short(body) });
         }
+        let body = response.text().await?;
         match self {
-            Self::Messages => messages_text(response.json().await?),
-            Self::ChatCompletions => completions_text(response.json().await?),
+            Self::Messages => messages_text(parse(&body)?),
+            Self::ChatCompletions => completions_text(parse(&body)?),
         }
     }
 
@@ -100,7 +106,7 @@ impl LlmClient {
         if !status.is_success() {
             return Err(LlmError::Status { status: status.as_u16(), body: short(response.text().await.unwrap_or_default()) });
         }
-        let parsed: ModelsResponse = response.json().await?;
+        let parsed: ModelsResponse = parse(&response.text().await?)?;
         // Gemini отдаёт полное имя ресурса, а в запросе ждёт короткое.
         let mut models: Vec<String> =
             parsed.data.into_iter().map(|model| model.id.trim_start_matches("models/").to_string()).collect();
@@ -261,11 +267,13 @@ struct CompletionsResponse {
 
 #[derive(Deserialize)]
 struct CompletionsChoice {
+    /// Gemini при блокировке отдаёт выбор без сообщения.
+    #[serde(default)]
     message: CompletionsMessage,
     finish_reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct CompletionsMessage {
     content: Option<String>,
 }
@@ -286,6 +294,28 @@ fn answer_text(text: String, stop: Option<&str>) -> Result<String, LlmError> {
         (true, _) => Err(LlmError::Empty),
         (false, _) => Ok(text.to_string()),
     }
+}
+
+/// Тело ответа в ожидаемый вид. Неразобранное тело попадает в ошибку и в журнал целиком: иначе не понять,
+/// что прислал сервер (ошибку с кодом 200, обрезанный JSON, другой формат).
+fn parse<T: serde::de::DeserializeOwned>(body: &str) -> Result<T, LlmError> {
+    serde_json::from_str(body).map_err(|error| {
+        tracing::warn!("Ответ сервера не разобран: {error}
+{body}");
+        let body = if body.trim().is_empty() { "пустое тело".to_string() } else { short(body.to_string()) };
+        LlmError::BadAnswer { reason: error.to_string(), body }
+    })
+}
+
+/// Ошибка reqwest с причинами: сама по себе она говорит только «error decoding response body».
+fn chain(error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        text.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    text
 }
 
 fn short(body: String) -> String {
@@ -360,6 +390,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn abort_drops_a_request_without_waiting_for_the_answer() {
+        // Сервер принимает запрос и молчит: ответ пришёл бы только по таймауту профиля.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://localhost:{}/v1", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().collect();
+            drop(held);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::AppState::start(dir.path().to_path_buf(), crate::state::tests::memory_secrets()).unwrap();
+        let target = target(ProviderKind::Local, &url, "gemma", None);
+        let run = crate::llm::LlmRun::begin(&state, None, Action::Lines, &target, crate::glossary::describe::tests::silent()).unwrap();
+
+        let slot = state.llm_run.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            slot.abort();
+        });
+        let started = std::time::Instant::now();
+        let answer = tauri::async_runtime::block_on(run.send(LlmClient::ChatCompletions, &target, &request()));
+        assert!(matches!(answer, Err(LlmError::Aborted)), "{answer:?}");
+        assert!(started.elapsed() < Duration::from_secs(3), "обрыв не ждёт ответа");
+        assert!(run.cancelled(), "обрыв останавливает и запуск");
+
+        // Обрыв раньше запроса тоже засчитывается: следующий запрос не уходит.
+        let again = tauri::async_runtime::block_on(run.send(LlmClient::ChatCompletions, &target, &request()));
+        assert!(matches!(again, Err(LlmError::Aborted)));
+        drop(run);
+        assert!(!state.llm_run.is_active());
+    }
+
+    #[test]
     fn completions_get_limits_temperature_and_profile_params() {
         let (url, seen) = fake_model(|_| completion("  [{\"id\": \"1\"}]  "));
         let answer = tauri::async_runtime::block_on(LlmClient::ChatCompletions.send(&target(ProviderKind::Local, &url, "gemma", None), &request()));
@@ -410,6 +472,20 @@ pub(crate) mod tests {
         assert!(matches!(error, Err(LlmError::Truncated)));
         let error = tauri::async_runtime::block_on(LlmClient::Messages.send(&target(ProviderKind::Claude, &url, "claude", None), &request()));
         assert!(matches!(error, Err(LlmError::NoKey(_))));
+    }
+
+    #[test]
+    fn unreadable_answer_shows_what_the_server_sent() {
+        let local = |url: &str| target(ProviderKind::Local, url, "gemma", None);
+        let (url, _) = fake_model(|_| "[{\"error\": {\"code\": 500, \"message\": \"Internal error\"}}]".to_string());
+        let error = tauri::async_runtime::block_on(LlmClient::ChatCompletions.send(&local(&url), &request())).unwrap_err();
+        assert!(matches!(error, LlmError::BadAnswer { .. }) && error.is_transient());
+        assert!(error.to_string().contains("Internal error"), "{error}");
+
+        // Gemini при блокировке отдаёт выбор без сообщения: это отказ, а не неразобранный ответ.
+        let (url, _) = fake_model(|_| serde_json::json!({ "choices": [{ "finish_reason": "content_filter", "index": 0 }] }).to_string());
+        let error = tauri::async_runtime::block_on(LlmClient::ChatCompletions.send(&local(&url), &request()));
+        assert!(matches!(error, Err(LlmError::Refused)));
     }
 
     #[test]

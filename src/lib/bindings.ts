@@ -31,6 +31,8 @@ export const commands = {
 	llmModels: (provider: ProviderInput_Deserialize) => __TAURI_INVOKE<string[]>("llm_models", { provider }),
 	/**  Останавливает текущий запуск модели между запросами: готовое остаётся. */
 	cancelLlmRun: () => __TAURI_INVOKE<void>("cancel_llm_run"),
+	/**  Останавливает текущий запуск модели, не дожидаясь ответа на идущий запрос: его ответ теряется, готовое остаётся. */
+	abortLlmRun: () => __TAURI_INVOKE<void>("abort_llm_run"),
 	/**  Идёт ли запуск модели: окно, открытое заново, узнаёт, что место занято. */
 	llmRunActive: () => __TAURI_INVOKE<boolean>("llm_run_active"),
 	/**  Граф сцен проекта. Первый запрос после считывания может пересобрать переходы из файлов снимка. */

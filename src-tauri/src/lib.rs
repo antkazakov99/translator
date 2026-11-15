@@ -56,6 +56,7 @@ fn commands() -> tauri_specta::Builder<tauri::Wry> {
             save_project_llm_action,
             llm_models,
             cancel_llm_run,
+            abort_llm_run,
             llm_run_active,
             scene_graph,
             glossary,

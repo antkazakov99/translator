@@ -91,6 +91,7 @@ impl<'a> BatchRun<'a> {
                 tracing::warn!("Модель отказалась отвечать на пакет, он пропущен");
                 Sent::Skipped
             }
+            Err(LlmError::Aborted) => Sent::Stop,
             Err(error) => {
                 self.error = Some(error.to_string());
                 Sent::Stop
@@ -181,6 +182,7 @@ impl Ask for RunAsk<'_> {
         match ask(LlmClient::for_kind(self.target.provider.kind()), self.target, request, self.run).await {
             Ok(Some(text)) => Sent::Text(text),
             Ok(None) => Sent::Skipped,
+            Err(LlmError::Aborted) => Sent::Stop,
             Err(error) => {
                 self.error = Some(error);
                 Sent::Stop
@@ -205,12 +207,12 @@ impl Ask for RunAsk<'_> {
     }
 }
 
-/// Один запрос с повтором при сбое сети. `None`: модель отказалась отвечать.
+/// Один запрос с повтором при сбое сети. `None`: модель отказалась отвечать. Обрыв запуска даёт `Aborted`.
 async fn ask(client: LlmClient, target: &LlmTarget, request: &ChatRequest, run: &LlmRun) -> Result<Option<String>, LlmError> {
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match client.send(target, request).await {
+        match run.send(client, target, request).await {
             Ok(text) => return Ok(Some(text)),
             Err(LlmError::Refused) => return Ok(None),
             Err(error) if error.is_transient() && attempt < ATTEMPTS && !run.cancelled() => {

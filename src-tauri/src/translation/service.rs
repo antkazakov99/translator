@@ -411,8 +411,10 @@ impl Job<'_> {
         let mut attempt = 0;
         let text = loop {
             attempt += 1;
-            match client.send(self.target, &request).await {
+            match self.run.send(client, self.target, &request).await {
                 Ok(text) => break text,
+                // Запуск уже отмечен остановленным: пакет остаётся пустым, следующие не спрашиваются.
+                Err(LlmError::Aborted) => return Ok(()),
                 Err(LlmError::Refused) => {
                     tracing::warn!("Модель отказалась переводить пакет сцены, реплики остаются пустыми");
                     return Ok(());

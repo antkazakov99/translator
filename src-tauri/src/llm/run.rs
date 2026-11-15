@@ -4,12 +4,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tokio::sync::watch;
+
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::Serialize;
 use tauri::ipc::Channel;
 
-use super::{Action, LlmTarget};
+use super::{Action, ChatRequest, LlmClient, LlmError, LlmTarget};
 use crate::common::{AppError, Timestamp, row_id};
 use crate::state::{AppState, OpenProject};
 use crate::storage::DbError;
@@ -68,26 +70,56 @@ pub struct RunStage {
     pub title: String,
 }
 
-/// Место для одного запуска во всём приложении. Флаг остановки общий на все запросы запуска.
+/// Остановка запуска, общая на все его запросы: мягкая (после текущего запроса) и обрыв идущего запроса.
+pub(crate) struct RunControl {
+    cancel: AtomicBool,
+    abort: watch::Sender<bool>,
+}
+
+impl RunControl {
+    fn new() -> Self {
+        Self { cancel: AtomicBool::new(false), abort: watch::Sender::new(false) }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Ждёт обрыва. Обрыв, случившийся раньше вызова, тоже засчитывается.
+    async fn aborted(&self) {
+        let mut abort = self.abort.subscribe();
+        let _ = abort.wait_for(|aborted| *aborted).await;
+    }
+}
+
+/// Место для одного запуска во всём приложении.
 #[derive(Default)]
-pub struct RunSlot(Mutex<Option<Arc<AtomicBool>>>);
+pub struct RunSlot(Mutex<Option<Arc<RunControl>>>);
 
 impl RunSlot {
     /// Занимает место. Второй запуск получает `RunActive`.
-    fn take(&self) -> Result<Arc<AtomicBool>, AppError> {
+    fn take(&self) -> Result<Arc<RunControl>, AppError> {
         let mut slot = self.0.lock();
         if slot.is_some() {
             return Err(AppError::RunActive);
         }
-        let cancel = Arc::new(AtomicBool::new(false));
-        *slot = Some(cancel.clone());
-        Ok(cancel)
+        let control = Arc::new(RunControl::new());
+        *slot = Some(control.clone());
+        Ok(control)
     }
 
     /// Останавливает текущий запуск между пакетами.
     pub fn cancel(&self) {
-        if let Some(flag) = self.0.lock().as_ref() {
-            flag.store(true, Ordering::Relaxed);
+        if let Some(control) = self.0.lock().as_ref() {
+            control.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Останавливает текущий запуск и обрывает идущий запрос: его ответ теряется, готовое остаётся.
+    pub fn abort(&self) {
+        if let Some(control) = self.0.lock().as_ref() {
+            control.cancel.store(true, Ordering::Relaxed);
+            control.abort.send_replace(true);
         }
     }
 
@@ -107,7 +139,7 @@ pub struct RunChain(Arc<ChainInner>);
 
 struct ChainInner {
     slot: Arc<RunSlot>,
-    cancel: Arc<AtomicBool>,
+    control: Arc<RunControl>,
     progress: Channel<RunProgress>,
     stage: Mutex<Option<RunStage>>,
 }
@@ -121,8 +153,8 @@ impl Drop for ChainInner {
 impl RunChain {
     /// Занимает место. Второй запуск получает `RunActive`.
     pub fn begin(state: &AppState, progress: Channel<RunProgress>) -> Result<Self, AppError> {
-        let cancel = state.llm_run.take()?;
-        Ok(Self(Arc::new(ChainInner { slot: state.llm_run.clone(), cancel, progress, stage: Mutex::new(None) })))
+        let control = state.llm_run.take()?;
+        Ok(Self(Arc::new(ChainInner { slot: state.llm_run.clone(), control, progress, stage: Mutex::new(None) })))
     }
 
     /// Шаг `index` из `count`: его несут все отчёты запусков дальше. Окно сразу узнаёт о новом шаге.
@@ -133,7 +165,7 @@ impl RunChain {
     }
 
     pub fn cancelled(&self) -> bool {
-        self.0.cancel.load(Ordering::Relaxed)
+        self.0.control.cancelled()
     }
 }
 
@@ -160,7 +192,7 @@ pub struct LlmRun {
     /// Своё место запуска. У шага цепочки `None`: место держит цепочка.
     slot: Option<Arc<RunSlot>>,
     chain: Option<RunChain>,
-    cancel: Arc<AtomicBool>,
+    control: Arc<RunControl>,
     progress: Channel<RunProgress>,
     project: Option<Arc<OpenProject>>,
     id: Option<RunId>,
@@ -177,14 +209,14 @@ impl LlmRun {
         target: &LlmTarget,
         host: impl Into<RunHost>,
     ) -> Result<LlmRun, AppError> {
-        let (slot, chain, cancel, progress) = match host.into() {
+        let (slot, chain, control, progress) = match host.into() {
             RunHost::Own(progress) => {
-                let cancel = state.llm_run.take()?;
-                (Some(state.llm_run.clone()), None, cancel, progress)
+                let control = state.llm_run.take()?;
+                (Some(state.llm_run.clone()), None, control, progress)
             }
             RunHost::Chain(chain) => {
-                let (cancel, progress) = (chain.0.cancel.clone(), chain.0.progress.clone());
-                (None, Some(chain), cancel, progress)
+                let (control, progress) = (chain.0.control.clone(), chain.0.progress.clone());
+                (None, Some(chain), control, progress)
             }
         };
         let id = match &project {
@@ -204,7 +236,7 @@ impl LlmRun {
             }
             None => None,
         };
-        Ok(LlmRun { slot, chain, cancel, progress, project, id, finished: false })
+        Ok(LlmRun { slot, chain, control, progress, project, id, finished: false })
     }
 
     pub fn id(&self) -> Option<RunId> {
@@ -212,7 +244,15 @@ impl LlmRun {
     }
 
     pub fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
+        self.control.cancelled()
+    }
+
+    /// Запрос к модели, который обрыв запуска прерывает сразу: соединение закрывается, ответ не ждётся.
+    pub async fn send(&self, client: LlmClient, target: &LlmTarget, request: &ChatRequest) -> Result<String, LlmError> {
+        tokio::select! {
+            answer = client.send(target, request) => answer,
+            () = self.control.aborted() => Err(LlmError::Aborted),
+        }
     }
 
     /// Ошибку канала не считает ошибкой запуска: окно могли перезагрузить. Шаг цепочки добавляет к ходу шаг.
