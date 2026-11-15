@@ -6,10 +6,13 @@ use rusqlite::Connection;
 use super::{NameField, SpeakerSuggestion, TermSuggestion, TokenSuggestion};
 
 use super::mentions::Checks;
+use super::relations::Pair;
 use super::repo::MentionCheckRepo;
+use super::resolve::merge_pair;
+use super::spelling::name_variant;
 use super::entries::{EntryLine, character_lines, character_names, scene_entries, speaker_lines, term_lines, term_names, token_lines};
 use super::{
-    Character, CharacterId, CharacterRepo, DiscardReason, DiscardedTerm, Form, LineSampleRepo, NameKey, NoteOwner, NoteRepo,
+    Character, CharacterId, CharacterRepo, DiscardReason, DiscardedTerm, Form, FormKind, LineSampleRepo, NameKey, NoteOwner, NoteRepo,
     SceneDescription, SceneDescriptionRepo, Speaker, SpeakerEntry, SpeakerLink, SpeakerRepo, SpeakerUse, Term,
     TermCategory, TermId, TermRepo, Token, TokenRepo,
 };
@@ -215,11 +218,33 @@ impl GlossaryService<'_> {
         self.write(project, |tx| give_term(tx, term, character))
     }
 
+    /// «Объединить с…» в окне: два персонажа или два термина это одно. Слияние то же, что после ответа модели
+    /// «да» на вопрос о паре (`resolve::merge_pair`). Возвращает запись, которая осталась.
+    pub fn merge(&self, project: ProjectId, entry: ExcludeOwner, other: ExcludeOwner) -> Result<ExcludeOwner, AppError> {
+        let same_kind = matches!(
+            (entry, other),
+            (ExcludeOwner::Character(_), ExcludeOwner::Character(_)) | (ExcludeOwner::Term(_), ExcludeOwner::Term(_))
+        );
+        let pair = Pair::new(entry, other).filter(|_| same_kind).ok_or(DbError::NotFound)?;
+        self.write(project, |tx| {
+            merge_pair(tx, pair)?.ok_or(DbError::NotFound)?;
+            let left = match entry {
+                ExcludeOwner::Character(id) => CharacterRepo { conn: tx }.get(id).map(|_| ()),
+                ExcludeOwner::Term(id) => TermRepo { conn: tx }.get(id).map(|_| ()),
+            };
+            match left {
+                Ok(()) => Ok(entry),
+                Err(DbError::NotFound) => Ok(other),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     /// Название из корзины ещё одному персонажу: общая фамилия достаётся всем.
     pub fn give_discarded_to_character(&self, project: ProjectId, name: &NameKey, character: CharacterId) -> Result<(), AppError> {
         self.write(project, |tx| {
             let discarded = TermRepo { conn: tx }.discarded()?.into_iter().find(|term| &term.key == name).ok_or(DbError::NotFound)?;
-            add_form(tx, character, &discarded.text, None)
+            add_form(tx, character, &new_form(&discarded.text, None)?)
         })
     }
 
@@ -456,7 +481,7 @@ pub(crate) fn give_term(tx: &Connection, term: TermId, character: CharacterId) -
     let terms = TermRepo { conn: tx };
     let term = terms.get(term)?;
     let id = term.id().ok_or(DbError::NotFound)?;
-    add_form(tx, character, term.name(), term.translation())?;
+    add_form(tx, character, &new_form(term.name(), term.translation())?)?;
     MentionCheckRepo { conn: tx }.copy(ExcludeOwner::Term(id), ExcludeOwner::Character(character))?;
     terms.delete(id)?;
     NoteRepo { conn: tx }.delete_owner(&NoteOwner::Term(id))?;
@@ -491,9 +516,94 @@ pub(crate) fn merge_terms(tx: &Connection, from: TermId, into: TermId) -> Result
     Ok(())
 }
 
-/// Персонаж `from` сливается в `into`: полное имя `from` и его формы становятся формами `into` с переводами,
-/// связи говорящих переходят без основного кода, род, описание и манера речи пишутся в пустое, исключённые
-/// сцены объединяются, `from` и его заметки удаляются.
+/// Имя и фамилия `source` формами для `target`, в которого он сливается. Имя, которое приходится имени `target`
+/// вариантом («Alexa» у «Alexandra»), ложится формой-именем, фамилия рядом с тем же именем формой-фамилией
+/// («Saint-Saens» у «Margaret Dvorak»). Одна фамилия без имени тоже форма-фамилия. Остальное это другое имя
+/// человека целиком (прозвище, псевдоним): форма вида `Other`.
+fn merged_names(source: &Character, target: &Character) -> Vec<Form> {
+    let same = |one: &str, other: Option<&str>| other.is_some_and(|other| NameKey::new(one) == NameKey::new(other) || name_variant(one, other));
+    let form = |text: &str, translation: Option<&str>, kind: FormKind| Form::named(text, translation, kind).ok();
+    let (first, last) = (source.first_name(), source.last_name());
+    let forms = match (first, last) {
+        (Some(first), Some(last)) if same(first, target.first_name()) => vec![
+            form(first, source.translated_first_name(), FormKind::First),
+            form(last, source.translated_last_name(), FormKind::Last),
+        ],
+        (Some(first), None) if same(first, target.first_name()) => vec![form(first, source.translated_first_name(), FormKind::First)],
+        (Some(first), None) if same(first, target.last_name()) => vec![form(first, source.translated_first_name(), FormKind::Last)],
+        (None, Some(last)) => vec![form(last, source.translated_last_name(), FormKind::Last)],
+        _ => vec![source.full_name().and_then(|name| form(&name, source.translated_full_name().as_deref(), FormKind::Other))],
+    };
+    forms.into_iter().flatten().collect()
+}
+
+/// Сколько реплик игры показывают написание: реплики, где оно стоит отдельным словом в том же регистре,
+/// и реплики говорящих персонажа с такой подписью.
+fn appearances(tx: &Connection, labels: &[(NameKey, usize)], name: &str) -> Result<usize, DbError> {
+    let name = name.trim();
+    let whole = |text: &str| {
+        text.match_indices(name).any(|(start, _)| {
+            let before = text[..start].chars().next_back();
+            let after = text[start + name.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+    };
+    let written = LineSampleRepo { conn: tx }.containing(name, None)?.iter().filter(|line| whole(&line.text)).count();
+    let spoken: usize = NameKey::new(name).map_or(0, |key| labels.iter().filter(|(label, _)| *label == key).map(|(_, lines)| lines).sum());
+    Ok(written + spoken)
+}
+
+/// Главное имя и фамилия персонажа по частоте: из имени и форм-имён главным становится написание, которое игра
+/// показывает чаще (`appearances`), остальные остаются формами; так же фамилия. При равенстве остаётся прежнее.
+/// Форму вида `Other` (прозвище, титул) выбор не трогает.
+pub(crate) fn settle_names(tx: &Connection, id: CharacterId) -> Result<(), DbError> {
+    let characters = CharacterRepo { conn: tx };
+    let mut character = characters.get(id)?;
+    let speakers = SpeakerRepo { conn: tx };
+    let linked: Vec<SpeakerKey> = speakers.links_of(id)?.into_iter().map(|link| link.speaker).collect();
+    let labels: Vec<(NameKey, usize)> = speakers
+        .current()?
+        .into_iter()
+        .filter(|used| linked.contains(&used.speaker.key))
+        .filter_map(|used| Some((NameKey::new(used.speaker.label.as_deref()?)?, used.lines)))
+        .collect();
+    let mut changed = false;
+    for kind in [FormKind::First, FormKind::Last] {
+        let spellings: Vec<String> = character.spellings(kind).into_iter().map(str::to_string).collect();
+        if spellings.len() < 2 {
+            // Одно написание без главного это форма в пустое поле: она и становится главной.
+            let main = match kind {
+                FormKind::First => character.first_name(),
+                _ => character.last_name(),
+            };
+            if let (None, [only]) = (main, spellings.as_slice())
+                && let Some(key) = NameKey::new(only)
+            {
+                changed |= character.promote(&key);
+            }
+            continue;
+        }
+        let mut best: Option<(&str, usize)> = None;
+        for spelling in &spellings {
+            let count = appearances(tx, &labels, spelling)?;
+            if best.is_none_or(|(_, top)| count > top) {
+                best = Some((spelling, count));
+            }
+        }
+        if let Some(key) = best.and_then(|(spelling, _)| NameKey::new(spelling)) {
+            changed |= character.promote(&key);
+        }
+    }
+    if changed {
+        characters.save(&character)?;
+    }
+    Ok(())
+}
+
+/// Персонаж `from` сливается в `into`: имя, фамилия и формы `from` становятся формами `into` с переводами
+/// (`merged_names`), связи говорящих переходят без основного кода, род, описание и манера речи пишутся
+/// в пустое, исключённые сцены объединяются, `from` и его заметки удаляются. Главное имя и фамилия после
+/// слияния выбираются по частоте (`settle_names`).
 pub(crate) fn merge_characters(tx: &Connection, from: CharacterId, into: CharacterId) -> Result<(), DbError> {
     if from == into {
         return Ok(());
@@ -506,13 +616,9 @@ pub(crate) fn merge_characters(tx: &Connection, from: CharacterId, into: Charact
     MentionCheckRepo { conn: tx }.copy(ExcludeOwner::Character(from), ExcludeOwner::Character(into))?;
     characters.delete(from)?;
     NoteRepo { conn: tx }.delete_owner(&NoteOwner::Character(from))?;
-    let names = source
-        .full_name()
-        .map(|name| (name, source.translated_full_name()))
-        .into_iter()
-        .chain(source.forms().iter().map(|form| (form.text().to_string(), form.translation().map(str::to_string))));
-    for (text, translation) in names {
-        add_form(tx, into, &text, translation.as_deref())?;
+    let names = merged_names(&source, &characters.get(into)?);
+    for form in names.iter().chain(source.forms()) {
+        add_form(tx, into, form)?;
     }
     let mut target = characters.get(into)?;
     if target.gender().is_none() {
@@ -531,19 +637,22 @@ pub(crate) fn merge_characters(tx: &Connection, from: CharacterId, into: Charact
     for container in excluded {
         characters.set_excluded(into, &container, true)?;
     }
-    Ok(())
+    settle_names(tx, into)
 }
 
-fn add_form(conn: &Connection, character: CharacterId, text: &str, translation: Option<&str>) -> Result<(), DbError> {
+fn new_form(text: &str, translation: Option<&str>) -> Result<Form, DbError> {
+    Form::new(text, translation).map_err(|error| DbError::bad_value("character_forms", "text", error))
+}
+
+fn add_form(conn: &Connection, character: CharacterId, form: &Form) -> Result<(), DbError> {
     let repo = CharacterRepo { conn };
     let mut person = repo.get(character)?;
-    let form = Form::new(text, translation).map_err(|error| DbError::bad_value("character_forms", "text", error))?;
     match person.add_form(form.clone()) {
         Ok(()) => {}
         Err(ValidationError::DuplicateForm(_)) => {
             // Повтор: перевод уходит в пустое поле совпавшей записи.
             let mut forms = person.forms().to_vec();
-            forms.push(form);
+            forms.push(form.clone());
             person = Character::restore(
                 character,
                 person.first_name().map(str::to_string),

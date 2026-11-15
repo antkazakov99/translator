@@ -1,7 +1,7 @@
 <script lang="ts">
   import DescribeParts from "./DescribeParts.svelte";
   import EntryLines from "./EntryLines.svelte";
-  import { Check, Languages, LoaderCircle, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Merge, Plus, Trash2, Undo2, UserRound } from "lucide-svelte";
   import Combobox from "./Combobox.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
   import SuggestStatus from "./SuggestStatus.svelte";
@@ -85,6 +85,9 @@
   let resetting = $state(false);
   let giving = $state(false);
   let giveText = $state("");
+  /** Открыт выбор термина, с которым объединяется открытый. */
+  let merging = $state(false);
+  let mergeText = $state("");
   let draft = $state<Term | null>(null);
 
   const shown = $derived(
@@ -105,7 +108,28 @@
     draft = found ? structuredClone($state.snapshot(found)) : null;
     fieldError = "";
     giving = false;
+    merging = false;
+    mergeText = "";
   });
+
+  const mergeOptions = (all: boolean) =>
+    data.terms
+      .filter((term) => term.id !== draft?.id)
+      .filter((term) => all || matches(mergeText, term.name, term.translation, ...term.forms.map((form) => form.text)))
+      .map((term) => ({ id: String(term.id), label: term.name }));
+
+  /** Два термина это одно: остаётся одна запись, её и открываем. */
+  async function merge(other: number) {
+    if (!draft) return;
+    try {
+      const kept = await commands.mergeEntries(projectId, { kind: "term", id: draft.id }, { kind: "term", id: other });
+      draft = null;
+      await reload();
+      selected = kept;
+    } catch (e) {
+      onError(String(e));
+    }
+  }
 
   /** Модель записала описание: оно ложится в открытую карточку. */
   async function described() {
@@ -303,7 +327,16 @@
                 aria-label="Это персонаж"
                 aria-pressed={giving}
                 title="Это персонаж: имя или фамилия, название станет формой персонажа"
-                onclick={() => (giving = !giving)}><UserRound size={14} /></button
+                onclick={() => ((giving = !giving), (merging = false))}><UserRound size={14} /></button
+              >
+              <button
+                class="icon-button"
+                class:active={merging}
+                disabled={data.terms.length < 2}
+                aria-label="Объединить с другим термином"
+                aria-pressed={merging}
+                title="Объединить с другим термином: это одно и то же. Название и формы второго станут формами"
+                onclick={() => ((merging = !merging), (giving = false))}><Merge size={14} /></button
               >
               <button
                 class="icon-button danger"
@@ -324,6 +357,17 @@
             empty="Персонажей нет"
             oninput={(text) => (giveText = text)}
             onpick={(id) => draft && act(() => commands.giveTermToCharacter(projectId, draft!.id, Number(id)), forget)}
+          />
+        {/if}
+        {#if merging && !resetting}
+          <Combobox
+            text={mergeText}
+            options={mergeOptions}
+            label="Термин"
+            placeholder="С чем объединить"
+            empty="Других терминов нет"
+            oninput={(text) => (mergeText = text)}
+            onpick={(id) => merge(Number(id))}
           />
         {/if}
 

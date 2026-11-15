@@ -26,7 +26,7 @@ pub mod terms;
 pub mod tokens;
 
 pub use analyze::{Finding, FoundKind, NameParts};
-pub use characters::{Character, CharacterId, Form, NameField, NameOrigin};
+pub use characters::{Character, CharacterId, Form, FormKind, NameField, NameOrigin};
 pub(crate) use describe::prune_notes;
 pub use describe::{DescribeService, DescribeTarget, Described, Pending, ReadingDepth};
 pub use run::Suggestions;

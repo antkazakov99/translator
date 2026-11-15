@@ -8,22 +8,66 @@ use crate::name_rules::LanguageTag;
 
 row_id!(CharacterId);
 
+/// Чем форма приходится имени персонажа. От вида зависит, как форму пишет перевод имён и может ли она стать
+/// главным именем или фамилией. У формы термина вида нет: всегда `Other`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum FormKind {
+    /// Другое написание имени: короткая форма, полная, опечатка («Dimi» у «Dimitria»).
+    First,
+    /// Другая фамилия или другое её написание («Saint-Saens» у «Margaret Dvorak»).
+    Last,
+    /// Всё остальное: прозвище, титул, обращение, подпись из игры.
+    #[default]
+    Other,
+}
+
+impl FormKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Last => "last",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, ValidationError> {
+        match text {
+            "first" => Ok(Self::First),
+            "last" => Ok(Self::Last),
+            "other" => Ok(Self::Other),
+            _ => Err(ValidationError::UnknownValue { field: "character_forms.kind", value: text.to_string() }),
+        }
+    }
+}
+
 /// Другая форма имени или названия: обращение, прозвище, сокращение, подпись из игры.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Form {
     text: String,
     key: NameKey,
     translation: Option<String>,
+    kind: FormKind,
 }
 
 impl Form {
+    /// Форма вида `Other`.
     pub fn new(text: &str, translation: Option<&str>) -> Result<Self, ValidationError> {
+        Self::named(text, translation, FormKind::Other)
+    }
+
+    pub fn named(text: &str, translation: Option<&str>, kind: FormKind) -> Result<Self, ValidationError> {
         let key = NameKey::new(text).ok_or(ValidationError::Empty("form"))?;
         Ok(Self {
             text: text.trim().to_string(),
             key,
             translation: translation.and_then(non_empty),
+            kind,
         })
+    }
+
+    pub fn kind(&self) -> FormKind {
+        self.kind
     }
 
     pub fn text(&self) -> &str {
@@ -170,6 +214,37 @@ impl Character {
 
     pub fn remove_form(&mut self, key: &NameKey) {
         self.forms.retain(|form| form.key() != key);
+    }
+
+    /// Имя (`First`) или фамилия (`Last`) и формы того же вида: написания, из которых выбирается главное.
+    pub fn spellings(&self, kind: FormKind) -> Vec<&str> {
+        let name = match kind {
+            FormKind::First => self.first_name(),
+            FormKind::Last => self.last_name(),
+            FormKind::Other => None,
+        };
+        name.into_iter().chain(self.forms.iter().filter(|form| form.kind == kind && kind != FormKind::Other).map(Form::text)).collect()
+    }
+
+    /// Форма вида «имя» или «фамилия» становится главным именем или фамилией. Прежнее написание уходит формой
+    /// того же вида, переводы остаются при своих написаниях. `false`: такой формы нет или она вида `Other`.
+    pub fn promote(&mut self, key: &NameKey) -> bool {
+        let Some(index) = self.forms.iter().position(|form| form.key() == key && form.kind != FormKind::Other) else { return false };
+        let form = self.forms.remove(index);
+        let kind = form.kind;
+        let (name, translated) = match kind {
+            FormKind::First => (&mut self.first_name, &mut self.translated_first_name),
+            _ => (&mut self.last_name, &mut self.translated_last_name),
+        };
+        let old = name.replace(form.text).map(|text| (text, translated.take()));
+        *translated = form.translation;
+        if let Some((text, translation)) = old
+            && let Ok(old) = Form::named(&text, translation.as_deref(), kind)
+        {
+            self.forms.push(old);
+        }
+        self.clean_forms();
+        true
     }
 
     /// Чистка форм (`uniqueForms`): уходят копии имён и других форм, а их перевод заполняет пустое поле.

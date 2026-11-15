@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use super::parts::{ScenesPart, pack_scenes, script_line};
+use super::parts::{Part, pack_scenes, script_line};
 use super::repo::StoryLine;
 use super::{Character, CharacterId, GlossaryData, Term, TermId};
 use crate::engines::{ContainerKey, SpeakerKey};
@@ -160,9 +160,9 @@ pub fn scene_entries(glossary: &GlossaryData, lines: &[StoryLine]) -> (Vec<Chara
 }
 
 /// Части из выбранных сцен: реплики строками «Говорящий: текст» с именами из глоссария и значениями токенов.
-pub fn entry_parts(lines: &[StoryLine], scenes: &[ContainerKey], context: &GlossaryContext) -> Vec<ScenesPart> {
+pub fn entry_parts(lines: &[StoryLine], scenes: &[ContainerKey], context: &GlossaryContext) -> Vec<Part> {
     let chosen: HashSet<&ContainerKey> = scenes.iter().collect();
-    let mut transcripts: Vec<(ContainerKey, Vec<String>)> = Vec::new();
+    let mut transcripts: Vec<(&ContainerKey, Vec<String>)> = Vec::new();
     for line in lines.iter().filter(|line| chosen.contains(&line.scene)) {
         let speaker = line
             .speaker_key
@@ -172,11 +172,11 @@ pub fn entry_parts(lines: &[StoryLine], scenes: &[ContainerKey], context: &Gloss
             .or_else(|| line.speaker_key.as_ref().map(|key| key.as_str().split_once(':').map_or(key.as_str(), |(_, tail)| tail).to_string()));
         let text = script_line(speaker.as_deref(), &context.fill(&line.text));
         match transcripts.last_mut() {
-            Some((key, texts)) if *key == line.scene => texts.push(text),
-            _ => transcripts.push((line.scene.clone(), vec![text])),
+            Some((key, texts)) if **key == line.scene => texts.push(text),
+            _ => transcripts.push((&line.scene, vec![text])),
         }
     }
-    pack_scenes(&transcripts)
+    pack_scenes(&transcripts.into_iter().map(|(_, texts)| texts).collect::<Vec<_>>())
 }
 
 #[cfg(test)]
@@ -220,13 +220,17 @@ mod tests {
     }
 
     #[test]
-    fn parts_name_their_scenes() {
-        let lines = [line("label:a", None, "One."), line("label:a", None, "Two."), line("label:b", None, "Three.")];
+    fn parts_join_the_chosen_scenes() {
+        let lines = [
+            line("label:a", None, "One."),
+            line("label:a", None, "Two."),
+            line("label:skipped", None, "Other."),
+            line("label:b", None, "Three."),
+        ];
         let scenes = [ContainerKey::new("label:a").unwrap(), ContainerKey::new("label:b").unwrap()];
         let parts = entry_parts(&lines, &scenes, &GlossaryContext::default());
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].part.text, "One.\nTwo.\n---\nThree.\n");
-        assert_eq!(parts[0].scenes, scenes);
+        assert_eq!(parts[0].text, "One.\nTwo.\n---\nThree.\n");
     }
 
     fn placed(id: i64, speaker: Option<&str>, text: &str) -> PlacedLine {

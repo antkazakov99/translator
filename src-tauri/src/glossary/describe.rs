@@ -13,12 +13,14 @@ use super::run::{Ask, BatchRun, RunAsk, Sent};
 use super::same_entry::{self, SameEntryPrompt};
 use super::service::ExcludeOwner;
 use super::describe_prompt::{
-    CharacterAnswer, CharacterPrompt, CondensePrompt, EntryKind, EntryPartPrompt, PartPrompt, ScenePrompt, TermPrompt, TitlePrompt, clean_note,
-    is_useful,
+    CharacterAnswer, CharacterPrompt, CondensePrompt, EntryKind, EntryPartPrompt, NotesAbout, PartPrompt, ScenePrompt, TermPrompt, TitlePrompt,
+    clean_note, is_useful,
 };
 use super::entries::{character_names, character_scenes, entry_parts, scene_entries, term_names, term_scenes};
-use super::parts::{MAX_PART_TEXT, Part, ScenesPart, pick_parts, scene_hash, script_line, split_lines};
-use super::repo::{AnalyzedPartRepo, LineSampleRepo, NoteRepo, PairCheckRepo, ReadingDepthRepo, SceneDescriptionRepo, StoryLine, TermRepo};
+use super::parts::{MAX_PART_TEXT, Part, pick_parts, scene_hash, script_line, split_lines};
+use super::repo::{
+    AnalyzedPartRepo, AskKind, AskRepo, LineSampleRepo, NoteRepo, PairCheckRepo, ReadingDepthRepo, SceneDescriptionRepo, StoryLine, TermRepo,
+};
 use super::{Note, NoteOwner, SceneDescription};
 use crate::common::Timestamp;
 use crate::storage::DbError;
@@ -41,6 +43,15 @@ pub enum DescribeTarget {
     Term(TermId),
     /// Сцена: части это её реплики, заметка единственной части сразу становится описанием.
     Scene(ContainerKey),
+}
+
+impl From<ExcludeOwner> for DescribeTarget {
+    fn from(owner: ExcludeOwner) -> Self {
+        match owner {
+            ExcludeOwner::Character(id) => Self::Character(id),
+            ExcludeOwner::Term(id) => Self::Term(id),
+        }
+    }
 }
 
 /// Глубина чтения в массовом обновлении: минимум и максимум частей и желаемый процент.
@@ -178,31 +189,57 @@ impl ScenePlan {
 
 /// Персонаж или термин, готовый к запуску: выбранные части его сцен и прочитанные заметки этой модели.
 struct EntryPlan {
-    target: DescribeTarget,
-    kind: EntryKind,
+    owner: ExcludeOwner,
     name: String,
     parts: Vec<Part>,
     stored: HashMap<String, Note>,
     /// Текст выбранных частей: по нему берутся подсказки сборки.
     text: String,
+    /// `Empty`: описание и манера речи пишутся только в пустое поле.
+    fill: Fill,
 }
 
 impl EntryPlan {
+    fn kind(&self) -> EntryKind {
+        match self.owner {
+            ExcludeOwner::Character(_) => EntryKind::Character,
+            ExcludeOwner::Term(_) => EntryKind::Term,
+        }
+    }
+
+    /// О чём заметки плана: для запроса сжатия.
+    fn about(&self) -> NotesAbout<'_> {
+        match self.owner {
+            ExcludeOwner::Character(_) => NotesAbout::Character(&self.name),
+            ExcludeOwner::Term(_) => NotesAbout::Term(&self.name),
+        }
+    }
+
     /// Непрочитанные части и сборка. У персонажа сборка всегда: из неё берётся манера речи.
     fn requests(&self) -> usize {
         let unread = self.parts.iter().filter(|part| !self.stored.contains_key(&part.hash)).count();
-        let assembly = match self.kind {
-            EntryKind::Character => true,
-            EntryKind::Term => self.parts.len() > 1,
+        let assembly = match self.owner {
+            ExcludeOwner::Character(_) => true,
+            ExcludeOwner::Term(_) => self.parts.len() > 1,
         };
         unread + usize::from(assembly)
     }
 
     /// «Персонаж «Lis»» или «Термин «Rusty Anchor»»: начало строки хода запуска.
     fn label(&self) -> String {
-        match self.kind {
-            EntryKind::Character => format!("Персонаж «{}»", self.name),
-            EntryKind::Term => format!("Термин «{}»", self.name),
+        match self.owner {
+            ExcludeOwner::Character(_) => format!("Персонаж «{}»", self.name),
+            ExcludeOwner::Term(_) => format!("Термин «{}»", self.name),
+        }
+    }
+
+    /// Ключ отметки «спрошено» в `glossary_asks`: запись и выбранные части. С другими частями (новые сцены
+    /// записи, другая глубина чтения) запись спросится снова.
+    fn ask_key(&self) -> String {
+        let parts = scene_hash(self.parts.iter().map(|part| part.hash.as_str()));
+        match self.owner {
+            ExcludeOwner::Character(id) => format!("character:{}:{parts}", id.get()),
+            ExcludeOwner::Term(id) => format!("term:{}:{parts}", id.get()),
         }
     }
 }
@@ -224,29 +261,29 @@ impl Plan {
     fn target(&self) -> DescribeTarget {
         match self {
             Self::Scene(plan) => DescribeTarget::Scene(plan.key.clone()),
-            Self::Entry(plan) => plan.target.clone(),
+            Self::Entry(plan) => plan.owner.into(),
+        }
+    }
+
+    /// Персонаж или термин, о котором цепочка уже спрашивала с этими частями и не получила описания.
+    fn asked(&self, asked: &HashSet<String>) -> bool {
+        match self {
+            Self::Scene(_) => false,
+            Self::Entry(plan) => asked.contains(&plan.ask_key()),
         }
     }
 }
 
-/// Часть сцен персонажа или термина для окна.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntryPart {
-    pub hash: String,
-    pub start: String,
-    pub scenes: Vec<ContainerKey>,
-    /// Заметка модели действия `descriptions`, иначе самая новая.
-    pub note: Option<Note>,
-    pub useful: bool,
-    /// Входит в выборку следующего запуска.
-    pub picked: bool,
-}
-
-/// Части записи, сколько из них прочитает запуск, и исключённые сцены.
+/// Части сцен персонажа или термина для окна.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EntryParts {
-    pub parts: Vec<EntryPart>,
+    /// Сколько частей у записи.
+    pub parts: usize,
+    /// У скольких есть заметка любой модели.
+    pub read: usize,
+    /// Сколько прочитает следующий запуск.
     pub picked: usize,
+    /// Сцены, которые модели не даются.
     pub excluded: Vec<ContainerKey>,
 }
 
@@ -266,7 +303,7 @@ impl DescribeService<'_> {
         one_off: Option<ProfileId>,
         host: impl Into<RunHost>,
     ) -> Result<Described, AppError> {
-        self.run(project, vec![target], Choice::Count(parts), Fill::Replace, one_off, host).await
+        self.run(project, vec![target], Choice::Count(parts), Fill::Replace, false, one_off, host).await
     }
 
     /// Группа по очереди с глубиной чтения приложения. Заполненная запись без новых частей в запуск не входит.
@@ -278,10 +315,38 @@ impl DescribeService<'_> {
         host: impl Into<RunHost>,
     ) -> Result<Described, AppError> {
         let depth = ReadingDepth::load(self.state)?;
-        self.run(project, targets, Choice::Depth(depth), Fill::ReplaceUnlessRead, one_off, host).await
+        self.run(project, targets, Choice::Depth(depth), Fill::ReplaceUnlessRead, false, one_off, host).await
     }
 
-    /// Сколько работы у группы `describe_many`: записи, которые войдут в запуск, и запросы без сжатия,
+    /// Кнопка записи в окне глоссария: персонаж или термин с глубиной чтения приложения. Описание заменяется
+    /// и тогда, когда новых частей нет: оно собирается из готовых заметок.
+    pub async fn describe_entry(
+        &self,
+        project: ProjectId,
+        owner: ExcludeOwner,
+        one_off: Option<ProfileId>,
+        host: impl Into<RunHost>,
+    ) -> Result<Described, AppError> {
+        let depth = ReadingDepth::load(self.state)?;
+        self.run(project, vec![owner.into()], Choice::Depth(depth), Fill::Replace, false, one_off, host).await
+    }
+
+    /// Группа цепочки автоперевода: как `describe_many`, но персонаж и термин, о которых цепочка уже спросила
+    /// и не получила описания (`glossary_asks`), в запуск не входят, а запись, оставшаяся после запуска без
+    /// описания, запоминается. То же с записями сцены перед её описанием. Описание и манера речи персонажа
+    /// и описание термина пишутся только в пустое поле.
+    pub async fn describe_unasked(
+        &self,
+        project: ProjectId,
+        targets: Vec<DescribeTarget>,
+        one_off: Option<ProfileId>,
+        host: impl Into<RunHost>,
+    ) -> Result<Described, AppError> {
+        let depth = ReadingDepth::load(self.state)?;
+        self.run(project, targets, Choice::Depth(depth), Fill::ReplaceUnlessRead, true, one_off, host).await
+    }
+
+    /// Сколько работы у группы `describe_unasked`: записи, которые войдут в запуск, и запросы без сжатия,
     /// разбора сцен и описания записей сцены.
     pub fn pending(&self, project: ProjectId, targets: Vec<DescribeTarget>) -> Result<Pending, AppError> {
         let open = self.state.open_project(project)?;
@@ -290,7 +355,7 @@ impl DescribeService<'_> {
         let plans = open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let mut context = GlossaryContext::new(&glossary);
-            plan_all(tx, &mut context, &glossary, targets, &model, choice, Fill::ReplaceUnlessRead)
+            unasked(tx, plan_all(tx, &mut context, &glossary, targets, &model, choice, Fill::ReplaceUnlessRead, Fill::Empty)?)
         })?;
         Ok(Pending { items: plans.len(), requests: plans.iter().map(Plan::requests).sum() })
     }
@@ -370,51 +435,27 @@ impl DescribeService<'_> {
         Ok(open.project.write(|tx| NoteRepo { conn: tx }.delete_owner(&owner))?)
     }
 
-    /// Части сцен персонажа или термина для окна: сцены части, заметка, войдёт ли часть в следующий запуск.
-    pub fn entry_parts(&self, project: ProjectId, target: &DescribeTarget) -> Result<EntryParts, AppError> {
+    /// Части сцен персонажа или термина для окна: сколько их, сколько прочитано и сколько прочитает запуск.
+    pub fn entry_parts(&self, project: ProjectId, owner: ExcludeOwner) -> Result<EntryParts, AppError> {
         let open = self.state.open_project(project)?;
-        // Без моделей окно всё равно показывает части: выборка считается по заметкам любой модели.
-        let model = LlmTargetService { state: self.state }
-            .target(Some(&open), Action::Descriptions, None)
-            .ok()
-            .map(|target| target.profile.model().to_string());
+        // Без настроенной модели выборка считается по заметкам любой модели.
+        let model = self.notes_model(&open, Action::Descriptions);
         let depth = ReadingDepth::load(self.state)?;
         Ok(open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let context = GlossaryContext::new(&glossary);
             let lines = LineSampleRepo { conn: tx }.story_lines()?;
-            let Some(selection) = select_entry(tx, &context, &glossary, &lines, target, false)? else { return Ok(EntryParts::default()) };
-            let notes = NoteRepo { conn: tx }.all_of(&owner_of(target))?;
-            let note_of = |hash: &str| {
-                let own = notes.iter().find(|note| note.part_hash == hash && Some(&note.model) == model.as_ref());
-                own.or_else(|| notes.iter().find(|note| note.part_hash == hash && model.is_none()))
-            };
-            let ready: Vec<bool> = selection.parts.iter().map(|part| note_of(&part.part.hash).is_some()).collect();
-            let picked = pick_parts(&ready, depth.parts_for(selection.parts.len()));
-            let parts = selection
-                .parts
-                .iter()
-                .enumerate()
-                .map(|(index, part)| {
-                    let note = note_of(&part.part.hash).or_else(|| notes.iter().find(|note| note.part_hash == part.part.hash)).cloned();
-                    EntryPart {
-                        hash: part.part.hash.clone(),
-                        start: part.part.start(),
-                        scenes: part.scenes.clone(),
-                        useful: note.as_ref().is_some_and(|note| is_useful(&note.text)),
-                        note,
-                        picked: picked.contains(&index),
-                    }
-                })
-                .collect();
-            Ok(EntryParts { parts, picked: picked.len(), excluded: selection.excluded })
+            let Some(selection) = select_entry(tx, &context, &glossary, &lines, owner, false)? else { return Ok(EntryParts::default()) };
+            let notes = NoteRepo { conn: tx }.all_of(&owner_of(&owner.into()))?;
+            let noted = |part: &Part, own: bool| notes.iter().any(|note| note.part_hash == part.hash && (!own || model.is_empty() || note.model == model));
+            let ready: Vec<bool> = selection.parts.iter().map(|part| noted(part, true)).collect();
+            Ok(EntryParts {
+                parts: selection.parts.len(),
+                read: selection.parts.iter().filter(|part| noted(part, false)).count(),
+                picked: pick_parts(&ready, depth.parts_for(selection.parts.len())).len(),
+                excluded: selection.excluded,
+            })
         })?)
-    }
-
-    /// Заметка не идёт в описание или возвращается в него.
-    pub fn exclude_note(&self, project: ProjectId, target: &DescribeTarget, model: &str, part_hash: &str, excluded: bool) -> Result<(), AppError> {
-        let open = self.state.open_project(project)?;
-        Ok(open.project.write(|tx| NoteRepo { conn: tx }.set_excluded(&owner_of(target), model, part_hash, excluded))?)
     }
 
     /// Части сцены с заметками всех моделей для окна: начало части и заметка, новая первой.
@@ -440,16 +481,24 @@ impl DescribeService<'_> {
         })?)
     }
 
+    /// `chain`: запуск цепочки автоперевода. Он не спрашивает о персонаже и термине, по которым уже не получил
+    /// описания, запоминает новые такие записи и пишет описание записи только в пустое поле.
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         project: ProjectId,
         targets: Vec<DescribeTarget>,
         choice: Choice,
         fill: Fill,
+        chain: bool,
         one_off: Option<ProfileId>,
         host: impl Into<RunHost>,
     ) -> Result<Described, AppError> {
         let open = self.state.open_project(project)?;
+        // Без записей модель не нужна: запуск проходит и там, где она не настроена.
+        if targets.is_empty() {
+            return Ok(Described::default());
+        }
         let service = LlmTargetService { state: self.state };
         let target = service.target(Some(&open), Action::Descriptions, one_off)?;
         let model = target.profile.model().to_string();
@@ -463,7 +512,9 @@ impl DescribeService<'_> {
         let (plans, hints, mut known, mut casings) = open.project.read(|tx| {
             let glossary = GlossaryData::load(tx)?;
             let mut context = GlossaryContext::new(&glossary);
-            let plans = plan_all(tx, &mut context, &glossary, targets, &model, choice, fill)?;
+            let entries = if chain { Fill::Empty } else { fill };
+            let plans = plan_all(tx, &mut context, &glossary, targets, &model, choice, fill, entries)?;
+            let plans = if chain { unasked(tx, plans)? } else { plans };
             let (known, casings) = if analysis.is_some() { (known_for_prompt(tx)?, game_casings(tx)?) } else { (Vec::new(), Casings::new([])) };
             Ok((plans, context.hints, known, casings))
         })?;
@@ -477,7 +528,7 @@ impl DescribeService<'_> {
         };
         let total = plans.iter().map(Plan::requests).sum::<usize>() + analyses;
         let mut run = BatchRun::begin(self.state, &open, Action::Descriptions, &target, host, total)?;
-        let writer = SceneWriter { open: &open, hints: &hints, target: &target, model: &model };
+        let writer = SceneWriter { open: &open, hints: &hints, target: &target, model: &model, chain };
         for plan in plans {
             let done = described.written.len();
             let outcome = match &plan {
@@ -580,7 +631,7 @@ impl SceneReader {
     /// написал или запуск остановлен. Ошибка запроса обрывает запуск.
     pub async fn read(&self, open: &Arc<OpenProject>, key: &ContainerKey, hints: &Hints, asker: &mut RunAsk<'_>) -> Result<Option<String>, AppError> {
         let Some(plan) = self.plans.iter().find(|plan| &plan.key == key) else { return Ok(None) };
-        let writer = SceneWriter { open, hints, target: &self.target, model: &self.model };
+        let writer = SceneWriter { open, hints, target: &self.target, model: &self.model, chain: false };
         let outcome = writer.scene(asker, plan, 0).await?;
         if let Some(error) = asker.error.take() {
             return Err(error.into());
@@ -738,6 +789,8 @@ async fn check_pairs(
 }
 
 /// Планы записей запуска описаний по порядку. Пропущенные записи (нечего читать, заполнены) в план не входят.
+/// `fill`: как писать описание сцены, `entries`: персонажа и термина.
+#[allow(clippy::too_many_arguments)]
 fn plan_all(
     tx: &rusqlite::Connection,
     context: &mut GlossaryContext,
@@ -746,19 +799,46 @@ fn plan_all(
     model: &str,
     choice: Choice,
     fill: Fill,
+    entries: Fill,
 ) -> Result<Vec<Plan>, DbError> {
     let first = SceneDescriptionRepo { conn: tx }.first_scene()?;
-    let entries = targets.iter().any(|target| !matches!(target, DescribeTarget::Scene(_)));
-    let lines = if entries { LineSampleRepo { conn: tx }.story_lines()? } else { Vec::new() };
+    let lines = if targets.iter().all(|target| matches!(target, DescribeTarget::Scene(_))) {
+        Vec::new()
+    } else {
+        LineSampleRepo { conn: tx }.story_lines()?
+    };
     let mut plans = Vec::new();
     for target in targets {
-        let plan = match target {
-            DescribeTarget::Scene(key) => plan_scene(tx, context, key, model, choice, fill, first.as_ref())?.map(Plan::Scene),
-            other => plan_entry(tx, context, glossary, &lines, other, model, choice, fill)?.map(Plan::Entry),
+        let owner = match target {
+            DescribeTarget::Scene(key) => {
+                plans.extend(plan_scene(tx, context, key, model, choice, fill, first.as_ref())?.map(Plan::Scene));
+                continue;
+            }
+            DescribeTarget::Character(id) => ExcludeOwner::Character(id),
+            DescribeTarget::Term(id) => ExcludeOwner::Term(id),
         };
-        plans.extend(plan);
+        plans.extend(plan_entry(tx, context, glossary, &lines, owner, model, choice, entries)?.map(Plan::Entry));
     }
     Ok(plans)
+}
+
+/// Планы без персонажей и терминов, о которых цепочка уже спрашивала и не получила описания (`glossary_asks`).
+fn unasked(tx: &rusqlite::Connection, mut plans: Vec<Plan>) -> Result<Vec<Plan>, DbError> {
+    let asked = AskRepo { conn: tx }.asked(AskKind::Description)?;
+    plans.retain(|plan| !plan.asked(&asked));
+    Ok(plans)
+}
+
+/// Персонажи с именем и термины без описания: работа шага `entries` цепочки автоперевода. Записи, о которых
+/// цепочка уже спрашивала, отсеивают `pending` и `describe_unasked`: отметка зависит от выбранных частей.
+pub(crate) fn entries_work(glossary: &GlossaryData) -> Vec<DescribeTarget> {
+    let characters = glossary
+        .characters
+        .iter()
+        .filter(|character| character.description().is_none() && character.full_name().is_some())
+        .filter_map(|character| Some(DescribeTarget::Character(character.id()?)));
+    let terms = glossary.terms.iter().filter(|term| term.description().is_none()).filter_map(|term| Some(DescribeTarget::Term(term.id()?)));
+    characters.chain(terms).collect()
 }
 
 fn owner_of(target: &DescribeTarget) -> NoteOwner {
@@ -845,42 +925,40 @@ fn plan_scene(
 
 /// Сцены записи без исключённых и части из них.
 struct Selection {
-    kind: EntryKind,
     name: String,
-    parts: Vec<ScenesPart>,
+    parts: Vec<Part>,
     excluded: Vec<ContainerKey>,
     /// Описание, которое уже есть.
     described: bool,
 }
 
-/// `None`: записи нет или у персонажа нет имени, по которому его искать.
 /// Сцены и части персонажа или термина. `ignore_exclusions`: части по всем сценам, как будто ничего не исключено.
+/// `None`: записи нет или у персонажа нет имени, по которому его искать.
 fn select_entry(
     tx: &rusqlite::Connection,
     context: &GlossaryContext,
     glossary: &GlossaryData,
     lines: &[StoryLine],
-    target: &DescribeTarget,
+    owner: ExcludeOwner,
     ignore_exclusions: bool,
 ) -> Result<Option<Selection>, DbError> {
-    Ok(match target {
-        DescribeTarget::Character(id) => {
-            let Some(character) = glossary.characters.iter().find(|character| character.id() == Some(*id)) else { return Ok(None) };
+    Ok(match owner {
+        ExcludeOwner::Character(id) => {
+            let Some(character) = glossary.characters.iter().find(|character| character.id() == Some(id)) else { return Ok(None) };
             let Some(name) = character.full_name() else { return Ok(None) };
-            let excluded = if ignore_exclusions { Vec::new() } else { CharacterRepo { conn: tx }.excluded_containers(*id)? };
-            let speakers = glossary.links.iter().filter(|link| link.character == *id).map(|link| link.speaker.clone()).collect();
-            let scenes = character_scenes(lines, &speakers, &character_names(character), glossary.character_checks.get(id), &excluded);
+            let excluded = if ignore_exclusions { Vec::new() } else { CharacterRepo { conn: tx }.excluded_containers(id)? };
+            let speakers = glossary.links.iter().filter(|link| link.character == id).map(|link| link.speaker.clone()).collect();
+            let scenes = character_scenes(lines, &speakers, &character_names(character), glossary.character_checks.get(&id), &excluded);
             let parts = entry_parts(lines, &scenes, context);
-            Some(Selection { kind: EntryKind::Character, name, parts, excluded, described: character.description().is_some() })
+            Some(Selection { name, parts, excluded, described: character.description().is_some() })
         }
-        DescribeTarget::Term(id) => {
-            let Some(term) = glossary.terms.iter().find(|term| term.id() == Some(*id)) else { return Ok(None) };
-            let excluded = if ignore_exclusions { Vec::new() } else { TermRepo { conn: tx }.excluded_containers(*id)? };
-            let scenes = term_scenes(lines, &term_names(term), glossary.term_checks.get(id), &excluded);
+        ExcludeOwner::Term(id) => {
+            let Some(term) = glossary.terms.iter().find(|term| term.id() == Some(id)) else { return Ok(None) };
+            let excluded = if ignore_exclusions { Vec::new() } else { TermRepo { conn: tx }.excluded_containers(id)? };
+            let scenes = term_scenes(lines, &term_names(term), glossary.term_checks.get(&id), &excluded);
             let parts = entry_parts(lines, &scenes, context);
-            Some(Selection { kind: EntryKind::Term, name: term.name().to_string(), parts, excluded, described: term.description().is_some() })
+            Some(Selection { name: term.name().to_string(), parts, excluded, described: term.description().is_some() })
         }
-        DescribeTarget::Scene(_) => None,
     })
 }
 
@@ -903,8 +981,8 @@ pub(crate) fn prune_notes(tx: &rusqlite::Connection) -> Result<usize, DbError> {
             NoteOwner::Container(key) => {
                 scene_text(tx, &mut context, key)?.map(|(parts, _, _)| parts.into_iter().map(|part| part.hash).collect()).unwrap_or_default()
             }
-            NoteOwner::Character(id) => entry_hashes(tx, &context, &glossary, &lines, &DescribeTarget::Character(*id))?,
-            NoteOwner::Term(id) => entry_hashes(tx, &context, &glossary, &lines, &DescribeTarget::Term(*id))?,
+            NoteOwner::Character(id) => entry_hashes(tx, &context, &glossary, &lines, ExcludeOwner::Character(*id))?,
+            NoteOwner::Term(id) => entry_hashes(tx, &context, &glossary, &lines, ExcludeOwner::Term(*id))?,
         };
         removed += notes.retain_parts(&owner, &hashes)?;
     }
@@ -925,12 +1003,12 @@ fn entry_hashes(
     context: &GlossaryContext,
     glossary: &GlossaryData,
     lines: &[StoryLine],
-    target: &DescribeTarget,
+    owner: ExcludeOwner,
 ) -> Result<Vec<String>, DbError> {
     let mut hashes = Vec::new();
     for ignore_exclusions in [true, false] {
-        if let Some(selection) = select_entry(tx, context, glossary, lines, target, ignore_exclusions)? {
-            hashes.extend(selection.parts.into_iter().map(|part| part.part.hash));
+        if let Some(selection) = select_entry(tx, context, glossary, lines, owner, ignore_exclusions)? {
+            hashes.extend(selection.parts.into_iter().map(|part| part.hash));
         }
     }
     Ok(hashes)
@@ -943,23 +1021,23 @@ fn plan_entry(
     context: &GlossaryContext,
     glossary: &GlossaryData,
     lines: &[StoryLine],
-    target: DescribeTarget,
+    owner: ExcludeOwner,
     model: &str,
     choice: Choice,
     fill: Fill,
 ) -> Result<Option<EntryPlan>, DbError> {
-    let Some(selection) = select_entry(tx, context, glossary, lines, &target, false)? else { return Ok(None) };
+    let Some(selection) = select_entry(tx, context, glossary, lines, owner, false)? else { return Ok(None) };
     if selection.parts.is_empty() {
         return Ok(None);
     }
     let stored: HashMap<String, Note> =
-        NoteRepo { conn: tx }.of(&owner_of(&target), model)?.into_iter().map(|note| (note.part_hash.clone(), note)).collect();
-    let ready: Vec<bool> = selection.parts.iter().map(|part| stored.contains_key(&part.part.hash)).collect();
+        NoteRepo { conn: tx }.of(&owner_of(&owner.into()), model)?.into_iter().map(|note| (note.part_hash.clone(), note)).collect();
+    let ready: Vec<bool> = selection.parts.iter().map(|part| stored.contains_key(&part.hash)).collect();
     let count = match choice {
         Choice::Count(count) => count,
         Choice::Depth(depth) => depth.parts_for(selection.parts.len()),
     };
-    let parts: Vec<Part> = pick_parts(&ready, count).into_iter().map(|index| selection.parts[index].part.clone()).collect();
+    let parts: Vec<Part> = pick_parts(&ready, count).into_iter().map(|index| selection.parts[index].clone()).collect();
     let skip = match fill {
         Fill::Replace => false,
         Fill::ReplaceUnlessRead => selection.described && parts.iter().all(|part| stored.contains_key(&part.hash)),
@@ -969,7 +1047,51 @@ fn plan_entry(
         return Ok(None);
     }
     let text = parts.iter().map(|part| part.text.as_str()).collect();
-    Ok(Some(EntryPlan { target, kind: selection.kind, name: selection.name, parts, stored, text }))
+    Ok(Some(EntryPlan { owner, name: selection.name, parts, stored, text, fill }))
+}
+
+/// Пишет ответ модели в запись. `Fill::Empty`: описание и манера речи только в пустое поле, заполненное за время
+/// запуска остаётся как есть. Род пишется только персонажу без рода. `false`: записи уже нет (удалена или слита
+/// за время запуска) или её описание заполнено.
+fn write_entry(tx: &rusqlite::Connection, owner: ExcludeOwner, fill: Fill, answer: &CharacterAnswer) -> Result<bool, DbError> {
+    let empty_only = fill == Fill::Empty;
+    match owner {
+        ExcludeOwner::Character(id) => {
+            let repo = CharacterRepo { conn: tx };
+            let mut character = match repo.get(id) {
+                Ok(character) => character,
+                Err(DbError::NotFound) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if empty_only && character.description().is_some() {
+                return Ok(false);
+            }
+            character.set_description(&answer.description);
+            if let Some(speech) = &answer.speech
+                && !(empty_only && character.speech().is_some())
+            {
+                character.set_speech(speech);
+            }
+            if character.gender().is_none() {
+                character.set_gender(answer.gender);
+            }
+            repo.save(&character)?;
+        }
+        ExcludeOwner::Term(id) => {
+            let repo = TermRepo { conn: tx };
+            let mut term = match repo.get(id) {
+                Ok(term) => term,
+                Err(DbError::NotFound) => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if empty_only && term.description().is_some() {
+                return Ok(false);
+            }
+            term.set_description(&answer.description);
+            repo.save(&term)?;
+        }
+    }
+    Ok(true)
 }
 
 /// Итог сцены: записанное описание и идёт ли запуск дальше.
@@ -990,11 +1112,21 @@ struct SceneWriter<'a> {
     hints: &'a Hints,
     target: &'a LlmTarget,
     model: &'a str,
+    /// Запуск цепочки автоперевода: записи без описания запоминаются в `glossary_asks` и снова не спрашиваются.
+    chain: bool,
 }
 
 impl SceneWriter<'_> {
-    /// Заметки выбранных частей: готовые из базы, новые спрашиваются и пишутся сразу. Исключённые, пустые
-    /// и отказы в итог не входят. `None`: запуск остановлен.
+    /// Цепочка запоминает персонажа или термин, о котором спросила и не получила описания.
+    fn unanswered(&self, plan: &EntryPlan) -> Result<(), AppError> {
+        if self.chain {
+            self.open.project.write(|tx| AskRepo { conn: tx }.mark(AskKind::Description, &plan.ask_key(), Timestamp::now()))?;
+        }
+        Ok(())
+    }
+
+    /// Заметки выбранных частей: готовые из базы, новые спрашиваются и пишутся сразу. Пустые и отказы в итог
+    /// не входят. `None`: запуск остановлен.
     #[allow(clippy::too_many_arguments)]
     async fn notes(
         &self,
@@ -1009,7 +1141,6 @@ impl SceneWriter<'_> {
         let mut notes = Vec::new();
         for (index, part) in parts.iter().enumerate() {
             let note = match stored.get(&part.hash) {
-                Some(note) if note.excluded => continue,
                 Some(note) => note.text.clone(),
                 None => {
                     run.note(format!("{label}: заметка к части {} из {}", index + 1, parts.len()));
@@ -1024,7 +1155,6 @@ impl SceneWriter<'_> {
                             model: self.model.to_string(),
                             part_hash: part.hash.clone(),
                             text: note.clone(),
-                            excluded: false,
                             created_at: Timestamp::now(),
                         };
                         self.open.project.write(|tx| NoteRepo { conn: tx }.save(&saved))?;
@@ -1061,10 +1191,14 @@ impl SceneWriter<'_> {
                 return Ok(Vec::new());
             }
             let lines = samples.story_lines()?;
-            let targets = characters.into_iter().map(DescribeTarget::Character).chain(terms.into_iter().map(DescribeTarget::Term));
+            let owners = characters.into_iter().map(ExcludeOwner::Character).chain(terms.into_iter().map(ExcludeOwner::Term));
             let mut plans = Vec::new();
-            for target in targets {
-                plans.extend(plan_entry(tx, &context, &glossary, &lines, target, self.model, choice, Fill::Empty)?);
+            for owner in owners {
+                plans.extend(plan_entry(tx, &context, &glossary, &lines, owner, self.model, choice, Fill::Empty)?);
+            }
+            if self.chain {
+                let asked = AskRepo { conn: tx }.asked(AskKind::Description)?;
+                plans.retain(|plan| !asked.contains(&plan.ask_key()));
             }
             Ok(plans)
         })?;
@@ -1073,7 +1207,7 @@ impl SceneWriter<'_> {
         for plan in plans {
             let outcome = self.entry(run, &plan, written).await?;
             if outcome.description.is_some() {
-                done.push(plan.target.clone());
+                done.push(plan.owner.into());
             }
             if !outcome.going {
                 return Ok((done, false));
@@ -1082,24 +1216,27 @@ impl SceneWriter<'_> {
         Ok((done, true))
     }
 
-    /// Описание персонажа или термина по заметкам частей. Запуск заменяет описание, у персонажа и манеру речи.
+    /// Описание персонажа или термина по заметкам частей. Единственная полезная заметка о термине сразу
+    /// становится описанием, у персонажа сборка идёт всегда: из неё берутся манера речи и род.
     async fn entry(&self, run: &mut impl Ask, plan: &EntryPlan, written: usize) -> Result<Outcome, AppError> {
-        let owner = owner_of(&plan.target);
+        let owner = owner_of(&plan.owner.into());
         let label = plan.label();
-        let request = |part: &Part| EntryPartPrompt::build(plan.kind, &plan.name, &part.text, self.hints, self.target);
+        let kind = plan.kind();
+        let request = |part: &Part| EntryPartPrompt::build(kind, &plan.name, &part.text, self.hints, self.target);
         let Some(notes) = self.notes(run, &label, &owner, &plan.parts, &plan.stored, written, request).await? else {
             return Ok(Outcome::STOPPED);
         };
         if notes.is_empty() {
+            self.unanswered(plan)?;
             return Ok(Outcome::NOTHING);
         }
         let mut going = true;
-        let answer = if let (EntryKind::Term, [_], [note]) = (plan.kind, plan.parts.as_slice(), notes.as_slice()) {
+        let answer = if let (EntryKind::Term, [note]) = (kind, notes.as_slice()) {
             Some(CharacterAnswer { description: note.clone(), ..CharacterAnswer::default() })
         } else {
-            let Some(notes) = self.condense(run, &label, notes, written).await else { return Ok(Outcome::STOPPED) };
+            let Some(notes) = self.condense(run, &label, plan.about(), notes, written).await else { return Ok(Outcome::STOPPED) };
             run.note(format!("{label}: сборка описания"));
-            let request = match plan.kind {
+            let request = match kind {
                 EntryKind::Character => CharacterPrompt::build(&plan.name, &notes, &plan.text, self.hints, self.target),
                 EntryKind::Term => TermPrompt::build(&plan.name, &notes, &plan.text, self.hints, self.target),
             };
@@ -1109,34 +1246,17 @@ impl SceneWriter<'_> {
                 Sent::Stop => return Ok(Outcome::STOPPED),
             };
             going = run.step(written);
-            match plan.kind {
+            match kind {
                 EntryKind::Character => CharacterPrompt::accept(&text),
                 EntryKind::Term => Some(clean_note(&text)).filter(|text| !text.is_empty()).map(|description| CharacterAnswer { description, ..CharacterAnswer::default() }),
             }
         };
-        let Some(answer) = answer else { return Ok(Outcome { description: None, going }) };
-        self.open.project.write(|tx| match &plan.target {
-            DescribeTarget::Character(id) => {
-                let repo = CharacterRepo { conn: tx };
-                let mut character = repo.get(*id)?;
-                character.set_description(&answer.description);
-                if let Some(speech) = &answer.speech {
-                    character.set_speech(speech);
-                }
-                if character.gender().is_none() {
-                    character.set_gender(answer.gender);
-                }
-                repo.save(&character).map(|_| ())
-            }
-            DescribeTarget::Term(id) => {
-                let repo = TermRepo { conn: tx };
-                let mut term = repo.get(*id)?;
-                term.set_description(&answer.description);
-                repo.save(&term).map(|_| ())
-            }
-            DescribeTarget::Scene(_) => Ok(()),
-        })?;
-        Ok(Outcome { description: Some(answer.description), going })
+        let Some(answer) = answer else {
+            self.unanswered(plan)?;
+            return Ok(Outcome { description: None, going });
+        };
+        let saved = self.open.project.write(|tx| write_entry(tx, plan.owner, plan.fill, &answer))?;
+        Ok(Outcome { description: saved.then_some(answer.description), going })
     }
 
     /// Возвращает записанное описание и идёт ли запуск дальше.
@@ -1154,7 +1274,7 @@ impl SceneWriter<'_> {
         let description = if let ([_], [note]) = (plan.parts.as_slice(), notes.as_slice()) {
             note.clone()
         } else {
-            let Some(notes) = self.condense(run, &plan.label, notes, written).await else { return Ok(Outcome::STOPPED) };
+            let Some(notes) = self.condense(run, &plan.label, NotesAbout::Scene, notes, written).await else { return Ok(Outcome::STOPPED) };
             run.note(format!("{}: сборка описания", plan.label));
             let description = match run.send(&ScenePrompt::build(&notes, &plan.text, self.hints, self.target)).await {
                 Sent::Text(text) => clean_note(&text),
@@ -1207,7 +1327,7 @@ impl SceneWriter<'_> {
     }
 
     /// Сжимает заметки группами, пока они не поместятся в запрос сборки. `None`: запуск остановлен.
-    async fn condense(&self, run: &mut impl Ask, label: &str, mut notes: Vec<String>, written: usize) -> Option<Vec<String>> {
+    async fn condense(&self, run: &mut impl Ask, label: &str, about: NotesAbout<'_>, mut notes: Vec<String>, written: usize) -> Option<Vec<String>> {
         for _ in 0..CONDENSE_ROUNDS {
             if CondensePrompt::fits(&notes) {
                 break;
@@ -1218,7 +1338,7 @@ impl SceneWriter<'_> {
             let count = groups.len();
             for (index, group) in groups.into_iter().enumerate() {
                 run.note(format!("{label}: сжатие заметок, группа {} из {count}", index + 1));
-                match run.send(&CondensePrompt::build(&group, self.target)).await {
+                match run.send(&CondensePrompt::build(&group, about, self.target)).await {
                     Sent::Text(text) => {
                         let text = clean_note(&text);
                         if text.is_empty() { condensed.extend(group) } else { condensed.push(text) }
@@ -1248,7 +1368,7 @@ pub(crate) mod tests {
     use super::super::analyze::{Finding, FoundKind, NameParts};
     use super::super::relations;
     use super::super::resolve::{Claim, save_found};
-    use crate::glossary::{Character, GlossaryService, SpeakerRepo, Term, TermCategory};
+    use crate::glossary::{Character, FormKind, GlossaryService, SpeakerRepo, Term, TermCategory};
 
     use crate::llm::client::tests::{completion, fake_model};
     use crate::engines::SpeakerKey;
@@ -1465,11 +1585,9 @@ pub(crate) mod tests {
         let character = DescribeTarget::Character(eileen);
         let term = DescribeTarget::Term(side);
 
-        let parts = service.entry_parts(id, &character).unwrap();
-        assert_eq!(parts.parts.len(), 1, "две маленькие сцены в одной части");
-        let scenes: Vec<&str> = parts.parts[0].scenes.iter().map(ContainerKey::as_str).collect();
-        assert_eq!(scenes, ["label:start", "label:left"]);
-        assert_eq!((parts.picked, parts.parts[0].note.is_none()), (1, true));
+        let owner = ExcludeOwner::Character(eileen);
+        let counts = |parts: &EntryParts| (parts.parts, parts.read, parts.picked);
+        assert_eq!(counts(&service.entry_parts(id, owner).unwrap()), (1, 0, 1), "две маленькие сцены в одной части");
 
         let described =
             tauri::async_runtime::block_on(service.describe_many(id, vec![character.clone(), term.clone()], None, silent()))
@@ -1488,18 +1606,69 @@ pub(crate) mod tests {
         assert_eq!(person.gender(), Some(crate::common::Gender::Female), "пустой род заполнен по описанию");
         assert_eq!(item.description(), Some("Сторона, куда ведёт дорога."), "заметка единственной части сразу описание");
 
-        let parts = service.entry_parts(id, &character).unwrap();
-        let note = parts.parts[0].note.clone().unwrap();
-        service.exclude_note(id, &character, &note.model, &note.part_hash, true).unwrap();
-        assert!(service.entry_parts(id, &character).unwrap().parts[0].note.as_ref().unwrap().excluded);
+        assert_eq!(counts(&service.entry_parts(id, owner).unwrap()), (1, 1, 1));
+
+        // Группа описанную запись без новых частей пропускает, кнопка записи собирает описание заново из заметки.
+        let mut edited = person.clone();
+        edited.set_description("Старое описание.");
+        glossary.save_character(id, &edited).unwrap();
+        let again = tauri::async_runtime::block_on(service.describe_many(id, vec![character.clone()], None, silent())).unwrap();
+        assert!(again.written.is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        let replaced = tauri::async_runtime::block_on(service.describe_entry(id, owner, None, silent())).unwrap();
+        assert_eq!(replaced.written, std::slice::from_ref(&character));
+        assert_eq!(seen.lock().unwrap().len(), 4, "только сборка");
+        let person = open.project.read(|tx| CharacterRepo { conn: tx }.get(eileen)).unwrap();
+        assert_eq!(person.description(), Some("Эйлин встречает героя."));
 
         let left = ContainerKey::new("label:left").unwrap();
-        glossary.set_excluded_scene(id, crate::glossary::ExcludeOwner::Character(eileen), &left, true).unwrap();
-        let parts = service.entry_parts(id, &character).unwrap();
+        glossary.set_excluded_scene(id, owner, &left, true).unwrap();
+        let parts = service.entry_parts(id, owner).unwrap();
         assert_eq!(parts.excluded, std::slice::from_ref(&left));
-        let scenes: Vec<&str> = parts.parts[0].scenes.iter().map(ContainerKey::as_str).collect();
-        assert_eq!(scenes, ["label:start"], "исключённая сцена модели не даётся");
-        assert!(parts.parts[0].note.is_none(), "у новой части заметки нет");
+        assert_eq!(counts(&parts), (1, 0, 1), "у новой части заметки нет");
+        tauri::async_runtime::block_on(service.describe_entry(id, owner, None, silent())).unwrap();
+        let part = user_text(&seen.lock().unwrap()[4]);
+        assert!(part.contains("Eileen: Hello.\n") && !part.contains("Left side"), "исключённая сцена модели не даётся: {part}");
+    }
+
+    #[test]
+    fn chain_writes_an_entry_only_into_empty_fields() {
+        let (url, _) = fake_model(|body| {
+            let answer = if system_text(body).contains("about one character") {
+                r#"{"description": "Эйлин встречает героя.", "speech": "Говорит на «ты»."}"#
+            } else {
+                "Эйлин здоровается."
+            };
+            completion(answer)
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), &url);
+        let glossary = GlossaryService { state: &state };
+        let eileen = glossary.speaker_to_character(id, &SpeakerKey::new("code:e").unwrap()).unwrap();
+        let open = state.open_project(id).unwrap();
+        let get = || open.project.read(|tx| CharacterRepo { conn: tx }.get(eileen)).unwrap();
+        let mut person = get();
+        person.set_speech("Сухо и коротко.");
+        glossary.save_character(id, &person).unwrap();
+
+        let target = DescribeTarget::Character(eileen);
+        let described =
+            tauri::async_runtime::block_on(DescribeService { state: &state }.describe_unasked(id, vec![target.clone()], None, silent())).unwrap();
+        assert_eq!(described.written, [target]);
+        let person = get();
+        assert_eq!((person.description(), person.speech()), (Some("Эйлин встречает героя."), Some("Сухо и коротко.")), "своя манера речи осталась");
+
+        // Описание, которое появилось за время запуска, цепочка не трогает, а кнопка записи заменяет.
+        let answer = CharacterAnswer { description: "Новое.".to_string(), speech: Some("Иначе.".to_string()), gender: None };
+        let owner = ExcludeOwner::Character(eileen);
+        assert!(!open.project.write(|tx| write_entry(tx, owner, Fill::Empty, &answer)).unwrap());
+        assert_eq!(get().description(), Some("Эйлин встречает героя."));
+        assert!(open.project.write(|tx| write_entry(tx, owner, Fill::Replace, &answer)).unwrap());
+        let person = get();
+        assert_eq!((person.description(), person.speech()), (Some("Новое."), Some("Иначе.")));
+        // Записи уже нет (удалена или слита за время запуска): писать некуда, запуск идёт дальше.
+        let gone = ExcludeOwner::Term(TermId::from_row(999_999));
+        assert!(!open.project.write(|tx| write_entry(tx, gone, Fill::Replace, &answer)).unwrap());
     }
 
     fn found(name: &str, kind: FoundKind, same_as: Option<&str>) -> Finding {
@@ -1592,7 +1761,8 @@ pub(crate) mod tests {
         assert!(list.iter().all(|term| term.id() != Some(od)), "аббревиатура слита");
         assert_eq!(forms(list.iter().find(|term| term.id() == Some(order)).unwrap()), [("OD".to_string(), None)]);
 
-        // Два известных персонажа, короткая и полная форма имени: главным остаётся полное имя.
+        // Два известных персонажа, короткая и полная форма имени: остаётся запись, записанная раньше, а в игре
+        // имён нет, поэтому главным остаётся её имя.
         let eileen = glossary.create_character(id, "Eileen").unwrap();
         let mut character = open.project.read(|tx| CharacterRepo { conn: tx }.get(eileen)).unwrap();
         character.set_last_name("Lee");
@@ -1604,14 +1774,17 @@ pub(crate) mod tests {
         character.set_description("Учитель.");
         glossary.save_character(id, &character).unwrap();
         let stuart = glossary.create_character(id, "Stuart").unwrap();
-        assert_eq!(save(&[found("Stuart", FoundKind::Character, Some("Stu"))]).added, ["Stu → Stuart (объединено)"]);
-        let (characters, links) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.list()?, SpeakerRepo { conn: tx }.links_of(stuart)?))).unwrap();
-        assert_eq!(characters.len(), 2, "Eileen Lee и Stuart");
-        let merged = characters.iter().find(|character| character.id() == Some(stuart)).unwrap();
+        assert_eq!(save(&[found("Stuart", FoundKind::Character, Some("Stu"))]).added, ["Stuart → Stu (объединено)"]);
+        let (characters, links) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.list()?, SpeakerRepo { conn: tx }.links_of(stu)?))).unwrap();
+        assert_eq!(characters.len(), 2, "Eileen Lee и Stu");
+        assert!(characters.iter().all(|character| character.id() != Some(stuart)), "вторая запись слита");
+        let merged = characters.iter().find(|character| character.id() == Some(stu)).unwrap();
         let forms_of = |character: &crate::glossary::Character| character.forms().iter().map(|form| (form.text().to_string(), form.translation().map(str::to_string))).collect::<Vec<_>>();
-        assert_eq!(forms_of(merged), [("Stu".to_string(), Some("Стю".to_string()))], "уменьшительное стало формой со своим переводом");
-        assert_eq!(merged.description(), Some("Учитель."), "пустое описание заполнено");
-        assert_eq!(links.iter().map(|link| link.speaker.as_str()).collect::<Vec<_>>(), ["code:e"], "говорящий перешёл");
+        assert_eq!((merged.first_name(), merged.translated_first_name()), (Some("Stu"), Some("Стю")));
+        assert_eq!(forms_of(merged), [("Stuart".to_string(), None)], "второе написание имени стало формой");
+        assert_eq!(merged.forms()[0].kind(), FormKind::First);
+        assert_eq!(merged.description(), Some("Учитель."));
+        assert_eq!(links.iter().map(|link| link.speaker.as_str()).collect::<Vec<_>>(), ["code:e"]);
 
         // Скрипт связи не видит: известные записи по одному слову модели не сливаются, пара идёт вопросом.
         let leeway = glossary.take_term(id, "Leeway", TermCategory::General).unwrap();
@@ -1648,7 +1821,7 @@ pub(crate) mod tests {
             person("Vellnikov", None, Some("Vellnikov"), Some("Dimitria")),
             person("Dimi", Some("Dimi"), None, Some("Dimitria")),
         ]);
-        assert_eq!(saved.added, ["Vera Karanovic", "Detective-Colonel", "Stu → Stuart", "Vellnikov → Dimitria Vellnikov", "Dimi → Dimitria Vellnikov"]);
+        assert_eq!(saved.added, ["Vera Karanovic", "Detective-Colonel", "Stuart → Stu", "Vellnikov → Dimitria Vellnikov", "Dimi → Dimitria Vellnikov"]);
         assert!(saved.claims.is_empty());
 
         let (characters, terms) = open.project.read(|tx| Ok((CharacterRepo { conn: tx }.list()?, TermRepo { conn: tx }.list()?))).unwrap();
@@ -1656,9 +1829,10 @@ pub(crate) mod tests {
         assert_eq!(vera.last_name(), Some("Karanovic"), "имя и фамилия по отдельности");
         assert!(vera.forms().is_empty(), "должность с фамилией не форма");
         assert_eq!(get(karanovic).full_name().as_deref(), Some("Karanovic"), "одиночная фамилия сама с однофамилицей не сливается");
-        assert_eq!(get(stu).first_name(), Some("Stuart"), "полное имя стало основным");
-        assert_eq!(get(stu).forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Stu"]);
+        assert_eq!(get(stu).first_name(), Some("Stu"), "в игре имён нет: главным остаётся прежнее");
+        assert_eq!(get(stu).forms().iter().map(|form| (form.text(), form.kind())).collect::<Vec<_>>(), [("Stuart", FormKind::First)]);
         assert_eq!((get(dimitria).last_name(), get(dimitria).forms().iter().map(|form| form.text()).collect::<Vec<_>>()), (Some("Vellnikov"), vec!["Dimi"]));
+        assert_eq!(get(dimitria).forms()[0].kind(), FormKind::First, "короткое имя это форма-имя");
         assert_eq!(terms.iter().map(|term| (term.name(), term.category())).collect::<Vec<_>>(), [("Detective-Colonel", TermCategory::Title)]);
 
         // Модель назвала одиночную фамилию Верой, и скрипт видит общую фамилию: слияние сразу.
@@ -1692,15 +1866,96 @@ pub(crate) mod tests {
         assert_eq!(text.as_deref(), Some("Petrova → Vera Karanovic (объединено)"));
         assert_eq!(list()[0].forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Petrova"]);
 
-        // Опечатка в фамилии: поле занято, но скрипт видит опечатку. Два довода, слияние сразу.
+        // Опечатка в фамилии: поле занято, но скрипт видит опечатку. Два довода, написание ложится формой-фамилией.
         let saved = save(&[person("Karanovich", None, Some("Karanovich"), Some("Vera Karanovic"))]);
-        assert_eq!(saved.added, ["Karanovich", "Karanovich → Vera Karanovic (объединено)"]);
+        assert_eq!(saved.added, ["Karanovich → Vera Karanovic"]);
         assert!(saved.claims.is_empty());
         assert_eq!(list().len(), 1);
 
         // Псевдоним без частей имени ложится формой сразу: другого довода у него не бывает.
         assert_eq!(save(&[found("Nightingale", FoundKind::Character, Some("Vera Karanovic"))]).added, ["Nightingale → Vera Karanovic"]);
-        assert_eq!(list()[0].forms().iter().map(|form| form.text()).collect::<Vec<_>>(), ["Petrova", "Karanovich", "Nightingale"]);
+        assert_eq!(
+            list()[0].forms().iter().map(|form| (form.text(), form.kind())).collect::<Vec<_>>(),
+            [("Petrova", FormKind::Last), ("Karanovich", FormKind::Last), ("Nightingale", FormKind::Other)]
+        );
+        assert_eq!(list()[0].full_name().as_deref(), Some("Vera Karanovic"), "в игре фамилий нет: главной остаётся прежняя");
+    }
+
+    /// Реплики с именами: главное написание выбирается по тому, сколько реплик его показывают.
+    const NAMES_SCRIPT: &str = r#"label names:
+    "Vera came in."
+    "Vera smiled."
+    "Veraaaa... oh."
+    "The fierce Jovankam smiled."
+    "Jovanka nodded."
+    "Jovanka left."
+    "That damned Alexa."
+    "Alexandra is here."
+    "Alexandra sat down."
+    "Name: Margaret Saint-Saens"
+    "My friend, Margaret Dvorak."
+    "Dvorak called."
+    "Her name is Maja Zoric."
+    "Maja waved."
+    "Claire Kralj signed it."
+"#;
+
+    #[test]
+    fn the_main_name_is_the_spelling_the_game_shows_most() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project_with(dir.path(), "http://127.0.0.1:9/v1", &[("names.rpy", NAMES_SCRIPT)]);
+        let glossary = GlossaryService { state: &state };
+        let open = state.open_project(id).unwrap();
+        let save = |findings: &[Finding]| open.project.write(|tx| save_scene_found(tx, findings, None)).unwrap();
+        let get = |id: CharacterId| open.project.read(|tx| CharacterRepo { conn: tx }.get(id)).unwrap();
+        let forms = |id: CharacterId| get(id).forms().iter().map(|form| (form.text().to_string(), form.kind())).collect::<Vec<_>>();
+
+        // Растянутое написание из одной реплики главным не становится, хотя оно длиннее.
+        let vera = glossary.create_character(id, "Vera").unwrap();
+        assert_eq!(save(&[person("Veraaaa", Some("Veraaaa"), None, Some("Vera"))]).added, ["Veraaaa → Vera"]);
+        assert_eq!((get(vera).first_name(), forms(vera)), (Some("Vera"), vec![("Veraaaa".to_string(), FormKind::First)]));
+
+        // Главным записано редкое написание: частое занимает его место, перевод остаётся при своём написании.
+        let jovanka = glossary.create_character(id, "Jovankam").unwrap();
+        let mut character = get(jovanka);
+        character.set_translated_names("Йованкам", "");
+        glossary.save_character(id, &character).unwrap();
+        save(&[found("Jovanka", FoundKind::Character, Some("Jovankam"))]);
+        let character = get(jovanka);
+        assert_eq!((character.first_name(), character.translated_first_name()), (Some("Jovanka"), None));
+        assert_eq!(
+            character.forms().iter().map(|form| (form.text(), form.translation(), form.kind())).collect::<Vec<_>>(),
+            [("Jovankam", Some("Йованкам"), FormKind::First)]
+        );
+
+        // Полное имя без частей от модели: имя известно, остаток это фамилия.
+        let maja = glossary.create_character(id, "Maja").unwrap();
+        assert_eq!(save(&[found("Maja Zoric", FoundKind::Character, Some("Maja"))]).added, ["Maja → Maja Zoric"]);
+        assert_eq!((get(maja).last_name(), forms(maja)), (Some("Zoric"), Vec::new()));
+        // Одно слово без частей, которое в репликах стоит после имени: фамилия.
+        let claire = glossary.create_character(id, "Claire").unwrap();
+        save(&[found("Kralj", FoundKind::Character, Some("Claire"))]);
+        assert_eq!((get(claire).last_name(), forms(claire)), (Some("Kralj"), Vec::new()));
+
+        // «Объединить с…» в окне: остаётся более ранняя запись, имя выбирает частота.
+        let alexa = glossary.create_character(id, "Alexa").unwrap();
+        let alexandra = glossary.create_character(id, "Alexandra").unwrap();
+        let kept = glossary.merge(id, ExcludeOwner::Character(alexandra), ExcludeOwner::Character(alexa)).unwrap();
+        assert_eq!(kept, ExcludeOwner::Character(alexa));
+        assert_eq!((get(alexa).first_name(), forms(alexa)), (Some("Alexandra"), vec![("Alexa".to_string(), FormKind::First)]));
+
+        // Две фамилии одного человека: вторая ложится формой-фамилией, главная та, что в игре чаще.
+        save(&[
+            person("Margaret Saint-Saens", Some("Margaret"), Some("Saint-Saens"), None),
+            person("Margaret Dvorak", Some("Margaret"), Some("Dvorak"), None),
+        ]);
+        let list = open.project.read(|tx| CharacterRepo { conn: tx }.list()).unwrap();
+        let record = |last: &str| list.iter().find(|character| character.last_name() == Some(last)).and_then(Character::id).unwrap();
+        let (saens, dvorak) = (record("Saint-Saens"), record("Dvorak"));
+        let kept = glossary.merge(id, ExcludeOwner::Character(dvorak), ExcludeOwner::Character(saens)).unwrap();
+        assert_eq!(kept, ExcludeOwner::Character(saens));
+        assert_eq!((get(saens).full_name().as_deref(), forms(saens)), (Some("Margaret Dvorak"), vec![("Saint-Saens".to_string(), FormKind::Last)]));
+        assert!(glossary.merge(id, ExcludeOwner::Character(saens), ExcludeOwner::Character(saens)).is_err(), "запись с собой не объединяется");
     }
 
     #[test]

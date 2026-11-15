@@ -50,7 +50,5 @@ pub struct Note {
     /// Отпечаток текста части.
     pub part_hash: String,
     pub text: String,
-    /// Пользователь исключил из описания.
-    pub excluded: bool,
     pub created_at: Timestamp,
 }

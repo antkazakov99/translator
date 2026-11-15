@@ -67,6 +67,8 @@ export const commands = {
 	restoreTerm: (project: string, key: string) => __TAURI_INVOKE<RowRef>("restore_term", { project, key }),
 	/**  Термин становится формой персонажа, название уходит в корзину. */
 	giveTermToCharacter: (project: string, term: RowRef, character: RowRef) => __TAURI_INVOKE<null>("give_term_to_character", { project, term, character }),
+	/**  «Объединить с…»: два персонажа или два термина это одно. Возвращает номер записи, которая осталась. */
+	mergeEntries: (project: string, entry: OwnerDto, other: OwnerDto) => __TAURI_INVOKE<RowRef>("merge_entries", { project, entry, other }),
 	/**  Окончательное удаление из корзины: название забывается, модель может найти его снова. */
 	forgetTermName: (project: string, key: string) => __TAURI_INVOKE<null>("forget_term_name", { project, key }),
 	/**  Значение или пояснение токена. Пустые оба удаляют запись. */
@@ -122,19 +124,12 @@ export const commands = {
 	writeNames: (project: string, names: NamePickDto[]) => __TAURI_INVOKE<number>("write_names", { project, names }),
 	/**  Сброс всего прогресса: переводы, описания, заметки, отметки, весь глоссарий и законченные запуски. */
 	resetGame: (project: string) => __TAURI_INVOKE<null>("reset_game", { project }),
-	/**  Части сцен персонажа или термина с заметками модели. */
-	entryParts: (project: string, owner: OwnerDto) => __TAURI_INVOKE<EntryPartsDto_Serialize>("entry_parts", { project, owner }),
-	/**  Описывает персонажа или термин по частям сцен с глубиной чтения проекта и заменяет описание. */
+	/**  Части сцен персонажа или термина: сколько их, сколько прочитано и сколько прочитает запуск. */
+	entryParts: (project: string, owner: OwnerDto) => __TAURI_INVOKE<EntryPartsDto>("entry_parts", { project, owner }),
+	/**  Описывает персонажа или термин по частям сцен с глубиной чтения приложения и заменяет описание. */
 	describeEntry: (project: string, owner: OwnerDto, profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_entry", { project, owner, profile, progress }),
-	/**
-	 *  Описывает отмеченных персонажей и термины по очереди с глубиной чтения проекта.
-	 *  Описанные записи без новых частей пропускаются.
-	 */
-	describeEntries: (project: string, owners: OwnerDto[], profile: string | null, progress: Channel<RunProgress_Deserialize>) => __TAURI_INVOKE<DescribedDto_Serialize>("describe_entries", { project, owners, profile, progress }),
 	/**  Сбрасывает заметки персонажа или термина. Возвращает число удалённых. */
 	resetEntryNotes: (project: string, owner: OwnerDto) => __TAURI_INVOKE<number>("reset_entry_notes", { project, owner }),
-	/**  Заметка не идёт в описание или возвращается в него. */
-	excludeNote: (project: string, owner: OwnerDto, model: string, hash: string, excluded: boolean) => __TAURI_INVOKE<null>("exclude_note", { project, owner, model, hash, excluded }),
 	/**  Сцена не даётся модели при описании персонажа или термина, или возвращается. */
 	excludeScene: (project: string, owner: OwnerDto, key: string, excluded: boolean) => __TAURI_INVOKE<null>("exclude_scene", { project, owner, key, excluded }),
 	/**  Реплики персонажа или термина по сюжету: где персонаж говорит или его упоминают, где есть термин. */
@@ -366,57 +361,15 @@ export type EntryLineDto_Serialize = {
 	spoken: boolean,
 };
 
-/**  Часть сцен персонажа или термина. */
-export type EntryPartDto = EntryPartDto_Serialize | EntryPartDto_Deserialize;
-
-/**  Часть сцен персонажа или термина. */
-export type EntryPartDto_Deserialize = {
-	hash: string,
-	/**  Первая строка части. */
-	start: string,
-	scenes: string[],
-	note?: string | null,
-	/**  Модель заметки: по ней заметку исключают. */
-	model?: string | null,
-	/**  Заметка идёт в описание: не пустая и не отказ модели. */
-	useful: boolean,
-	/**  Пользователь исключил заметку. */
-	excluded: boolean,
-	/**  Часть войдёт в следующий запуск. */
-	picked: boolean,
-};
-
-/**  Часть сцен персонажа или термина. */
-export type EntryPartDto_Serialize = {
-	hash: string,
-	/**  Первая строка части. */
-	start: string,
-	scenes: string[],
-	note: string | null,
-	/**  Модель заметки: по ней заметку исключают. */
-	model: string | null,
-	/**  Заметка идёт в описание: не пустая и не отказ модели. */
-	useful: boolean,
-	/**  Пользователь исключил заметку. */
-	excluded: boolean,
-	/**  Часть войдёт в следующий запуск. */
-	picked: boolean,
-};
-
-/**  Части записи, сколько из них прочитает запуск, и исключённые сцены. */
-export type EntryPartsDto = EntryPartsDto_Serialize | EntryPartsDto_Deserialize;
-
-/**  Части записи, сколько из них прочитает запуск, и исключённые сцены. */
-export type EntryPartsDto_Deserialize = {
-	parts: EntryPartDto_Deserialize[],
+/**  Части сцен персонажа или термина для кнопки описания. */
+export type EntryPartsDto = {
+	/**  Сколько частей у записи. */
+	parts: number,
+	/**  У скольких есть заметка модели. */
+	read: number,
+	/**  Сколько прочитает следующий запуск. */
 	picked: number,
-	excluded: string[],
-};
-
-/**  Части записи, сколько из них прочитает запуск, и исключённые сцены. */
-export type EntryPartsDto_Serialize = {
-	parts: EntryPartDto_Serialize[],
-	picked: number,
+	/**  Сцены, которые модели не даются. */
 	excluded: string[],
 };
 
@@ -465,12 +418,28 @@ export type FormDto = FormDto_Serialize | FormDto_Deserialize;
 export type FormDto_Deserialize = {
 	text: string,
 	translation?: string | null,
+	/**  Вид формы персонажа. У формы термина всегда `other`. */
+	kind?: FormKind,
 };
 
 export type FormDto_Serialize = {
 	text: string,
 	translation: string | null,
+	/**  Вид формы персонажа. У формы термина всегда `other`. */
+	kind: FormKind,
 };
+
+/**
+ *  Чем форма приходится имени персонажа. От вида зависит, как форму пишет перевод имён и может ли она стать
+ *  главным именем или фамилией. У формы термина вида нет: всегда `Other`.
+ */
+export type FormKind = 
+/**  Другое написание имени: короткая форма, полная, опечатка («Dimi» у «Dimitria»). */
+"first" | 
+/**  Другая фамилия или другое её написание («Saint-Saens» у «Margaret Dvorak»). */
+"last" | 
+/**  Всё остальное: прозвище, титул, обращение, подпись из игры. */
+"other";
 
 /**  Шрифт игры. */
 export type GameFontDto = GameFontDto_Serialize | GameFontDto_Deserialize;

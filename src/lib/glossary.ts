@@ -1,6 +1,7 @@
 import type {
   CharacterDto_Serialize,
   FormDto_Serialize,
+  FormKind,
   Gender,
   GlossaryDto_Serialize,
   NameField,
@@ -61,6 +62,13 @@ export function untranslatedNames(character: Character) {
 }
 
 export const nameFieldLabels: Record<NameField, string> = { first: "Имя", last: "Фамилия", form: "Форма" };
+
+/** Вид формы персонажа: другое написание имени, другая фамилия или остальное (прозвище, титул, обращение). */
+export const formKinds: { value: FormKind; label: string }[] = [
+  { value: "first", label: "Имя" },
+  { value: "last", label: "Фамилия" },
+  { value: "other", label: "Другое" },
+];
 
 let languageNames: Intl.DisplayNames | null = null;
 

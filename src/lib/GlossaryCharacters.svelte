@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { Check, Languages, LoaderCircle, Plus, Trash2, TriangleAlert } from "lucide-svelte";
+  import { Check, Languages, LoaderCircle, Merge, Plus, Trash2, TriangleAlert } from "lucide-svelte";
+  import Combobox from "./Combobox.svelte";
   import DescribeParts from "./DescribeParts.svelte";
   import EntryLines from "./EntryLines.svelte";
   import GlossaryForms from "./GlossaryForms.svelte";
@@ -106,6 +107,9 @@
   let confirmDelete = $state(false);
   /** Открыт вопрос о сбросе заметок модели: остальные действия шапки на это время скрыты. */
   let resetting = $state(false);
+  /** Открыт выбор персонажа, с которым объединяется открытый. */
+  let merging = $state(false);
+  let mergeText = $state("");
   /** Карточка в правке. Сбрасывается только при выборе другого персонажа. */
   let draft = $state<Character | null>(null);
 
@@ -128,7 +132,28 @@
     draft = found ? structuredClone($state.snapshot(found)) : null;
     fieldError = "";
     confirmDelete = false;
+    merging = false;
+    mergeText = "";
   });
+
+  const mergeOptions = (all: boolean) =>
+    data.characters
+      .filter((character) => character.id !== draft?.id)
+      .filter((character) => all || matches(mergeText, characterName(character), ...character.forms.map((form) => form.text)))
+      .map((character) => ({ id: String(character.id), label: characterName(character) }));
+
+  /** Два персонажа это один человек: остаётся одна запись, её и открываем. */
+  async function merge(other: number) {
+    if (!draft) return;
+    try {
+      const kept = await commands.mergeEntries(projectId, { kind: "character", id: draft.id }, { kind: "character", id: other });
+      draft = null;
+      await reload();
+      selected = kept;
+    } catch (e) {
+      onError(String(e));
+    }
+  }
 
   /** Модель записала описание и манеру речи: они ложатся в открытую карточку. */
   async function described() {
@@ -262,6 +287,15 @@
           {:else}
             <DescribeParts {projectId} owner={{ kind: "character", id: draft.id }} {runs} bind:confirming={resetting} onDescribed={described} {onError} />
             {#if !resetting}
+              <button
+                class="icon-button"
+                class:active={merging}
+                disabled={data.characters.length < 2}
+                aria-label="Объединить с другим персонажем"
+                aria-pressed={merging}
+                title="Объединить с другим персонажем: это один человек. Имена и формы обоих останутся, главное имя и фамилия выберутся по частоте в игре"
+                onclick={() => (merging = !merging)}><Merge size={14} /></button
+              >
               <button class="icon-button danger" aria-label="Удалить персонажа" title="Удалить персонажа" onclick={() => (confirmDelete = true)}>
                 <Trash2 size={14} />
               </button>
@@ -269,6 +303,18 @@
           {/if}
         </div>
       </div>
+
+      {#if merging && !resetting && !confirmDelete}
+        <Combobox
+          text={mergeText}
+          options={mergeOptions}
+          label="Персонаж"
+          placeholder="С кем объединить"
+          empty="Других персонажей нет"
+          oninput={(text) => (mergeText = text)}
+          onpick={(id) => merge(Number(id))}
+        />
+      {/if}
 
       <!-- Связи стоят сразу под шапкой, как персонажи у говорящего. -->
       <div class="field">
@@ -306,7 +352,7 @@
         </div>
       </div>
 
-      <GlossaryForms forms={draft.forms} hint="Обращения, прозвища, подписи из игры" onchange={setForms} />
+      <GlossaryForms forms={draft.forms} hint="Обращения, прозвища, подписи из игры" kinds onchange={setForms} />
 
       <label class="field">Манера речи<input class="input" bind:value={draft.speech} onchange={save} placeholder="Например: грубит, говорит коротко" /></label>
       <label class="field">Описание<textarea class="input" rows="6" bind:value={draft.description} onchange={save}></textarea></label>

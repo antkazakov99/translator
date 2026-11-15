@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
-use super::describe::{EntryPart, PartNote};
+use super::describe::PartNote;
 use super::{NameTaking, Taking};
 use super::entries::EntryLine;
 use super::{
-    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, ExcludeOwner, GlossaryOverview, ReadingDepth, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesFound, SuggestService, SpeakerEntry,
+    Character, CharacterId, DescribeService, DescribeTarget, Described, Form, FormKind, ExcludeOwner, GlossaryOverview, ReadingDepth, GlossaryService, NameField, NameKey, NameSuggestion, NameVariant, NamesFound, SuggestService, SpeakerEntry,
     SpeakerSuggestion, Term,
     TermCategory, TermId, TermSuggestion, Token, TokenSuggestion,
 };
@@ -55,11 +55,14 @@ pub struct SpeakerDto {
 pub struct FormDto {
     pub text: String,
     pub translation: Option<String>,
+    /// Вид формы персонажа. У формы термина всегда `other`.
+    #[serde(default)]
+    pub kind: FormKind,
 }
 
 impl From<&Form> for FormDto {
     fn from(form: &Form) -> Self {
-        Self { text: form.text().to_string(), translation: form.translation().map(str::to_string) }
+        Self { text: form.text().to_string(), translation: form.translation().map(str::to_string), kind: form.kind() }
     }
 }
 
@@ -67,7 +70,7 @@ fn forms(forms: &[FormDto]) -> Result<Vec<Form>, AppError> {
     Ok(forms
         .iter()
         .filter(|form| !form.text.trim().is_empty())
-        .map(|form| Form::new(&form.text, form.translation.as_deref()))
+        .map(|form| Form::named(&form.text, form.translation.as_deref(), form.kind))
         .collect::<Result<Vec<_>, _>>()?)
 }
 
@@ -422,6 +425,20 @@ pub async fn give_term_to_character(app: AppHandle, project: String, term: RowRe
             TermId::from_row(term.0),
             CharacterId::from_row(character.0),
         )
+    })
+    .await
+}
+
+/// «Объединить с…»: два персонажа или два термина это одно. Возвращает номер записи, которая осталась.
+#[tauri::command]
+#[specta::specta]
+pub async fn merge_entries(app: AppHandle, project: String, entry: OwnerDto, other: OwnerDto) -> Result<RowRef, String> {
+    blocking(app, move |state| {
+        let kept = GlossaryService { state }.merge(self::project(&project)?, entry.exclude(), other.exclude())?;
+        Ok(RowRef(match kept {
+            ExcludeOwner::Character(id) => id.get(),
+            ExcludeOwner::Term(id) => id.get(),
+        }))
     })
     .await
 }
@@ -840,13 +857,6 @@ pub enum OwnerDto {
 }
 
 impl OwnerDto {
-    fn target(self) -> DescribeTarget {
-        match self {
-            Self::Character { id } => DescribeTarget::Character(CharacterId::from_row(id.0)),
-            Self::Term { id } => DescribeTarget::Term(TermId::from_row(id.0)),
-        }
-    }
-
     fn exclude(self) -> ExcludeOwner {
         match self {
             Self::Character { id } => ExcludeOwner::Character(CharacterId::from_row(id.0)),
@@ -855,31 +865,17 @@ impl OwnerDto {
     }
 }
 
-/// Часть сцен персонажа или термина.
-#[derive(Debug, Clone, Serialize, specta::Type)]
-#[serde(rename_all = "camelCase")]
-pub struct EntryPartDto {
-    pub hash: String,
-    /// Первая строка части.
-    pub start: String,
-    pub scenes: Vec<String>,
-    pub note: Option<String>,
-    /// Модель заметки: по ней заметку исключают.
-    pub model: Option<String>,
-    /// Заметка идёт в описание: не пустая и не отказ модели.
-    pub useful: bool,
-    /// Пользователь исключил заметку.
-    pub excluded: bool,
-    /// Часть войдёт в следующий запуск.
-    pub picked: bool,
-}
-
-/// Части записи, сколько из них прочитает запуск, и исключённые сцены.
+/// Части сцен персонажа или термина для кнопки описания.
 #[derive(Debug, Clone, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct EntryPartsDto {
-    pub parts: Vec<EntryPartDto>,
+    /// Сколько частей у записи.
+    pub parts: u32,
+    /// У скольких есть заметка модели.
+    pub read: u32,
+    /// Сколько прочитает следующий запуск.
     pub picked: u32,
+    /// Сцены, которые модели не даются.
     pub excluded: Vec<String>,
 }
 
@@ -938,35 +934,24 @@ pub async fn describe_scene(
     Ok(described.into())
 }
 
-/// Части сцен персонажа или термина с заметками модели.
+/// Части сцен персонажа или термина: сколько их, сколько прочитано и сколько прочитает запуск.
 #[tauri::command]
 #[specta::specta]
 pub async fn entry_parts(app: AppHandle, project: String, owner: OwnerDto) -> Result<EntryPartsDto, String> {
     blocking(app, move |state| {
-        let found = DescribeService { state }.entry_parts(self::project(&project)?, &owner.target())?;
+        let found = DescribeService { state }.entry_parts(self::project(&project)?, owner.exclude())?;
+        let count = |count: usize| u32::try_from(count).unwrap_or(u32::MAX);
         Ok(EntryPartsDto {
-            parts: found
-                .parts
-                .into_iter()
-                .map(|part: EntryPart| EntryPartDto {
-                    hash: part.hash,
-                    start: part.start,
-                    scenes: part.scenes.into_iter().map(|key| key.to_string()).collect(),
-                    useful: part.useful,
-                    excluded: part.note.as_ref().is_some_and(|note| note.excluded),
-                    model: part.note.as_ref().map(|note| note.model.clone()),
-                    note: part.note.map(|note| note.text),
-                    picked: part.picked,
-                })
-                .collect(),
-            picked: u32::try_from(found.picked).unwrap_or(u32::MAX),
+            parts: count(found.parts),
+            read: count(found.read),
+            picked: count(found.picked),
             excluded: found.excluded.into_iter().map(|key| key.to_string()).collect(),
         })
     })
     .await
 }
 
-/// Описывает персонажа или термин по частям сцен с глубиной чтения проекта и заменяет описание.
+/// Описывает персонажа или термин по частям сцен с глубиной чтения приложения и заменяет описание.
 #[tauri::command]
 #[specta::specta]
 pub async fn describe_entry(
@@ -976,27 +961,8 @@ pub async fn describe_entry(
     profile: Option<String>,
     progress: Channel<RunProgress>,
 ) -> Result<DescribedDto, String> {
-    let described = DescribeService { state: &state }
-        .describe_many(self::project(&project)?, vec![owner.target()], self::profile(profile)?, progress)
-        .await?;
-    Ok(described.into())
-}
-
-/// Описывает отмеченных персонажей и термины по очереди с глубиной чтения проекта.
-/// Описанные записи без новых частей пропускаются.
-#[tauri::command]
-#[specta::specta]
-pub async fn describe_entries(
-    state: State<'_, AppState>,
-    project: String,
-    owners: Vec<OwnerDto>,
-    profile: Option<String>,
-    progress: Channel<RunProgress>,
-) -> Result<DescribedDto, String> {
-    let targets = owners.into_iter().map(OwnerDto::target).collect();
-    let described = DescribeService { state: &state }
-        .describe_many(self::project(&project)?, targets, self::profile(profile)?, progress)
-        .await?;
+    let described =
+        DescribeService { state: &state }.describe_entry(self::project(&project)?, owner.exclude(), self::profile(profile)?, progress).await?;
     Ok(described.into())
 }
 
@@ -1005,17 +971,10 @@ pub async fn describe_entries(
 #[specta::specta]
 pub async fn reset_entry_notes(app: AppHandle, project: String, owner: OwnerDto) -> Result<u32, String> {
     blocking(app, move |state| {
-        let removed = DescribeService { state }.reset_notes(self::project(&project)?, &owner.target())?;
+        let removed = DescribeService { state }.reset_notes(self::project(&project)?, &owner.exclude().into())?;
         Ok(u32::try_from(removed).unwrap_or(u32::MAX))
     })
     .await
-}
-
-/// Заметка не идёт в описание или возвращается в него.
-#[tauri::command]
-#[specta::specta]
-pub async fn exclude_note(app: AppHandle, project: String, owner: OwnerDto, model: String, hash: String, excluded: bool) -> Result<(), String> {
-    blocking(app, move |state| DescribeService { state }.exclude_note(self::project(&project)?, &owner.target(), &model, &hash, excluded)).await
 }
 
 /// Сцена не даётся модели при описании персонажа или термина, или возвращается.

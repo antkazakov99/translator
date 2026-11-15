@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 
 use super::suggest::{AnswerItem, answer_tokens, by_number, field, hints_block, quoted, usable_label};
-use super::{Character, CharacterId, NameField, NameKey, NameOrigin};
+use super::{Character, CharacterId, FormKind, NameField, NameKey, NameOrigin};
 use crate::common::Gender;
 use crate::llm::{ChatRequest, LlmTarget};
 use crate::name_rules::{LanguageTag, NameRule, has_rules};
@@ -107,6 +107,8 @@ pub struct NameOwner {
 pub struct NameItem {
     pub name: String,
     pub field: NameField,
+    /// Вид формы: другое написание имени, другая фамилия или прозвище. У имени и фамилии `Other`.
+    pub form: FormKind,
     pub gender: Option<Gender>,
     /// Полное имя владельца по-русски: от него строится форма.
     pub base: Option<String>,
@@ -171,6 +173,7 @@ pub fn name_items(characters: &[&Character]) -> Vec<NameItem> {
                 None => items.push(NameItem {
                     name: name.to_string(),
                     field,
+                    form: FormKind::Other,
                     gender,
                     base: None,
                     owners: vec![owner.clone()],
@@ -200,6 +203,7 @@ pub fn form_items(characters: &[&Character]) -> Vec<NameItem> {
             items.push(NameItem {
                 name: form.text().to_string(),
                 field: NameField::Form,
+                form: form.kind(),
                 gender: character.gender(),
                 base: (!base.is_empty()).then(|| base.clone()),
                 owners: vec![owner.clone()],
@@ -278,8 +282,15 @@ fn name_line(number: usize, item: &NameItem) -> String {
         (NameField::First, _) if item.gender.is_none() => None,
         (NameField::First, _) => Some(format!("given name of {person}")),
         (NameField::Last, _) => Some(format!("surname of {person}")),
-        (NameField::Form, Some(base)) => Some(format!("name of {person}, form of {base}")),
-        (NameField::Form, None) => Some(format!("name of {person}")),
+        // Другая фамилия пишется сама по себе: от записанного имени она не строится.
+        (NameField::Form, _) if item.form == FormKind::Last => Some(format!("another surname of {person}")),
+        (NameField::Form, base) => {
+            let what = if item.form == FormKind::First { "another given name of" } else { "name of" };
+            Some(match base {
+                Some(base) => format!("{what} {person}, form of {base}"),
+                None => format!("{what} {person}"),
+            })
+        }
     };
     let detail = detail.map(|detail| format!(", {detail}")).unwrap_or_default();
     format!("- id: {number}, name: {}{detail}\n", quoted(&item.name))
@@ -373,10 +384,12 @@ impl OriginsPrompt {
     pub fn build(batch: &[NameItem], cast: &[String], target: &LlmTarget) -> ChatRequest {
         let mut list = String::new();
         for (index, item) in batch.iter().enumerate() {
-            let kind = match item.field {
-                NameField::First => "given name",
-                NameField::Last => "surname",
-                NameField::Form => "another way to call the character",
+            let kind = match (item.field, item.form) {
+                (NameField::First, _) => "given name",
+                (NameField::Last, _) => "surname",
+                (NameField::Form, FormKind::First) => "another spelling or form of the given name",
+                (NameField::Form, FormKind::Last) => "another surname of the character",
+                (NameField::Form, FormKind::Other) => "another way to call the character",
             };
             let mut owners: Vec<&str> = Vec::new();
             for owner in item.owners.iter().filter(|owner| !owner.context.is_empty()) {
@@ -604,6 +617,7 @@ mod tests {
         NameItem {
             name: name.to_string(),
             field,
+            form: FormKind::Other,
             gender: Some(Gender::Female),
             base: None,
             owners: vec![NameOwner { character: CharacterId::from_row(owner), context: context.to_string() }],

@@ -2,7 +2,7 @@
 //! предлагает пару, ничего не пишет: одно ли это, решает модель вопросом (`same_entry.rs`). Все догадки
 //! по строкам о связи записей живут здесь.
 
-use super::spelling::{abbreviates, short_and_full, title_and_name, typo};
+use super::spelling::{abbreviates, respelled, short_and_full, title_and_name, typo};
 use super::{Character, CharacterId, ExcludeOwner, GlossaryData, NameKey, Term};
 
 /// Почему скрипт считает две записи похожими. Порядок это порядок вопросов: первыми те, где связь вероятнее.
@@ -19,6 +19,9 @@ pub enum Relation {
     Short,
     /// Аббревиатура по первым буквам: «PPF» и «People's Police Force».
     Abbreviation,
+    /// То же название, записанное иначе: слитно и раздельно или с сокращённым словом («Dept. of Knowledge»
+    /// и «Department of Knowledge»).
+    Spelling,
     /// Термин это должность перед именем персонажа: «Princess Selena» и «Selena».
     Titled,
     /// Написания отличаются одной опечаткой: «Karanovic» и «Karanovich».
@@ -159,6 +162,9 @@ pub fn terms(a: &Term, b: &Term) -> Option<Relation> {
     if abbreviated {
         return Some(Relation::Abbreviation);
     }
+    if term_names(a).any(|one| term_names(b).any(|other| respelled(one, other))) {
+        return Some(Relation::Spelling);
+    }
     typo(a.name(), b.name()).then_some(Relation::Typo)
 }
 
@@ -279,6 +285,8 @@ mod tests {
         assert_eq!(terms(&police, &term(2, "Police", &["PPF"])), Some(Relation::Abbreviation), "по форме");
         assert_eq!(terms(&term(2, "Fey Court", &[]), &term(3, "Fairy Court", &[])), None);
         assert_eq!(terms(&term(2, "Truthsayer", &[]), &term(3, "Truthsayar", &[])), Some(Relation::Typo));
+        assert_eq!(terms(&term(2, "Dept. of Knowledge", &[]), &term(3, "Department of Knowledge", &[])), Some(Relation::Spelling));
+        assert_eq!(terms(&term(2, "Nightlife", &[]), &term(3, "Night club", &["Night life"])), Some(Relation::Spelling), "по форме");
 
         let selena = character(1, "Selena", "", None);
         assert_eq!(term_and_person(&term(1, "Princess Selena", &[]), &selena), Some(Relation::Titled));

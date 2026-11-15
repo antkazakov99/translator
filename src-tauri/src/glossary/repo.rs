@@ -7,7 +7,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use super::parts::scene_hash;
 use super::scenes::SceneSource;
 use super::{
-    Character, CharacterId, DiscardReason, DiscardedTerm, Form, KeptTerm, NameField, NameKey, NameOrigin, Note, NoteOwner, SceneDescription, Speaker,
+    Character, CharacterId, DiscardReason, DiscardedTerm, Form, FormKind, KeptTerm, NameField, NameKey, NameOrigin, Note, NoteOwner, SceneDescription, Speaker,
     SpeakerEntry, SpeakerLink, Term, TermCategory, TermId, Token,
 };
 use crate::common::{Gender, Timestamp, ValidationError};
@@ -246,14 +246,18 @@ impl CharacterRepo<'_> {
     /// Формы по персонажам: одного или всех.
     fn forms(&self, only: Option<CharacterId>) -> Result<HashMap<i64, Vec<Form>>, DbError> {
         let mut statement = self.conn.prepare(
-            "SELECT character_id, text, translation FROM character_forms WHERE ?1 IS NULL OR character_id = ?1 ORDER BY id",
+            "SELECT character_id, text, translation, kind FROM character_forms WHERE ?1 IS NULL OR character_id = ?1 ORDER BY id",
         )?;
         let rows = statement
-            .query_map([only.map(CharacterId::get)], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)))?
+            .query_map([only.map(CharacterId::get)], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut forms: HashMap<i64, Vec<Form>> = HashMap::new();
-        for (id, text, translation) in rows {
-            forms.entry(id).or_default().push(form("character_forms", &text, translation.as_deref())?);
+        for (id, text, translation, kind) in rows {
+            let kind = FormKind::parse(&kind).map_err(|error| DbError::bad_value("character_forms", "kind", error))?;
+            let form = Form::named(&text, translation.as_deref(), kind).map_err(|error| DbError::bad_value("character_forms", "text", error))?;
+            forms.entry(id).or_default().push(form);
         }
         Ok(forms)
     }
@@ -291,8 +295,8 @@ impl CharacterRepo<'_> {
         self.conn.execute("DELETE FROM character_forms WHERE character_id = ?1", [id.get()])?;
         for form in character.forms() {
             self.conn.execute(
-                "INSERT INTO character_forms (character_id, text, text_key, translation) VALUES (?1, ?2, ?3, ?4)",
-                params![id.get(), form.text(), form.key().as_str(), form.translation()],
+                "INSERT INTO character_forms (character_id, text, text_key, translation, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id.get(), form.text(), form.key().as_str(), form.translation(), form.kind().as_str()],
             )?;
         }
         Ok(id)
@@ -830,7 +834,7 @@ impl NoteRepo<'_> {
     /// Заметки владельца от одной модели.
     pub fn of(&self, owner: &NoteOwner, model: &str) -> Result<Vec<Note>, DbError> {
         self.query(
-            "SELECT model, part_hash, text, excluded, created_at FROM notes
+            "SELECT model, part_hash, text, created_at FROM notes
              WHERE owner_kind = ?1 AND owner_ref = ?2 AND model = ?3 ORDER BY created_at, part_hash",
             owner,
             Some(model),
@@ -840,7 +844,7 @@ impl NoteRepo<'_> {
     /// Заметки владельца от всех моделей, новые первыми.
     pub fn all_of(&self, owner: &NoteOwner) -> Result<Vec<Note>, DbError> {
         self.query(
-            "SELECT model, part_hash, text, excluded, created_at FROM notes
+            "SELECT model, part_hash, text, created_at FROM notes
              WHERE owner_kind = ?1 AND owner_ref = ?2 ORDER BY created_at DESC, model",
             owner,
             None,
@@ -856,8 +860,7 @@ impl NoteRepo<'_> {
                 model: row.get(0)?,
                 part_hash: row.get(1)?,
                 text: row.get(2)?,
-                excluded: row.get::<_, i64>(3)? != 0,
-                created_at: Timestamp::from_secs(row.get(4)?),
+                created_at: Timestamp::from_secs(row.get(3)?),
             })
         };
         let notes = match model {
@@ -870,26 +873,9 @@ impl NoteRepo<'_> {
     /// Новая заметка той же части заменяет прежнюю.
     pub fn save(&self, note: &Note) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO notes (owner_kind, owner_ref, model, part_hash, text, excluded, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT (owner_kind, owner_ref, model, part_hash) DO UPDATE SET text = excluded.text,
-               excluded = excluded.excluded, created_at = excluded.created_at",
-            params![
-                note.owner.kind(),
-                note.owner.reference(),
-                note.model,
-                note.part_hash,
-                note.text,
-                i64::from(note.excluded),
-                note.created_at.secs()
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_excluded(&self, owner: &NoteOwner, model: &str, part_hash: &str, excluded: bool) -> Result<(), DbError> {
-        self.conn.execute(
-            "UPDATE notes SET excluded = ?5 WHERE owner_kind = ?1 AND owner_ref = ?2 AND model = ?3 AND part_hash = ?4",
-            params![owner.kind(), owner.reference(), model, part_hash, i64::from(excluded)],
+            "INSERT INTO notes (owner_kind, owner_ref, model, part_hash, text, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (owner_kind, owner_ref, model, part_hash) DO UPDATE SET text = excluded.text, created_at = excluded.created_at",
+            params![note.owner.kind(), note.owner.reference(), note.model, note.part_hash, note.text, note.created_at.secs()],
         )?;
         Ok(())
     }
@@ -1121,6 +1107,9 @@ pub enum AskKind {
     Token,
     /// Ключ: `names::ask_key`, персонаж, поле и написание.
     Name,
+    /// Описание персонажа или термина. Ключ: запись и отпечаток выбранных частей её сцен. С другими частями
+    /// запись спросится снова.
+    Description,
 }
 
 impl AskKind {
@@ -1130,6 +1119,7 @@ impl AskKind {
             Self::Speaker => "speaker",
             Self::Token => "token",
             Self::Name => "name",
+            Self::Description => "description",
         }
     }
 }

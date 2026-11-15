@@ -9,6 +9,7 @@ use tauri::ipc::Channel;
 use super::{GameRun, GameStep, NamesMode, StepResult, StepWork, WorkCount, ordered};
 use crate::common::AppError;
 use crate::engines::ContainerKey;
+use crate::glossary::describe::entries_work;
 use crate::glossary::same_entry::translation_pairs;
 use crate::glossary::suggest_service::{glossary_work, names_work};
 use crate::glossary::{
@@ -54,7 +55,7 @@ impl GameRunService<'_> {
         let analyzed = analysis.items == 0;
         let names_batch = self.batch_size(&open, Action::Names);
         let (names, glossary, entries) =
-            open.project.read(|tx| Ok((names_work(tx, names_batch)?, glossary_work(tx, analyzed)?, entry_targets(&GlossaryData::load(tx)?))))?;
+            open.project.read(|tx| Ok((names_work(tx, names_batch)?, glossary_work(tx, analyzed)?, entries_work(&GlossaryData::load(tx)?))))?;
         let glossary_requests = glossary.requests(|action| self.batch_size(&open, action));
         let entries = describe.pending(project, entries)?;
         let scenes = describe.pending(project, unread.into_iter().map(DescribeTarget::Scene).collect())?;
@@ -178,13 +179,13 @@ impl GameRunService<'_> {
             GameStep::Glossary => self.glossary(project, chain, index, count).await,
             GameStep::Entries => {
                 let open = self.state.open_project(project)?;
-                let targets = open.project.read(|tx| Ok(entry_targets(&GlossaryData::load(tx)?)))?;
-                Ok(StepOutcome::from_described(describe.describe_many(project, targets, None, chain).await?))
+                let targets = open.project.read(|tx| Ok(entries_work(&GlossaryData::load(tx)?)))?;
+                Ok(StepOutcome::from_described(describe.describe_unasked(project, targets, None, chain).await?))
             }
             GameStep::Scenes => {
                 let keys = self.scene_keys(project, |scene| !scene.described || scene.stale)?;
                 let targets = keys.into_iter().map(DescribeTarget::Scene).collect();
-                Ok(StepOutcome::from_described(describe.describe_many(project, targets, None, chain).await?))
+                Ok(StepOutcome::from_described(describe.describe_unasked(project, targets, None, chain).await?))
             }
             GameStep::Lines => {
                 let run = lines.translate(project, TranslationScope::Project, None, chain).await?;
@@ -279,17 +280,6 @@ impl GameRunService<'_> {
             .map_or_else(|_| action.default_batch_size(), |target| target.settings.batch_size)
             .get()
     }
-}
-
-/// Персонажи с именем и термины без описания: работа шага `entries`.
-fn entry_targets(glossary: &GlossaryData) -> Vec<DescribeTarget> {
-    let characters = glossary
-        .characters
-        .iter()
-        .filter(|character| character.description().is_none() && character.full_name().is_some())
-        .filter_map(|character| Some(DescribeTarget::Character(character.id()?)));
-    let terms = glossary.terms.iter().filter(|term| term.description().is_none()).filter_map(|term| Some(DescribeTarget::Term(term.id()?)));
-    characters.chain(terms).collect()
 }
 
 #[cfg(test)]
@@ -515,6 +505,37 @@ mod tests {
         let result = tauri::async_runtime::block_on(service.run(id, &chosen, NamesMode::Auto, silent())).unwrap();
         assert_eq!(steps(&result), chosen);
         assert_eq!(analyses(), 2, "прочитанная часть пропущена, разобрана только вторая сцена");
+    }
+
+    #[test]
+    fn chain_asks_about_an_entry_without_a_description_once() {
+        // Сборка описания персонажа приходит без JSON: описания из неё не взять.
+        let (url, seen) = fake_model(|body| {
+            if text(body, 0).contains("glossary entry about one character") { completion("Не знаю.") } else { reply(body) }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id, eileen) = project(dir.path(), &url);
+        let service = GameRunService { state: &state };
+        let assemblies = || seen.lock().unwrap().iter().filter(|body| text(body, 0).contains("glossary entry about one character")).count();
+        assert!(!empty_steps(&state, id).contains(&GameStep::Entries));
+
+        let result = tauri::async_runtime::block_on(service.run(id, &[GameStep::Entries], NamesMode::Auto, silent())).unwrap();
+        assert_eq!((steps(&result), result.error.as_deref()), (vec![GameStep::Entries], None));
+        assert_eq!(result.finished[0].written, 0);
+        assert_eq!(assemblies(), 1);
+        assert_eq!(count(&state, id, "SELECT count(*) FROM glossary_asks WHERE kind = 'description'"), 1);
+        assert!(empty_steps(&state, id).contains(&GameStep::Entries), "запись без годного ответа сводка не считает");
+
+        // Ни шаг описаний, ни описание записей сцены перед её описанием о ней больше не спрашивают.
+        let again = tauri::async_runtime::block_on(service.run(id, &[GameStep::Entries, GameStep::Scenes], NamesMode::Auto, silent())).unwrap();
+        assert_eq!((steps(&again), again.error.as_deref()), (vec![GameStep::Entries, GameStep::Scenes], None));
+        assert_eq!(assemblies(), 1);
+
+        // Кнопка записи в окне глоссария спрашивает, не глядя на отметку.
+        let owner = crate::glossary::ExcludeOwner::Character(eileen);
+        let described = tauri::async_runtime::block_on(DescribeService { state: &state }.describe_entry(id, owner, None, silent())).unwrap();
+        assert!(described.written.is_empty() && described.error.is_none(), "{described:?}");
+        assert_eq!(assemblies(), 2);
     }
 
     #[test]

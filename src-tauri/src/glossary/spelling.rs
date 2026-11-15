@@ -63,6 +63,61 @@ pub fn is_fuller(long: &str, short: &str) -> bool {
     !short.is_empty() && !long.contains(char::is_whitespace) && !short.contains(char::is_whitespace) && long.len() > short.len() && long.starts_with(&short)
 }
 
+/// Два написания это варианты одного имени или одной фамилии: одно начинает другое («Alexa» и «Alexandra»,
+/// «Jovanka» и «Jovankam») или отличается опечаткой («Camila» и «Camilla»). Какое из них главное, правило
+/// не говорит: это решает частота в игре.
+pub fn name_variant(one: &str, other: &str) -> bool {
+    is_fuller(one, other) || is_fuller(other, one) || typo(one, other)
+}
+
+/// Слова названия без знаков: по ним сравниваются написания.
+fn bare_words(name: &str) -> Vec<String> {
+    name.split(|c: char| c.is_whitespace() || c == '-')
+        .map(|word| word.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect::<String>())
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Сокращение слова не короче этого.
+const MIN_CUT_WORD: usize = 2;
+/// Слово длиннее своего сокращения хотя бы на столько букв: «points» не сокращение «point».
+const MIN_CUT_GAP: usize = 2;
+
+/// `short` сокращает слово `long`: та же первая буква, а остальные идут в слове в том же порядке
+/// («dept» у «department», «mk» у «mark», «lab» у «laboratory»). Оба без знаков и строчными.
+fn cuts_word(short: &str, long: &str) -> bool {
+    let (short_chars, long_chars) = (short.chars().count(), long.chars().count());
+    if short_chars < MIN_CUT_WORD || long_chars < short_chars + MIN_CUT_GAP || short.chars().next() != long.chars().next() {
+        return false;
+    }
+    let mut rest = long.chars();
+    short.chars().all(|letter| rest.any(|other| other == letter))
+}
+
+/// Два названия похожи на одно, записанное по-разному: те же слова, слитно или раздельно («Night life»
+/// и «Nightlife», «Mk2» и «Mk 2»), или одно из слов сокращено («Dept. of Knowledge» и «Department of
+/// Knowledge»). Одно слово сокращением другого считается только с точкой («Dept.» и «Department»): без неё
+/// похожими стали бы «Mine» и «Machine». Правило грубое: оно даёт пару для вопроса модели, а не слияние.
+pub fn respelled(one: &str, other: &str) -> bool {
+    let (a, b) = (bare_words(one), bare_words(other));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a.concat() == b.concat() {
+        return true;
+    }
+    if a.len() != b.len() {
+        return false;
+    }
+    let dotted = |name: &str| name.trim().ends_with('.');
+    if a.len() == 1 {
+        return (dotted(one) && cuts_word(&a[0], &b[0])) || (dotted(other) && cuts_word(&b[0], &a[0]));
+    }
+    let cut = |x: &str, y: &str| cuts_word(x, y) || cuts_word(y, x);
+    let same = a.iter().zip(&b).filter(|(x, y)| x == y).count();
+    same > 0 && same < a.len() && a.iter().zip(&b).all(|(x, y)| x == y || cut(x, y))
+}
+
 /// Должности и звания перед именем: по ним «Detective-Colonel Karanovic» делится на должность и имя.
 const RANKS: [&str; 34] = [
     "detective", "colonel", "general", "major", "captain", "lieutenant", "sergeant", "corporal", "private", "officer", "agent", "inspector",
@@ -272,6 +327,26 @@ mod tests {
         assert!(!short_and_full("Eileen", "Eileenor"), "длинное имя не короткая форма");
         assert!(!short_and_full("Al", "Alice"), "слишком коротко");
         assert!(!short_and_full("Anya", "Anastasia"));
+    }
+
+    #[test]
+    fn respelled_names_share_words_or_cut_one() {
+        assert!(respelled("Dept. of Knowledge", "Department of Knowledge"));
+        assert!(respelled("Department of Measure", "dept. of measure"), "регистр не важен");
+        assert!(respelled("Night life", "Nightlife") && respelled("CREED Mk2", "CREED Mk 2") && respelled("Counter-intelligence", "Counter intelligence"));
+        assert!(respelled("Dept.", "Department") && !respelled("Dept", "Department"), "одно слово только с точкой");
+        assert!(!respelled("Mine", "Machine") && !respelled("Voyeur", "Voyeurism"));
+        assert!(!respelled("Fey Court", "Fairy Court"), "синоним не сокращение");
+        assert!(!respelled("Department of Measure", "Department of Knowledge") && !respelled("Research point", "Research points"));
+        assert!(!respelled("Security tasks", "Insurgence tasks") && !respelled("Dept. of Knowledge", "Department of the Interior"));
+        assert!(!respelled("Mk II", "Mark Two"), "хотя бы одно слово общее");
+    }
+
+    #[test]
+    fn name_variants_start_alike_or_differ_by_a_typo() {
+        assert!(name_variant("Alexa", "Alexandra") && name_variant("Jovankam", "Jovanka") && name_variant("Veraaaa", "Vera"));
+        assert!(name_variant("Camila", "Camilla"));
+        assert!(!name_variant("Rita", "Margaret") && !name_variant("Maria", "Marta") && !name_variant("Vera", "Vera"));
     }
 
     #[test]

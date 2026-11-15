@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { Eraser, LoaderCircle, Sparkles, Undo2 } from "lucide-svelte";
-  import { commands, type EntryPartsDto_Serialize as EntryParts, type OwnerDto } from "./bindings";
+  import { commands, type EntryPartsDto as EntryParts, type OwnerDto } from "./bindings";
   import { runsBusy, type GlossaryRuns } from "./glossary";
   import { sceneLabel } from "./scene-graph";
   import { depthChanges } from "./reading-depth.svelte";
@@ -54,8 +54,6 @@
     }
   }
 
-  const read = $derived(parts?.parts.filter((part) => part.note !== null).length ?? 0);
-
   async function describe() {
     const current = owner;
     const written = await run.start(
@@ -93,9 +91,9 @@
 
   function describeTitle() {
     if (!parts) return "Описать моделью";
-    if (parts.parts.length === 0) return "Описать моделью. Модели нечего читать: сцен нет или все исключены";
+    if (parts.parts === 0) return "Описать моделью. Модели нечего читать: сцен нет или все исключены";
     if (runsBusy(runs)) return "Описать моделью. Модель уже работает или ждёт отбор";
-    return `Описать моделью. Частей сцен: ${parts.parts.length}, прочитано: ${read}, запуск прочитает: ${parts.picked}. Описание заменится`;
+    return `Описать моделью. Частей сцен: ${parts.parts}, прочитано: ${parts.read}, запуск прочитает: ${parts.picked}. Описание заменится`;
   }
 </script>
 
@@ -106,14 +104,14 @@
 {:else}
   <button
     class="icon-button"
-    disabled={!parts || parts.parts.length === 0 || runsBusy(runs)}
+    disabled={!parts || parts.parts === 0 || runsBusy(runs)}
     aria-label="Описать моделью"
     title={describeTitle()}
     onclick={describe}
   >
     {#if run.active}<LoaderCircle size={14} class="spin" />{:else}<Sparkles size={14} />{/if}
   </button>
-  {#if parts && read > 0}
+  {#if parts && parts.read > 0}
     <button
       class="icon-button"
       aria-label="Сбросить заметки модели"

@@ -5,7 +5,8 @@
 //! 2. Написание известно: пропуск. С `other_than` модели создаётся тёзка, с `same_as` на другую запись пара.
 //! 3. То же слово в другом числе или с точками в аббревиатуре: форма.
 //! 4. `same_as` модели о новом написании: привязка к записи, роль написания решает `character_link`.
-//!    Занятое поле привязку не даёт: запись создаётся, пара идёт вопросом.
+//!    Другое написание имени или фамилии ложится формой своего вида, главное из написаний выбирает частота
+//!    в игре (`service::settle_names`). Занятое поле привязку не даёт: запись создаётся, пара идёт вопросом.
 //! 5. Иначе новая запись.
 //!
 //! Скрипт записи сам не сливает. Пара от модели сливается сразу, только если отношение видит и скрипт
@@ -18,12 +19,12 @@ use super::analyze::{CastMember, Finding, FoundKind, NameParts, parse_cast_ref};
 use super::entries::{character_names, scene_entries};
 use super::relations::{self, Pair};
 use super::repo::{CharacterRepo, LineSampleRepo, MentionCheckRepo, PairCheckRepo, SpeakerRepo, TermRepo};
-use super::service::{give_term, merge_characters, merge_terms};
+use super::service::{give_term, merge_characters, merge_terms, settle_names};
 use super::spelling::{
-    abbreviates, acronym, is_common_title, is_common_word, is_fragment, is_fuller, is_person_title, is_token_label, plural_of, same_acronym,
-    short_and_full, title_and_name, without_article,
+    abbreviates, acronym, is_common_title, is_common_word, is_fragment, is_person_title, is_token_label, name_variant, plural_of, same_acronym,
+    title_and_name, without_article,
 };
-use super::{Character, CharacterId, ExcludeOwner, Form, GlossaryData, NameKey, NoteOwner, NoteRepo, Speaker, SpeakerLink, Term, TermCategory, TermId};
+use super::{Character, CharacterId, ExcludeOwner, Form, FormKind, GlossaryData, NameKey, NoteOwner, NoteRepo, Speaker, SpeakerLink, Term, TermCategory, TermId};
 use crate::engines::ContainerKey;
 use crate::storage::DbError;
 use crate::translation::text::mentions;
@@ -369,8 +370,34 @@ impl Saver<'_> {
         Ok(())
     }
 
+    /// Имя и фамилия находки, когда модель их не назвала, а они выводятся из записи персонажа: полное имя
+    /// с известным именем («Maja Zoric» у «Maja») или с известной фамилией у персонажа без имени, одно слово,
+    /// которое приходится вариантом имени или фамилии («Alexa» у «Alexandra»), одно слово рядом с именем
+    /// в репликах игры («Kralj» у «Claire»: «Claire Kralj»). `None`: вывести нечего, это другое имя человека
+    /// (прозвище, титул).
+    fn derived_parts(&self, finding: &Finding, character: &Character) -> Result<Option<NameParts>, DbError> {
+        let same = |one: &str, other: &str| NameKey::new(one).is_some() && NameKey::new(one) == NameKey::new(other);
+        let (first, last) = (character.first_name(), character.last_name());
+        let parts = |first: Option<&str>, last: Option<&str>| NameParts::check(&finding.name, first, last);
+        let together = |text: String| -> Result<bool, DbError> {
+            let text = text.to_lowercase();
+            Ok(LineSampleRepo { conn: self.tx }.containing(&text, None)?.iter().any(|line| mentions(&line.text.to_lowercase(), &text)))
+        };
+        let words: Vec<&str> = finding.name.split_whitespace().collect();
+        Ok(match (words.as_slice(), first, last) {
+            ([given, surname], Some(first), _) if same(given, first) || name_variant(given, first) => parts(Some(given), Some(surname)),
+            ([given, surname], None, Some(last)) if same(surname, last) && !self.is_common_word(given)? => parts(Some(given), Some(surname)),
+            ([word], Some(first), _) if name_variant(word, first) => parts(Some(word), None),
+            ([word], _, Some(last)) if name_variant(word, last) => parts(None, Some(word)),
+            ([word], Some(first), None) if !word.contains('[') && together(format!("{first} {word}"))? => parts(None, Some(word)),
+            ([word], None, Some(last)) if !word.contains('[') && together(format!("{word} {last}"))? => parts(Some(word), None),
+            _ => None,
+        })
+    }
+
     /// Чем новое написание приходится персонажу, на которого указала модель: фамилия или имя в пустое поле,
-    /// полное имя к половинке, полная форма вместо короткой, иначе форма (прозвище, псевдоним, титул).
+    /// полное имя к половинке, другое написание имени или фамилии формой своего вида, иначе форма (прозвище,
+    /// псевдоним, титул). Какое из написаний имени главное, решает частота (`settle_names`).
     /// `false`: это имя или фамилия, а поле занято другим значением. Тогда привязки нет.
     fn character_link(&mut self, finding: &Finding, id: CharacterId) -> Result<bool, DbError> {
         let characters = CharacterRepo { conn: self.tx };
@@ -379,21 +406,16 @@ impl Saver<'_> {
         let last = character.last_name().map(str::to_string);
         let same = |one: &str, other: &str| NameKey::new(one).is_some() && NameKey::new(one) == NameKey::new(other);
         let single = |name: &str| !name.contains(char::is_whitespace);
-        let (given, surname) = match &finding.parts {
+        let parts = match &finding.parts {
+            Some(parts) => Some(parts.clone()),
+            None => self.derived_parts(finding, &character)?,
+        };
+        let (given, surname) = match &parts {
             Some(parts) => (parts.first.as_deref(), parts.last.as_deref()),
             None => (None, None),
         };
-        // Полная форма имени вместо короткой: она становится именем, короткая формой со своим переводом.
-        let fuller = |character: &mut Character, old: &str, new: &str| {
-            let translated = character.translated_first_name().map(str::to_string);
-            let last = character.translated_last_name().unwrap_or_default().to_string();
-            character.set_first_name(new);
-            character.set_translated_names("", &last);
-            if let Ok(form) = Form::new(old, translated.as_deref()) {
-                let _ = character.add_form(form);
-            }
-        };
-        let form = |character: &mut Character, text: &str| Form::new(text, None).is_ok_and(|form| character.add_form(form).is_ok());
+        let variant = |one: &str, other: &str| single(one) && single(other) && name_variant(one, other);
+        let form = |character: &mut Character, text: &str, kind: FormKind| Form::named(text, None, kind).is_ok_and(|form| character.add_form(form).is_ok());
         let text = match (given, surname, first.as_deref(), last.as_deref()) {
             // Фамилия к персонажу с одним именем: «Vellnikov» у «Dimitria».
             (None, Some(surname), Some(_), None) => {
@@ -405,37 +427,37 @@ impl Saver<'_> {
                 character.set_first_name(given);
                 format!("{given} → {}", character.full_name().unwrap_or_default())
             }
-            // Полное имя к персонажу с тем же именем или его короткой формой: фамилия в пустое поле.
-            (Some(given), Some(surname), Some(old), None) if same(old, given) || (single(old) && single(given) && short_and_full(old, given)) => {
-                if is_fuller(given, old) {
-                    fuller(&mut character, old, given);
+            // Полное имя к персонажу с тем же именем или его вариантом: фамилия в пустое поле.
+            (Some(given), Some(surname), Some(old), None) if same(old, given) || variant(old, given) => {
+                if !same(old, given) {
+                    form(&mut character, given, FormKind::First);
                 }
                 character.set_last_name(surname);
-                format!("{old} → {}", character.full_name().unwrap_or_default())
+                format!("{old} → {}", finding.name)
             }
             // Полное имя к персонажу с той же фамилией: имя в пустое поле.
             (Some(given), Some(surname), None, Some(old)) if same(old, surname) => {
                 character.set_first_name(given);
                 format!("{old} → {}", character.full_name().unwrap_or_default())
             }
-            (Some(given), None, Some(old), _) if is_fuller(given, old) => {
-                fuller(&mut character, old, given);
-                format!("{old} → {given}")
-            }
-            (Some(given), None, Some(old), _) if is_fuller(old, given) => {
-                if !form(&mut character, given) {
+            // Другое написание имени: короткое, полное, с опечаткой.
+            (Some(given), None, Some(old), _) if variant(old, given) => {
+                if !form(&mut character, given, FormKind::First) {
                     return Ok(true);
                 }
                 format!("{given} → {}", character.full_name().unwrap_or_default())
             }
+            // Другое написание фамилии.
+            (None, Some(surname), _, Some(old)) if variant(old, surname) => {
+                if !form(&mut character, surname, FormKind::Last) {
+                    return Ok(true);
+                }
+                format!("{surname} → {}", character.full_name().unwrap_or_default())
+            }
             // Имя или фамилия от модели, а поле занято другим.
             (Some(_), _, _, _) | (_, Some(_), _, _) => return Ok(false),
-            (None, None, Some(old), _) if is_fuller(&finding.name, old) => {
-                fuller(&mut character, old, &finding.name);
-                format!("{old} → {}", finding.name)
-            }
             (None, None, _, _) => {
-                if !form(&mut character, &finding.name) {
+                if !form(&mut character, &finding.name, FormKind::Other) {
                     return Ok(true);
                 }
                 format!("{} → {}", finding.name, character.full_name().unwrap_or_default())
@@ -445,9 +467,10 @@ impl Saver<'_> {
             character.set_gender(finding.gender);
         }
         characters.save(&character)?;
+        settle_names(self.tx, id)?;
         self.added.push(text);
         self.names.add(&finding.name, ExcludeOwner::Character(id));
-        self.names.add_person(&character, id);
+        self.names.add_person(&characters.get(id)?, id);
         Ok(true)
     }
 
@@ -536,19 +559,12 @@ fn shape(character: &Character) -> (bool, bool) {
     (character.first_name().is_some(), character.last_name().is_some())
 }
 
-/// Остаётся ли главным `one`, когда два персонажа сливаются: полное имя важнее половинки, полная форма имени
-/// важнее короткой, иначе записанный раньше.
+/// Остаётся ли запись `one`, когда два персонажа сливаются: запись с именем и фамилией важнее половинки, иначе
+/// записанная раньше. Главное имя и фамилию после слияния выбирает частота (`settle_names`), а не этот выбор.
 fn keeps(one: &Character, other: &Character) -> bool {
     let full = |character: &Character| shape(character) == (true, true);
     if full(one) != full(other) {
         return full(one);
-    }
-    let first = |character: &Character| character.first_name().unwrap_or_default().to_string();
-    if is_fuller(&first(one), &first(other)) {
-        return true;
-    }
-    if is_fuller(&first(other), &first(one)) {
-        return false;
     }
     one.id().map(CharacterId::get) < other.id().map(CharacterId::get)
 }
@@ -585,8 +601,8 @@ fn text_order(tx: &rusqlite::Connection, one: &Character, other: &Character) -> 
 }
 
 /// Два персонажа это один человек: имя и фамилия порознь соединяются («Dimitria» и «Vellnikov»: по полям,
-/// а у двух одиночных имён по порядку в репликах игры), иначе один сливается в главного (`keeps`), его имя
-/// и формы становятся формами. `None`: одного из них уже нет.
+/// а у двух одиночных имён по порядку в репликах игры), иначе одна запись сливается в другую (`keeps`), её имя
+/// и формы становятся формами, главное имя и фамилию выбирает частота. `None`: одного из них уже нет.
 pub fn merge_people(tx: &rusqlite::Connection, a: CharacterId, b: CharacterId) -> Result<Option<String>, DbError> {
     let characters = CharacterRepo { conn: tx };
     let (Ok(one), Ok(other)) = (characters.get(a), characters.get(b)) else { return Ok(None) };

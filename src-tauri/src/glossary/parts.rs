@@ -2,8 +2,6 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::engines::ContainerKey;
-
 /// Сколько символов текста уходит модели в одном запросе части.
 pub const MAX_PART_TEXT: usize = 12_000;
 /// Меньше этого в конце длинной сцены модели не хватает контекста: хвост начинается с конца предыдущей части.
@@ -80,20 +78,12 @@ const SCENE_BREAK: &str = "---\n";
 /// Сколько следующих кусков просматривается, чтобы заполнить часть до конца.
 const SCENE_WINDOW: usize = 8;
 
-/// Часть персонажа или термина и сцены, из которых она собрана.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScenesPart {
-    pub part: Part,
-    pub scenes: Vec<ContainerKey>,
-}
-
-/// Раскладывает сцены по частям: целые сцены по сюжету через `---`, часть дополняется подходящими по размеру
-/// кусками из следующих `SCENE_WINDOW`. По репликам режется только сцена, которая сама не помещается.
-/// Так частей меньше, а порядок сюжета нарушается только в пределах окна.
-pub fn pack_scenes(scenes: &[(ContainerKey, Vec<String>)]) -> Vec<ScenesPart> {
-    let pieces: Vec<(String, &ContainerKey)> =
-        scenes.iter().flat_map(|(key, lines)| split_lines(lines).into_iter().map(move |part| (part.text, key))).collect();
-    let sizes: Vec<usize> = pieces.iter().map(|(text, _)| text.chars().count()).collect();
+/// Раскладывает сцены (реплики каждой) по частям: целые сцены по сюжету через `---`, часть дополняется
+/// подходящими по размеру кусками из следующих `SCENE_WINDOW`. По репликам режется только сцена, которая сама
+/// не помещается. Так частей меньше, а порядок сюжета нарушается только в пределах окна.
+pub fn pack_scenes(scenes: &[Vec<String>]) -> Vec<Part> {
+    let pieces: Vec<String> = scenes.iter().flat_map(|lines| split_lines(lines)).map(|part| part.text).collect();
+    let sizes: Vec<usize> = pieces.iter().map(|text| text.chars().count()).collect();
     let gap = SCENE_BREAK.chars().count();
     let mut pending: Vec<usize> = (0..pieces.len()).collect();
     let mut parts = Vec::new();
@@ -112,14 +102,7 @@ pub fn pack_scenes(scenes: &[(ContainerKey, Vec<String>)]) -> Vec<ScenesPart> {
             }
         }
         chosen.sort_unstable();
-        let text = chosen.iter().map(|&index| pieces[index].0.as_str()).collect::<Vec<_>>().join(SCENE_BREAK);
-        let mut keys: Vec<ContainerKey> = Vec::new();
-        for &index in &chosen {
-            if !keys.contains(pieces[index].1) {
-                keys.push(pieces[index].1.clone());
-            }
-        }
-        parts.push(ScenesPart { part: Part::new(text), scenes: keys });
+        parts.push(Part::new(chosen.iter().map(|&index| pieces[index].as_str()).collect::<Vec<_>>().join(SCENE_BREAK)));
     }
     parts
 }
@@ -185,17 +168,11 @@ mod tests {
 
     #[test]
     fn small_scenes_share_a_part_and_big_ones_fill_it_from_the_window() {
-        let key = |name: &str| ContainerKey::new(format!("label:{name}")).unwrap();
-        let scenes = vec![
-            (key("a"), lines(6, 999)),
-            (key("b"), lines(7, 999)),
-            (key("c"), lines(3, 999)),
-        ];
-        let parts = pack_scenes(&scenes);
+        let scene = |name: &str, count: usize| lines(count, 999).into_iter().map(|line| format!("{name}{line}")).collect::<Vec<_>>();
+        let parts = pack_scenes(&[scene("a", 6), scene("b", 7), scene("c", 3)]);
         assert_eq!(parts.len(), 2, "b не помещается к a, зато c помещается");
-        assert_eq!(parts[0].scenes, [key("a"), key("c")]);
-        assert!(parts[0].part.text.contains("\n---\n"));
-        assert_eq!(parts[1].scenes, [key("b")]);
+        assert!(parts[0].text.starts_with("a0000") && parts[0].text.contains("\n---\nc0000"), "a и c в одной части");
+        assert!(parts[1].text.starts_with("b0000") && !parts[1].text.contains("---"));
     }
 
     #[test]

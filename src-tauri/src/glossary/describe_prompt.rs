@@ -1,4 +1,5 @@
-//! Запросы описаний сцен: заметка по части, сжатие заметок, сборка описания, название. Ответы это обычный текст.
+//! Запросы описаний сцен, персонажей и терминов: заметка по части, сжатие заметок, сборка описания, название
+//! сцены. Ответы это обычный текст, у сборки персонажа объект JSON.
 
 use std::sync::LazyLock;
 
@@ -28,8 +29,8 @@ A line starting with \"Gender:\" tells who is male or female. \
 A line starting with \"Known terms:\" gives established translations: use them. \
 Never copy these glossary hint lines into your answer. Write only the note text, without headings, labels or Markdown.";
 
-const CONDENSE_SYSTEM: &str = "You merge notes about one scene of a visual novel. Write in Russian. \
-Keep concrete facts: events, who takes part, relations, mood, how they address each other. Drop repetitions. \
+const CONDENSE_SYSTEM: &str = "You merge notes about {subject} of a visual novel. Write in Russian. \
+Keep concrete facts: {facts}. Drop repetitions. \
 Respond with plain text only.";
 
 const SCENE_SYSTEM: &str = "You describe one scene of a visual novel for its translator into Russian. \
@@ -68,13 +69,28 @@ impl PartPrompt {
     }
 }
 
+/// О чём заметки: от этого зависит, какие сведения сжатие обязано сохранить.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotesAbout<'a> {
+    Scene,
+    Character(&'a str),
+    Term(&'a str),
+}
+
 /// Заметки, которые вместе длиннее запроса, сжимаются группами.
 pub struct CondensePrompt;
 
 impl CondensePrompt {
-    pub fn build(notes: &[String], target: &LlmTarget) -> ChatRequest {
+    pub fn build(notes: &[String], about: NotesAbout, target: &LlmTarget) -> ChatRequest {
+        let (subject, facts) = match about {
+            NotesAbout::Scene => ("one scene".to_string(), "events, who takes part, relations, mood, how they address each other"),
+            NotesAbout::Character(name) => {
+                (format!("the character {name}"), "who the character is, occupation, what they do, relations with others, how they speak")
+            }
+            NotesAbout::Term(name) => (format!("the term {name}"), "what it is, who or what it is connected with, what happens with it"),
+        };
         ChatRequest {
-            system: CONDENSE_SYSTEM.to_string(),
+            system: CONDENSE_SYSTEM.replace("{subject}", &subject).replace("{facts}", facts),
             user: format!("Notes:\n\n{}\n\nMerge them:", notes.join("\n\n")),
             temperature: target.settings.temperature,
             max_tokens: NOTE_ANSWER_TOKENS,
@@ -177,7 +193,7 @@ You receive notes about the character collected from the game. Answer with a JSO
 \"speech\": one short sentence in Russian on how the character speaks: tone, slang, \"ты\" or \"вы\" and to whom; \
 an empty string if the notes say nothing about it. \
 \"gender\": \"male\", \"female\" or \"unknown\", the grammatical gender the character uses about themself, \
-judging by the notes and the lines; \"unknown\" when they do not settle it. \
+judging by the notes; \"unknown\" when they do not settle it. \
 Use only the notes and do not invent facts. \
 A line starting with \"Russian names:\" gives the exact spelling of names: always use it, declining the name as Russian grammar requires. \
 A line starting with \"Gender:\" tells who is male or female. \
