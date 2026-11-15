@@ -39,7 +39,7 @@ test('run bar shows the step of the chain', () => {
     chainText({ done: 2, total: 5, written: 1, message: 'в пакете: Rusty Anchor', stage }, false),
     'Шаг 2 из 4 · Перевод терминов: запрос 3 из 5 · записано: 1 · в пакете: Rusty Anchor',
   );
-  assert.equal(chainText({ done: 2, total: 5, written: 1, message: null }, true), 'Автоперевод: останавливается после текущего запроса');
+  assert.equal(chainText({ done: 2, total: 5, written: 1, message: null }, true), 'Выполнение: останавливается после текущего запроса');
 });
 
 test('outcomes mark done, broken, waiting and skipped steps', () => {

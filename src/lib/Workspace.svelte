@@ -587,7 +587,7 @@
       title="Шаги модели по всей игре одной очередью: разбор сцен, имена, глоссарий, описания, перевод и вычитка"
     >
       {#if game.active}<LoaderCircle size={15} class="spin" />{:else}<ListChecks size={15} />{/if}
-      <span>Автоперевод</span>
+      <span>Выполнение</span>
     </button>
     <button
       class="btn small"

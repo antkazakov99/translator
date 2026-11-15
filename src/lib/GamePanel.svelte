@@ -9,7 +9,7 @@
   import { activeRun } from "./run-status.svelte";
 
   /**
-   * Окно «Автоперевод»: шаги модели по всей игре одной очередью. Открывается сразу:
+   * Окно «Выполнение»: шаги модели по всей игре одной очередью. Открывается сразу:
    * сколько осталось каждому шагу, считается только по кнопке. Запуск, отбор имён и итог живут в `game`.
    */
   let { projectId, game, onClose }: { projectId: string; game: GameRun; onClose: () => void } = $props();
@@ -60,6 +60,15 @@
 
   function toggle(step: GameStep, on: boolean) {
     chosen = on ? [...chosen, step] : chosen.filter((item) => item !== step);
+  }
+
+  /** Галочка «Все шаги»: отмечены все, ни одного или часть. */
+  const allChosen = $derived(toRun.length === gameSteps.length);
+  const someChosen = $derived(toRun.length > 0 && !allChosen);
+
+  /** Отмечены не все: отмечает все. Отмечены все: снимает все. */
+  function toggleAll() {
+    chosen = allChosen ? [] : [...gameSteps];
   }
 
   function owner(id: number) {
@@ -117,7 +126,7 @@
 </script>
 
 <Dialog
-  title="Автоперевод"
+  title="Выполнение"
   note="Отмеченные шаги идут по порядку одной очередью. Повторный запуск продолжает с того же места: сделанное пропускается"
   closeTitle="Закрыть. Запуск при этом продолжается"
   {onClose}
@@ -189,6 +198,12 @@
       <button class="icon-button" aria-label="Скрыть ошибку" title="Скрыть ошибку" onclick={() => (error = "")}><X size={14} /></button>
     </div>
   {/if}
+
+  <label class="all" title={allChosen ? "Снять все шаги" : "Отметить все шаги"}>
+    <input type="checkbox" checked={allChosen} indeterminate={someChosen} disabled={busy || game.names !== null} onchange={toggleAll} />
+    <span>Все шаги</span>
+    <span class="faint">отмечено {toRun.length} из {gameSteps.length}</span>
+  </label>
 
   <ol class="steps">
     {#each gameSteps as step, index (step)}
@@ -299,6 +314,27 @@
     align-items: center;
     padding: 6px 4px;
     border-bottom: 1px solid var(--divider-row);
+  }
+
+  /* Галочка стоит в той же колонке, что галочки шагов. */
+  .all {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: -10px;
+    padding: 4px 4px 6px;
+    border-bottom: 1px solid var(--divider);
+    cursor: pointer;
+  }
+
+  .all span:first-of-type {
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .all .faint {
+    margin-left: auto;
   }
 
   .steps li.off,

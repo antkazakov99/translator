@@ -1,4 +1,4 @@
-//! Команды панели «Автоперевод».
+//! Команды окна «Выполнение».
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;

@@ -60,9 +60,9 @@ export function leftLabel(work: StepWorkDto) {
 
 /** Строка общей полосы: «Шаг 2 из 4 · Перевод терминов: запрос 3 из 5 · записано: 2 · в пакете: Rusty Anchor». */
 export function chainText(progress: RunProgress, stopping: boolean) {
-  if (stopping) return "Автоперевод: останавливается после текущего запроса";
+  if (stopping) return "Выполнение: останавливается после текущего запроса";
   const stage = progress.stage;
-  const head = stage ? `Шаг ${stage.index} из ${stage.count} · ${stage.title}` : "Автоперевод";
+  const head = stage ? `Шаг ${stage.index} из ${stage.count} · ${stage.title}` : "Выполнение";
   if (progress.total === 0) return `${head}: подготовка`;
   const counts = `${head}: запрос ${Math.min(progress.done + 1, progress.total)} из ${progress.total} · записано: ${progress.written}`;
   return progress.message ? `${counts} · ${progress.message}` : counts;
