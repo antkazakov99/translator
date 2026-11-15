@@ -48,6 +48,23 @@ impl LanguageTag {
         Self(Self::UNDETERMINED.to_string())
     }
 
+    /// Проверка новых данных по встроенному реестру IANA (`language-tags`).
+    /// Чтение старых записей через `parse` намеренно не требует регистрации кода.
+    pub fn validate_registered(&self) -> Result<(), ValidationError> {
+        let bad = || ValidationError::BadLanguage(self.0.clone());
+        let tag = language_tags::LanguageTag::parse(&self.0).map_err(|_| bad())?;
+        tag.validate().map_err(|_| bad())?;
+        // Пользовательские языки пока не поддерживаются.
+        if tag.private_use().is_some() || ("qaa"..="qtz").contains(&tag.primary_language()) {
+            return Err(bad());
+        }
+        // Группа языков не задаёт произношение имени: модель должна уточнить язык.
+        if include_str!("language-collections.txt").lines().any(|code| code == tag.primary_language()) {
+            return Err(bad());
+        }
+        Ok(())
+    }
+
     pub fn is_undetermined(&self) -> bool {
         self.0 == Self::UNDETERMINED
     }
@@ -60,6 +77,22 @@ impl LanguageTag {
 impl fmt::Display for LanguageTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LanguageTag;
+
+    #[test]
+    fn registered_tags_validate_language_script_and_region() {
+        for code in ["ja", "ko", "zh", "sv", "uk", "se", "kr", "tlh", "el", "grc", "und", "zxx", "pt-BR", "sr-Latn", "zh-Hant-TW"] {
+            assert!(LanguageTag::parse(code).unwrap().validate_registered().is_ok(), "{code}");
+        }
+        for code in ["jp", "cn", "ua", "zz", "english", "en-AB", "en-Abcd", "en-US-US", "en-x-game", "qaa", "grk", "grk-Latn", "gem", "sla", "art"] {
+            // Старые значения всё ещё читаются, новые требуют зарегистрированных кодов.
+            assert!(LanguageTag::parse(code).unwrap().validate_registered().is_err(), "{code}");
+        }
     }
 }
 

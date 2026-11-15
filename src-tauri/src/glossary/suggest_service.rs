@@ -288,6 +288,7 @@ impl SuggestService<'_> {
         one_off: Option<ProfileId>,
         host: impl Into<RunHost>,
     ) -> Result<Suggestions<String>, AppError> {
+        from.validate_registered()?;
         if !crate::name_rules::has_rules(&from) {
             return Err(ValidationError::BadLanguage(from.to_string()).into());
         }
@@ -756,6 +757,25 @@ impl Spelling<'_> {
                         found.iter().try_for_each(|(id, origin)| repo.save_origins(*id, std::slice::from_ref(origin)))
                     })?;
                     self.known.extend(found);
+                    let invalid = OriginsPrompt::invalid(&text, batch);
+                    if !invalid.is_empty() {
+                        self.run.grow(1);
+                        if !self.run.step(self.shown()) {
+                            return Ok(false);
+                        }
+                        self.run.note("Происхождение имён: исправление неверных кодов языков".to_string());
+                        let mut repaired = match self.run.send(&OriginsPrompt::repair(&invalid, &self.cast, self.target)).await {
+                            Sent::Text(text) => OriginsPrompt::accept(&text, &invalid),
+                            Sent::Skipped => Vec::new(),
+                            Sent::Stop => return Ok(false),
+                        };
+                        repaired.extend(OriginsPrompt::unresolved(&invalid, &repaired));
+                        self.open.project.write(|tx| {
+                            let repo = CharacterRepo { conn: tx };
+                            repaired.iter().try_for_each(|(id, origin)| repo.save_origins(*id, std::slice::from_ref(origin)))
+                        })?;
+                        self.known.extend(repaired);
+                    }
                 }
                 Sent::Skipped => {}
                 Sent::Stop => return Ok(false),
@@ -1002,6 +1022,58 @@ mod tests {
         assert!(again.items.is_empty());
         assert_eq!(seen.lock().unwrap().len(), 2);
         assert!(open.project.read(|tx| same_entry::translation_pairs(tx, &GlossaryData::load(tx)?)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rules_reject_unregistered_codes_but_old_rules_can_be_read_and_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, id) = project(dir.path(), "http://localhost:1");
+        let service = NameRuleService { state: &state };
+        let invalid = LanguageTag::parse("jp").unwrap();
+        assert!(service.save_shared(id, &invalid, "правило").is_err());
+        assert!(service.save_own(id, &invalid, "правило").is_err());
+        let rule = NameRule::new(invalid.clone(), LanguageTag::parse("ru").unwrap(), "старое правило").unwrap();
+        state.app.write(|tx| crate::name_rules::NameRuleRepo { conn: tx }.save(&rule)).unwrap();
+        let open = state.open_project(id).unwrap();
+        let own = crate::name_rules::NameRuleOverride::new(invalid.clone(), "старое правило проекта").unwrap();
+        open.project.write(|tx| crate::name_rules::NameRuleOverrideRepo { conn: tx }.save(&own)).unwrap();
+        assert_eq!(service.overview(id).unwrap().len(), 1);
+        service.save_shared(id, &invalid, "").unwrap();
+        service.save_own(id, &invalid, "").unwrap();
+        assert!(service.overview(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn names_retry_invalid_language_once_and_keep_the_result() {
+        for (invalid, corrected) in [("jp", true), ("jp", false), ("grk", true), ("grk", false)] {
+            let (url, seen) = fake_model(move |body| {
+                if system_text(body).contains("linguistic origins") {
+                    if corrected && user_text(body).contains("A previous answer") {
+                        completion(r#"[{"id":1,"languages":["ja"]}]"#)
+                    } else {
+                        completion(&format!(r#"[{{"id":1,"languages":["{invalid}"]}}]"#))
+                    }
+                } else {
+                    completion("[]")
+                }
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let (state, id) = project(dir.path(), &url);
+            let character = GlossaryService { state: &state }.create_character(id, "Yuki").unwrap();
+            let service = SuggestService { state: &state };
+            let result =
+                tauri::async_runtime::block_on(service.translate_names(id, vec![character], None, silent(), NameTaking::Offer)).unwrap();
+            assert!(result.suggestions.error.is_none());
+            let open = state.open_project(id).unwrap();
+            let origins = open.project.read(|tx| CharacterRepo { conn: tx }.origins(character)).unwrap();
+            assert_eq!(origins[0].languages[0].as_str(), if corrected { "ja" } else { "und" });
+            if !corrected {
+                assert!(origins[0].reason.as_ref().unwrap().contains("повторного запроса"));
+            }
+            tauri::async_runtime::block_on(service.translate_names(id, vec![character], None, silent(), NameTaking::Offer)).unwrap();
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.iter().filter(|request| system_text(request).contains("linguistic origins")).count(), 2);
+        }
     }
 
     #[test]

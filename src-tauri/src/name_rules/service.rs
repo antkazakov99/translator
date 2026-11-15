@@ -32,6 +32,8 @@ impl NameRuleService<'_> {
     }
 
     pub fn save(&self, rule: &NameRule) -> Result<(), AppError> {
+        rule.from().validate_registered()?;
+        rule.to().validate_registered()?;
         Ok(self.state.app.write(|tx| NameRuleRepo { conn: tx }.save(rule))?)
     }
 
@@ -41,6 +43,10 @@ impl NameRuleService<'_> {
 
     /// Новые пары дополняют библиотеку, существующие не заменяются. Возвращает число добавленных.
     pub fn merge(&self, rules: &[NameRule]) -> Result<usize, AppError> {
+        for rule in rules {
+            rule.from().validate_registered()?;
+            rule.to().validate_registered()?;
+        }
         Ok(self.state.app.write(|tx| {
             let repo = NameRuleRepo { conn: tx };
             let mut added = 0;
@@ -75,6 +81,9 @@ impl NameRuleService<'_> {
 
     /// Своё правило проекта. Пустой текст удаляет его.
     pub fn save_own(&self, project: ProjectId, from: &LanguageTag, rules: &str) -> Result<(), AppError> {
+        if !rules.trim().is_empty() {
+            from.validate_registered()?;
+        }
         let open = self.state.open_project(project)?;
         let rule = (!rules.trim().is_empty()).then(|| NameRuleOverride::new(from.clone(), rules)).transpose()?;
         Ok(open.project.write(|tx| {

@@ -85,6 +85,7 @@ Never use a country code as a substitute for a language code:
 A country may provide context, but does not uniquely identify a language. Choose the language from the name and the available context.
 Add a script or region subtag only when it matters for the name's pronunciation or Russian spelling, for example "pt-BR".
 Do not invent language codes. If you cannot determine the language, use "und".
+Do not use language family or collection codes such as "grk", "gem", or "sla". Choose a specific language: Modern Greek is "el", Ancient Greek is "grc". If several languages are plausible, list their individual codes; if none can be identified, use "und".
 
 - Roles, titles, kinship words, descriptions and abbreviations ("Old Bartender", "Mom", "MC") use "zxx": they are translated by meaning.
 - A form like "Mrs. Karanovic" takes the language of the name inside it.
@@ -387,13 +388,60 @@ fn origin_issues(languages: &[LanguageTag]) -> Vec<String> {
 /// Код языка из ответа разбора: только язык из двух или трёх букв с необязательными подтегами.
 fn origin_language(text: &str) -> Option<LanguageTag> {
     let tag = LanguageTag::parse(text).ok()?;
+    tag.validate_registered().ok()?;
     let primary = tag.as_str().split('-').next()?.len();
     (2..=3).contains(&primary).then_some(tag)
 }
 
 pub struct OriginsPrompt;
 
+fn valid_origin_languages(answer: &AnswerItem) -> bool {
+    answer.languages.as_ref().and_then(serde_json::Value::as_array).is_some_and(|languages| {
+        !languages.is_empty() && languages.iter().all(|language| language.as_str().and_then(origin_language).is_some())
+    })
+}
+
 impl OriginsPrompt {
+    /// Переспрашиваем всю запись с неверным кодом, чтобы не потерять вероятный язык при фильтрации.
+    pub fn invalid(text: &str, batch: &[NameItem]) -> Vec<NameItem> {
+        by_number(text, batch).into_iter().filter(|(_, answer)| !valid_origin_languages(answer)).map(|(item, _)| item.clone()).collect()
+    }
+
+    pub fn repair(batch: &[NameItem], cast: &[String], target: &LlmTarget) -> ChatRequest {
+        let mut request = Self::build(batch, cast, target);
+        request.user.push_str("\nA previous answer for these names contained missing or unsuitable language tags. Return registered IANA language tags, not country codes, language names, or language family/collection codes. Reconsider each name using its context. If unsure, use und. IDs refer only to the list above.\n");
+        request
+    }
+
+    /// После единственной попытки исправления сохраняем неизвестное происхождение с пояснением.
+    pub fn unresolved(batch: &[NameItem], found: &[(CharacterId, NameOrigin)]) -> Vec<(CharacterId, NameOrigin)> {
+        batch
+            .iter()
+            .flat_map(|item| {
+                item.owners.iter().filter_map(|owner| {
+                    if found.iter().any(|(id, origin)| {
+                        *id == owner.character
+                            && origin.field == item.field
+                            && origin.source == item.name
+                            && origin.context == owner.context
+                    }) {
+                        return None;
+                    }
+                    Some((
+                        owner.character,
+                        NameOrigin {
+                            field: item.field,
+                            source: item.name.clone(),
+                            context: owner.context.clone(),
+                            languages: vec![LanguageTag::undetermined()],
+                            reason: Some("Модель не указала допустимый код языка после повторного запроса.".to_string()),
+                        },
+                    ))
+                })
+            })
+            .collect()
+    }
+
     pub fn build(batch: &[NameItem], cast: &[String], target: &LlmTarget) -> ChatRequest {
         let mut list = String::new();
         for (index, item) in batch.iter().enumerate() {
@@ -425,6 +473,7 @@ impl OriginsPrompt {
     pub fn accept(text: &str, batch: &[NameItem]) -> Vec<(CharacterId, NameOrigin)> {
         by_number(text, batch)
             .into_iter()
+            .filter(|(_, answer)| valid_origin_languages(answer))
             .flat_map(|(item, answer)| {
                 let mut languages: Vec<LanguageTag> = Vec::new();
                 let listed = answer.languages.as_ref().and_then(serde_json::Value::as_array).into_iter().flatten();
@@ -686,6 +735,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_origins_are_retried_as_whole_records_and_fall_back_to_unknown() {
+        let batch = [item("Yuki", NameField::First, 1, "Yuki"), item("Anna", NameField::First, 2, "Anna")];
+        let answer = r#"[{"id":1,"languages":["ja","jp"]},{"id":2,"languages":["de"]}]"#;
+        let found = OriginsPrompt::accept(answer, &batch);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1.source, "Anna");
+        let retry = OriginsPrompt::invalid(answer, &batch);
+        assert_eq!(retry, [batch[0].clone()]);
+        let corrected = OriginsPrompt::accept(r#"[{"id":1,"languages":["ja"]}]"#, &retry);
+        assert!(OriginsPrompt::unresolved(&retry, &corrected).is_empty());
+        let unknown = OriginsPrompt::unresolved(&retry, &[]);
+        assert_eq!(unknown[0].1.languages, [tag("und")]);
+        assert!(unknown[0].1.reason.is_some());
+    }
+
+    #[test]
     fn origins_are_kept_per_owner_and_only_with_language_codes() {
         let mut shared = item("Karanovic", NameField::Last, 1, "Anna Karanovic");
         shared.owners.push(NameOwner { character: CharacterId::from_row(3), context: "Mila Karanovic".to_string() });
@@ -693,7 +758,7 @@ mod tests {
         let request = OriginsPrompt::build(&batch, &["Anna Karanovic".to_string()], &target());
         assert!(request.user.contains("- id: 1, name: \"Karanovic\", surname, owner: \"Anna Karanovic; Mila Karanovic\"\n"), "{}", request.user);
 
-        let answer = r#"[{"id": 1, "languages": ["SR", "hr", "sr", "Serbian"], "reason": "Окончание -ić без диакритики."},
+        let answer = r#"[{"id": 1, "languages": ["SR", "hr", "sr"], "reason": "Окончание -ić без диакритики."},
                         {"id": 2, "languages": ["zxx"]},
                         {"id": 3, "languages": ["serbian"]}]"#;
         let origins = OriginsPrompt::accept(answer, &batch);

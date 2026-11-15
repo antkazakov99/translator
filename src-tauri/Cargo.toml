@@ -37,6 +37,7 @@ tracing = "0.1"
 
 # Парсинг
 regex = "1.11"
+language-tags = "0.3.2"
 flate2 = "1.0"
 
 # Сеть и LLM
